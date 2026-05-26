@@ -1,5 +1,4 @@
 #!/bin/bash
-# kto VPN: Ультимативный инсталлятор
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -8,16 +7,19 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${CYAN}==========================================${NC}"
-echo -e "${GREEN}    kto VPN: Ультимативное говно        ${NC}"
+echo -e "${GREEN}    kto VPN: Ультимативное говно         ${NC}"
 echo -e "${CYAN}==========================================${NC}"
 echo "1) Полная оптимизация системы"
-echo "2) Установка ноды Remnawave"
-read -p "Выберите действие (1-2): " choice
+echo "2) Установка/обновление ноды Remnawave"
+echo "3) Установка SelfSteal (от DigneZzZ)"
+echo "4) Установка Reverse Proxy (от eGamesAPI)"
+echo "0) Выход"
+echo -e "${CYAN}==========================================${NC}"
+read -p "Выберите действие (0-4): " choice
 
 case $choice in
     1)
-        # --- БЛОК ОПТИМИЗАЦИИ (Твой старый код) ---
-        echo -e "\n${YELLOW}[..]${NC} Запуск оптимизации..."
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск тихой оптимизации. Пожалуйста, подождите..."
         SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config | grep -v "^#" | awk '{print $2}' | head -n 1)
         SSH_PORT=${SSH_PORT:-22}
         
@@ -30,25 +32,65 @@ case $choice in
         sudo apt-get update > /dev/null 2>&1
         sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64 > /dev/null 2>&1
         
-        # Конфиги (Sysctl, limits) оставляем как были...
-        echo -e "${GREEN}[OK]${NC} Оптимизация завершена. Сделай sudo reboot!"
+        echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null 2>&1
+        sudo systemctl restart cpufrequtils > /dev/null 2>&1 || true
+        sudo systemctl enable --now irqbalance > /dev/null 2>&1 || true
+        
+        sudo tee /etc/sysctl.d/99-vpn-tuning.conf > /dev/null 2>&1 <<EOF
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_tw_buckets = 1440000
+net.ipv4.tcp_max_syn_backlog = 3240000
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_syncookies = 1
+net.core.rmem_default = 1048576
+net.core.rmem_max = 16777216
+net.core.wmem_default = 1048576
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 1048576 2097152
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+vm.swappiness = 1
+EOF
+        sudo sysctl --system > /dev/null 2>&1
+        
+        sudo tee /etc/security/limits.d/99-vpn-limits.conf > /dev/null 2>&1 <<EOF
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
+        sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/system.conf > /dev/null 2>&1
+        sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/user.conf > /dev/null 2>&1
+        sudo systemctl daemon-reload > /dev/null 2>&1
+        
+        sudo ufw --force reset > /dev/null 2>&1
+        sudo ufw default deny incoming > /dev/null 2>&1
+        sudo ufw default allow outgoing > /dev/null 2>&1
+        sudo ufw allow $SSH_PORT/tcp > /dev/null 2>&1
+        sudo ufw allow 443 > /dev/null 2>&1
+        sudo ufw allow 1488 > /dev/null 2>&1
+        sudo ufw --force enable > /dev/null 2>&1
+        sudo systemctl enable --now chronyd > /dev/null 2>&1
+        
+        echo -e "${GREEN}[OK]${NC} Оптимизация завершена. Обязательно выполни: ${CYAN}sudo reboot${NC}"
         ;;
 
     2)
-        # --- БЛОК УСТАНОВКИ НОДЫ ---
-        echo -e "\n${YELLOW}[..]${NC} Установка Remnawave Node..."
+        echo -e "\n${YELLOW}[..]${NC} Подготовка к установке Remnawave..."
         
-        # Спрашиваем ключ
         read -p "Введите SECRET_KEY для ноды: " SECRET_KEY
         [ -z "$SECRET_KEY" ] && { echo -e "${RED}Ошибка: Ключ не может быть пустым!${NC}"; exit 1; }
 
-        # Ставим Docker, если нет
         if ! command -v docker &> /dev/null; then
-            echo -e "${YELLOW}[..]${NC} Установка Docker..."
+            echo -e "${YELLOW}[..]${NC} Docker не найден, устанавливаем..."
             curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
         fi
 
-        # Создаем конфиг
         sudo mkdir -p /opt/remnawave/
         cd /opt/remnawave/ || exit
         
@@ -72,7 +114,6 @@ services:
 EOF
 
         echo -e "${YELLOW}[..]${NC} Запуск контейнера..."
-        # Пробуем новую команду, если не сработает — старую
         if command -v docker compose &> /dev/null; then
             sudo docker compose up -d
         else
@@ -80,9 +121,30 @@ EOF
         fi
         
         echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
-        echo -e "Логи: ${CYAN}docker logs -f remnanode${NC}"
+        echo -e "Для просмотра логов введи: ${CYAN}docker logs -f remnanode${NC}"
+        ;;
+
+    3)
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск скрипта SelfSteal..."
+        bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install
+        echo -e "\n${GREEN}[OK]${NC} Скрипт SelfSteal завершил работу!"
+        ;;
+
+    4)
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск установки Reverse Proxy..."
+        cd /tmp || exit
+        curl -L -o install_remnawave_proxy.sh https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh
+        chmod +x install_remnawave_proxy.sh
+        sudo ./install_remnawave_proxy.sh
+        rm -f install_remnawave_proxy.sh
+        echo -e "\n${GREEN}[OK]${NC} Установка Reverse Proxy завершена!"
+        ;;
+
+    0)
+        echo -e "${CYAN}Выход.${NC}"
+        exit 0
         ;;
     *)
-        echo "Неверный выбор."
+        echo -e "${RED}Ошибка: Неверный выбор!${NC}"
         ;;
 esac
