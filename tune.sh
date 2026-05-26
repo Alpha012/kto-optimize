@@ -18,11 +18,12 @@ echo -e "2) Установка ноды Remnawave"
 echo -e "3) Установка SelfSteal"
 echo -e "4) Установка WARP Native"
 echo -e "5) Проверка говна"
+echo -e "6) Speedtest"
 echo -e "0) Выход"
 echo -e "${PURPLE}==========================================${NC}"
 
 # Кастомная и красивая строка ввода с ZSH-style стрелочкой
-echo -ne "${PURPLE}❯${NC} ${BOLD}Выберите действие (0-5):${NC} "
+echo -ne "${PURPLE}❯${NC} ${BOLD}Выберите действие (0-6):${NC} "
 read choice
 
 case $choice in
@@ -219,6 +220,20 @@ EOF
             echo -e "${RED}Файрвол выключен или правила не заданы!${NC}"
         fi
         echo -e "${PURPLE}==========================================${NC}"
+        ;;
+
+    6)
+        echo -e "\n${YELLOW}[INFO]${NC} Подготовка к замеру скорости..."
+        if ! command -v speedtest &> /dev/null; then
+            echo -e "${YELLOW}[..]${NC} Установка официального Speedtest (Ookla)..."
+            curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | sudo bash > /dev/null 2>&1
+            sudo apt-get install speedtest -y > /dev/null 2>&1
+        fi
+        
+        echo -e "${PURPLE}[..]${NC} Запуск теста (это займет около минуты)...\n"
+        # Флаги --accept-license и --accept-gdpr нужны, чтобы он не просил нажать YES при первом запуске
+        speedtest --accept-license --accept-gdpr
+        echo -e "\n${GREEN}[OK]${NC} Тест завершен!"
         ;;
 
     0)
