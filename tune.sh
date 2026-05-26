@@ -50,7 +50,7 @@ case $choice in
 
         # Создаем конфиг
         sudo mkdir -p /opt/remnawave/
-        cd /opt/remnawave/
+        cd /opt/remnawave/ || exit
         
         cat <<EOF | sudo tee docker-compose.yml > /dev/null
 services:
@@ -68,11 +68,17 @@ services:
         hard: 1048576
     environment:
       - NODE_PORT=1488
-      - SECRET_KEY=$SECRET_KEY
+      - SECRET_KEY="$SECRET_KEY"
 EOF
 
         echo -e "${YELLOW}[..]${NC} Запуск контейнера..."
-        sudo docker compose up -d
+        # Пробуем новую команду, если не сработает — старую
+        if command -v docker compose &> /dev/null; then
+            sudo docker compose up -d
+        else
+            sudo docker-compose up -d
+        fi
+        
         echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
         echo -e "Логи: ${CYAN}docker logs -f remnanode${NC}"
         ;;
