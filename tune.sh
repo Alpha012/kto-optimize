@@ -4,19 +4,26 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 RED='\033[0;31m'
+BOLD='\033[1m'
 NC='\033[0m'
 
+# Очищаем консоль при запуске скрипта
+clear
+
 echo -e "${CYAN}==========================================${NC}"
-echo -e "${GREEN}    kto VPN: Ультимативное говно          ${NC}"
+echo -e "${BOLD}${GREEN}    kto VPN: Ультимативное говно          ${NC}"
 echo -e "${CYAN}==========================================${NC}"
-echo "1) Полная оптимизация системы"
-echo "2) Установка/обновление ноды Remnawave"
-echo "3) Установка SelfSteal"
-echo "4) Установка WARP Native"
-echo "5) Проверка говна"
-echo "0) Выход"
+echo -e "1) Полная оптимизация системы"
+echo -e "2) Установка/обновление ноды Remnawave"
+echo -e "3) Установка SelfSteal (от DigneZzZ)"
+echo -e "4) Установка WARP Native"
+echo -e "5) Проверка состояния ноды (Чекер)"
+echo -e "0) Выход"
 echo -e "${CYAN}==========================================${NC}"
-read -p "Выберите действие (0-5): " choice
+
+# Кастомная и красивая строка ввода с ZSH-style стрелочкой
+echo -ne "${CYAN}❯${NC} ${BOLD}Выберите действие (0-5):${NC} "
+read choice
 
 case $choice in
     1)
@@ -78,14 +85,16 @@ EOF
         sudo ufw --force enable > /dev/null 2>&1
         sudo systemctl enable --now chronyd > /dev/null 2>&1
         
-        echo -e "${GREEN}[OK]${NC} Оптимизация завершена. Обязательно выполни: ${CYAN}sudo reboot${NC}"
+        echo -e "${GREEN}[OK]${NC} Оптимизация завершена. Обязательно выполни: ${BOLD}${CYAN}sudo reboot${NC}"
         ;;
 
     2)
         echo -e "\n${YELLOW}[..]${NC} Подготовка к установке Remnawave..."
         
-        read -p "Введите SECRET_KEY для ноды: " SECRET_KEY
-        [ -z "$SECRET_KEY" ] && { echo -e "${RED}Ошибка: Ключ не может быть пустым!${NC}"; exit 1; }
+        # Красивый запрос ключа
+        echo -ne "${CYAN}❯${NC} ${BOLD}Введите SECRET_KEY для ноды:${NC} "
+        read SECRET_KEY
+        [ -z "$SECRET_KEY" ] && { echo -e "\n${RED}Ошибка: Ключ не может быть пустым!${NC}"; exit 1; }
 
         if ! command -v docker &> /dev/null; then
             echo -e "${YELLOW}[..]${NC} Docker не найден, устанавливаем..."
@@ -122,7 +131,7 @@ EOF
         fi
         
         echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
-        echo -e "Для просмотра логов введи: ${CYAN}docker logs -f remnanode${NC}"
+        echo -e "Для просмотра логов введи: ${BOLD}${CYAN}docker logs -f remnanode${NC}"
         ;;
 
     3)
@@ -138,8 +147,10 @@ EOF
         ;;
 
     5)
-        echo -e "\n${CYAN}==========================================${NC}"
-        echo -e "${YELLOW}         kto VPN: Проверка говна          ${NC}"
+        # Очищаем консоль перед выводом чекера для красоты
+        clear
+        echo -e "${CYAN}==========================================${NC}"
+        echo -e "${BOLD}${YELLOW}    kto VPN: Умная проверка ноды          ${NC}"
         echo -e "${CYAN}==========================================${NC}\n"
 
         KERNEL=$(uname -r)
