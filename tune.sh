@@ -2,7 +2,7 @@
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
+PURPLE='\033[38;5;93m' # Тот самый красивый темно-фиолетовый
 RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
@@ -10,19 +10,19 @@ NC='\033[0m'
 # Жесткая очистка консоли через системный сброс
 printf '\033c'
 
-echo -e "${CYAN}==========================================${NC}"
+echo -e "${PURPLE}==========================================${NC}"
 echo -e "${BOLD}${GREEN}    kto VPN: Ультимативное говно          ${NC}"
-echo -e "${CYAN}==========================================${NC}"
+echo -e "${PURPLE}==========================================${NC}"
 echo -e "1) Полная оптимизация системы"
 echo -e "2) Установка/обновление ноды Remnawave"
 echo -e "3) Установка SelfSteal (от DigneZzZ)"
 echo -e "4) Установка WARP Native"
 echo -e "5) Проверка состояния ноды (Чекер)"
 echo -e "0) Выход"
-echo -e "${CYAN}==========================================${NC}"
+echo -e "${PURPLE}==========================================${NC}"
 
 # Кастомная и красивая строка ввода с ZSH-style стрелочкой
-echo -ne "${CYAN}❯${NC} ${BOLD}Выберите действие (0-5):${NC} "
+echo -ne "${PURPLE}❯${NC} ${BOLD}Выберите действие (0-5):${NC} "
 read choice
 
 case $choice in
@@ -85,14 +85,14 @@ EOF
         sudo ufw --force enable > /dev/null 2>&1
         sudo systemctl enable --now chronyd > /dev/null 2>&1
         
-        echo -e "${GREEN}[OK]${NC} Оптимизация завершена. Обязательно выполни: ${BOLD}${CYAN}sudo reboot${NC}"
+        echo -e "${GREEN}[OK]${NC} Оптимизация завершена. Обязательно выполни: ${BOLD}${PURPLE}sudo reboot${NC}"
         ;;
 
     2)
         echo -e "\n${YELLOW}[..]${NC} Подготовка к установке Remnawave..."
         
         # Красивый запрос ключа
-        echo -ne "${CYAN}❯${NC} ${BOLD}Введите SECRET_KEY для ноды:${NC} "
+        echo -ne "${PURPLE}❯${NC} ${BOLD}Введите SECRET_KEY для ноды:${NC} "
         read SECRET_KEY
         [ -z "$SECRET_KEY" ] && { echo -e "\n${RED}Ошибка: Ключ не может быть пустым!${NC}"; exit 1; }
 
@@ -131,7 +131,7 @@ EOF
         fi
         
         echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
-        echo -e "Для просмотра логов введи: ${BOLD}${CYAN}docker logs -f remnanode${NC}"
+        echo -e "Для просмотра логов введи: ${BOLD}${PURPLE}docker logs -f remnanode${NC}"
         ;;
 
     3)
@@ -150,9 +150,9 @@ EOF
         # Жесткая очистка консоли перед выводом чекера
         printf '\033c'
         
-        echo -e "${CYAN}==========================================${NC}"
+        echo -e "${PURPLE}==========================================${NC}"
         echo -e "${BOLD}${YELLOW}    kto VPN: Умная проверка ноды          ${NC}"
-        echo -e "${CYAN}==========================================${NC}\n"
+        echo -e "${PURPLE}==========================================${NC}\n"
 
         KERNEL=$(uname -r)
         if echo "$KERNEL" | grep -q "liquorix"; then
@@ -198,7 +198,7 @@ EOF
             echo -e "6. Лимиты: ${RED}Стандартные ($LIMIT)${NC}"
         fi
 
-        echo -e "\n${CYAN}=== СТАТУС СЛУЖБ ===${NC}"
+        echo -e "\n${PURPLE}=== СТАТУС СЛУЖБ ===${NC}"
         CORES=$(nproc)
         for svc in chronyd ufw irqbalance; do
             if systemctl is-active --quiet $svc; then
@@ -212,15 +212,20 @@ EOF
             fi
         done
 
-        echo -e "\n${CYAN}=== ОТКРЫТЫЕ ПОРТЫ ===${NC}"
+        echo -e "\n${PURPLE}=== ОТКРЫТЫЕ ПОРТЫ ===${NC}"
         if sudo ufw status | grep -q "ALLOW"; then
             sudo ufw status | grep ALLOW
         else
             echo -e "${RED}Файрвол выключен или правила не заданы!${NC}"
         fi
-        echo -e "${CYAN}==========================================${NC}"
+        echo -e "${PURPLE}==========================================${NC}"
         ;;
 
     0)
-        echo -e "${CYAN}Выход.${NC}"
+        echo -e "${PURPLE}Выход.${NC}"
         exit 0
+        ;;
+    *)
+        echo -e "${RED}Ошибка: Неверный выбор!${NC}"
+        ;;
+esac
