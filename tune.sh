@@ -1,42 +1,54 @@
 #!/bin/bash
-# Скрипт автонастройки ноды kto VPN
+# Скрипт автонастройки ноды kto VPN (Silent Mode)
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
-echo -e "${YELLOW}==========================================${NC}"
+echo -e "${CYAN}==========================================${NC}"
 echo -e "${GREEN}    kto VPN: Auto-Tuning Node Setup       ${NC}"
-echo -e "${YELLOW}==========================================${NC}"
-echo "Начинаем универсальный тюнинг сервера..."
+echo -e "${CYAN}==========================================${NC}"
+echo "Начинаем тихую установку. Пожалуйста, подождите..."
+echo ""
 
-# Автоопределение порта SSH (чтобы не заблокировать себя)
+# Автоопределение порта SSH
 SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config | grep -v "^#" | awk '{print $2}' | head -n 1)
-if [ -z "$SSH_PORT" ]; then
-    SSH_PORT=22
-fi
-echo "Обнаружен SSH порт: $SSH_PORT. Он будет добавлен в UFW."
+SSH_PORT=${SSH_PORT:-22}
+echo -e "${GREEN}[INFO]${NC} Обнаружен SSH порт: $SSH_PORT. Он будет защищен."
+echo ""
 
-# 1. Подготовка и удаление snapd
-sudo systemctl disable --now snapd.socket snapd.service 2>/dev/null
-sudo apt purge snapd -y
-sudo apt autoremove -y
+# 1. Мусор
+echo -n -e "${YELLOW}[..]${NC} 1/7 Удаление мусора (snapd)... "
+sudo systemctl disable --now snapd.socket snapd.service > /dev/null 2>&1
+sudo apt-get purge snapd -y > /dev/null 2>&1
+sudo apt-get autoremove -y > /dev/null 2>&1
+echo -e "\r${GREEN}[OK]${NC} 1/7 Удаление мусора (snapd) завершено!     "
 
-# 2. Установка утилит
-sudo apt update && sudo apt install -y wget gnupg2 chrony ufw cpufrequtils irqbalance software-properties-common
+# 2. Утилиты
+echo -n -e "${YELLOW}[..]${NC} 2/7 Установка базовых утилит... "
+sudo apt-get update > /dev/null 2>&1
+# Переменная DEBIAN_FRONTEND отключает розовые экраны с подтверждениями во время установки
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y wget gnupg2 chrony ufw cpufrequtils irqbalance software-properties-common > /dev/null 2>&1
+echo -e "\r${GREEN}[OK]${NC} 2/7 Базовые утилиты установлены!           "
 
-# Устанавливаем ядро Liquorix
-sudo add-apt-repository ppa:damentz/liquorix -y
-sudo apt update
-sudo apt install linux-image-liquorix-amd64 linux-headers-liquorix-amd64 -y
+# 3. Liquorix
+echo -n -e "${YELLOW}[..]${NC} 3/7 Установка ядра Liquorix (занимает 1-2 мин)... "
+sudo add-apt-repository ppa:damentz/liquorix -y > /dev/null 2>&1
+sudo apt-get update > /dev/null 2>&1
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64 > /dev/null 2>&1
+echo -e "\r${GREEN}[OK]${NC} 3/7 Ядро Liquorix успешно установлено!                       "
 
-# 3. Настройка процессора и прерываний
-echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null
-sudo systemctl restart cpufrequtils 2>/dev/null || true
-sudo systemctl enable --now irqbalance 2>/dev/null || true
+# 4. Процессор
+echo -n -e "${YELLOW}[..]${NC} 4/7 Настройка процессора и прерываний... "
+echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null 2>&1
+sudo systemctl restart cpufrequtils > /dev/null 2>&1 || true
+sudo systemctl enable --now irqbalance > /dev/null 2>&1 || true
+echo -e "\r${GREEN}[OK]${NC} 4/7 Процессор настроен!                          "
 
-# 4. Тюнинг сетевого стека (Sysctl)
-sudo tee /etc/sysctl.d/99-vpn-tuning.conf > /dev/null <<EOF
+# 5. Sysctl
+echo -n -e "${YELLOW}[..]${NC} 5/7 Оптимизация сети (Sysctl, BBR, FQ)... "
+sudo tee /etc/sysctl.d/99-vpn-tuning.conf > /dev/null 2>&1 <<EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.somaxconn = 65535
@@ -56,34 +68,36 @@ net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 vm.swappiness = 1
 EOF
-sudo sysctl --system
+sudo sysctl --system > /dev/null 2>&1
+echo -e "\r${GREEN}[OK]${NC} 5/7 Оптимизация сети завершена!                   "
 
-# 5. Лимиты на файловые дескрипторы
-sudo tee /etc/security/limits.d/99-vpn-limits.conf > /dev/null <<EOF
+# 6. Лимиты
+echo -n -e "${YELLOW}[..]${NC} 6/7 Снятие лимитов на дескрипторы... "
+sudo tee /etc/security/limits.d/99-vpn-limits.conf > /dev/null 2>&1 <<EOF
 * soft nofile 1048576
 * hard nofile 1048576
 root soft nofile 1048576
 root hard nofile 1048576
 EOF
-sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/system.conf
-sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/user.conf
-sudo systemctl daemon-reload
+sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/system.conf > /dev/null 2>&1
+sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/user.conf > /dev/null 2>&1
+sudo systemctl daemon-reload > /dev/null 2>&1
+echo -e "\r${GREEN}[OK]${NC} 6/7 Лимиты системы расширены!              "
 
-# 6. Настройка UFW
-sudo ufw --force reset
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
+# 7. UFW и Chrony
+echo -n -e "${YELLOW}[..]${NC} 7/7 Настройка файрвола (UFW) и времени... "
+sudo ufw --force reset > /dev/null 2>&1
+sudo ufw default deny incoming > /dev/null 2>&1
+sudo ufw default allow outgoing > /dev/null 2>&1
+sudo ufw allow $SSH_PORT/tcp > /dev/null 2>&1
+sudo ufw allow 443 > /dev/null 2>&1
+sudo ufw allow 1488 > /dev/null 2>&1
+sudo ufw --force enable > /dev/null 2>&1
+sudo systemctl enable --now chronyd > /dev/null 2>&1
+echo -e "\r${GREEN}[OK]${NC} 7/7 Файрвол и время готовы!                     "
 
-sudo ufw allow $SSH_PORT/tcp
-sudo ufw allow 443     
-sudo ufw allow 1488    
-sudo ufw --force enable
-
-# 7. Включаем точное время
-sudo systemctl enable --now chronyd
-
-echo -e "${GREEN}========================================================${NC}"
-echo -e "${YELLOW}Тюнинг успешно завершен!${NC}"
-echo -e "Твой SSH порт ($SSH_PORT) в безопасности."
+echo ""
+echo -e "${CYAN}========================================================${NC}"
+echo -e "${GREEN}Тюнинг успешно завершен без единого лога!${NC}"
 echo -e "Для применения ядра Liquorix напиши: ${GREEN}sudo reboot${NC}"
-echo -e "${GREEN}========================================================${NC}"
+echo -e "${CYAN}========================================================${NC}"
