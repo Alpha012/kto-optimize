@@ -183,7 +183,6 @@ EOF
         echo -e "\n${YELLOW}[INFO]${NC} Запуск установки WARP Native..."
         curl -sL "https://raw.githubusercontent.com/distillium/warp-native/main/install.sh" -o /tmp/warp.sh
         
-        # Передаем 2 (Русский) и 1 (Установка) напрямую в скрипт, пропуская ручной ввод
         if echo -e "2\n1\n" | sudo bash /tmp/warp.sh; then
             echo -e "\n${GREEN}[OK]${NC} WARP успешно установлен!"
         else
@@ -288,9 +287,8 @@ EOF
         if [ -z "$DOMAIN" ]; then
             echo -e "${RED}[ОШИБКА] Домен не может быть пустым!${NC}"
         else
-            echo -e "${PURPLE}[..]${NC} Установка cron, socat и acme.sh..."
+            echo -e "${PURPLE}[..]${NC} Подготовка окружения..."
             sudo apt-get update > /dev/null 2>&1
-            # socat обязателен для standalone режима
             sudo apt-get install cron socat -y > /dev/null 2>&1
             sudo systemctl enable --now cron > /dev/null 2>&1
             
@@ -298,29 +296,25 @@ EOF
                 curl -s https://get.acme.sh | sh -s email=aaaaaa123456@gmail.com --force > /dev/null 2>&1
             fi
             
-            echo -e "${PURPLE}[..]${NC} Подключение к Let's Encrypt..."
+            echo -e "${PURPLE}[..]${NC} Настройка Let's Encrypt..."
             /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt > /dev/null 2>&1
             
-            echo -e "${PURPLE}[..]${NC} Выпуск сертификата (это займет около минуты)..."
-            # Временно открываем порт для проверки
-            sudo ufw allow 8443/tcp > /dev/null 2>&1
+            echo -e "${PURPLE}[..]${NC} Выпуск сертификата (ожидай около минуты)..."
+            sudo ufw allow 80/tcp > /dev/null 2>&1
+            sudo docker stop remnanode > /dev/null 2>&1
             sudo mkdir -p /opt/remnawave/
             
-            if /root/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN" \
-                --key-file /opt/remnawave/privkey.key \
-                --fullchain-file /opt/remnawave/fullchain.pem \
-                --alpn --tlsport 8443; then
-                
+            if /root/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN" --key-file /opt/remnawave/privkey.key --fullchain-file /opt/remnawave/fullchain.pem --force > /dev/null 2>&1; then
                 echo -e "\n${GREEN}[OK]${NC} Сертификат успешно выпущен!"
-                echo -e "${GREEN}[+]${NC} Cron настроен, сертификат будет продлеваться автоматически."
+                echo -e "${GREEN}[+]${NC} Cron настроен, автопродление активно."
                 echo -e "Ключ:       ${BOLD}/opt/remnawave/privkey.key${NC}"
                 echo -e "Fullchain:  ${BOLD}/opt/remnawave/fullchain.pem${NC}"
             else
-                echo -e "\n${RED}[ОШИБКА] Ошибка выпуска. Убедись, что домен ${DOMAIN} реально направлен на IP этого сервера!${NC}"
+                echo -e "\n${RED}[ОШИБКА] Ошибка выпуска. Убедись, что домен направлен на IP этого сервера!${NC}"
             fi
             
-            # Закрываем временный порт
-            sudo ufw delete allow 8443/tcp > /dev/null 2>&1
+            sudo docker start remnanode > /dev/null 2>&1
+            sudo ufw delete allow 80/tcp > /dev/null 2>&1
         fi
         ;;
 
