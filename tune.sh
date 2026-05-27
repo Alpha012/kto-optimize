@@ -10,7 +10,7 @@ NC='\033[0m'
 printf '\033c'
 
 echo -e "${PURPLE}==========================================${NC}"
-echo -e "${BOLD}${GREEN}    kto VPN                             ${NC}"
+echo -e "${BOLD}${GREEN}                 kto VPN                  ${NC}"
 echo -e "${PURPLE}==========================================${NC}"
 echo -e "1) Полная оптимизация"
 echo -e "2) Установка ноды Remnawave"
@@ -194,7 +194,7 @@ EOF
         sudo sysctl -p /etc/sysctl.d/99-vpn-tuning.conf > /dev/null 2>&1
         
         echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
-        echo -e "             ${BOLD}${YELLOW}kto VPN${NC}"
+        echo -e "${BOLD}${YELLOW}                       kto VPN                        ${NC}"
         echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
         
         echo -e "${BOLD}${PURPLE}[ СИСТЕМА ]${NC}"
@@ -204,7 +204,7 @@ EOF
             local val=$2
             local expected=$3
             
-            printf " %-20s " "$name"
+            echo -ne " $name "
             if [[ "$val" == *"$expected"* ]]; then
                 echo -e "${GREEN}[ OK ]${NC}"
             else
@@ -213,20 +213,20 @@ EOF
         }
 
         KERNEL_VER=$(uname -r)
-        print_stat "Ядро Liquorix" "$KERNEL_VER" "liquorix"
+        print_stat "Ядро Liquorix   " "$KERNEL_VER" "liquorix"
         
         NET_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
         NET_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-        print_stat "BBR + FQ" "${NET_CC}+${NET_QDISC}" "bbr+fq"
+        print_stat "BBR + FQ        " "${NET_CC}+${NET_QDISC}" "bbr+fq"
         
         TFO=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)
-        print_stat "TCP Fast Open" "$TFO" "3"
+        print_stat "TCP Fast Open   " "$TFO" "3"
         
         KEEPALIVE=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
-        print_stat "Keepalive (10m)" "$KEEPALIVE" "600"
+        print_stat "Keepalive (10m) " "$KEEPALIVE" "600"
         
         SNAP_STATUS=$(command -v snap &> /dev/null && echo "found" || echo "clean")
-        print_stat "Snapd удален" "$SNAP_STATUS" "clean"
+        print_stat "Snapd удален    " "$SNAP_STATUS" "clean"
 
         echo -e "\n${BOLD}${PURPLE}[ СЛУЖБЫ ]${NC}"
         echo -ne " "
