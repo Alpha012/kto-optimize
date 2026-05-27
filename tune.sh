@@ -28,24 +28,29 @@ read choice
 
 case $choice in
     1)
-        echo -e "\n${YELLOW}[INFO]${NC} Запуск тихой оптимизации. Пожалуйста, подождите..."
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск оптимизации. Пожалуйста, подождите..."
         SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config | grep -v "^#" | awk '{print $2}' | head -n 1)
         SSH_PORT=${SSH_PORT:-22}
         
         sudo systemctl disable --now snapd.socket snapd.service > /dev/null 2>&1
         sudo apt-get purge snapd -y > /dev/null 2>&1
-        sudo apt-get update > /dev/null 2>&1
-        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y wget gnupg2 chrony ufw cpufrequtils irqbalance software-properties-common > /dev/null 2>&1
         
-        sudo add-apt-repository ppa:damentz/liquorix -y > /dev/null 2>&1
-        sudo apt-get update > /dev/null 2>&1
-        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64 > /dev/null 2>&1
+        echo -e "${PURPLE}[..]${NC} Обновление пакетов и установка базовых утилит..."
+        sudo apt-get update > /dev/null
+        # Обрати внимание: тут только > /dev/null. Если будет ошибка зависимостей, она вылезет на экран.
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget gnupg2 chrony ufw cpufrequtils irqbalance software-properties-common > /dev/null
         
-        echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null 2>&1
+        echo -e "${PURPLE}[..]${NC} Установка ядра Liquorix..."
+        sudo add-apt-repository ppa:damentz/liquorix -y > /dev/null
+        sudo apt-get update > /dev/null
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64 > /dev/null
+        
+        echo -e "${PURPLE}[..]${NC} Тюнинг процессора и сети..."
+        echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null
         sudo systemctl restart cpufrequtils > /dev/null 2>&1 || true
         sudo systemctl enable --now irqbalance > /dev/null 2>&1 || true
         
-        sudo tee /etc/sysctl.d/99-vpn-tuning.conf > /dev/null 2>&1 <<EOF
+        sudo tee /etc/sysctl.d/99-vpn-tuning.conf > /dev/null <<EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.somaxconn = 65535
@@ -65,41 +70,41 @@ net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 vm.swappiness = 1
 EOF
-        sudo sysctl --system > /dev/null 2>&1
+        sudo sysctl --system > /dev/null
         
-        sudo tee /etc/security/limits.d/99-vpn-limits.conf > /dev/null 2>&1 <<EOF
+        sudo tee /etc/security/limits.d/99-vpn-limits.conf > /dev/null <<EOF
 * soft nofile 1048576
 * hard nofile 1048576
 root soft nofile 1048576
 root hard nofile 1048576
 EOF
-        sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/system.conf > /dev/null 2>&1
-        sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/user.conf > /dev/null 2>&1
-        sudo systemctl daemon-reload > /dev/null 2>&1
+        sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/system.conf > /dev/null
+        sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/user.conf > /dev/null
+        sudo systemctl daemon-reload > /dev/null
         
-        sudo ufw --force reset > /dev/null 2>&1
-        sudo ufw default deny incoming > /dev/null 2>&1
-        sudo ufw default allow outgoing > /dev/null 2>&1
-        sudo ufw allow $SSH_PORT/tcp > /dev/null 2>&1
-        sudo ufw allow 443 > /dev/null 2>&1
-        sudo ufw allow 1488 > /dev/null 2>&1
-        sudo ufw --force enable > /dev/null 2>&1
-        sudo systemctl enable --now chronyd > /dev/null 2>&1
+        echo -e "${PURPLE}[..]${NC} Настройка Firewall (UFW)..."
+        sudo ufw --force reset > /dev/null
+        sudo ufw default deny incoming > /dev/null
+        sudo ufw default allow outgoing > /dev/null
+        sudo ufw allow $SSH_PORT/tcp > /dev/null
+        sudo ufw allow 443 > /dev/null
+        sudo ufw allow 1488 > /dev/null
+        sudo ufw --force enable > /dev/null
+        sudo systemctl enable --now chronyd > /dev/null
         
-        echo -e "${GREEN}[OK]${NC} Оптимизация завершена. Обязательно выполни: ${BOLD}${PURPLE}sudo reboot${NC}"
+        echo -e "\n${GREEN}[OK]${NC} Оптимизация завершена. Если не было красных ошибок, пиши: ${BOLD}${PURPLE}sudo reboot${NC}"
         ;;
 
     2)
         echo -e "\n${YELLOW}[..]${NC} Подготовка к установке Remnawave..."
         
-        # Красивый запрос ключа
         echo -ne "${PURPLE}❯${NC} ${BOLD}Введите SECRET_KEY для ноды:${NC} "
         read SECRET_KEY
-        [ -z "$SECRET_KEY" ] && { echo -e "\n${RED}Ошибка: Ключ не может быть пустым!${NC}"; exit 1; }
+        [ -z "$SECRET_KEY" ] && { echo -e "\n${RED}[ОШИБКА] Ключ не может быть пустым!${NC}"; exit 1; }
 
         if ! command -v docker &> /dev/null; then
             echo -e "${YELLOW}[..]${NC} Docker не найден, устанавливаем..."
-            curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
+            curl -fsSL https://get.docker.com | sh > /dev/null
         fi
 
         sudo mkdir -p /opt/remnawave/
@@ -126,31 +131,40 @@ EOF
 
         echo -e "${YELLOW}[..]${NC} Запуск контейнера..."
         if command -v docker compose &> /dev/null; then
-            sudo docker compose up -d
+            DOCKER_CMD="sudo docker compose"
         else
-            sudo docker-compose up -d
+            DOCKER_CMD="sudo docker-compose"
         fi
         
-        echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
-        echo -e "Для просмотра логов введи: ${BOLD}${PURPLE}docker logs -f remnanode${NC}"
+        # Жесткая проверка успешности докера
+        if $DOCKER_CMD up -d; then
+            echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
+            echo -e "Для просмотра логов введи: ${BOLD}${PURPLE}docker logs -f remnanode${NC}"
+        else
+            echo -e "\n${RED}[ОШИБКА] Docker не смог запустить ноду! Ищи причину в тексте выше.${NC}"
+        fi
         ;;
 
     3)
         echo -e "\n${YELLOW}[INFO]${NC} Запуск скрипта SelfSteal..."
-        bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install
-        echo -e "\n${GREEN}[OK]${NC} Скрипт SelfSteal завершил работу!"
+        if bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install; then
+            echo -e "\n${GREEN}[OK]${NC} Скрипт SelfSteal успешно завершил работу!"
+        else
+            echo -e "\n${RED}[ОШИБКА] Скрипт SelfSteal прервался с ошибкой!${NC}"
+        fi
         ;;
 
     4)
         echo -e "\n${YELLOW}[INFO]${NC} Запуск установки WARP Native..."
-        bash <(curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh)
-        echo -e "\n${GREEN}[OK]${NC} Установка WARP Native завершена!"
+        if bash <(curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh); then
+            echo -e "\n${GREEN}[OK]${NC} Установка WARP Native успешно завершена!"
+        else
+            echo -e "\n${RED}[ОШИБКА] Установка WARP Native прервалась с ошибкой!${NC}"
+        fi
         ;;
 
     5)
-        # Жесткая очистка консоли перед выводом чекера
         printf '\033c'
-        
         echo -e "${PURPLE}==========================================${NC}"
         echo -e "${BOLD}${YELLOW}    kto VPN: Проверка говна               ${NC}"
         echo -e "${PURPLE}==========================================${NC}\n"
@@ -224,16 +238,26 @@ EOF
 
     6)
         echo -e "\n${YELLOW}[INFO]${NC} Подготовка к замеру скорости..."
+        
+        # Сначала проверяем, есть ли вообще curl
+        if ! command -v curl &> /dev/null; then
+            sudo apt-get update > /dev/null && sudo apt-get install -y curl > /dev/null
+        fi
+
         if ! command -v speedtest &> /dev/null; then
-            echo -e "${YELLOW}[..]${NC} Установка официального Speedtest (Ookla)..."
-            curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | sudo bash > /dev/null 2>&1
-            sudo apt-get install speedtest -y > /dev/null 2>&1
+            echo -e "${PURPLE}[..]${NC} Установка официального Speedtest (Ookla)..."
+            curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | sudo bash > /dev/null
+            sudo apt-get install speedtest -y > /dev/null
         fi
         
-        echo -e "${PURPLE}[..]${NC} Запуск теста (это займет около минуты)...\n"
-        # Флаги --accept-license и --accept-gdpr нужны, чтобы он не просил нажать YES при первом запуске
-        speedtest --accept-license --accept-gdpr
-        echo -e "\n${GREEN}[OK]${NC} Тест завершен!"
+        # Жесткая проверка: установился ли он в итоге?
+        if command -v speedtest &> /dev/null; then
+            echo -e "${PURPLE}[..]${NC} Запуск теста...\n"
+            speedtest --accept-license --accept-gdpr
+            echo -e "\n${GREEN}[OK]${NC} Тест завершен!"
+        else
+            echo -e "\n${RED}[ОШИБКА] Speedtest так и не установился! Проверь ошибки в тексте выше.${NC}"
+        fi
         ;;
 
     0)
