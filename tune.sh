@@ -10,13 +10,13 @@ NC='\033[0m'
 printf '\033c'
 
 echo -e "${PURPLE}==========================================${NC}"
-echo -e "${BOLD}${GREEN}    kto VPN: Ультимативное говно          ${NC}"
+echo -e "${BOLD}${GREEN}    kto VPN                             ${NC}"
 echo -e "${PURPLE}==========================================${NC}"
-echo -e "1) Полная оптимизация (с авто-починкой ОС)"
+echo -e "1) Полная оптимизация"
 echo -e "2) Установка ноды Remnawave"
 echo -e "3) Установка SelfSteal"
 echo -e "4) Установка WARP Native"
-echo -e "5) Проверка говна"
+echo -e "5) Панель состояния"
 echo -e "6) Speedtest"
 echo -e "0) Выход"
 echo -e "${PURPLE}==========================================${NC}"
@@ -26,30 +26,29 @@ read choice
 
 case $choice in
     1)
-        echo -e "\n${YELLOW}[INFO]${NC} Запуск PRO-оптимизации и самолечения..."
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск оптимизации..."
         SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config | grep -v "^#" | awk '{print $2}' | head -n 1)
         SSH_PORT=${SSH_PORT:-22}
         
-        echo -e "${PURPLE}[..]${NC} Убиваем фоновые процессы Ubuntu, мешающие установке..."
+        echo -e "${PURPLE}[..]${NC} Очистка процессов..."
         sudo systemctl stop unattended-upgrades > /dev/null 2>&1
         sudo killall apt apt-get > /dev/null 2>&1
         sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock*
         sudo dpkg --configure -a > /dev/null 2>&1
         
-        echo -e "${PURPLE}[..]${NC} Лечим APT..."
+        echo -e "${PURPLE}[..]${NC} Подготовка системы..."
         sudo rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list > /dev/null 2>&1
-        
         sudo systemctl disable --now snapd.socket snapd.service > /dev/null 2>&1
         sudo apt-get purge snapd -y > /dev/null 2>&1
         
         export NEEDRESTART_MODE=a
         export NEEDRESTART_SUSPEND=1
         
-        echo -e "${PURPLE}[..]${NC} Обновление и установка утилит..."
+        echo -e "${PURPLE}[..]${NC} Установка утилит..."
         sudo apt-get update > /dev/null 2>&1
         sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget gnupg2 chrony ufw cpufrequtils irqbalance software-properties-common > /dev/null 2>&1
         
-        echo -e "${PURPLE}[..]${NC} Установка ядра Liquorix (бронебойный метод)..."
+        echo -e "${PURPLE}[..]${NC} Установка ядра Liquorix..."
         sudo add-apt-repository ppa:damentz/liquorix -y > /dev/null 2>&1
         sudo apt-get update > /dev/null 2>&1
         
@@ -61,7 +60,7 @@ case $choice in
             sleep 2
         done
         
-        echo -e "${PURPLE}[..]${NC} Тюнинг ядра и сети (Pro-Level)..."
+        echo -e "${PURPLE}[..]${NC} Применение сетевых настроек..."
         echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null
         sudo systemctl restart cpufrequtils > /dev/null 2>&1 || true
         sudo systemctl enable --now irqbalance > /dev/null 2>&1 || true
@@ -125,7 +124,6 @@ EOF
         [ -z "$SECRET_KEY" ] && { echo -e "\n${RED}[ОШИБКА] Ключ не может быть пустым!${NC}"; exit 1; }
 
         if ! command -v docker &> /dev/null; then
-            echo -e "${YELLOW}[..]${NC} Docker не найден, устанавливаем..."
             curl -fsSL https://get.docker.com | sudo sh > /dev/null 2>&1
         fi
 
@@ -151,7 +149,6 @@ services:
       - SECRET_KEY="$SECRET_KEY"
 EOF
 
-        echo -e "${YELLOW}[..]${NC} Запуск контейнера..."
         if command -v docker compose &> /dev/null; then
             DOCKER_CMD="sudo docker compose"
         else
@@ -159,21 +156,21 @@ EOF
         fi
         
         if $DOCKER_CMD up -d; then
-            echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
+            echo -e "${GREEN}[OK]${NC} Нода запущена!"
             echo -e "Для просмотра логов введи: ${BOLD}${PURPLE}sudo docker logs -f remnanode${NC}"
         else
-            echo -e "\n${RED}[ОШИБКА] Docker не смог запустить ноду! Проверь лимиты Docker Hub.${NC}"
+            echo -e "\n${RED}[ОШИБКА] Docker не смог запустить ноду! Проверь лимиты.${NC}"
         fi
         ;;
 
     3)
-        echo -e "\n${YELLOW}[INFO]${NC} Запуск скрипта SelfSteal..."
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск установки SelfSteal..."
         curl -sL "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh" -o /tmp/selfsteal.sh
         
         if sudo bash /tmp/selfsteal.sh @ install < /dev/tty; then
-            echo -e "\n${GREEN}[OK]${NC} Скрипт SelfSteal успешно завершил работу!"
+            echo -e "\n${GREEN}[OK]${NC} SelfSteal установлен!"
         else
-            echo -e "\n${RED}[ОШИБКА] Скрипт SelfSteal прервался с ошибкой!${NC}"
+            echo -e "\n${RED}[ОШИБКА] Ошибка SelfSteal.${NC}"
         fi
         
         rm -f /tmp/selfsteal.sh
@@ -184,9 +181,9 @@ EOF
         curl -sL "https://raw.githubusercontent.com/distillium/warp-native/main/install.sh" -o /tmp/warp.sh
         
         if sudo bash /tmp/warp.sh < /dev/tty; then
-            echo -e "\n${GREEN}[OK]${NC} Установка WARP Native успешно завершена!"
+            echo -e "\n${GREEN}[OK]${NC} WARP установлен!"
         else
-            echo -e "\n${RED}[ОШИБКА] Установка WARP Native прервалась с ошибкой!${NC}"
+            echo -e "\n${RED}[ОШИБКА] Ошибка WARP.${NC}"
         fi
         
         rm -f /tmp/warp.sh
@@ -197,7 +194,7 @@ EOF
         sudo sysctl -p /etc/sysctl.d/99-vpn-tuning.conf > /dev/null 2>&1
         
         echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
-        echo -e "             ${BOLD}${YELLOW}kto VPN: ПАНЕЛЬ СОСТОЯНИЯ${NC}"
+        echo -e "             ${BOLD}${YELLOW}kto VPN${NC}"
         echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
         
         echo -e "${BOLD}${PURPLE}[ СИСТЕМА ]${NC}"
@@ -206,31 +203,30 @@ EOF
             local name=$1
             local val=$2
             local expected=$3
-            local extra=$4
             
             printf " %-20s " "$name"
             if [[ "$val" == *"$expected"* ]]; then
-                echo -e "${GREEN}[ OK ]${NC} ${extra}"
+                echo -e "${GREEN}[ OK ]${NC}"
             else
-                echo -e "${RED}[ БЕДА ]${NC} ${extra} (сейчас: $val)"
+                echo -e "${RED}[ FAIL ]${NC} ($val)"
             fi
         }
 
         KERNEL_VER=$(uname -r)
-        print_stat "Ядро Liquorix" "$KERNEL_VER" "liquorix" "($KERNEL_VER)"
+        print_stat "Ядро Liquorix" "$KERNEL_VER" "liquorix"
         
         NET_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
         NET_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-        print_stat "BBR + FQ" "${NET_CC}+${NET_QDISC}" "bbr+fq" ""
+        print_stat "BBR + FQ" "${NET_CC}+${NET_QDISC}" "bbr+fq"
         
         TFO=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)
-        print_stat "TCP Fast Open" "$TFO" "3" ""
+        print_stat "TCP Fast Open" "$TFO" "3"
         
         KEEPALIVE=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
-        print_stat "Keepalive (10m)" "$KEEPALIVE" "600" ""
+        print_stat "Keepalive (10m)" "$KEEPALIVE" "600"
         
         SNAP_STATUS=$(command -v snap &> /dev/null && echo "found" || echo "clean")
-        print_stat "Snapd удален" "$SNAP_STATUS" "clean" ""
+        print_stat "Snapd удален" "$SNAP_STATUS" "clean"
 
         echo -e "\n${BOLD}${PURPLE}[ СЛУЖБЫ ]${NC}"
         echo -ne " "
@@ -250,19 +246,19 @@ EOF
         ;;
 
     6)
-        echo -e "\n${YELLOW}[INFO]${NC} Подготовка к замеру скорости..."
+        echo -e "\n${YELLOW}[INFO]${NC} Подготовка Speedtest..."
         
-        if ! command -v speedtest &> /dev/null; then
-            echo -e "${PURPLE}[..]${NC} Прямое скачивание бинарника Speedtest (Ookla)..."
-            wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | sudo tar xvz -C /usr/local/bin/ speedtest > /dev/null 2>&1
-        fi
+        sudo apt-get remove -y speedtest-cli > /dev/null 2>&1
+        sudo rm -f /usr/bin/speedtest /usr/local/bin/speedtest > /dev/null 2>&1
         
-        if command -v speedtest &> /dev/null; then
+        wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | sudo tar xvz -C /usr/local/bin/ speedtest > /dev/null 2>&1
+        
+        if [ -f "/usr/local/bin/speedtest" ]; then
             echo -e "${PURPLE}[..]${NC} Запуск теста...\n"
-            speedtest --accept-license --accept-gdpr
+            /usr/local/bin/speedtest --accept-license --accept-gdpr
             echo -e "\n${GREEN}[OK]${NC} Тест завершен!"
         else
-            echo -e "\n${RED}[ОШИБКА] Не удалось скачать Speedtest. Проверь интернет на сервере.${NC}"
+            echo -e "\n${RED}[ОШИБКА] Ошибка скачивания Speedtest.${NC}"
         fi
         ;;
 
