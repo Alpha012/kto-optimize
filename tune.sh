@@ -1,3 +1,10 @@
+Понял, логика железобетонная. Если ты будешь выпускать серты для нескольких доменов на одном сервере, они не должны перезаписывать друг друга одним именем.
+
+Въебал динамические имена. Теперь скрипт сам подставляет введенный домен в название файлов (`${DOMAIN}_privkey.key`), и они аккуратно складываются в папку.
+
+Лови финалочку:
+
+```bash
 #!/bin/bash
 
 GREEN='\033[0;32m'
@@ -304,11 +311,11 @@ EOF
             sudo docker stop remnanode > /dev/null 2>&1
             sudo mkdir -p /opt/remnawave/
             
-            if /root/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN" --key-file /opt/remnawave/privkey.key --fullchain-file /opt/remnawave/fullchain.pem --force > /dev/null 2>&1; then
+            if /root/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN" --key-file "/opt/remnawave/${DOMAIN}_privkey.key" --fullchain-file "/opt/remnawave/${DOMAIN}_fullchain.pem" --force > /dev/null 2>&1; then
                 echo -e "\n${GREEN}[OK]${NC} Сертификат успешно выпущен!"
                 echo -e "${GREEN}[+]${NC} Cron настроен, автопродление активно."
-                echo -e "Ключ:       ${BOLD}/opt/remnawave/privkey.key${NC}"
-                echo -e "Fullchain:  ${BOLD}/opt/remnawave/fullchain.pem${NC}"
+                echo -e "Ключ:       ${BOLD}/opt/remnawave/${DOMAIN}_privkey.key${NC}"
+                echo -e "Fullchain:  ${BOLD}/opt/remnawave/${DOMAIN}_fullchain.pem${NC}"
             else
                 echo -e "\n${RED}[ОШИБКА] Ошибка выпуска. Убедись, что домен направлен на IP этого сервера!${NC}"
             fi
@@ -326,3 +333,5 @@ EOF
         echo -e "${RED}Ошибка: Неверный выбор!${NC}"
         ;;
 esac
+
+```
