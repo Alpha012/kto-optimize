@@ -155,49 +155,47 @@ EOF
         rm -f /tmp/warp.sh
         ;;
 
-5)
+    5)
         printf '\033c'
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -e "${BOLD}${YELLOW}    kto VPN: Проверка говна               ${NC}"
-        echo -e "${PURPLE}==========================================${NC}\n"
+        echo -e "${PURPLE}┌──────────────────────────────────────────┐${NC}"
+        echo -e "${PURPLE}│${NC}        ${BOLD}${YELLOW}КТО VPN: STATUS DASHBOARD${NC}         ${PURPLE}│${NC}"
+        echo -e "${PURPLE}└──────────────────────────────────────────┘${NC}"
 
-        # Функция для красивого вывода статуса
-        check_status() {
-            if [ "$1" == "$2" ]; then
-                echo -e "${GREEN}OK${NC}"
+        # Функция отрисовки строки статуса
+        render_line() {
+            local label=$1
+            local status=$2
+            local value=$3
+            printf "${PURPLE}│${NC} %-20s " "$label"
+            if [ "$status" == "OK" ]; then
+                printf "${GREEN}● OK${NC}"
             else
-                echo -e "${RED}НЕ OK ($1)${NC}"
+                printf "${RED}○ BAD${NC}"
             fi
+            printf " ${PURPLE}│${NC}\n"
         }
 
-        # Проверки
-        echo -ne "• Ядро Liquorix:      "
-        [[ "$(uname -r)" == *"liquorix"* ]] && echo -e "${GREEN}OK" || echo -e "${RED}НЕ OK ($(uname -r))"
+        echo -e "${PURPLE}┌──────────────────────────────────────────┐${NC}"
+        render_line "Ядро Liquorix" "$(uname -r | grep -q liquorix && echo OK || echo BAD)"
+        render_line "BBR + FQ" "$( [ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ] && echo OK || echo BAD )"
+        render_line "TCP Fast Open" "$( [ "$(sysctl -n net.ipv4.tcp_fastopen)" == "3" ] && echo OK || echo BAD )"
+        render_line "Keepalive (10m)" "$( [ "$(sysctl -n net.ipv4.tcp_keepalive_time)" == "600" ] && echo OK || echo BAD )"
+        render_line "Snapd Удален" "$( ! command -v snap &> /dev/null && echo OK || echo BAD )"
+        echo -e "${PURPLE}├──────────────────────────────────────────┤${NC}"
         
-        echo -ne "• BBR + FQ:           "
-        [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" && "$(sysctl -n net.core.default_qdisc)" == "fq" ]] && echo -e "${GREEN}OK" || echo -e "${RED}НЕ OK"
-        
-        echo -ne "• TCP Fast Open:      "
-        check_status "$(sysctl -n net.ipv4.tcp_fastopen)" "3"
-        
-        echo -ne "• Max Open Files:     "
-        [[ "$(ulimit -n)" -ge 100000 ]] && echo -e "${GREEN}OK ($(ulimit -n))" || echo -e "${RED}НЕ OK ($(ulimit -n))"
-        
-        echo -ne "• Keepalive (10мин):  "
-        check_status "$(sysctl -n net.ipv4.tcp_keepalive_time)" "600"
-        
-        echo -ne "• Snapd удален:       "
-        ! command -v snap &> /dev/null && echo -e "${GREEN}OK" || echo -e "${RED}НЕ OK"
-
-        echo -e "\n${PURPLE}=== СЛУЖБЫ ===${NC}"
+        # Статус служб одной строкой
+        echo -ne "${PURPLE}│${NC} Службы: "
         for svc in chronyd ufw irqbalance; do
-            echo -ne "• $svc: "
-            systemctl is-active --quiet $svc && echo -e "${GREEN}OK" || echo -e "${RED}НЕ OK"
+            systemctl is-active --quiet $svc && echo -ne "${GREEN} $svc " || echo -ne "${RED} $svc "
         done
-
-        echo -e "\n${PURPLE}=== ПОРТЫ ===${NC}"
-        sudo ufw status | grep ALLOW > /dev/null && echo -e "${GREEN}Firewall работает (есть правила)${NC}" || echo -e "${RED}Файрвол не настроен${NC}"
-        echo -e "${PURPLE}==========================================${NC}"
+        printf "             ${PURPLE}│${NC}\n"
+        
+        echo -e "${PURPLE}└──────────────────────────────────────────┘${NC}"
+        
+        # Порты
+        echo -e "${PURPLE}┌──────────────────────────────────────────┐${NC}"
+        echo -e "${PURPLE}│${NC} ${BOLD}Порты:${NC} $(sudo ufw status | grep ALLOW | awk '{print $1}' | xargs | sed 's/ /, /g')     ${PURPLE}│${NC}"
+        echo -e "${PURPLE}└──────────────────────────────────────────┘${NC}"
         ;;
 
     6)
