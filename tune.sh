@@ -178,7 +178,7 @@ EOF
             if [[ "$val" == *"$expected"* ]]; then
                 echo -e "${GREEN}[ OK ]${NC} ${extra}"
             else
-                echo -e "${RED}[ БЕДА ]${NC} ${extra} (сейчас: $val)"
+                echo -e "${RED}[ НЕ ОК ]${NC} ${extra} (сейчас: $val)"
             fi
         }
 
