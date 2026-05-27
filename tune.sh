@@ -155,17 +155,48 @@ EOF
         rm -f /tmp/warp.sh
         ;;
 
-    5)
+5)
         printf '\033c'
         echo -e "${PURPLE}==========================================${NC}"
         echo -e "${BOLD}${YELLOW}    kto VPN: Проверка говна               ${NC}"
         echo -e "${PURPLE}==========================================${NC}\n"
+
+        # Функция для красивого вывода статуса
+        check_status() {
+            if [ "$1" == "$2" ]; then
+                echo -e "${GREEN}OK${NC}"
+            else
+                echo -e "${RED}НЕ OK ($1)${NC}"
+            fi
+        }
+
+        # Проверки
+        echo -ne "• Ядро Liquorix:      "
+        [[ "$(uname -r)" == *"liquorix"* ]] && echo -e "${GREEN}OK" || echo -e "${RED}НЕ OK ($(uname -r))"
         
-        echo -e "1. Ядро: $(uname -r) $(echo $(uname -r) | grep -q liquorix && echo "${GREEN}OK" || echo "${RED}Нужен reboot!")${NC}"
-        echo -e "2. BBR: $(sysctl -n net.ipv4.tcp_congestion_control) $([ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ] && echo "${GREEN}OK" || echo "${RED}NO")${NC}"
-        echo -e "3. CPU: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "Locked")${NC}"
-        echo -e "4. Swap: $(sysctl -n vm.swappiness) ${NC}"
-        echo -e "5. Snapd: $(command -v snap &> /dev/null && echo "${RED}Установлен" || echo "${GREEN}Удален")${NC}"
+        echo -ne "• BBR + FQ:           "
+        [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" && "$(sysctl -n net.core.default_qdisc)" == "fq" ]] && echo -e "${GREEN}OK" || echo -e "${RED}НЕ OK"
+        
+        echo -ne "• TCP Fast Open:      "
+        check_status "$(sysctl -n net.ipv4.tcp_fastopen)" "3"
+        
+        echo -ne "• Max Open Files:     "
+        [[ "$(ulimit -n)" -ge 100000 ]] && echo -e "${GREEN}OK ($(ulimit -n))" || echo -e "${RED}НЕ OK ($(ulimit -n))"
+        
+        echo -ne "• Keepalive (10мин):  "
+        check_status "$(sysctl -n net.ipv4.tcp_keepalive_time)" "600"
+        
+        echo -ne "• Snapd удален:       "
+        ! command -v snap &> /dev/null && echo -e "${GREEN}OK" || echo -e "${RED}НЕ OK"
+
+        echo -e "\n${PURPLE}=== СЛУЖБЫ ===${NC}"
+        for svc in chronyd ufw irqbalance; do
+            echo -ne "• $svc: "
+            systemctl is-active --quiet $svc && echo -e "${GREEN}OK" || echo -e "${RED}НЕ OK"
+        done
+
+        echo -e "\n${PURPLE}=== ПОРТЫ ===${NC}"
+        sudo ufw status | grep ALLOW > /dev/null && echo -e "${GREEN}Firewall работает (есть правила)${NC}" || echo -e "${RED}Файрвол не настроен${NC}"
         echo -e "${PURPLE}==========================================${NC}"
         ;;
 
