@@ -157,47 +157,63 @@ EOF
 
     5)
         printf '\033c'
-        # Принудительно применяем все настройки sysctl еще раз перед выводом
+        # Принудительно применяем sysctl, чтобы красные значения обновились на зеленые
         sudo sysctl -p /etc/sysctl.d/99-vpn-tuning.conf > /dev/null 2>&1
         
-        echo -e "${PURPLE}+------------------------------------------+${NC}"
-        echo -e "${PURPLE}|${NC}        ${BOLD}${YELLOW}kto VPN: Стата говна${NC}              ${PURPLE}|${NC}"
-        echo -e "${PURPLE}+------------------------------------------+${NC}"
-
-        # Улучшенная функция: она сама знает, что является "OK", а что "BAD"
-        # Передаем: метку, фактическое значение, ожидаемое значение
-        render_row() {
-            local label=$1
-            local actual=$2
+        echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
+        echo -e "             ${BOLD}${YELLOW}kto VPN: ПАНЕЛЬ СОСТОЯНИЯ${NC}"
+        echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
+        
+        echo -e "${BOLD}${PURPLE}[ СИСТЕМА ]${NC}"
+        
+        # Пуленепробиваемая функция вывода (без правых рамок)
+        print_stat() {
+            local name=$1
+            local val=$2
             local expected=$3
+            local extra=$4
             
-            printf "${PURPLE}|${NC} %-20s " "$label"
-            if [[ "$actual" == *"$expected"* ]]; then
-                printf "${GREEN}● OK${NC}"
+            # Ровный отступ в 20 символов для левой колонки
+            printf " %-20s " "$name"
+            if [[ "$val" == *"$expected"* ]]; then
+                echo -e "${GREEN}[ OK ]${NC} ${extra}"
             else
-                printf "${RED}○ BAD ($actual)${NC}"
+                echo -e "${RED}[ БЕДА ]${NC} ${extra} (сейчас: $val)"
             fi
-            printf " ${PURPLE}|${NC}\n"
         }
 
-        render_row "Ядро Liquorix" "$(uname -r)" "liquorix"
-        render_row "BBR + FQ" "$(sysctl -n net.ipv4.tcp_congestion_control)+$(sysctl -n net.core.default_qdisc)" "bbr+fq"
-        render_row "TCP Fast Open" "$(sysctl -n net.ipv4.tcp_fastopen)" "3"
-        render_row "Keepalive (10m)" "$(sysctl -n net.ipv4.tcp_keepalive_time)" "600"
-        render_row "Snapd Удален" "$( ! command -v snap &> /dev/null && echo "OK" || echo "BAD" )" "OK"
+        KERNEL_VER=$(uname -r)
+        print_stat "Ядро Liquorix" "$KERNEL_VER" "liquorix" "($KERNEL_VER)"
         
-        echo -e "${PURPLE}+------------------------------------------+${NC}"
-        echo -ne "${PURPLE}|${NC} Службы: "
+        NET_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+        NET_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+        print_stat "BBR + FQ" "${NET_CC}+${NET_QDISC}" "bbr+fq" ""
+        
+        TFO=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)
+        print_stat "TCP Fast Open" "$TFO" "3" ""
+        
+        KEEPALIVE=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)
+        print_stat "Keepalive (10m)" "$KEEPALIVE" "600" ""
+        
+        SNAP_STATUS=$(command -v snap &> /dev/null && echo "found" || echo "clean")
+        print_stat "Snapd удален" "$SNAP_STATUS" "clean" ""
+
+        echo -e "\n${BOLD}${PURPLE}[ СЛУЖБЫ ]${NC}"
+        echo -ne " "
         for svc in chronyd ufw irqbalance; do
-            systemctl is-active --quiet $svc && echo -ne "${GREEN} $svc " || echo -ne "${RED} $svc "
+            if systemctl is-active --quiet $svc; then
+                echo -ne "${BOLD}$svc:${NC} ${GREEN}OK${NC}    "
+            else
+                echo -ne "${BOLD}$svc:${NC} ${RED}FAIL${NC}  "
+            fi
         done
-        printf "     ${PURPLE}|${NC}\n"
-        
-        echo -e "${PURPLE}+------------------------------------------+${NC}"
-        # Вывод портов списком
-        PORTS=$(sudo ufw status | grep ALLOW | awk '{print $1}' | sort -u | xargs | sed 's/ /, /g')
-        printf "${PURPLE}|${NC} ${BOLD}Порты:${NC} %-33s ${PURPLE}|${NC}\n" "$PORTS"
-        echo -e "${PURPLE}+------------------------------------------+${NC}"
+        echo ""
+
+        echo -e "\n${BOLD}${PURPLE}[ ПОРТЫ ]${NC}"
+        # Вытаскиваем порты, вырезаем дубли (v6), сортируем и выводим красиво
+        PORTS=$(sudo ufw status | grep ALLOW | awk '{print $1}' | sed 's/(v6)//g' | sort -u | xargs | sed 's/ /, /g')
+        echo -e " Открыты:  ${YELLOW}${PORTS:-Файрвол не настроен}${NC}"
+        echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
         ;;
 
     6)
