@@ -236,18 +236,13 @@ EOF
         echo -e "${PURPLE}==========================================${NC}"
         ;;
 
-    6)
+     6)
         echo -e "\n${YELLOW}[INFO]${NC} Подготовка к замеру скорости..."
         
-        # Сначала проверяем, есть ли вообще curl
-        if ! command -v curl &> /dev/null; then
-            sudo apt-get update > /dev/null && sudo apt-get install -y curl > /dev/null
-        fi
-
         if ! command -v speedtest &> /dev/null; then
-            echo -e "${PURPLE}[..]${NC} Установка официального Speedtest (Ookla)..."
-            curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | sudo bash > /dev/null
-            sudo apt-get install speedtest -y > /dev/null
+            echo -e "${PURPLE}[..]${NC} Прямое скачивание бинарника Speedtest (Ookla)..."
+            # Качаем архив и на лету распаковываем исполняемый файл прямо в системные программы
+            wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | sudo tar xvz -C /usr/local/bin/ speedtest > /dev/null 2>&1
         fi
         
         # Жесткая проверка: установился ли он в итоге?
@@ -256,7 +251,7 @@ EOF
             speedtest --accept-license --accept-gdpr
             echo -e "\n${GREEN}[OK]${NC} Тест завершен!"
         else
-            echo -e "\n${RED}[ОШИБКА] Speedtest так и не установился! Проверь ошибки в тексте выше.${NC}"
+            echo -e "\n${RED}[ОШИБКА] Не удалось скачать Speedtest. Проверь интернет на сервере.${NC}"
         fi
         ;;
 
