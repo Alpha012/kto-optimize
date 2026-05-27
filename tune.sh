@@ -22,7 +22,6 @@ echo -e "6) Speedtest"
 echo -e "0) Выход"
 echo -e "${PURPLE}==========================================${NC}"
 
-# Кастомная и красивая строка ввода с ZSH-style стрелочкой
 echo -ne "${PURPLE}❯${NC} ${BOLD}Выберите действие (0-6):${NC} "
 read choice
 
@@ -145,22 +144,32 @@ EOF
 
     3)
         echo -e "\n${YELLOW}[INFO]${NC} Запуск скрипта SelfSteal..."
-        # Принудительный запуск от sudo с передачей аргументов
-        if curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh | sudo bash -s -- @ install; then
+        # Физически скачиваем файл во временную папку
+        curl -sL "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh" -o /tmp/selfsteal.sh
+        
+        # Запускаем от рута как обычный скрипт (чтобы инпуты работали)
+        if sudo bash /tmp/selfsteal.sh @ install; then
             echo -e "\n${GREEN}[OK]${NC} Скрипт SelfSteal успешно завершил работу!"
         else
             echo -e "\n${RED}[ОШИБКА] Скрипт SelfSteal прервался с ошибкой!${NC}"
         fi
+        
+        # Удаляем мусор за собой
+        rm -f /tmp/selfsteal.sh
         ;;
 
     4)
         echo -e "\n${YELLOW}[INFO]${NC} Запуск установки WARP Native..."
-        # Принудительный запуск от sudo
-        if curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh | sudo bash; then
+        # Аналогичный безопасный запуск для WARP
+        curl -sL "https://raw.githubusercontent.com/distillium/warp-native/main/install.sh" -o /tmp/warp.sh
+        
+        if sudo bash /tmp/warp.sh; then
             echo -e "\n${GREEN}[OK]${NC} Установка WARP Native успешно завершена!"
         else
             echo -e "\n${RED}[ОШИБКА] Установка WARP Native прервалась с ошибкой!${NC}"
         fi
+        
+        rm -f /tmp/warp.sh
         ;;
 
     5)
