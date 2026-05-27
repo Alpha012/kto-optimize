@@ -157,45 +157,36 @@ EOF
 
     5)
         printf '\033c'
-        echo -e "${PURPLE}┌──────────────────────────────────────────┐${NC}"
-        echo -e "${PURPLE}│${NC}        ${BOLD}${YELLOW}КТО VPN: STATUS DASHBOARD${NC}         ${PURPLE}│${NC}"
-        echo -e "${PURPLE}└──────────────────────────────────────────┘${NC}"
+        # Функция для проверки параметров
+        is_ok() { [ "$1" == "$2" ] && echo "OK" || echo "BAD"; }
 
-        # Функция отрисовки строки статуса
-        render_line() {
+        echo -e "${PURPLE}+------------------------------------------+${NC}"
+        echo -e "${PURPLE}|${NC}        ${BOLD}${YELLOW}kto VPN: Стата говна${NC}              ${PURPLE}|${NC}"
+        echo -e "${PURPLE}+------------------------------------------+${NC}"
+
+        render_row() {
             local label=$1
-            local status=$2
-            local value=$3
-            printf "${PURPLE}│${NC} %-20s " "$label"
-            if [ "$status" == "OK" ]; then
-                printf "${GREEN}● OK${NC}"
-            else
-                printf "${RED}○ BAD${NC}"
-            fi
-            printf " ${PURPLE}│${NC}\n"
+            local val=$2
+            local status=$3
+            printf "${PURPLE}|${NC} %-20s %-10s ${PURPLE}|${NC}\n" "$label" "$([ "$status" == "OK" ] && echo -e "${GREEN}● OK" || echo -e "${RED}○ BAD")"
         }
 
-        echo -e "${PURPLE}┌──────────────────────────────────────────┐${NC}"
-        render_line "Ядро Liquorix" "$(uname -r | grep -q liquorix && echo OK || echo BAD)"
-        render_line "BBR + FQ" "$( [ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ] && echo OK || echo BAD )"
-        render_line "TCP Fast Open" "$( [ "$(sysctl -n net.ipv4.tcp_fastopen)" == "3" ] && echo OK || echo BAD )"
-        render_line "Keepalive (10m)" "$( [ "$(sysctl -n net.ipv4.tcp_keepalive_time)" == "600" ] && echo OK || echo BAD )"
-        render_line "Snapd Удален" "$( ! command -v snap &> /dev/null && echo OK || echo BAD )"
-        echo -e "${PURPLE}├──────────────────────────────────────────┤${NC}"
+        render_row "Ядро Liquorix" "$(uname -r | grep -q liquorix && echo OK || echo BAD)"
+        render_row "BBR + FQ" "$( [ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ] && echo OK || echo BAD )"
+        render_row "TCP Fast Open" "$( [ "$(sysctl -n net.ipv4.tcp_fastopen)" == "3" ] && echo OK || echo BAD )"
+        render_row "Keepalive (10m)" "$( [ "$(sysctl -n net.ipv4.tcp_keepalive_time)" == "600" ] && echo OK || echo BAD )"
+        render_row "Snapd Удален" "$( ! command -v snap &> /dev/null && echo OK || echo BAD )"
         
-        # Статус служб одной строкой
-        echo -ne "${PURPLE}│${NC} Службы: "
+        echo -e "${PURPLE}+------------------------------------------+${NC}"
+        echo -ne "${PURPLE}|${NC} Службы: "
         for svc in chronyd ufw irqbalance; do
             systemctl is-active --quiet $svc && echo -ne "${GREEN} $svc " || echo -ne "${RED} $svc "
         done
-        printf "             ${PURPLE}│${NC}\n"
+        printf "     ${PURPLE}|${NC}\n"
         
-        echo -e "${PURPLE}└──────────────────────────────────────────┘${NC}"
-        
-        # Порты
-        echo -e "${PURPLE}┌──────────────────────────────────────────┐${NC}"
-        echo -e "${PURPLE}│${NC} ${BOLD}Порты:${NC} $(sudo ufw status | grep ALLOW | awk '{print $1}' | xargs | sed 's/ /, /g')     ${PURPLE}│${NC}"
-        echo -e "${PURPLE}└──────────────────────────────────────────┘${NC}"
+        echo -e "${PURPLE}+------------------------------------------+${NC}"
+        echo -e "${PURPLE}|${NC} ${BOLD}Порты:${NC} $(sudo ufw status | grep ALLOW | awk '{print $1}' | sort -u | xargs | sed 's/ /, /g') ${PURPLE}|${NC}"
+        echo -e "${PURPLE}+------------------------------------------+${NC}"
         ;;
 
     6)
