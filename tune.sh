@@ -7,13 +7,12 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Жесткая очистка консоли
 printf '\033c'
 
 echo -e "${PURPLE}==========================================${NC}"
 echo -e "${BOLD}${GREEN}    kto VPN: Ультимативное говно          ${NC}"
 echo -e "${PURPLE}==========================================${NC}"
-echo -e "1) Полная оптимизация"
+echo -e "1) Полная оптимизация (с авто-починкой ОС)"
 echo -e "2) Установка ноды Remnawave"
 echo -e "3) Установка SelfSteal"
 echo -e "4) Установка WARP Native"
@@ -27,26 +26,40 @@ read choice
 
 case $choice in
     1)
-        echo -e "\n${YELLOW}[INFO]${NC} Запуск оптимизации и самолечения..."
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск PRO-оптимизации и самолечения..."
         SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config | grep -v "^#" | awk '{print $2}' | head -n 1)
         SSH_PORT=${SSH_PORT:-22}
         
-        echo -e "${PURPLE}[..]${NC} Лечим APT..."
-        sudo rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list
-        sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
+        echo -e "${PURPLE}[..]${NC} Убиваем фоновые процессы Ubuntu, мешающие установке..."
+        sudo systemctl stop unattended-upgrades > /dev/null 2>&1
+        sudo killall apt apt-get > /dev/null 2>&1
+        sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock*
         sudo dpkg --configure -a > /dev/null 2>&1
+        
+        echo -e "${PURPLE}[..]${NC} Лечим APT..."
+        sudo rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list > /dev/null 2>&1
         
         sudo systemctl disable --now snapd.socket snapd.service > /dev/null 2>&1
         sudo apt-get purge snapd -y > /dev/null 2>&1
         
-        echo -e "${PURPLE}[..]${NC} Обновление и установка утилит..."
-        sudo apt-get update > /dev/null
-        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget gnupg2 chrony ufw cpufrequtils irqbalance software-properties-common > /dev/null
+        export NEEDRESTART_MODE=a
+        export NEEDRESTART_SUSPEND=1
         
-        echo -e "${PURPLE}[..]${NC} Установка ядра Liquorix..."
-        sudo add-apt-repository ppa:damentz/liquorix -y > /dev/null
-        sudo apt-get update > /dev/null
-        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64 > /dev/null
+        echo -e "${PURPLE}[..]${NC} Обновление и установка утилит..."
+        sudo apt-get update > /dev/null 2>&1
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget gnupg2 chrony ufw cpufrequtils irqbalance software-properties-common > /dev/null 2>&1
+        
+        echo -e "${PURPLE}[..]${NC} Установка ядра Liquorix (бронебойный метод)..."
+        sudo add-apt-repository ppa:damentz/liquorix -y > /dev/null 2>&1
+        sudo apt-get update > /dev/null 2>&1
+        
+        for i in {1..3}; do
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" linux-image-liquorix-amd64 linux-headers-liquorix-amd64 > /dev/null 2>&1
+            if dpkg -l | grep -q linux-image-liquorix; then
+                break
+            fi
+            sleep 2
+        done
         
         echo -e "${PURPLE}[..]${NC} Тюнинг ядра и сети (Pro-Level)..."
         echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null
@@ -78,7 +91,7 @@ net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 net.core.optmem_max = 65536
 EOF
-        sudo sysctl --system > /dev/null
+        sudo sysctl --system > /dev/null 2>&1
         
         sudo tee /etc/security/limits.d/99-vpn-limits.conf > /dev/null <<EOF
 * soft nofile 1048576
@@ -88,29 +101,32 @@ root hard nofile 1048576
 EOF
         sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/system.conf > /dev/null
         sudo sed -i 's/#DefaultLimitNOFILE=/DefaultLimitNOFILE=1048576/g' /etc/systemd/user.conf > /dev/null
-        sudo systemctl daemon-reload > /dev/null
+        sudo systemctl daemon-reload > /dev/null 2>&1
         
         echo -e "${PURPLE}[..]${NC} Настройка Firewall (UFW)..."
-        sudo ufw --force reset > /dev/null
-        sudo ufw default deny incoming > /dev/null
-        sudo ufw default allow outgoing > /dev/null
-        sudo ufw allow $SSH_PORT/tcp > /dev/null
-        sudo ufw allow 443 > /dev/null
-        sudo ufw allow 1488 > /dev/null
-        sudo ufw --force enable > /dev/null
-        sudo systemctl enable --now chronyd > /dev/null
+        sudo ufw --force reset > /dev/null 2>&1
+        sudo ufw default deny incoming > /dev/null 2>&1
+        sudo ufw default allow outgoing > /dev/null 2>&1
+        sudo ufw allow $SSH_PORT/tcp > /dev/null 2>&1
+        sudo ufw allow 443 > /dev/null 2>&1
+        sudo ufw allow 1488 > /dev/null 2>&1
+        sudo ufw --force enable > /dev/null 2>&1
+        
+        sudo systemctl enable --now chrony > /dev/null 2>&1
         
         echo -e "\n${GREEN}[OK]${NC} Оптимизация завершена. Не забудь: ${BOLD}${PURPLE}sudo reboot${NC}"
         ;;
 
     2)
         echo -e "\n${YELLOW}[..]${NC} Подготовка к установке Remnawave..."
+        
         echo -ne "${PURPLE}❯${NC} ${BOLD}Введите SECRET_KEY для ноды:${NC} "
         read SECRET_KEY
-        [ -z "$SECRET_KEY" ] && { echo -e "\n${RED}[ОШИБКА] Ключ пуст!${NC}"; exit 1; }
+        [ -z "$SECRET_KEY" ] && { echo -e "\n${RED}[ОШИБКА] Ключ не может быть пустым!${NC}"; exit 1; }
 
         if ! command -v docker &> /dev/null; then
-            curl -fsSL https://get.docker.com | sudo sh > /dev/null
+            echo -e "${YELLOW}[..]${NC} Docker не найден, устанавливаем..."
+            curl -fsSL https://get.docker.com | sudo sh > /dev/null 2>&1
         fi
 
         sudo mkdir -p /opt/remnawave/
@@ -135,50 +151,68 @@ services:
       - SECRET_KEY="$SECRET_KEY"
 EOF
 
-        if [ -x "$(command -v docker-compose)" ]; then
-            sudo docker-compose up -d
+        echo -e "${YELLOW}[..]${NC} Запуск контейнера..."
+        if command -v docker compose &> /dev/null; then
+            DOCKER_CMD="sudo docker compose"
         else
-            sudo docker compose up -d
+            DOCKER_CMD="sudo docker-compose"
         fi
-        echo -e "${GREEN}[OK]${NC} Нода запущена!"
+        
+        if $DOCKER_CMD up -d; then
+            echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
+            echo -e "Для просмотра логов введи: ${BOLD}${PURPLE}sudo docker logs -f remnanode${NC}"
+        else
+            echo -e "\n${RED}[ОШИБКА] Docker не смог запустить ноду! Проверь лимиты Docker Hub.${NC}"
+        fi
         ;;
 
     3)
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск скрипта SelfSteal..."
         curl -sL "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh" -o /tmp/selfsteal.sh
-        sudo bash /tmp/selfsteal.sh @ install < /dev/tty
+        
+        if sudo bash /tmp/selfsteal.sh @ install < /dev/tty; then
+            echo -e "\n${GREEN}[OK]${NC} Скрипт SelfSteal успешно завершил работу!"
+        else
+            echo -e "\n${RED}[ОШИБКА] Скрипт SelfSteal прервался с ошибкой!${NC}"
+        fi
+        
         rm -f /tmp/selfsteal.sh
         ;;
 
     4)
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск установки WARP Native..."
         curl -sL "https://raw.githubusercontent.com/distillium/warp-native/main/install.sh" -o /tmp/warp.sh
-        sudo bash /tmp/warp.sh < /dev/tty
+        
+        if sudo bash /tmp/warp.sh < /dev/tty; then
+            echo -e "\n${GREEN}[OK]${NC} Установка WARP Native успешно завершена!"
+        else
+            echo -e "\n${RED}[ОШИБКА] Установка WARP Native прервалась с ошибкой!${NC}"
+        fi
+        
         rm -f /tmp/warp.sh
         ;;
 
     5)
         printf '\033c'
-        # Принудительно применяем sysctl, чтобы красные значения обновились на зеленые
         sudo sysctl -p /etc/sysctl.d/99-vpn-tuning.conf > /dev/null 2>&1
         
         echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
-        echo -e "                       ${BOLD}${YELLOW}kto VPN${NC}"
+        echo -e "             ${BOLD}${YELLOW}kto VPN: ПАНЕЛЬ СОСТОЯНИЯ${NC}"
         echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
         
         echo -e "${BOLD}${PURPLE}[ СИСТЕМА ]${NC}"
         
-        # Пуленепробиваемая функция вывода (без правых рамок)
         print_stat() {
             local name=$1
             local val=$2
             local expected=$3
             local extra=$4
             
-            # Ровный отступ в 20 символов для левой колонки
             printf " %-20s " "$name"
             if [[ "$val" == *"$expected"* ]]; then
                 echo -e "${GREEN}[ OK ]${NC} ${extra}"
             else
-                echo -e "${RED}[ НЕ ОК ]${NC} ${extra} (сейчас: $val)"
+                echo -e "${RED}[ БЕДА ]${NC} ${extra} (сейчас: $val)"
             fi
         }
 
@@ -200,7 +234,7 @@ EOF
 
         echo -e "\n${BOLD}${PURPLE}[ СЛУЖБЫ ]${NC}"
         echo -ne " "
-        for svc in chronyd ufw irqbalance; do
+        for svc in chrony ufw irqbalance; do
             if systemctl is-active --quiet $svc; then
                 echo -ne "${BOLD}$svc:${NC} ${GREEN}OK${NC}    "
             else
@@ -210,23 +244,33 @@ EOF
         echo ""
 
         echo -e "\n${BOLD}${PURPLE}[ ПОРТЫ ]${NC}"
-        # Вытаскиваем порты, вырезаем дубли (v6), сортируем и выводим красиво
         PORTS=$(sudo ufw status | grep ALLOW | awk '{print $1}' | sed 's/(v6)//g' | sort -u | xargs | sed 's/ /, /g')
         echo -e " Открыты:  ${YELLOW}${PORTS:-Файрвол не настроен}${NC}"
         echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
         ;;
 
     6)
+        echo -e "\n${YELLOW}[INFO]${NC} Подготовка к замеру скорости..."
+        
         if ! command -v speedtest &> /dev/null; then
+            echo -e "${PURPLE}[..]${NC} Прямое скачивание бинарника Speedtest (Ookla)..."
             wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | sudo tar xvz -C /usr/local/bin/ speedtest > /dev/null 2>&1
         fi
-        speedtest --accept-license --accept-gdpr
+        
+        if command -v speedtest &> /dev/null; then
+            echo -e "${PURPLE}[..]${NC} Запуск теста...\n"
+            speedtest --accept-license --accept-gdpr
+            echo -e "\n${GREEN}[OK]${NC} Тест завершен!"
+        else
+            echo -e "\n${RED}[ОШИБКА] Не удалось скачать Speedtest. Проверь интернет на сервере.${NC}"
+        fi
         ;;
 
     0)
+        echo -e "${PURPLE}Выход.${NC}"
         exit 0
         ;;
     *)
-        echo -e "${RED}Ошибка!${NC}"
+        echo -e "${RED}Ошибка: Неверный выбор!${NC}"
         ;;
 esac
