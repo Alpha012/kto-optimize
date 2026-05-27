@@ -161,7 +161,7 @@ EOF
         sudo sysctl -p /etc/sysctl.d/99-vpn-tuning.conf > /dev/null 2>&1
         
         echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
-        echo -e "             ${BOLD}${YELLOW}kto VPN: ПАНЕЛЬ СОСТОЯНИЯ${NC}"
+        echo -e "                     ${BOLD}${YELLOW}kto VPN${NC}"
         echo -e "${PURPLE}══════════════════════════════════════════════════════${NC}"
         
         echo -e "${BOLD}${PURPLE}[ СИСТЕМА ]${NC}"
