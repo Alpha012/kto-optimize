@@ -18,10 +18,13 @@ echo -e "3) Установка SelfSteal"
 echo -e "4) Установка WARP Native"
 echo -e "5) Панель состояния"
 echo -e "6) Speedtest"
+echo -e "7) Проверка IP (IP.Check.Place)"
+echo -e "8) Проверка IP (Region Check)"
+echo -e "9) Сгенерировать SSL-сертификат"
 echo -e "0) Выход"
 echo -e "${PURPLE}==========================================${NC}"
 
-echo -ne "${PURPLE}❯${NC} ${BOLD}Выберите действие (0-6):${NC} "
+echo -ne "${PURPLE}❯${NC} ${BOLD}Выберите действие (0-9):${NC} "
 read choice
 
 case $choice in
@@ -180,8 +183,9 @@ EOF
         echo -e "\n${YELLOW}[INFO]${NC} Запуск установки WARP Native..."
         curl -sL "https://raw.githubusercontent.com/distillium/warp-native/main/install.sh" -o /tmp/warp.sh
         
-        if sudo bash /tmp/warp.sh < /dev/tty; then
-            echo -e "\n${GREEN}[OK]${NC} WARP установлен!"
+        # Передаем 2 (Русский) и 1 (Установка) напрямую в скрипт, пропуская ручной ввод
+        if echo -e "2\n1\n" | sudo bash /tmp/warp.sh; then
+            echo -e "\n${GREEN}[OK]${NC} WARP успешно установлен!"
         else
             echo -e "\n${RED}[ОШИБКА] Ошибка WARP.${NC}"
         fi
@@ -259,6 +263,64 @@ EOF
             echo -e "\n${GREEN}[OK]${NC} Тест завершен!"
         else
             echo -e "\n${RED}[ОШИБКА] Ошибка скачивания Speedtest.${NC}"
+        fi
+        ;;
+
+    7)
+        printf '\033c'
+        echo -e "${YELLOW}[INFO]${NC} Выполнение IP Check (IP.Check.Place)...\n"
+        bash <(curl -Ls https://IP.Check.Place) -l en
+        echo -e "\n${GREEN}[OK]${NC} Проверка завершена!"
+        ;;
+
+    8)
+        printf '\033c'
+        echo -e "${YELLOW}[INFO]${NC} Выполнение IP Region Check...\n"
+        bash <(wget -qO- https://github.com/Davoyan/ipregion/raw/main/ipregion.sh)
+        echo -e "\n${GREEN}[OK]${NC} Проверка завершена!"
+        ;;
+
+    9)
+        echo -e "\n${YELLOW}[INFO]${NC} Генерация SSL-сертификата..."
+        echo -ne "${PURPLE}❯${NC} ${BOLD}Введите домен (например, vpn.domain.com):${NC} "
+        read DOMAIN
+        
+        if [ -z "$DOMAIN" ]; then
+            echo -e "${RED}[ОШИБКА] Домен не может быть пустым!${NC}"
+        else
+            echo -e "${PURPLE}[..]${NC} Установка cron, socat и acme.sh..."
+            sudo apt-get update > /dev/null 2>&1
+            # socat обязателен для standalone режима
+            sudo apt-get install cron socat -y > /dev/null 2>&1
+            sudo systemctl enable --now cron > /dev/null 2>&1
+            
+            if [ ! -f "/root/.acme.sh/acme.sh" ]; then
+                curl -s https://get.acme.sh | sh -s email=aaaaaa123456@gmail.com --force > /dev/null 2>&1
+            fi
+            
+            echo -e "${PURPLE}[..]${NC} Подключение к Let's Encrypt..."
+            /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt > /dev/null 2>&1
+            
+            echo -e "${PURPLE}[..]${NC} Выпуск сертификата (это займет около минуты)..."
+            # Временно открываем порт для проверки
+            sudo ufw allow 8443/tcp > /dev/null 2>&1
+            sudo mkdir -p /opt/remnawave/
+            
+            if /root/.acme.sh/acme.sh --issue --standalone -d "$DOMAIN" \
+                --key-file /opt/remnawave/privkey.key \
+                --fullchain-file /opt/remnawave/fullchain.pem \
+                --alpn --tlsport 8443; then
+                
+                echo -e "\n${GREEN}[OK]${NC} Сертификат успешно выпущен!"
+                echo -e "${GREEN}[+]${NC} Cron настроен, сертификат будет продлеваться автоматически."
+                echo -e "Ключ:       ${BOLD}/opt/remnawave/privkey.key${NC}"
+                echo -e "Fullchain:  ${BOLD}/opt/remnawave/fullchain.pem${NC}"
+            else
+                echo -e "\n${RED}[ОШИБКА] Ошибка выпуска. Убедись, что домен ${DOMAIN} реально направлен на IP этого сервера!${NC}"
+            fi
+            
+            # Закрываем временный порт
+            sudo ufw delete allow 8443/tcp > /dev/null 2>&1
         fi
         ;;
 
