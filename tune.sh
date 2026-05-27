@@ -13,7 +13,7 @@ printf '\033c'
 echo -e "${PURPLE}==========================================${NC}"
 echo -e "${BOLD}${GREEN}    kto VPN: Ультимативное говно          ${NC}"
 echo -e "${PURPLE}==========================================${NC}"
-echo -e "1) Полная оптимизация (с авто-починкой ОС)"
+echo -e "1) Полная оптимизация"
 echo -e "2) Установка ноды Remnawave"
 echo -e "3) Установка SelfSteal"
 echo -e "4) Установка WARP Native"
@@ -27,22 +27,19 @@ read choice
 
 case $choice in
     1)
-        echo -e "\n${YELLOW}[INFO]${NC} Запуск оптимизации и самолечения ОС..."
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск оптимизации и самолечения..."
         SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config | grep -v "^#" | awk '{print $2}' | head -n 1)
         SSH_PORT=${SSH_PORT:-22}
         
-        echo -e "${PURPLE}[..]${NC} Лечим APT (чистим сломанные репозитории и блокировки)..."
-        # Удаляем мертвый репозиторий Ookla, который ломает apt
+        echo -e "${PURPLE}[..]${NC} Лечим APT..."
         sudo rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list
-        # Снимаем зависшие локи (если apt упал с ошибкой ранее)
         sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
-        # Чиним прерванные установки
         sudo dpkg --configure -a > /dev/null 2>&1
         
         sudo systemctl disable --now snapd.socket snapd.service > /dev/null 2>&1
         sudo apt-get purge snapd -y > /dev/null 2>&1
         
-        echo -e "${PURPLE}[..]${NC} Обновление пакетов и установка базовых утилит..."
+        echo -e "${PURPLE}[..]${NC} Обновление и установка утилит..."
         sudo apt-get update > /dev/null
         sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget gnupg2 chrony ufw cpufrequtils irqbalance software-properties-common > /dev/null
         
@@ -51,7 +48,7 @@ case $choice in
         sudo apt-get update > /dev/null
         sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-liquorix-amd64 linux-headers-liquorix-amd64 > /dev/null
         
-        echo -e "${PURPLE}[..]${NC} Тюнинг процессора и сети..."
+        echo -e "${PURPLE}[..]${NC} Тюнинг ядра и сети (Pro-Level)..."
         echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null
         sudo systemctl restart cpufrequtils > /dev/null 2>&1 || true
         sudo systemctl enable --now irqbalance > /dev/null 2>&1 || true
@@ -75,6 +72,11 @@ net.ipv4.tcp_wmem = 4096 65536 16777216
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 vm.swappiness = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.core.optmem_max = 65536
 EOF
         sudo sysctl --system > /dev/null
         
@@ -98,18 +100,16 @@ EOF
         sudo ufw --force enable > /dev/null
         sudo systemctl enable --now chronyd > /dev/null
         
-        echo -e "\n${GREEN}[OK]${NC} Оптимизация завершена. Если не было красных ошибок, пиши: ${BOLD}${PURPLE}sudo reboot${NC}"
+        echo -e "\n${GREEN}[OK]${NC} Оптимизация завершена. Не забудь: ${BOLD}${PURPLE}sudo reboot${NC}"
         ;;
 
     2)
         echo -e "\n${YELLOW}[..]${NC} Подготовка к установке Remnawave..."
-        
         echo -ne "${PURPLE}❯${NC} ${BOLD}Введите SECRET_KEY для ноды:${NC} "
         read SECRET_KEY
-        [ -z "$SECRET_KEY" ] && { echo -e "\n${RED}[ОШИБКА] Ключ не может быть пустым!${NC}"; exit 1; }
+        [ -z "$SECRET_KEY" ] && { echo -e "\n${RED}[ОШИБКА] Ключ пуст!${NC}"; exit 1; }
 
         if ! command -v docker &> /dev/null; then
-            echo -e "${YELLOW}[..]${NC} Docker не найден, устанавливаем..."
             curl -fsSL https://get.docker.com | sudo sh > /dev/null
         fi
 
@@ -135,46 +135,23 @@ services:
       - SECRET_KEY="$SECRET_KEY"
 EOF
 
-        echo -e "${YELLOW}[..]${NC} Запуск контейнера..."
-        if command -v docker compose &> /dev/null; then
-            DOCKER_CMD="sudo docker compose"
+        if [ -x "$(command -v docker-compose)" ]; then
+            sudo docker-compose up -d
         else
-            DOCKER_CMD="sudo docker-compose"
+            sudo docker compose up -d
         fi
-        
-        if $DOCKER_CMD up -d; then
-            echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
-            echo -e "Для просмотра логов введи: ${BOLD}${PURPLE}sudo docker logs -f remnanode${NC}"
-        else
-            echo -e "\n${RED}[ОШИБКА] Docker не смог запустить ноду! Ищи причину в тексте выше.${NC}"
-        fi
+        echo -e "${GREEN}[OK]${NC} Нода запущена!"
         ;;
 
     3)
-        echo -e "\n${YELLOW}[INFO]${NC} Запуск скрипта SelfSteal..."
         curl -sL "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh" -o /tmp/selfsteal.sh
-        
-        # Запускаем от рута и ЖЕСТКО привязываем к терминалу (< /dev/tty)
-        if sudo bash /tmp/selfsteal.sh @ install < /dev/tty; then
-            echo -e "\n${GREEN}[OK]${NC} Скрипт SelfSteal успешно завершил работу!"
-        else
-            echo -e "\n${RED}[ОШИБКА] Скрипт SelfSteal прервался с ошибкой!${NC}"
-        fi
-        
+        sudo bash /tmp/selfsteal.sh @ install < /dev/tty
         rm -f /tmp/selfsteal.sh
         ;;
 
     4)
-        echo -e "\n${YELLOW}[INFO]${NC} Запуск установки WARP Native..."
         curl -sL "https://raw.githubusercontent.com/distillium/warp-native/main/install.sh" -o /tmp/warp.sh
-        
-        # Аналогично прибиваем WARP к терминалу, чтобы не спамил
-        if sudo bash /tmp/warp.sh < /dev/tty; then
-            echo -e "\n${GREEN}[OK]${NC} Установка WARP Native успешно завершена!"
-        else
-            echo -e "\n${RED}[ОШИБКА] Установка WARP Native прервалась с ошибкой!${NC}"
-        fi
-        
+        sudo bash /tmp/warp.sh < /dev/tty
         rm -f /tmp/warp.sh
         ;;
 
@@ -183,96 +160,26 @@ EOF
         echo -e "${PURPLE}==========================================${NC}"
         echo -e "${BOLD}${YELLOW}    kto VPN: Проверка говна               ${NC}"
         echo -e "${PURPLE}==========================================${NC}\n"
-
-        KERNEL=$(uname -r)
-        if echo "$KERNEL" | grep -q "liquorix"; then
-            echo -e "1. Ядро ОС: ${GREEN}Liquorix активно ($KERNEL)${NC}"
-        else
-            echo -e "1. Ядро ОС: ${RED}Стоковое ($KERNEL). Нужен reboot!${NC}"
-        fi
-
-        BBR=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-        FQ=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-        if [ "$BBR" == "bbr" ] && [ "$FQ" == "fq" ]; then
-            echo -e "2. Сеть: ${GREEN}BBR + FQ включены${NC}"
-        else
-            echo -e "2. Сеть: ${RED}Ошибка ($BBR, $FQ)${NC}"
-        fi
-
-        CPU_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
-        if [ "$CPU_GOV" == "performance" ]; then
-            echo -e "3. CPU: ${GREEN}Performance (Максимальная мощь)${NC}"
-        elif [ -z "$CPU_GOV" ]; then
-            echo -e "3. CPU: ${YELLOW}Заблокирован хостером (Норма)${NC}"
-        else
-            echo -e "3. CPU: ${RED}Не performance ($CPU_GOV)${NC}"
-        fi
-
-        SWAP=$(sysctl -n vm.swappiness 2>/dev/null)
-        if [ "$SWAP" == "1" ]; then
-            echo -e "4. Swap: ${GREEN}Настроен (1)${NC}"
-        else
-            echo -e "4. Swap: ${RED}Не настроен ($SWAP)${NC}"
-        fi
-
-        if ! command -v snap &> /dev/null; then
-            echo -e "5. Snapd: ${GREEN}Успешно удален${NC}"
-        else
-            echo -e "5. Snapd: ${RED}Установлен!${NC}"
-        fi
-
-        LIMIT=$(systemctl show -p DefaultLimitNOFILE | cut -d= -f2)
-        if [ "$LIMIT" == "1048576" ] || [ "$LIMIT" == "infinity" ] || [ "$LIMIT" -ge 500000 ] 2>/dev/null; then
-            echo -e "6. Лимиты: ${GREEN}Расширены ($LIMIT)${NC}"
-        else
-            echo -e "6. Лимиты: ${RED}Стандартные ($LIMIT)${NC}"
-        fi
-
-        echo -e "\n${PURPLE}=== СТАТУС СЛУЖБ ===${NC}"
-        CORES=$(nproc)
-        for svc in chronyd ufw irqbalance; do
-            if systemctl is-active --quiet $svc; then
-                echo -e "[$svc]: ${GREEN}Работает${NC}"
-            else
-                if [ "$svc" == "irqbalance" ] && [ "$CORES" -eq 1 ]; then
-                    echo -e "[$svc]: ${YELLOW}Выключена (1 ядро)${NC}"
-                else
-                    echo -e "[$svc]: ${RED}НЕ РАБОТАЕТ${NC}"
-                fi
-            fi
-        done
-
-        echo -e "\n${PURPLE}=== ОТКРЫТЫЕ ПОРТЫ ===${NC}"
-        if sudo ufw status | grep -q "ALLOW"; then
-            sudo ufw status | grep ALLOW
-        else
-            echo -e "${RED}Файрвол выключен или правила не заданы!${NC}"
-        fi
+        
+        echo -e "1. Ядро: $(uname -r) $(echo $(uname -r) | grep -q liquorix && echo "${GREEN}OK" || echo "${RED}Нужен reboot!")${NC}"
+        echo -e "2. BBR: $(sysctl -n net.ipv4.tcp_congestion_control) $([ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ] && echo "${GREEN}OK" || echo "${RED}NO")${NC}"
+        echo -e "3. CPU: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "Locked")${NC}"
+        echo -e "4. Swap: $(sysctl -n vm.swappiness) ${NC}"
+        echo -e "5. Snapd: $(command -v snap &> /dev/null && echo "${RED}Установлен" || echo "${GREEN}Удален")${NC}"
         echo -e "${PURPLE}==========================================${NC}"
         ;;
 
     6)
-        echo -e "\n${YELLOW}[INFO]${NC} Подготовка к замеру скорости..."
-        
         if ! command -v speedtest &> /dev/null; then
-            echo -e "${PURPLE}[..]${NC} Прямое скачивание бинарника Speedtest (Ookla)..."
             wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | sudo tar xvz -C /usr/local/bin/ speedtest > /dev/null 2>&1
         fi
-        
-        if command -v speedtest &> /dev/null; then
-            echo -e "${PURPLE}[..]${NC} Запуск теста...\n"
-            speedtest --accept-license --accept-gdpr
-            echo -e "\n${GREEN}[OK]${NC} Тест завершен!"
-        else
-            echo -e "\n${RED}[ОШИБКА] Не удалось скачать Speedtest. Проверь интернет на сервере.${NC}"
-        fi
+        speedtest --accept-license --accept-gdpr
         ;;
 
     0)
-        echo -e "${PURPLE}Выход.${NC}"
         exit 0
         ;;
     *)
-        echo -e "${RED}Ошибка: Неверный выбор!${NC}"
+        echo -e "${RED}Ошибка!${NC}"
         ;;
 esac
