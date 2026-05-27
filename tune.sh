@@ -7,13 +7,13 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Жесткая очистка консоли через системный сброс
+# Жесткая очистка консоли
 printf '\033c'
 
 echo -e "${PURPLE}==========================================${NC}"
 echo -e "${BOLD}${GREEN}    kto VPN: Ультимативное говно          ${NC}"
 echo -e "${PURPLE}==========================================${NC}"
-echo -e "1) Полная оптимизация системы"
+echo -e "1) Полная оптимизация (с авто-починкой ОС)"
 echo -e "2) Установка ноды Remnawave"
 echo -e "3) Установка SelfSteal"
 echo -e "4) Установка WARP Native"
@@ -27,9 +27,17 @@ read choice
 
 case $choice in
     1)
-        echo -e "\n${YELLOW}[INFO]${NC} Запуск оптимизации. Пожалуйста, подождите..."
+        echo -e "\n${YELLOW}[INFO]${NC} Запуск оптимизации и самолечения ОС..."
         SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config | grep -v "^#" | awk '{print $2}' | head -n 1)
         SSH_PORT=${SSH_PORT:-22}
+        
+        echo -e "${PURPLE}[..]${NC} Лечим APT (чистим сломанные репозитории и блокировки)..."
+        # Удаляем мертвый репозиторий Ookla, который ломает apt
+        sudo rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list
+        # Снимаем зависшие локи (если apt упал с ошибкой ранее)
+        sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
+        # Чиним прерванные установки
+        sudo dpkg --configure -a > /dev/null 2>&1
         
         sudo systemctl disable --now snapd.socket snapd.service > /dev/null 2>&1
         sudo apt-get purge snapd -y > /dev/null 2>&1
@@ -144,26 +152,24 @@ EOF
 
     3)
         echo -e "\n${YELLOW}[INFO]${NC} Запуск скрипта SelfSteal..."
-        # Физически скачиваем файл во временную папку
         curl -sL "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh" -o /tmp/selfsteal.sh
         
-        # Запускаем от рута как обычный скрипт (чтобы инпуты работали)
-        if sudo bash /tmp/selfsteal.sh @ install; then
+        # Запускаем от рута и ЖЕСТКО привязываем к терминалу (< /dev/tty)
+        if sudo bash /tmp/selfsteal.sh @ install < /dev/tty; then
             echo -e "\n${GREEN}[OK]${NC} Скрипт SelfSteal успешно завершил работу!"
         else
             echo -e "\n${RED}[ОШИБКА] Скрипт SelfSteal прервался с ошибкой!${NC}"
         fi
         
-        # Удаляем мусор за собой
         rm -f /tmp/selfsteal.sh
         ;;
 
     4)
         echo -e "\n${YELLOW}[INFO]${NC} Запуск установки WARP Native..."
-        # Аналогичный безопасный запуск для WARP
         curl -sL "https://raw.githubusercontent.com/distillium/warp-native/main/install.sh" -o /tmp/warp.sh
         
-        if sudo bash /tmp/warp.sh; then
+        # Аналогично прибиваем WARP к терминалу, чтобы не спамил
+        if sudo bash /tmp/warp.sh < /dev/tty; then
             echo -e "\n${GREEN}[OK]${NC} Установка WARP Native успешно завершена!"
         else
             echo -e "\n${RED}[ОШИБКА] Установка WARP Native прервалась с ошибкой!${NC}"
