@@ -157,30 +157,33 @@ EOF
 
     5)
         printf '\033c'
+        # Принудительно применяем все настройки sysctl еще раз перед выводом
+        sudo sysctl -p /etc/sysctl.d/99-vpn-tuning.conf > /dev/null 2>&1
+        
         echo -e "${PURPLE}+------------------------------------------+${NC}"
         echo -e "${PURPLE}|${NC}        ${BOLD}${YELLOW}kto VPN: Стата говна${NC}              ${PURPLE}|${NC}"
         echo -e "${PURPLE}+------------------------------------------+${NC}"
 
-        # Улучшенная функция рендеринга
+        # Улучшенная функция: она сама знает, что является "OK", а что "BAD"
+        # Передаем: метку, фактическое значение, ожидаемое значение
         render_row() {
             local label=$1
             local actual=$2
             local expected=$3
             
             printf "${PURPLE}|${NC} %-20s " "$label"
-            if [ "$actual" == "$expected" ]; then
+            if [[ "$actual" == *"$expected"* ]]; then
                 printf "${GREEN}● OK${NC}"
             else
-                printf "${RED}○ BAD${NC}"
+                printf "${RED}○ BAD ($actual)${NC}"
             fi
             printf " ${PURPLE}|${NC}\n"
         }
 
-        # Проверки с правильной логикой
-        render_row "Ядро Liquorix" "$(uname -r | grep -q liquorix && echo "OK" || echo "BAD")" "OK"
-        render_row "BBR + FQ" "$( [ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ] && echo "OK" || echo "BAD" )" "OK"
-        render_row "TCP Fast Open" "$( [ "$(sysctl -n net.ipv4.tcp_fastopen)" == "3" ] && echo "OK" || echo "BAD" )" "OK"
-        render_row "Keepalive (10m)" "$( [ "$(sysctl -n net.ipv4.tcp_keepalive_time)" == "600" ] && echo "OK" || echo "BAD" )" "OK"
+        render_row "Ядро Liquorix" "$(uname -r)" "liquorix"
+        render_row "BBR + FQ" "$(sysctl -n net.ipv4.tcp_congestion_control)+$(sysctl -n net.core.default_qdisc)" "bbr+fq"
+        render_row "TCP Fast Open" "$(sysctl -n net.ipv4.tcp_fastopen)" "3"
+        render_row "Keepalive (10m)" "$(sysctl -n net.ipv4.tcp_keepalive_time)" "600"
         render_row "Snapd Удален" "$( ! command -v snap &> /dev/null && echo "OK" || echo "BAD" )" "OK"
         
         echo -e "${PURPLE}+------------------------------------------+${NC}"
@@ -191,7 +194,9 @@ EOF
         printf "     ${PURPLE}|${NC}\n"
         
         echo -e "${PURPLE}+------------------------------------------+${NC}"
-        echo -e "${PURPLE}|${NC} ${BOLD}Порты:${NC} $(sudo ufw status | grep ALLOW | awk '{print $1}' | sort -u | xargs | sed 's/ /, /g') ${PURPLE}|${NC}"
+        # Вывод портов списком
+        PORTS=$(sudo ufw status | grep ALLOW | awk '{print $1}' | sort -u | xargs | sed 's/ /, /g')
+        printf "${PURPLE}|${NC} ${BOLD}Порты:${NC} %-33s ${PURPLE}|${NC}\n" "$PORTS"
         echo -e "${PURPLE}+------------------------------------------+${NC}"
         ;;
 
