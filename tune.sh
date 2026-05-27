@@ -157,25 +157,31 @@ EOF
 
     5)
         printf '\033c'
-        # Функция для проверки параметров
-        is_ok() { [ "$1" == "$2" ] && echo "OK" || echo "BAD"; }
-
         echo -e "${PURPLE}+------------------------------------------+${NC}"
         echo -e "${PURPLE}|${NC}        ${BOLD}${YELLOW}kto VPN: Стата говна${NC}              ${PURPLE}|${NC}"
         echo -e "${PURPLE}+------------------------------------------+${NC}"
 
+        # Улучшенная функция рендеринга
         render_row() {
             local label=$1
-            local val=$2
-            local status=$3
-            printf "${PURPLE}|${NC} %-20s %-10s ${PURPLE}|${NC}\n" "$label" "$([ "$status" == "OK" ] && echo -e "${GREEN}● OK" || echo -e "${RED}○ BAD")"
+            local actual=$2
+            local expected=$3
+            
+            printf "${PURPLE}|${NC} %-20s " "$label"
+            if [ "$actual" == "$expected" ]; then
+                printf "${GREEN}● OK${NC}"
+            else
+                printf "${RED}○ BAD${NC}"
+            fi
+            printf " ${PURPLE}|${NC}\n"
         }
 
-        render_row "Ядро Liquorix" "$(uname -r | grep -q liquorix && echo OK || echo BAD)"
-        render_row "BBR + FQ" "$( [ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ] && echo OK || echo BAD )"
-        render_row "TCP Fast Open" "$( [ "$(sysctl -n net.ipv4.tcp_fastopen)" == "3" ] && echo OK || echo BAD )"
-        render_row "Keepalive (10m)" "$( [ "$(sysctl -n net.ipv4.tcp_keepalive_time)" == "600" ] && echo OK || echo BAD )"
-        render_row "Snapd Удален" "$( ! command -v snap &> /dev/null && echo OK || echo BAD )"
+        # Проверки с правильной логикой
+        render_row "Ядро Liquorix" "$(uname -r | grep -q liquorix && echo "OK" || echo "BAD")" "OK"
+        render_row "BBR + FQ" "$( [ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ] && echo "OK" || echo "BAD" )" "OK"
+        render_row "TCP Fast Open" "$( [ "$(sysctl -n net.ipv4.tcp_fastopen)" == "3" ] && echo "OK" || echo "BAD" )" "OK"
+        render_row "Keepalive (10m)" "$( [ "$(sysctl -n net.ipv4.tcp_keepalive_time)" == "600" ] && echo "OK" || echo "BAD" )" "OK"
+        render_row "Snapd Удален" "$( ! command -v snap &> /dev/null && echo "OK" || echo "BAD" )" "OK"
         
         echo -e "${PURPLE}+------------------------------------------+${NC}"
         echo -ne "${PURPLE}|${NC} Службы: "
