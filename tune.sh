@@ -37,7 +37,6 @@ case $choice in
         
         echo -e "${PURPLE}[..]${NC} Обновление пакетов и установка базовых утилит..."
         sudo apt-get update > /dev/null
-        # Обрати внимание: тут только > /dev/null. Если будет ошибка зависимостей, она вылезет на экран.
         sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget gnupg2 chrony ufw cpufrequtils irqbalance software-properties-common > /dev/null
         
         echo -e "${PURPLE}[..]${NC} Установка ядра Liquorix..."
@@ -104,7 +103,7 @@ EOF
 
         if ! command -v docker &> /dev/null; then
             echo -e "${YELLOW}[..]${NC} Docker не найден, устанавливаем..."
-            curl -fsSL https://get.docker.com | sh > /dev/null
+            curl -fsSL https://get.docker.com | sudo sh > /dev/null
         fi
 
         sudo mkdir -p /opt/remnawave/
@@ -136,10 +135,9 @@ EOF
             DOCKER_CMD="sudo docker-compose"
         fi
         
-        # Жесткая проверка успешности докера
         if $DOCKER_CMD up -d; then
             echo -e "${GREEN}[OK]${NC} Нода успешно запущена!"
-            echo -e "Для просмотра логов введи: ${BOLD}${PURPLE}docker logs -f remnanode${NC}"
+            echo -e "Для просмотра логов введи: ${BOLD}${PURPLE}sudo docker logs -f remnanode${NC}"
         else
             echo -e "\n${RED}[ОШИБКА] Docker не смог запустить ноду! Ищи причину в тексте выше.${NC}"
         fi
@@ -147,7 +145,8 @@ EOF
 
     3)
         echo -e "\n${YELLOW}[INFO]${NC} Запуск скрипта SelfSteal..."
-        if bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install; then
+        # Принудительный запуск от sudo с передачей аргументов
+        if curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh | sudo bash -s -- @ install; then
             echo -e "\n${GREEN}[OK]${NC} Скрипт SelfSteal успешно завершил работу!"
         else
             echo -e "\n${RED}[ОШИБКА] Скрипт SelfSteal прервался с ошибкой!${NC}"
@@ -156,7 +155,8 @@ EOF
 
     4)
         echo -e "\n${YELLOW}[INFO]${NC} Запуск установки WARP Native..."
-        if bash <(curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh); then
+        # Принудительный запуск от sudo
+        if curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh | sudo bash; then
             echo -e "\n${GREEN}[OK]${NC} Установка WARP Native успешно завершена!"
         else
             echo -e "\n${RED}[ОШИБКА] Установка WARP Native прервалась с ошибкой!${NC}"
@@ -236,16 +236,14 @@ EOF
         echo -e "${PURPLE}==========================================${NC}"
         ;;
 
-     6)
+    6)
         echo -e "\n${YELLOW}[INFO]${NC} Подготовка к замеру скорости..."
         
         if ! command -v speedtest &> /dev/null; then
             echo -e "${PURPLE}[..]${NC} Прямое скачивание бинарника Speedtest (Ookla)..."
-            # Качаем архив и на лету распаковываем исполняемый файл прямо в системные программы
             wget -qO- https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | sudo tar xvz -C /usr/local/bin/ speedtest > /dev/null 2>&1
         fi
         
-        # Жесткая проверка: установился ли он в итоге?
         if command -v speedtest &> /dev/null; then
             echo -e "${PURPLE}[..]${NC} Запуск теста...\n"
             speedtest --accept-license --accept-gdpr
