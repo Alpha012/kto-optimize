@@ -1150,7 +1150,7 @@ public_ipv4() {
     if command_exists curl; then
         ip="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
     fi
-    if [[ -z "$ip" && command_exists wget ]]; then
+    if [[ -z "$ip" ]] && command_exists wget; then
         ip="$(wget -qO- --timeout=8 https://api.ipify.org 2>/dev/null || true)"
     fi
     printf '%s\n' "$ip"
