@@ -5,10 +5,11 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="kto VPN"
-SCRIPT_VERSION="2.1.2"
+SCRIPT_VERSION="2.2.0"
 
 DRY_RUN=0
-ASSUME_YES="${KTO_ASSUME_YES:-1}"
+ASSUME_YES="${KTO_ASSUME_YES:-0}"
+RUN_VERBOSE="${KTO_VERBOSE:-0}"
 NO_COLOR="${NO_COLOR:-0}"
 ACTION="${KTO_ACTION:-}"
 PROFILE="${KTO_PROFILE:-throughput}"
@@ -120,8 +121,9 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
 
 Опции:
   --profile balanced|throughput|low-memory
-  --yes                             Автоответ "да" на подтверждения
+  --yes                             Автоответ "да" на подтверждения для выбранного действия
   --ask                             Включить ручные вопросы
+  --verbose                         Подробный вывод команд на экран
   --dry-run                         Показать действия без изменений
   --no-color                        Без цветов
   --log PATH                        Путь к лог-файлу
@@ -145,6 +147,7 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   SSL_DOMAIN=vpn.domain.com
   ACME_EMAIL=admin@domain.com
   CERT_DIR=/opt/remnawave/nginx
+  KTO_VERBOSE=1                     Подробный вывод, если нужен
 EOF
 }
 
@@ -169,6 +172,10 @@ parse_args() {
                 ;;
             --ask)
                 ASSUME_YES=0
+                shift
+                ;;
+            --verbose)
+                RUN_VERBOSE=1
                 shift
                 ;;
             --dry-run)
@@ -249,16 +256,22 @@ require_sudo() {
         exit 1
     fi
 
-    step "Проверяю sudo-доступ"
+    if [[ "$RUN_VERBOSE" == "1" ]]; then
+        step "Проверяю sudo-доступ"
+    fi
     "${SUDO[@]}" -v
-    ok "sudo доступен"
+    if [[ "$RUN_VERBOSE" == "1" ]]; then
+        ok "sudo доступен"
+    fi
 }
 
 run() {
     local title="$1"
     shift
 
-    step "$title"
+    if [[ "$RUN_VERBOSE" == "1" ]]; then
+        step "$title"
+    fi
 
     {
         echo
@@ -274,7 +287,9 @@ run() {
     fi
 
     if "$@" >> "$LOG_FILE" 2>&1; then
-        ok "$title"
+        if [[ "$RUN_VERBOSE" == "1" ]]; then
+            ok "$title"
+        fi
     else
         local rc=$?
         fail "$title"
@@ -292,7 +307,9 @@ run_optional() {
         return 0
     fi
 
-    warn "$title: пропускаю, это не критично"
+    if [[ "$RUN_VERBOSE" == "1" ]]; then
+        warn "$title: пропускаю, это не критично"
+    fi
     return 0
 }
 
@@ -872,24 +889,36 @@ EOF
 }
 
 optimize_system() {
+    local previous_assume_yes="$ASSUME_YES"
+    ASSUME_YES=1
+
     print_header
-    info "Запуск полной оптимизации. Профиль: ${PROFILE}"
+    info "Полная оптимизация: профиль ${PROFILE}, порт ноды ${DEFAULT_NODE_PORT}, без доп. вопросов"
     require_sudo
     detect_os
+
+    info "Бэкап конфигов"
     backup_configs
 
     export NEEDRESTART_MODE=a
     export NEEDRESTART_SUSPEND=1
 
+    info "Пакеты и базовые службы"
     install_base_packages
     maybe_remove_snapd
+
+    info "Ядро и сетевые параметры"
     install_liquorix_kernel
     apply_sysctl_profile "$PROFILE"
     apply_limits
+
+    info "Службы и firewall"
     configure_journald_limits
     configure_cpu_and_services
     configure_firewall
     install_fail2ban_optional
+
+    ASSUME_YES="$previous_assume_yes"
 
     echo
     ok "Оптимизация завершена."
@@ -1488,11 +1517,6 @@ show_menu() {
 
     case "$choice" in
         1)
-            if [[ "$ASSUME_YES" != "1" ]]; then
-                echo
-                echo "Профили: balanced, throughput, low-memory"
-                PROFILE="$(ask_default "Профиль оптимизации" "$PROFILE")"
-            fi
             case "$PROFILE" in
                 balanced|throughput|low-memory) ;;
                 *)
