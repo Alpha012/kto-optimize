@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="kto VPN"
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.1"
 
 DRY_RUN=0
 ASSUME_YES="${KTO_ASSUME_YES:-0}"
@@ -133,17 +133,13 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   ./tune.sh
   ./tune.sh optimize --profile throughput
   ./tune.sh menu --ask
-  REMNA_SSL_CERT='...' ./tune.sh install-node
+  REMNA_SECRET_KEY='...' ./tune.sh install-node
   ./tune.sh status --no-color
 
 Переменные для автоматизации:
   KTO_PROFILE=throughput|balanced|low-memory
   KTO_NODE_PORT=1488
-  REMNA_MODE=modern|legacy
-  REMNA_SSL_CERT=...                 Для modern Remnawave Node
-  REMNA_SECRET_KEY=...               Для legacy Remnawave Node
-  REMNA_IMAGE_TAG=latest
-  REMNA_PANEL_IP=1.2.3.4
+  REMNA_SECRET_KEY=...               SECRET_KEY для Remnawave Node
   SSL_DOMAIN=vpn.domain.com
   ACME_EMAIL=admin@domain.com
   CERT_DIR=/opt/remnawave/nginx
@@ -311,6 +307,42 @@ run_optional() {
         warn "$title: пропускаю, это не критично"
     fi
     return 0
+}
+
+run_in_dir() {
+    local title="$1"
+    local dir="$2"
+    shift 2
+
+    if [[ "$RUN_VERBOSE" == "1" ]]; then
+        step "$title"
+    fi
+
+    {
+        echo
+        echo "[$(date -Is)] $title"
+        echo "cwd: $dir"
+        printf '+'
+        printf ' %q' "$@"
+        echo
+    } >> "$LOG_FILE"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo -e "${BLUE}[DRY]${NC} cd $dir && $*"
+        return 0
+    fi
+
+    if (cd "$dir" && "$@") >> "$LOG_FILE" 2>&1; then
+        if [[ "$RUN_VERBOSE" == "1" ]]; then
+            ok "$title"
+        fi
+    else
+        local rc=$?
+        fail "$title"
+        echo -e "${YELLOW}Последние строки лога:${NC}" >&2
+        tail -n 35 "$LOG_FILE" >&2 || true
+        return "$rc"
+    fi
 }
 
 write_root_file() {
@@ -960,158 +992,82 @@ ensure_docker() {
     ok "Docker Compose готов"
 }
 
-remna_env_mode_prompt() {
-    local mode
-
-    if [[ -n "${REMNA_MODE:-}" ]]; then
-        case "$REMNA_MODE" in
-            modern|legacy)
-                printf '%s\n' "$REMNA_MODE"
-                return 0
-                ;;
-            *)
-                fail "REMNA_MODE должен быть modern или legacy"
-                return 1
-                ;;
-        esac
-    fi
-
-    echo
-    echo -e "${BOLD}Формат Remnawave Node:${NC}"
-    echo "  1) modern: APP_PORT + SSL_CERT (актуальная схема из документации)"
-    echo "  2) legacy: NODE_PORT + SECRET_KEY (старые/сгенерированные compose)"
-    mode="$(ask_default "Выбери режим 1/2" "1")"
-
-    case "$mode" in
-        1|modern) printf '%s\n' "modern" ;;
-        2|legacy) printf '%s\n' "legacy" ;;
-        *)
-            warn "Неизвестный режим, использую modern"
-            printf '%s\n' "modern"
-            ;;
-    esac
-}
-
 write_remnawave_node_files() {
-    local mode="$1"
-    local node_port="$2"
-    local secret_value="$3"
-    local image_tag="$4"
-    local env_tmp compose_tmp
+    local secret_value="$1"
+    local compose_tmp escaped_secret
 
     run "Создание каталога Remnawave Node" "${SUDO[@]}" mkdir -p "$REMNA_DIR"
 
-    env_tmp="$(mktemp)"
     compose_tmp="$(mktemp)"
-    cleanup_files+=("$env_tmp" "$compose_tmp")
-
-    if [[ "$mode" == "modern" ]]; then
-        secret_value="${secret_value#SSL_CERT=}"
-        cat > "$env_tmp" <<EOF
-APP_PORT=${node_port}
-SSL_CERT=${secret_value}
-EOF
-    else
-        secret_value="${secret_value#SECRET_KEY=}"
-        cat > "$env_tmp" <<EOF
-NODE_PORT=${node_port}
-SECRET_KEY=${secret_value}
-EOF
-    fi
+    cleanup_files+=("$compose_tmp")
+    escaped_secret="${secret_value//\\/\\\\}"
+    escaped_secret="${escaped_secret//\"/\\\"}"
 
     cat > "$compose_tmp" <<EOF
 services:
   remnanode:
     container_name: ${REMNA_CONTAINER}
     hostname: ${REMNA_CONTAINER}
-    image: remnawave/node:${image_tag}
-    restart: always
+    image: remnawave/node:latest
     network_mode: host
-    env_file:
-      - .env
+    restart: always
+    cap_add:
+      - NET_ADMIN
     ulimits:
       nofile:
         soft: 1048576
         hard: 1048576
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
+    environment:
+      - NODE_PORT=1488
+      - SECRET_KEY="${escaped_secret}"
 EOF
 
     if [[ "$DRY_RUN" == "1" ]]; then
-        step "DRY-RUN Remnawave .env"
-        sed 's/^/  | /' "$env_tmp"
         step "DRY-RUN Remnawave docker-compose.yml"
         sed 's/^/  | /' "$compose_tmp"
         return 0
     fi
 
-    run "Запись Remnawave .env" "${SUDO[@]}" install -m 0600 "$env_tmp" "$REMNA_DIR/.env"
     run "Запись Remnawave docker-compose.yml" "${SUDO[@]}" install -m 0644 "$compose_tmp" "$REMNA_DIR/docker-compose.yml"
 }
 
-configure_remna_firewall() {
-    local node_port="$1"
-    local panel_ip
-
-    if ! command_exists ufw; then
-        warn "ufw не найден, firewall правило для Remnawave Node не добавлено"
-        return 0
-    fi
-
-    if ! "${SUDO[@]}" ufw status >/dev/null 2>&1; then
-        warn "ufw недоступен, пропускаю firewall правило"
-        return 0
-    fi
-
-    panel_ip="$(ask_default "IP/CIDR панели Remnawave для доступа к порту ${node_port}. Оставь пустым, чтобы не открывать" "${REMNA_PANEL_IP:-}")"
-    if [[ -n "$panel_ip" ]]; then
-        if valid_ip_or_cidrish "$panel_ip"; then
-            run "UFW allow Remnawave Node ${node_port} from ${panel_ip}" \
-                "${SUDO[@]}" ufw allow from "$panel_ip" to any port "$node_port" proto tcp
-        else
-            warn "IP/CIDR выглядит странно: $panel_ip. Правило не добавлено."
-        fi
-    elif confirm "Открыть ${node_port}/tcp для всех? Это хуже по безопасности." "n"; then
-        run "UFW allow Remnawave Node ${node_port}/tcp globally" "${SUDO[@]}" ufw allow "${node_port}/tcp"
-    else
-        warn "Порт ${node_port} не открыт. Панель не достучится до ноды, пока не добавишь правило."
-    fi
-}
-
 install_remnawave_node() {
+    local previous_assume_yes="$ASSUME_YES"
+    local secret_value
+
     print_header
     info "Установка Remnawave Node"
+
+    secret_value="${REMNA_SECRET_KEY:-${SECRET_KEY:-}}"
+    if [[ -z "$secret_value" ]]; then
+        if [[ ! -t 0 ]]; then
+            fail "Нужно передать SECRET_KEY через env или запустить интерактивно"
+            return 1
+        fi
+        read -r -s -p "$(echo -e "${PURPLE}>${NC} ${BOLD}Введите SECRET_KEY для ноды:${NC} ")" secret_value
+        echo
+    fi
+    if [[ -z "$secret_value" ]]; then
+        fail "SECRET_KEY не может быть пустым"
+        return 1
+    fi
+
+    ASSUME_YES=1
+
     require_sudo
     detect_os
     backup_configs
-    install_base_packages
     ensure_docker
 
-    local mode node_port secret_value image_tag
-    mode="$(remna_env_mode_prompt)"
-    node_port="$(ask_port "Порт Remnawave Node" "$DEFAULT_NODE_PORT")"
-    image_tag="$(ask_default "Docker image tag remnawave/node" "${REMNA_IMAGE_TAG:-latest}")"
+    write_remnawave_node_files "$secret_value"
 
-    if [[ "$mode" == "modern" ]]; then
-        secret_value="${REMNA_SSL_CERT:-${SSL_CERT:-}}"
-        if [[ -z "$secret_value" ]]; then
-            secret_value="$(ask_secret "Вставь SSL_CERT из панели Remnawave")"
-        fi
-    else
-        secret_value="${REMNA_SECRET_KEY:-${SECRET_KEY:-}}"
-        if [[ -z "$secret_value" ]]; then
-            secret_value="$(ask_secret "Вставь SECRET_KEY из панели Remnawave")"
-        fi
-    fi
+    info "Скачивание образа remnawave/node:latest"
+    run_in_dir "Docker compose pull Remnawave Node" "$REMNA_DIR" "${SUDO[@]}" docker compose pull
 
-    write_remnawave_node_files "$mode" "$node_port" "$secret_value" "$image_tag"
-    configure_remna_firewall "$node_port"
+    info "Запуск: docker compose up -d"
+    run_in_dir "Docker compose up -d Remnawave Node" "$REMNA_DIR" "${SUDO[@]}" docker compose up -d
 
-    run "Docker compose pull Remnawave Node" "${SUDO[@]}" docker compose -f "$REMNA_DIR/docker-compose.yml" --env-file "$REMNA_DIR/.env" pull
-    run "Docker compose up Remnawave Node" "${SUDO[@]}" docker compose -f "$REMNA_DIR/docker-compose.yml" --env-file "$REMNA_DIR/.env" up -d
+    ASSUME_YES="$previous_assume_yes"
 
     echo
     ok "Remnawave Node запущена"
