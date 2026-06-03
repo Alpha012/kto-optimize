@@ -5,12 +5,12 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="kto VPN"
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="2.1.2"
 
 DRY_RUN=0
 ASSUME_YES="${KTO_ASSUME_YES:-1}"
 NO_COLOR="${NO_COLOR:-0}"
-ACTION="${KTO_ACTION:-optimize}"
+ACTION="${KTO_ACTION:-}"
 PROFILE="${KTO_PROFILE:-throughput}"
 DEFAULT_NODE_PORT="${KTO_NODE_PORT:-1488}"
 
@@ -105,7 +105,7 @@ usage() {
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
 
 Использование:
-  ./tune.sh                         Полная оптимизация без вопросов
+  ./tune.sh                         Интерактивное меню
   ./tune.sh menu                    Интерактивное меню
   ./tune.sh optimize                Полная оптимизация
   ./tune.sh install-node            Установка Remnawave Node
@@ -1538,7 +1538,7 @@ main() {
         selfsteal) install_selfsteal ;;
         warp) install_warp_native ;;
         rollback) rollback_latest_backup ;;
-        "") optimize_system ;;
+        "") show_menu ;;
         *)
             fail "Неизвестное действие: $ACTION"
             exit 2
