@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.0.1"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnanode"
 REMNA_CONTAINER="remnanode"
@@ -259,6 +259,7 @@ EOF
     cmd "${SUDO[@]}" ufw default allow outgoing
     cmd "${SUDO[@]}" ufw allow "${ssh_port}/tcp"
     cmd "${SUDO[@]}" ufw allow 443/tcp
+    cmd "${SUDO[@]}" ufw allow 443/udp
     cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
     cmd "${SUDO[@]}" ufw --force enable
 
@@ -462,9 +463,14 @@ service_ok() {
     systemctl is-active --quiet "$svc" 2>/dev/null && echo 1 || echo 0
 }
 
-port_listen() {
+tcp_listen() {
     local port="$1"
     command_exists ss && ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$" && echo 1 || echo 0
+}
+
+udp_listen() {
+    local port="$1"
+    command_exists ss && ss -lnu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$" && echo 1 || echo 0
 }
 
 file_ok() {
@@ -493,9 +499,10 @@ show_status() {
 
     echo -e "${BOLD}${PURPLE}[ СЕТЬ ]${NC}"
     print_row "BBR + FQ" "${cc} + ${qdisc}" "$([[ "$cc" == "bbr" && "$qdisc" == "fq" ]] && echo 1 || echo 0)"
-    print_row "SSH ${ssh_port}" "listen" "$(port_listen "$ssh_port")"
-    print_row "HTTPS 443" "listen" "$(port_listen 443)"
-    print_row "Node ${NODE_PORT}" "listen" "$(port_listen "$NODE_PORT")"
+    print_row "SSH ${ssh_port}/tcp" "listen" "$(tcp_listen "$ssh_port")"
+    print_row "TLS 443/tcp" "listen" "$(tcp_listen 443)"
+    print_row "Hysteria 443/udp" "listen" "$(udp_listen 443)"
+    print_row "Node ${NODE_PORT}/tcp" "listen" "$(tcp_listen "$NODE_PORT")"
 
     echo
     echo -e "${BOLD}${PURPLE}[ СЛУЖБЫ ]${NC}"
