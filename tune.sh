@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="kto VPN"
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.4.0"
 
 DRY_RUN=0
 ASSUME_YES="${KTO_ASSUME_YES:-0}"
@@ -140,6 +140,7 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   KTO_PROFILE=throughput|balanced|low-memory
   KTO_NODE_PORT=1488
   REMNA_SECRET_KEY=...               SECRET_KEY для Remnawave Node
+  SELFSTEAL_DOMAIN=reality.domain.com
   SSL_DOMAIN=vpn.domain.com
   ACME_EMAIL=admin@domain.com
   CERT_DIR=/opt/remnawave/nginx
@@ -1075,20 +1076,30 @@ install_remnawave_node() {
 }
 
 install_selfsteal() {
+    local domain
+    local previous_assume_yes="$ASSUME_YES"
+
     print_header
     info "Установка SelfSteal"
-    require_sudo
 
-    warn "Скрипт будет скачан и выполнен с GitHub. Используй только если доверяешь источнику."
-    if ! confirm "Продолжить?" "n"; then
-        exit 0
+    domain="${SELFSTEAL_DOMAIN:-}"
+    if [[ -z "$domain" ]]; then
+        domain="$(ask_domain)"
+    elif ! validate_domain "$domain"; then
+        fail "Некорректный домен в SELFSTEAL_DOMAIN: $domain"
+        return 1
     fi
 
-    local script
-    script="$(mktemp)"
-    cleanup_files+=("$script")
-    download_file "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh" "$script"
-    run "Запуск SelfSteal installer" "${SUDO[@]}" bash "$script" @ install
+    ASSUME_YES=1
+    require_sudo
+    ASSUME_YES="$previous_assume_yes"
+
+    info "Запуск SelfSteal для домена ${domain}"
+    run "Запуск SelfSteal installer" \
+        "${SUDO[@]}" bash -c \
+        'bash <(curl -Ls "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh") --force --domain "$1" install' \
+        _ "$domain"
+
     ok "SelfSteal установлен"
 }
 
