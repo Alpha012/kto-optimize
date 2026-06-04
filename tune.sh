@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="3.2.1"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -183,6 +183,13 @@ require_node_mode() {
     fi
 }
 
+require_whitelist_mode() {
+    if [[ "$MACHINE_MODE" != "whitelist" ]]; then
+        fail "Этот пункт доступен только для режима whitelist."
+        exit 1
+    fi
+}
+
 apt_update_quiet() {
     "${SUDO[@]}" apt-get -o DPkg::Lock::Timeout=600 update >> "$LOG_FILE" 2>&1
 }
@@ -221,6 +228,29 @@ ask_domain() {
             return 0
         fi
         fail "Некорректный домен. Пример: vpn.domain.com"
+    done
+}
+
+validate_ipv4() {
+    local ip="$1" octet
+    local octets=()
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet >= 0 && 10#$octet <= 255 )) || return 1
+    done
+}
+
+ask_ipv4() {
+    local prompt="${1:-Введите IP}"
+    local ip
+    while true; do
+        read -r -p "$(echo -e "${PURPLE}>${NC} ${BOLD}${prompt}:${NC} ")" ip
+        if validate_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+        fail "Некорректный IPv4. Пример: 1.2.3.4"
     done
 }
 
@@ -345,27 +375,25 @@ optimize_system() {
     export NEEDRESTART_SUSPEND=1
 
     stage "Пакеты"
-    packages=(ca-certificates curl wget ufw openssl dnsutils)
+    packages=(ca-certificates curl wget gnupg2 software-properties-common ufw openssl dnsutils)
     if [[ "$MACHINE_MODE" == "node" ]]; then
-        packages+=(gnupg2 chrony cpufrequtils irqbalance software-properties-common logrotate tar xz-utils)
+        packages+=(chrony cpufrequtils irqbalance logrotate tar xz-utils)
     fi
     must "apt update" apt_update_quiet
     must "Установка пакетов" apt_install_quiet "${packages[@]}"
 
-    if [[ "$MACHINE_MODE" == "node" ]]; then
-        stage "Liquorix kernel"
-        if [[ "$(uname -m)" == "x86_64" ]] && grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
-            cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y
-            cmd apt_update_quiet
-            for _ in 1 2 3; do
-                if apt_install_quiet linux-image-liquorix-amd64 linux-headers-liquorix-amd64; then
-                    break
-                fi
-                sleep 2
-            done
-        else
-            echo "Liquorix skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
-        fi
+    stage "Liquorix kernel"
+    if [[ "$(uname -m)" == "x86_64" ]] && grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
+        cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y
+        cmd apt_update_quiet
+        for _ in 1 2 3; do
+            if apt_install_quiet linux-image-liquorix-amd64 linux-headers-liquorix-amd64; then
+                break
+            fi
+            sleep 2
+        done
+    else
+        echo "Liquorix skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
     fi
 
     stage "Сеть и лимиты"
@@ -633,6 +661,73 @@ issue_ssl_certificate() {
     echo -e "Fullchain: ${BOLD}${CERT_DIR}/fullchain.pem${NC}"
 }
 
+install_haproxy() {
+    header
+    require_whitelist_mode
+    need_root
+    local backend_ip
+    backend_ip="$(ask_ipv4 "Введите выходной IP")"
+
+    stage "HAProxy"
+    must "apt update" apt_update_quiet
+    must "Установка HAProxy" apt_install_quiet haproxy
+
+    write_root_file /etc/haproxy/haproxy.cfg <<EOF
+global
+    maxconn 200000
+    nbthread 32
+    tune.ssl.default-dh-param 2048
+    tune.maxaccept 10000
+    tune.bufsize 65536
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    option dontlognull
+
+    option clitcpka
+    option srvtcpka
+    option tcp-smart-accept
+    option tcp-smart-connect
+    option splice-auto
+    option splice-request
+    option splice-response
+
+    timeout connect 5s
+    timeout client 2h
+    timeout server 2h
+    timeout tunnel 2h
+
+    default-server inter 30s fall 8 rise 3
+
+
+# -------------------------
+# FRONTEND : 8443
+# -------------------------
+frontend vless_in
+    bind *:443
+    default_backend vless_pool
+
+backend vless_pool
+    mode tcp
+    balance leastconn
+
+    server xray1 ${backend_ip}:443 weight 10
+EOF
+
+    if ! "${SUDO[@]}" haproxy -c -f /etc/haproxy/haproxy.cfg >> "$LOG_FILE" 2>&1; then
+        fail "Проверка HAProxy config"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        return 1
+    fi
+
+    cmd "${SUDO[@]}" systemctl enable haproxy || true
+    must "Перезапуск HAProxy" "${SUDO[@]}" systemctl restart haproxy
+
+    ok "HAProxy установлен: 443 -> ${backend_ip}:443"
+}
+
 badge() {
     local ok_flag="$1"
     if [[ "$ok_flag" == "1" ]]; then
@@ -714,6 +809,9 @@ show_status() {
     echo -e "${BOLD}${PURPLE}[ СЛУЖБЫ ]${NC}"
     print_row "ufw" "firewall" "$(service_ok ufw)"
     print_row "antiscanner" "$(antiscanner_rules_count) rules" "$(file_ok "$ANTISCANNER_SCRIPT")"
+    if command_exists haproxy; then
+        print_row "haproxy" "proxy" "$(service_ok haproxy)"
+    fi
     print_row "fail2ban" "ssh guard" "$(service_ok fail2ban)"
 
     if [[ "$MACHINE_MODE" != "node" ]]; then
@@ -774,10 +872,12 @@ menu() {
     echo -e "8) Проверка IP (Region Check)"
     if [[ "$MACHINE_MODE" == "node" ]]; then
         echo -e "9) Сгенерировать SSL-сертификат"
+    else
+        echo -e "10) HAProxy"
     fi
     echo -e "0) Выход"
     echo -e "${PURPLE}==========================================${NC}"
-    echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие (0-9):${NC} "
+    echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
 
     local choice
     read -r choice
@@ -791,6 +891,7 @@ menu() {
         7) ipcheck_place ;;
         8) ipcheck_region ;;
         9) require_node_mode; issue_ssl_certificate ;;
+        10) require_whitelist_mode; install_haproxy ;;
         0) echo -e "${PURPLE}Выход.${NC}" ;;
         *) fail "Неверный выбор" ;;
     esac
@@ -812,6 +913,7 @@ main() {
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
+        haproxy|install-haproxy) install_haproxy ;;
         *) menu ;;
     esac
 }
