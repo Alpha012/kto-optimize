@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.2"
+SCRIPT_VERSION="3.3.3"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -104,6 +104,7 @@ must() {
 PROGRESS_TOTAL=1
 PROGRESS_CURRENT=0
 PROGRESS_WIDTH=26
+PROGRESS_LINE_WIDTH=100
 
 progress_bar() {
     local percent="$1"
@@ -121,7 +122,18 @@ progress_line() {
     local percent="$1"
     local title="$2"
     local frame="$3"
-    printf '\r\033[K%b %3d%% [%s] %s' "${PURPLE}${frame}${NC}" "$percent" "$(progress_bar "$percent")" "$title"
+    local text width
+    width="${COLUMNS:-80}"
+    if (( width < 40 )); then
+        width=79
+    else
+        width=$(( width - 1 ))
+    fi
+    if (( width > PROGRESS_LINE_WIDTH )); then
+        width="$PROGRESS_LINE_WIDTH"
+    fi
+    printf -v text '%s %3d%% [%s] %s' "$frame" "$percent" "$(progress_bar "$percent")" "$title"
+    printf '\r%-*s' "$width" "$text"
 }
 
 progress_start() {
@@ -142,10 +154,10 @@ progress_step() {
     frame_idx=0
 
     if [[ ! -t 1 ]]; then
-        echo -e "${PURPLE}[..]${NC} ${to}% ${title}"
+        printf '[..] %3d%% [%s] %s\n' "$to" "$(progress_bar "$to")" "$title"
         if "$@" >> "$LOG_FILE" 2>&1; then
             PROGRESS_CURRENT=$(( PROGRESS_CURRENT + 1 ))
-            ok "$title"
+            printf '[OK] %s\n' "$title"
             return 0
         fi
         fail "$title"
@@ -182,7 +194,6 @@ progress_step() {
 
     PROGRESS_CURRENT=$(( PROGRESS_CURRENT + 1 ))
     progress_line "$to" "$title" 'OK'
-    echo
 }
 
 command_exists() {
@@ -320,8 +331,8 @@ select_node_profile() {
     while true; do
         header
         echo -e "${BOLD}${PURPLE}[ ПРОФИЛЬ НОДЫ ]${NC}"
-        echo -e "1) Reality   - без SSL-сертов"
-        echo -e "2) Hysteria2 - SSL + volume /opt/remnawave"
+        echo -e "1) Reality"
+        echo -e "2) Hysteria2"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите профиль (1-2):${NC} "
         read -r choice
@@ -348,8 +359,8 @@ select_machine_mode() {
     while true; do
         header
         echo -e "${BOLD}${PURPLE}[ РЕЖИМ МАШИНЫ ]${NC}"
-        echo -e "1) node      - нода Remnawave, 443 + ${NODE_PORT}, Docker"
-        echo -e "2) whitelist - только сеть и 443, без ноды/докера/сертов"
+        echo -e "1) node"
+        echo -e "2) whitelist"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите режим (1-2):${NC} "
         read -r choice
