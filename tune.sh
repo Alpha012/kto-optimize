@@ -4,12 +4,14 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.0.1"
+SCRIPT_VERSION="3.1.0"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnanode"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
 LOG_FILE="${KTO_LOG_FILE:-/var/log/kto-vpn-tune.log}"
+ANTISCANNER_SCRIPT="/usr/local/bin/update-antiscanner.sh"
+ANTISCANNER_URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -163,6 +165,76 @@ ensure_docker() {
     cmd "${SUDO[@]}" systemctl enable --now docker || true
 }
 
+install_antiscanner() {
+    stage "AntiScanner"
+
+    apt_install_quiet curl ufw cron || true
+    cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y iptables-persistent || true
+    cmd "${SUDO[@]}" systemctl enable --now cron || true
+
+    write_root_file "$ANTISCANNER_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+URL="${ANTISCANNER_URL}"
+TEMP_FILE="\$(mktemp)"
+LOG="/var/log/antiscanner_update.log"
+
+cleanup() {
+    rm -f "\$TEMP_FILE"
+}
+trap cleanup EXIT
+
+if ! command -v ufw >/dev/null 2>&1; then
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] ufw not found" >> "\$LOG"
+    exit 1
+fi
+
+if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
+    for rules_file in /etc/ufw/user.rules /etc/ufw/user6.rules; do
+        [[ -f "\$rules_file" ]] && sed -i '/AntiScanner-Block/d' "\$rules_file"
+    done
+
+    while IFS= read -r subnet; do
+        subnet="\$(echo "\$subnet" | xargs)"
+        [[ -z "\$subnet" || "\$subnet" == "#"* ]] && continue
+
+        if [[ "\$subnet" =~ \. || "\$subnet" =~ : ]]; then
+            ufw insert 1 deny from "\$subnet" comment 'AntiScanner-Block' >/dev/null 2>&1 || true
+        fi
+    done < "\$TEMP_FILE"
+
+    ufw reload >/dev/null 2>&1 || true
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] AntiScanner updated via ufw" >> "\$LOG"
+else
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to download blacklist" >> "\$LOG"
+    exit 1
+fi
+EOF
+    cmd "${SUDO[@]}" chmod +x "$ANTISCANNER_SCRIPT"
+
+    cmd "${SUDO[@]}" bash -c "(crontab -l 2>/dev/null | grep -v '$ANTISCANNER_SCRIPT' ; echo '20 3 * * * $ANTISCANNER_SCRIPT >> /var/log/antiscanner_update.log 2>&1') | crontab -"
+
+    write_root_file /etc/systemd/system/antiscanner-update.service <<EOF
+[Unit]
+Description=Update AntiScanner Blocklist on Boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${ANTISCANNER_SCRIPT}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cmd "${SUDO[@]}" systemctl daemon-reload
+    cmd "${SUDO[@]}" systemctl enable antiscanner-update.service
+    cmd "${SUDO[@]}" "$ANTISCANNER_SCRIPT" || true
+}
+
 optimize_system() {
     header
     need_root
@@ -262,6 +334,8 @@ EOF
     cmd "${SUDO[@]}" ufw allow 443/udp
     cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
     cmd "${SUDO[@]}" ufw --force enable
+
+    install_antiscanner
 
     stage "Fail2ban"
     apt_install_quiet fail2ban || true
@@ -478,6 +552,14 @@ file_ok() {
     [[ -s "$file" ]] && echo 1 || echo 0
 }
 
+antiscanner_rules_count() {
+    if command_exists ufw; then
+        "${SUDO[@]}" ufw status 2>/dev/null | grep -c 'AntiScanner-Block' || true
+    else
+        echo 0
+    fi
+}
+
 print_row() {
     local name="$1"
     local value="$2"
@@ -507,6 +589,7 @@ show_status() {
     echo
     echo -e "${BOLD}${PURPLE}[ СЛУЖБЫ ]${NC}"
     print_row "ufw" "firewall" "$(service_ok ufw)"
+    print_row "antiscanner" "$(antiscanner_rules_count) rules" "$(file_ok "$ANTISCANNER_SCRIPT")"
     print_row "chrony" "time sync" "$(service_ok chrony)"
     print_row "irqbalance" "irq" "$(service_ok irqbalance)"
     print_row "fail2ban" "ssh guard" "$(service_ok fail2ban)"
