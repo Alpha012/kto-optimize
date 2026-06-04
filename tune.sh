@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.1"
+SCRIPT_VERSION="3.3.2"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -214,6 +214,14 @@ node_profile_label() {
     esac
 }
 
+config_label() {
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        echo "node / $(node_profile_label)"
+    else
+        echo "$MACHINE_MODE"
+    fi
+}
+
 load_machine_mode() {
     local saved_mode="" saved_profile="" source_file="$CONFIG_FILE"
     CONFIG_SOURCE_FILE=""
@@ -257,6 +265,53 @@ save_machine_mode() {
 MACHINE_MODE="$MACHINE_MODE"
 NODE_PROFILE="$NODE_PROFILE"
 EOF
+}
+
+compose_down_dir() {
+    local dir="$1"
+    if command_exists docker && "${SUDO[@]}" test -f "$dir/docker-compose.yml" 2>/dev/null; then
+        (cd "$dir" && "${SUDO[@]}" docker compose down -v --remove-orphans) >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
+remove_runtime_dir() {
+    local dir="$1"
+    case "$dir" in
+        "$REMNA_DIR"|/opt/caddy|/opt/nginx-selfsteal)
+            cmd "${SUDO[@]}" rm -rf -- "$dir" || true
+            ;;
+        *)
+            warn "Пропускаю небезопасный путь очистки: $dir"
+            ;;
+    esac
+}
+
+cleanup_runtime_state() {
+    need_root
+    stage "Очищаю старую установку"
+
+    compose_down_dir "$REMNA_DIR"
+    compose_down_dir /opt/caddy
+    compose_down_dir /opt/nginx-selfsteal
+
+    if command_exists docker; then
+        for container in "$REMNA_CONTAINER" caddy-selfsteal nginx-selfsteal; do
+            cmd "${SUDO[@]}" docker rm -f "$container" || true
+        done
+    fi
+
+    remove_runtime_dir "$REMNA_DIR"
+    remove_runtime_dir /opt/caddy
+    remove_runtime_dir /opt/nginx-selfsteal
+
+    cmd "${SUDO[@]}" find /opt -maxdepth 1 -type d -name 'selfsteal-backup-*' -exec rm -rf -- {} + || true
+    cmd "${SUDO[@]}" rm -f /dev/shm/nginx.sock "$LEGACY_CONFIG_FILE" || true
+    cmd "${SUDO[@]}" systemctl disable --now haproxy || true
+
+    if command_exists ufw; then
+        cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+        cmd "${SUDO[@]}" ufw --force delete allow 80/tcp || true
+    fi
 }
 
 select_node_profile() {
@@ -321,6 +376,26 @@ select_machine_mode() {
 
     need_root
     save_machine_mode
+}
+
+reconfigure_machine_mode() {
+    local old_mode="$MACHINE_MODE"
+    local old_profile="$NODE_PROFILE"
+
+    select_machine_mode
+
+    if [[ "$old_mode" != "$MACHINE_MODE" || "$old_profile" != "$NODE_PROFILE" ]]; then
+        header
+        stage "Применяю новый конфиг"
+        cleanup_runtime_state
+        save_machine_mode
+        echo
+        ok "Конфиг обновлён: $(config_label)"
+        ok "Старая нода/SelfSteal очищены"
+    else
+        echo
+        ok "Настройки не изменились"
+    fi
 }
 
 ensure_machine_mode() {
@@ -1160,6 +1235,7 @@ menu() {
     elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
         echo -e "10) HAProxy"
     fi
+    echo -e "11) Настройки"
     echo -e "0) Выход"
     echo -e "${PURPLE}==========================================${NC}"
     echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -1177,6 +1253,7 @@ menu() {
         8) ipcheck_region ;;
         9) require_hysteria2_profile; issue_ssl_certificate ;;
         10) require_whitelist_mode; install_haproxy ;;
+        11) reconfigure_machine_mode ;;
         0) echo -e "${PURPLE}Выход.${NC}" ;;
         *) fail "Неверный выбор" ;;
     esac
@@ -1188,7 +1265,7 @@ main() {
 
     case "${1:-menu}" in
         menu) menu ;;
-        mode) select_machine_mode ;;
+        mode|config|settings) reconfigure_machine_mode ;;
         optimize) optimize_system ;;
         node|install-node) install_remnawave_node ;;
         selfsteal) install_selfsteal ;;
