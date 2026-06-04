@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.4"
+SCRIPT_VERSION="3.3.5"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -23,6 +23,7 @@ else
 fi
 ANTISCANNER_SCRIPT="/usr/local/bin/update-antiscanner.sh"
 ANTISCANNER_URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
+APT_UPDATED=0
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -468,15 +469,49 @@ require_whitelist_mode() {
 }
 
 apt_update_quiet() {
+    if [[ "$APT_UPDATED" == "1" ]]; then
+        echo "apt update skipped: cache already refreshed" >> "$LOG_FILE"
+        return 0
+    fi
+    apt_update_force
+}
+
+apt_update_force() {
     "${SUDO[@]}" apt-get -o DPkg::Lock::Timeout=600 update >> "$LOG_FILE" 2>&1
+    APT_UPDATED=1
+}
+
+package_installed() {
+    local pkg="$1"
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"
 }
 
 apt_install_quiet() {
+    local missing=() pkg
+    for pkg in "$@"; do
+        if ! package_installed "$pkg"; then
+            missing+=("$pkg")
+        fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        echo "apt install skipped: already installed: $*" >> "$LOG_FILE"
+        return 0
+    fi
+
     "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive \
         apt-get -o DPkg::Lock::Timeout=600 install -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" \
-        "$@" >> "$LOG_FILE" 2>&1
+        "${missing[@]}" >> "$LOG_FILE" 2>&1
+}
+
+liquorix_installed() {
+    package_installed linux-image-liquorix-amd64 && package_installed linux-headers-liquorix-amd64
+}
+
+liquorix_source_configured() {
+    grep -RqsE 'damentz.*liquorix|liquorix' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null
 }
 
 detect_ssh_port() {
@@ -567,6 +602,8 @@ ensure_docker() {
 
 install_antiscanner() {
     stage "AntiScanner"
+    local existing_rules=0
+    existing_rules="$(antiscanner_rules_count)"
 
     apt_install_quiet curl ufw cron || true
     cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y iptables-persistent || true
@@ -632,15 +669,23 @@ EOF
 
     cmd "${SUDO[@]}" systemctl daemon-reload
     cmd "${SUDO[@]}" systemctl enable antiscanner-update.service
-    cmd "${SUDO[@]}" "$ANTISCANNER_SCRIPT" || true
+    if [[ "$existing_rules" =~ ^[0-9]+$ && "$existing_rules" -gt 0 ]]; then
+        echo "AntiScanner update skipped: rules already present ($existing_rules)" >> "$LOG_FILE"
+    else
+        cmd "${SUDO[@]}" "$ANTISCANNER_SCRIPT" || true
+    fi
 }
 
 opt_prepare_system() {
     cmd "${SUDO[@]}" systemctl stop unattended-upgrades || true
     cmd "${SUDO[@]}" dpkg --configure -a || true
     cmd "${SUDO[@]}" rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list || true
-    cmd "${SUDO[@]}" systemctl disable --now snapd.socket snapd.service || true
-    cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd || true
+    if package_installed snapd; then
+        cmd "${SUDO[@]}" systemctl disable --now snapd.socket snapd.service || true
+        cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd || true
+    else
+        echo "snapd purge skipped: not installed" >> "$LOG_FILE"
+    fi
 }
 
 opt_install_packages() {
@@ -655,8 +700,16 @@ opt_install_packages() {
 
 opt_liquorix_kernel() {
     if [[ "$(uname -m)" == "x86_64" ]] && grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
-        cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y
-        cmd apt_update_quiet
+        if liquorix_installed; then
+            echo "Liquorix skipped: packages already installed" >> "$LOG_FILE"
+            return 0
+        fi
+        if liquorix_source_configured; then
+            apt_update_quiet
+        else
+            cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y
+            apt_update_force
+        fi
         for _ in 1 2 3; do
             if apt_install_quiet linux-image-liquorix-amd64 linux-headers-liquorix-amd64; then
                 break
@@ -727,7 +780,14 @@ EOF
 
 opt_firewall() {
     local ssh_port="$1"
-    cmd "${SUDO[@]}" ufw --force reset
+    local anti_rules
+    anti_rules="$(antiscanner_rules_count)"
+
+    if [[ "$anti_rules" =~ ^[0-9]+$ && "$anti_rules" -gt 0 ]]; then
+        echo "ufw reset skipped: AntiScanner rules already present ($anti_rules)" >> "$LOG_FILE"
+    else
+        cmd "${SUDO[@]}" ufw --force reset
+    fi
     cmd "${SUDO[@]}" ufw default deny incoming
     cmd "${SUDO[@]}" ufw default allow outgoing
     cmd "${SUDO[@]}" ufw allow "${ssh_port}/tcp"
@@ -735,6 +795,8 @@ opt_firewall() {
     cmd "${SUDO[@]}" ufw allow 443/udp
     if [[ "$MACHINE_MODE" == "node" ]]; then
         cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
+    else
+        cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
     fi
     cmd "${SUDO[@]}" ufw --force enable
 }
@@ -932,12 +994,16 @@ install_speedtest() {
     need_root
     local output filtered
     stage "Готовлю Speedtest"
-    cmd "${SUDO[@]}" apt-get remove -y speedtest-cli || true
-    cmd "${SUDO[@]}" rm -f /usr/bin/speedtest /usr/local/bin/speedtest || true
-    if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
-        curl -fsSL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz | "${SUDO[@]}" tar xz -C /usr/local/bin speedtest >> "$LOG_FILE" 2>&1
+    if ! [[ -x /usr/local/bin/speedtest ]]; then
+        cmd "${SUDO[@]}" apt-get remove -y speedtest-cli || true
+        cmd "${SUDO[@]}" rm -f /usr/bin/speedtest /usr/local/bin/speedtest || true
+        if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
+            curl -fsSL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz | "${SUDO[@]}" tar xz -C /usr/local/bin speedtest >> "$LOG_FILE" 2>&1
+        else
+            curl -fsSL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | "${SUDO[@]}" tar xz -C /usr/local/bin speedtest >> "$LOG_FILE" 2>&1
+        fi
     else
-        curl -fsSL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | "${SUDO[@]}" tar xz -C /usr/local/bin speedtest >> "$LOG_FILE" 2>&1
+        echo "Speedtest binary skipped: already installed" >> "$LOG_FILE"
     fi
     echo
     stage "Запускаю Ookla"
