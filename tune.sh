@@ -4,12 +4,18 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.1.1"
+SCRIPT_VERSION="3.1.2"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
-LOG_FILE="${KTO_LOG_FILE:-/var/log/kto-vpn-tune.log}"
+if [[ -n "${KTO_LOG_FILE:-}" ]]; then
+    LOG_FILE="$KTO_LOG_FILE"
+elif [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    LOG_FILE="/var/log/kto-vpn-tune.log"
+else
+    LOG_FILE="/tmp/kto-vpn-tune.log"
+fi
 ANTISCANNER_SCRIPT="/usr/local/bin/update-antiscanner.sh"
 ANTISCANNER_URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
 
@@ -22,7 +28,7 @@ DIM='\033[2m'
 NC='\033[0m'
 
 SUDO=()
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+if command -v sudo >/dev/null 2>&1; then
     SUDO=(sudo)
 fi
 
@@ -37,8 +43,18 @@ trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 init_log() {
     local log_dir
     log_dir="$(dirname "$LOG_FILE")"
-    "${SUDO[@]}" mkdir -p "$log_dir" >/dev/null 2>&1 || true
-    "${SUDO[@]}" touch "$LOG_FILE" >/dev/null 2>&1 || LOG_FILE="/tmp/kto-vpn-tune.log"
+
+    if [[ "$LOG_FILE" == /tmp/* ]]; then
+        mkdir -p "$log_dir" >/dev/null 2>&1 || true
+        touch "$LOG_FILE" >/dev/null 2>&1 || LOG_FILE="/tmp/kto-vpn-tune.log"
+    else
+        "${SUDO[@]}" mkdir -p "$log_dir" >/dev/null 2>&1 || true
+        "${SUDO[@]}" touch "$LOG_FILE" >/dev/null 2>&1 || LOG_FILE="/tmp/kto-vpn-tune.log"
+        if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+            "${SUDO[@]}" chmod 0666 "$LOG_FILE" >/dev/null 2>&1 || true
+        fi
+    fi
+
     echo "===== kto VPN v${SCRIPT_VERSION} $(date -Is) =====" >> "$LOG_FILE" 2>/dev/null || true
 }
 
@@ -56,7 +72,7 @@ warn() { echo -e "${YELLOW}[!]${NC} $*" >&2; }
 fail() { echo -e "${RED}[ОШИБКА]${NC} $*" >&2; }
 
 need_root() {
-    if [[ ${#SUDO[@]} -gt 0 ]] && ! command -v sudo >/dev/null 2>&1; then
+    if [[ ${#SUDO[@]} -eq 0 && ${EUID:-$(id -u)} -ne 0 ]]; then
         fail "Запусти от root или установи sudo."
         exit 1
     fi
@@ -539,7 +555,7 @@ badge() {
 
 service_ok() {
     local svc="$1"
-    systemctl is-active --quiet "$svc" 2>/dev/null && echo 1 || echo 0
+    "${SUDO[@]}" systemctl is-active --quiet "$svc" 2>/dev/null && echo 1 || echo 0
 }
 
 tcp_listen() {
