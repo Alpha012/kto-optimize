@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.9"
+SCRIPT_VERSION="3.4.0"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -565,7 +565,8 @@ ask_domain() {
     local prompt="${1:-Введите домен}"
     local domain
     while true; do
-        read -r -p "$(echo -e "${PURPLE}>${NC} ${BOLD}${prompt}:${NC} ")" domain
+        echo -e "${PURPLE}>${NC} ${BOLD}${prompt}${NC}" >&2
+        read -r domain
         if validate_domain "$domain"; then
             echo "$domain"
             return 0
@@ -575,11 +576,12 @@ ask_domain() {
 }
 
 ask_secret_key() {
-    local prompt="${1:-Введите SECRET_KEY для ноды}"
+    local prompt="Введите секрет кей"
     local secret
     while true; do
-        read -r -s -p "$(echo -e "${PURPLE}>${NC} ${BOLD}${prompt}:${NC} ")" secret
-        echo
+        echo -e "${PURPLE}>${NC} ${BOLD}${prompt}${NC}" >&2
+        read -r -s secret
+        echo >&2
         if [[ -n "$secret" ]]; then
             echo "$secret"
             return 0
@@ -602,7 +604,8 @@ ask_ipv4() {
     local prompt="${1:-Введите IP}"
     local ip
     while true; do
-        read -r -p "$(echo -e "${PURPLE}>${NC} ${BOLD}${prompt}:${NC} ")" ip
+        echo -e "${PURPLE}>${NC} ${BOLD}${prompt}${NC}" >&2
+        read -r ip
         if validate_ipv4 "$ip"; then
             echo "$ip"
             return 0
@@ -613,6 +616,8 @@ ask_ipv4() {
 
 escape_yaml_secret() {
     local value="$1"
+    value="${value//$'\r'/}"
+    value="${value//$'\n'/}"
     value="${value//\\/\\\\}"
     value="${value//\"/\\\"}"
     echo "$value"
@@ -943,6 +948,11 @@ EOF
     fi
 
     stage "Запускаю контейнер"
+    if ! (cd "$REMNA_DIR" && "${SUDO[@]}" docker compose config >/dev/null) >> "$LOG_FILE" 2>&1; then
+        fail "docker-compose.yml"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        exit 1
+    fi
     if ! (cd "$REMNA_DIR" && "${SUDO[@]}" docker compose pull) >> "$LOG_FILE" 2>&1; then
         fail "Docker compose pull"
         tail -n 25 "$LOG_FILE" >&2 || true
@@ -964,7 +974,7 @@ install_remnawave_node() {
     require_node_mode
     need_root
     local secret
-    secret="$(ask_secret_key "Введите SECRET_KEY для ноды")"
+    secret="$(ask_secret_key)"
     do_install_remnawave_node "$secret"
 }
 
@@ -989,7 +999,7 @@ install_selfsteal() {
     require_reality_profile
     need_root
     local domain
-    domain="$(ask_domain "Введите домен для SelfSteal")"
+    domain="$(ask_domain "Введите домен")"
     do_install_selfsteal "$domain"
 }
 
@@ -1178,7 +1188,7 @@ issue_ssl_certificate() {
     require_hysteria2_profile
     need_root
     local domain
-    domain="$(ask_domain "Введите домен для SSL")"
+    domain="$(ask_domain "Введите домен")"
     do_issue_ssl_certificate "$domain"
 }
 
@@ -1188,12 +1198,8 @@ install_common_stack() {
     need_root
     local secret domain started_at duration
 
-    secret="$(ask_secret_key "Введите SECRET_KEY для ноды")"
-    if [[ "$NODE_PROFILE" == "reality" ]]; then
-        domain="$(ask_domain "Введите домен для SelfSteal")"
-    else
-        domain="$(ask_domain "Введите домен для SSL")"
-    fi
+    secret="$(ask_secret_key)"
+    domain="$(ask_domain "Введите домен")"
 
     started_at="$(date +%s)"
     echo
