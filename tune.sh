@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.7"
+SCRIPT_VERSION="3.3.8"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -76,6 +76,22 @@ stage() { echo -e "${PURPLE}[..]${NC} $*"; }
 ok() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*" >&2; }
 fail() { echo -e "${RED}[ОШИБКА]${NC} $*" >&2; }
+
+format_duration() {
+    local total="$1"
+    local hours minutes seconds
+    hours=$(( total / 3600 ))
+    minutes=$(( (total % 3600) / 60 ))
+    seconds=$(( total % 60 ))
+
+    if (( hours > 0 )); then
+        printf '%dh %dm %ds' "$hours" "$minutes" "$seconds"
+    elif (( minutes > 0 )); then
+        printf '%dm %ds' "$minutes" "$seconds"
+    else
+        printf '%ds' "$seconds"
+    fi
+}
 
 need_root() {
     if [[ ${#SUDO[@]} -eq 0 && ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -835,7 +851,8 @@ EOF
 optimize_system() {
     header
     need_root
-    local ssh_port
+    local ssh_port started_at duration
+    started_at="$(date +%s)"
     ssh_port="$(detect_ssh_port)"
 
     export NEEDRESTART_MODE=a
@@ -851,7 +868,9 @@ optimize_system() {
     progress_step "Настраиваю Fail2ban" opt_fail2ban
 
     echo
+    duration=$(( $(date +%s) - started_at ))
     ok "Оптимизация завершена. Рекомендуется: sudo reboot"
+    ok "Время: $(format_duration "$duration")"
 }
 
 install_remnawave_node() {
