@@ -4,9 +4,9 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.1.1"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
-REMNA_DIR="/opt/remnanode"
+REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
 LOG_FILE="${KTO_LOG_FILE:-/var/log/kto-vpn-tune.log}"
@@ -427,7 +427,12 @@ install_warp_native() {
     local script
     script="$(mktemp)"
     must "Скачивание WARP" curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh -o "$script"
-    printf '2\n1\n' | "${SUDO[@]}" bash "$script" >> "$LOG_FILE" 2>&1
+    if ! printf '2\n1\n' | "${SUDO[@]}" bash "$script" >> "$LOG_FILE" 2>&1; then
+        rm -f "$script"
+        fail "WARP не установился"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        exit 1
+    fi
     rm -f "$script"
     echo
     ok "WARP установлен"
