@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.5"
+SCRIPT_VERSION="3.3.6"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -343,7 +343,13 @@ cleanup_runtime_state() {
     cmd "${SUDO[@]}" systemctl disable --now haproxy || true
 
     if command_exists ufw; then
-        cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+        cmd "${SUDO[@]}" ufw allow 443/tcp || true
+        cmd "${SUDO[@]}" ufw allow 443/udp || true
+        if [[ "$MACHINE_MODE" == "node" ]]; then
+            cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp" || true
+        else
+            cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+        fi
         cmd "${SUDO[@]}" ufw --force delete allow 80/tcp || true
     fi
 }
