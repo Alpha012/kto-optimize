@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.4.0"
+SCRIPT_VERSION="3.4.1"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -565,7 +565,7 @@ ask_domain() {
     local prompt="${1:-Введите домен}"
     local domain
     while true; do
-        echo -e "${PURPLE}>${NC} ${BOLD}${prompt}${NC}" >&2
+        printf '%s: ' "$prompt" >&2
         read -r domain
         if validate_domain "$domain"; then
             echo "$domain"
@@ -576,12 +576,11 @@ ask_domain() {
 }
 
 ask_secret_key() {
-    local prompt="Введите секрет кей"
     local secret
     while true; do
-        echo -e "${PURPLE}>${NC} ${BOLD}${prompt}${NC}" >&2
+        printf 'Введите SECRET_KEY: ' >&2
         read -r -s secret
-        echo >&2
+        printf '\n' >&2
         if [[ -n "$secret" ]]; then
             echo "$secret"
             return 0
