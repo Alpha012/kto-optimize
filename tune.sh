@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.1.2"
+SCRIPT_VERSION="3.1.3"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -29,7 +29,7 @@ NC='\033[0m'
 
 SUDO=()
 if command -v sudo >/dev/null 2>&1; then
-    SUDO=(sudo)
+    SUDO=(sudo -n)
 fi
 
 on_error() {
@@ -76,7 +76,10 @@ need_root() {
         fail "Запусти от root или установи sudo."
         exit 1
     fi
-    "${SUDO[@]}" -v >/dev/null 2>&1 || true
+    if [[ ${EUID:-$(id -u)} -ne 0 ]] && ! "${SUDO[@]}" true >/dev/null 2>&1; then
+        fail "sudo требует пароль. Запусти от root или включи NOPASSWD для пользователя."
+        exit 1
+    fi
 }
 
 cmd() {
