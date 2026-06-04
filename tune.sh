@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.2.2"
+SCRIPT_VERSION="3.2.3"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -96,6 +96,90 @@ must() {
         tail -n 25 "$LOG_FILE" >&2 || true
         return 1
     fi
+}
+
+PROGRESS_TOTAL=1
+PROGRESS_CURRENT=0
+PROGRESS_WIDTH=26
+
+progress_bar() {
+    local percent="$1"
+    local filled empty bar gap
+    filled=$(( percent * PROGRESS_WIDTH / 100 ))
+    empty=$(( PROGRESS_WIDTH - filled ))
+    printf -v bar '%*s' "$filled" ''
+    printf -v gap '%*s' "$empty" ''
+    bar="${bar// /#}"
+    gap="${gap// /-}"
+    printf '%s%s' "$bar" "$gap"
+}
+
+progress_line() {
+    local percent="$1"
+    local title="$2"
+    local frame="$3"
+    printf '\r\033[K%b %3d%% [%s] %s' "${PURPLE}${frame}${NC}" "$percent" "$(progress_bar "$percent")" "$title"
+}
+
+progress_start() {
+    PROGRESS_TOTAL="$1"
+    PROGRESS_CURRENT=0
+    echo
+}
+
+progress_step() {
+    local title="$1"
+    shift
+
+    local from to shown pid rc frame_idx frame
+    local frames=('|' '/' '-' '\')
+    from=$(( PROGRESS_CURRENT * 100 / PROGRESS_TOTAL ))
+    to=$(( (PROGRESS_CURRENT + 1) * 100 / PROGRESS_TOTAL ))
+    shown="$from"
+    frame_idx=0
+
+    if [[ ! -t 1 ]]; then
+        echo -e "${PURPLE}[..]${NC} ${to}% ${title}"
+        if "$@" >> "$LOG_FILE" 2>&1; then
+            PROGRESS_CURRENT=$(( PROGRESS_CURRENT + 1 ))
+            ok "$title"
+            return 0
+        fi
+        fail "$title"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        return 1
+    fi
+
+    ("$@") >> "$LOG_FILE" 2>&1 &
+    pid=$!
+
+    while jobs -pr | grep -qx "$pid"; do
+        frame="${frames[$frame_idx]}"
+        progress_line "$shown" "$title" "$frame"
+        sleep 0.12
+        frame_idx=$(( (frame_idx + 1) % 4 ))
+        if (( shown < to - 1 )); then
+            shown=$(( shown + 1 ))
+        fi
+    done
+
+    if wait "$pid"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    if (( rc != 0 )); then
+        progress_line "$shown" "$title" '!'
+        echo
+        fail "$title"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        return "$rc"
+    fi
+
+    PROGRESS_CURRENT=$(( PROGRESS_CURRENT + 1 ))
+    progress_line "$to" "$title" 'OK'
+    echo
 }
 
 command_exists() {
@@ -358,31 +442,25 @@ EOF
     cmd "${SUDO[@]}" "$ANTISCANNER_SCRIPT" || true
 }
 
-optimize_system() {
-    header
-    need_root
-    local ssh_port packages
-    ssh_port="$(detect_ssh_port)"
-
-    stage "Подготовка системы"
+opt_prepare_system() {
     cmd "${SUDO[@]}" systemctl stop unattended-upgrades || true
     cmd "${SUDO[@]}" dpkg --configure -a || true
     cmd "${SUDO[@]}" rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list || true
     cmd "${SUDO[@]}" systemctl disable --now snapd.socket snapd.service || true
     cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd || true
+}
 
-    export NEEDRESTART_MODE=a
-    export NEEDRESTART_SUSPEND=1
-
-    stage "Пакеты"
+opt_install_packages() {
+    local packages
     packages=(ca-certificates curl wget gnupg2 software-properties-common ufw openssl dnsutils)
     if [[ "$MACHINE_MODE" == "node" ]]; then
         packages+=(chrony cpufrequtils irqbalance logrotate tar xz-utils)
     fi
-    must "apt update" apt_update_quiet
-    must "Установка пакетов" apt_install_quiet "${packages[@]}"
+    apt_update_quiet
+    apt_install_quiet "${packages[@]}"
+}
 
-    stage "Liquorix kernel"
+opt_liquorix_kernel() {
     if [[ "$(uname -m)" == "x86_64" ]] && grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
         cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y
         cmd apt_update_quiet
@@ -395,8 +473,9 @@ optimize_system() {
     else
         echo "Liquorix skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
     fi
+}
 
-    stage "Сеть и лимиты"
+opt_network_limits() {
     cmd "${SUDO[@]}" modprobe tcp_bbr || true
     write_root_file /etc/sysctl.d/99-vpn-tuning.conf <<'EOF'
 fs.file-max = 2097152
@@ -451,8 +530,10 @@ EOF
         cmd "${SUDO[@]}" systemctl enable --now irqbalance chrony || true
         cmd "${SUDO[@]}" systemctl restart cpufrequtils || true
     fi
+}
 
-    stage "Firewall"
+opt_firewall() {
+    local ssh_port="$1"
     cmd "${SUDO[@]}" ufw --force reset
     cmd "${SUDO[@]}" ufw default deny incoming
     cmd "${SUDO[@]}" ufw default allow outgoing
@@ -463,10 +544,13 @@ EOF
         cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
     fi
     cmd "${SUDO[@]}" ufw --force enable
+}
 
+opt_antiscanner() {
     install_antiscanner
+}
 
-    stage "Fail2ban"
+opt_fail2ban() {
     apt_install_quiet fail2ban || true
     write_root_file /etc/fail2ban/jail.d/99-kto-sshd.conf <<'EOF'
 [sshd]
@@ -476,6 +560,25 @@ findtime = 10m
 maxretry = 5
 EOF
     cmd "${SUDO[@]}" systemctl enable --now fail2ban || true
+}
+
+optimize_system() {
+    header
+    need_root
+    local ssh_port
+    ssh_port="$(detect_ssh_port)"
+
+    export NEEDRESTART_MODE=a
+    export NEEDRESTART_SUSPEND=1
+
+    progress_start 7
+    progress_step "Подготовка системы" opt_prepare_system
+    progress_step "Пакеты" opt_install_packages
+    progress_step "Liquorix kernel" opt_liquorix_kernel
+    progress_step "Сеть и лимиты" opt_network_limits
+    progress_step "Firewall" opt_firewall "$ssh_port"
+    progress_step "AntiScanner" opt_antiscanner
+    progress_step "Fail2ban" opt_fail2ban
 
     echo
     ok "Оптимизация завершена. Рекомендуется: sudo reboot"
