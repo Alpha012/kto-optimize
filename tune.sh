@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.6"
+SCRIPT_VERSION="3.3.7"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -308,11 +308,12 @@ compose_down_dir() {
     fi
 }
 
-remove_runtime_dir() {
+clear_runtime_dir() {
     local dir="$1"
     case "$dir" in
         "$REMNA_DIR"|/opt/caddy|/opt/nginx-selfsteal)
-            cmd "${SUDO[@]}" rm -rf -- "$dir" || true
+            cmd "${SUDO[@]}" mkdir -p -- "$dir" || true
+            cmd "${SUDO[@]}" find "$dir" -mindepth 1 -exec rm -rf -- {} + || true
             ;;
         *)
             warn "Пропускаю небезопасный путь очистки: $dir"
@@ -334,9 +335,9 @@ cleanup_runtime_state() {
         done
     fi
 
-    remove_runtime_dir "$REMNA_DIR"
-    remove_runtime_dir /opt/caddy
-    remove_runtime_dir /opt/nginx-selfsteal
+    clear_runtime_dir "$REMNA_DIR"
+    clear_runtime_dir /opt/caddy
+    clear_runtime_dir /opt/nginx-selfsteal
 
     cmd "${SUDO[@]}" find /opt -maxdepth 1 -type d -name 'selfsteal-backup-*' -exec rm -rf -- {} + || true
     cmd "${SUDO[@]}" rm -f /dev/shm/nginx.sock "$LEGACY_CONFIG_FILE" || true
@@ -463,6 +464,14 @@ require_hysteria2_profile() {
     require_node_mode
     if [[ "$NODE_PROFILE" != "hysteria2" ]]; then
         fail "SSL доступен только для профиля Hysteria2."
+        exit 1
+    fi
+}
+
+require_reality_profile() {
+    require_node_mode
+    if [[ "$NODE_PROFILE" != "reality" ]]; then
+        fail "SelfSteal доступен только для профиля Reality."
         exit 1
     fi
 }
@@ -923,7 +932,7 @@ EOF
 
 install_selfsteal() {
     header
-    require_node_mode
+    require_reality_profile
     need_root
     local domain
     domain="$(ask_domain "Введите домен для SelfSteal")"
@@ -1321,45 +1330,79 @@ show_status() {
 
 menu() {
     header
+    local labels=() actions=() choice action i
+
     echo -e "${DIM}Режим: ${MACHINE_MODE}${NC}"
     if [[ "$MACHINE_MODE" == "node" ]]; then
         echo -e "${DIM}Профиль: $(node_profile_label)${NC}"
     fi
-    echo -e "1) Полная оптимизация"
+
+    labels+=("Полная оптимизация")
+    actions+=("optimize")
+
     if [[ "$MACHINE_MODE" == "node" ]]; then
-        echo -e "2) Установка ноды Remnawave"
-        echo -e "3) Установка SelfSteal"
-        echo -e "4) Установка WARP Native"
+        labels+=("Установка ноды Remnawave")
+        actions+=("node")
+        if [[ "$NODE_PROFILE" == "reality" ]]; then
+            labels+=("Установка SelfSteal")
+            actions+=("selfsteal")
+        fi
+        labels+=("Установка WARP Native")
+        actions+=("warp")
     fi
-    echo -e "5) Панель состояния"
-    echo -e "6) Speedtest"
-    echo -e "7) Проверка IP (IP.Check.Place)"
-    echo -e "8) Проверка IP (Region Check)"
+
+    labels+=("Панель состояния")
+    actions+=("status")
+    labels+=("Speedtest")
+    actions+=("speedtest")
+    labels+=("Проверка IP (IP.Check.Place)")
+    actions+=("ipcheck-place")
+    labels+=("Проверка IP (Region Check)")
+    actions+=("ipcheck-region")
+
     if [[ "$MACHINE_MODE" == "node" && "$NODE_PROFILE" == "hysteria2" ]]; then
-        echo -e "9) Сгенерировать SSL-сертификат"
+        labels+=("Сгенерировать SSL-сертификат")
+        actions+=("ssl")
     elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
-        echo -e "10) HAProxy"
+        labels+=("HAProxy")
+        actions+=("haproxy")
     fi
-    echo -e "11) Настройки"
+
+    labels+=("Настройки")
+    actions+=("settings")
+
+    for i in "${!labels[@]}"; do
+        echo -e "$((i + 1))) ${labels[$i]}"
+    done
     echo -e "0) Выход"
     echo -e "${PURPLE}==========================================${NC}"
     echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
 
-    local choice
     read -r choice
-    case "$choice" in
-        1) optimize_system ;;
-        2) require_node_mode; install_remnawave_node ;;
-        3) require_node_mode; install_selfsteal ;;
-        4) require_node_mode; install_warp_native ;;
-        5) show_status ;;
-        6) install_speedtest ;;
-        7) ipcheck_place ;;
-        8) ipcheck_region ;;
-        9) require_hysteria2_profile; issue_ssl_certificate ;;
-        10) require_whitelist_mode; install_haproxy ;;
-        11) reconfigure_machine_mode ;;
-        0) echo -e "${PURPLE}Выход.${NC}" ;;
+
+    if [[ "$choice" == "0" ]]; then
+        echo -e "${PURPLE}Выход.${NC}"
+        return 0
+    fi
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#actions[@]} )); then
+        fail "Неверный выбор"
+        return 1
+    fi
+
+    action="${actions[$((choice - 1))]}"
+    case "$action" in
+        optimize) optimize_system ;;
+        node) install_remnawave_node ;;
+        selfsteal) install_selfsteal ;;
+        warp) install_warp_native ;;
+        status) show_status ;;
+        speedtest) install_speedtest ;;
+        ipcheck-place) ipcheck_place ;;
+        ipcheck-region) ipcheck_region ;;
+        ssl) issue_ssl_certificate ;;
+        haproxy) install_haproxy ;;
+        settings) reconfigure_machine_mode ;;
         *) fail "Неверный выбор" ;;
     esac
 }
