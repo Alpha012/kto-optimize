@@ -4,13 +4,14 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.2.3"
+SCRIPT_VERSION="3.3.0"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
 CONFIG_FILE="/etc/kto-vpn.conf"
 MACHINE_MODE="${KTO_MACHINE_MODE:-}"
+NODE_PROFILE="${KTO_NODE_PROFILE:-}"
 if [[ -n "${KTO_LOG_FILE:-}" ]]; then
     LOG_FILE="$KTO_LOG_FILE"
 elif [[ ${EUID:-$(id -u)} -eq 0 ]]; then
@@ -199,27 +200,83 @@ valid_machine_mode() {
     [[ "$1" == "node" || "$1" == "whitelist" ]]
 }
 
+valid_node_profile() {
+    [[ "$1" == "reality" || "$1" == "hysteria2" ]]
+}
+
+node_profile_label() {
+    case "${NODE_PROFILE:-}" in
+        reality) echo "Reality" ;;
+        hysteria2) echo "Hysteria2" ;;
+        *) echo "-" ;;
+    esac
+}
+
 load_machine_mode() {
-    local saved_mode=""
+    local saved_mode="" saved_profile=""
 
     if [[ -n "$MACHINE_MODE" ]]; then
-        if valid_machine_mode "$MACHINE_MODE"; then
-            return 0
+        if ! valid_machine_mode "$MACHINE_MODE"; then
+            warn "KTO_MACHINE_MODE должен быть node или whitelist. Игнорирую."
+            MACHINE_MODE=""
         fi
-        warn "KTO_MACHINE_MODE должен быть node или whitelist. Игнорирую."
-        MACHINE_MODE=""
+    fi
+
+    if [[ -n "$NODE_PROFILE" ]]; then
+        if ! valid_node_profile "$NODE_PROFILE"; then
+            warn "KTO_NODE_PROFILE должен быть reality или hysteria2. Игнорирую."
+            NODE_PROFILE=""
+        fi
     fi
 
     saved_mode="$("${SUDO[@]}" awk -F= '$1=="MACHINE_MODE"{gsub(/"/,"",$2); print $2; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
-    if valid_machine_mode "$saved_mode"; then
+    if [[ -z "$MACHINE_MODE" ]] && valid_machine_mode "$saved_mode"; then
         MACHINE_MODE="$saved_mode"
+    fi
+
+    saved_profile="$("${SUDO[@]}" awk -F= '$1=="NODE_PROFILE"{gsub(/"/,"",$2); print $2; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
+    if [[ -z "$NODE_PROFILE" ]] && valid_node_profile "$saved_profile"; then
+        NODE_PROFILE="$saved_profile"
+    fi
+
+    if [[ "$MACHINE_MODE" != "node" ]]; then
+        NODE_PROFILE=""
     fi
 }
 
 save_machine_mode() {
     write_root_file "$CONFIG_FILE" <<EOF
 MACHINE_MODE="$MACHINE_MODE"
+NODE_PROFILE="$NODE_PROFILE"
 EOF
+}
+
+select_node_profile() {
+    local choice
+
+    while true; do
+        header
+        echo -e "${BOLD}${PURPLE}[ ПРОФИЛЬ НОДЫ ]${NC}"
+        echo -e "1) Reality   - без SSL-сертов"
+        echo -e "2) Hysteria2 - SSL + volume /opt/remnawave"
+        echo -e "${PURPLE}==========================================${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите профиль (1-2):${NC} "
+        read -r choice
+        case "$choice" in
+            1|reality|Reality)
+                NODE_PROFILE="reality"
+                break
+                ;;
+            2|hysteria2|Hysteria2|hysteria|Hysteria)
+                NODE_PROFILE="hysteria2"
+                break
+                ;;
+            *)
+                fail "Неверный выбор"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 select_machine_mode() {
@@ -228,7 +285,7 @@ select_machine_mode() {
     while true; do
         header
         echo -e "${BOLD}${PURPLE}[ РЕЖИМ МАШИНЫ ]${NC}"
-        echo -e "1) node      - нода Remnawave, 443 + ${NODE_PORT}, SSL, Docker"
+        echo -e "1) node      - нода Remnawave, 443 + ${NODE_PORT}, Docker"
         echo -e "2) whitelist - только сеть и 443, без ноды/докера/сертов"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите режим (1-2):${NC} "
@@ -240,6 +297,7 @@ select_machine_mode() {
                 ;;
             2|whitelist)
                 MACHINE_MODE="whitelist"
+                NODE_PROFILE=""
                 break
                 ;;
             *)
@@ -249,6 +307,10 @@ select_machine_mode() {
         esac
     done
 
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        select_node_profile
+    fi
+
     need_root
     save_machine_mode
 }
@@ -257,12 +319,24 @@ ensure_machine_mode() {
     load_machine_mode
     if ! valid_machine_mode "$MACHINE_MODE"; then
         select_machine_mode
+    elif [[ "$MACHINE_MODE" == "node" ]] && ! valid_node_profile "$NODE_PROFILE"; then
+        select_node_profile
+        need_root
+        save_machine_mode
     fi
 }
 
 require_node_mode() {
     if [[ "$MACHINE_MODE" != "node" ]]; then
         fail "Этот пункт доступен только для режима node."
+        exit 1
+    fi
+}
+
+require_hysteria2_profile() {
+    require_node_mode
+    if [[ "$NODE_PROFILE" != "hysteria2" ]]; then
+        fail "SSL доступен только для профиля Hysteria2."
         exit 1
     fi
 }
@@ -572,13 +646,13 @@ optimize_system() {
     export NEEDRESTART_SUSPEND=1
 
     progress_start 7
-    progress_step "Подготовка системы" opt_prepare_system
-    progress_step "Пакеты" opt_install_packages
-    progress_step "Liquorix kernel" opt_liquorix_kernel
-    progress_step "Сеть и лимиты" opt_network_limits
-    progress_step "Firewall" opt_firewall "$ssh_port"
-    progress_step "AntiScanner" opt_antiscanner
-    progress_step "Fail2ban" opt_fail2ban
+    progress_step "Готовлю систему" opt_prepare_system
+    progress_step "Ставлю пакеты" opt_install_packages
+    progress_step "Обновляю kernel" opt_liquorix_kernel
+    progress_step "Настраиваю сеть" opt_network_limits
+    progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
+    progress_step "Подключаю AntiScanner" opt_antiscanner
+    progress_step "Настраиваю Fail2ban" opt_fail2ban
 
     echo
     ok "Оптимизация завершена. Рекомендуется: sudo reboot"
@@ -599,9 +673,31 @@ install_remnawave_node() {
 
     ensure_docker
 
-    stage "Remnawave Node"
+    stage "Готовлю Remnawave Node ($(node_profile_label))"
     cmd "${SUDO[@]}" mkdir -p "$REMNA_DIR"
-    write_root_file "$REMNA_DIR/docker-compose.yml" <<EOF
+    if [[ "$NODE_PROFILE" == "hysteria2" ]]; then
+        write_root_file "$REMNA_DIR/docker-compose.yml" <<EOF
+services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: remnawave/node:latest
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    volumes:
+      - /opt/remnawave:/opt/remnawave:ro
+    environment:
+      - NODE_PORT=1488
+      - SECRET_KEY="${escaped}"
+EOF
+    else
+        write_root_file "$REMNA_DIR/docker-compose.yml" <<EOF
 services:
   remnanode:
     container_name: remnanode
@@ -619,8 +715,9 @@ services:
       - NODE_PORT=1488
       - SECRET_KEY="${escaped}"
 EOF
+    fi
 
-    stage "docker compose up -d"
+    stage "Запускаю контейнер"
     if ! (cd "$REMNA_DIR" && "${SUDO[@]}" docker compose pull) >> "$LOG_FILE" 2>&1; then
         fail "Docker compose pull"
         tail -n 25 "$LOG_FILE" >&2 || true
@@ -644,7 +741,7 @@ install_selfsteal() {
     local domain
     domain="$(ask_domain "Введите домен для SelfSteal")"
 
-    stage "SelfSteal"
+    stage "Устанавливаю SelfSteal"
     must "SelfSteal install" \
         "${SUDO[@]}" bash -c \
         'bash <(curl -Ls "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh") --force --domain "$1" install' \
@@ -658,7 +755,7 @@ install_warp_native() {
     header
     require_node_mode
     need_root
-    stage "WARP Native"
+    stage "Устанавливаю WARP Native"
     local script
     script="$(mktemp)"
     must "Скачивание WARP" curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh -o "$script"
@@ -676,7 +773,8 @@ install_warp_native() {
 install_speedtest() {
     header
     need_root
-    stage "Speedtest"
+    local output filtered
+    stage "Готовлю Speedtest"
     cmd "${SUDO[@]}" apt-get remove -y speedtest-cli || true
     cmd "${SUDO[@]}" rm -f /usr/bin/speedtest /usr/local/bin/speedtest || true
     if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
@@ -685,19 +783,36 @@ install_speedtest() {
         curl -fsSL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | "${SUDO[@]}" tar xz -C /usr/local/bin speedtest >> "$LOG_FILE" 2>&1
     fi
     echo
-    /usr/local/bin/speedtest --accept-license --accept-gdpr
+    stage "Запускаю Ookla"
+    if ! output="$(/usr/local/bin/speedtest --accept-license --accept-gdpr --progress=no 2>&1)"; then
+        if ! output="$(/usr/local/bin/speedtest --accept-license --accept-gdpr 2>&1)"; then
+            fail "Speedtest"
+            printf '%s\n' "$output" >&2
+            return 1
+        fi
+    fi
+    filtered="$(printf '%s\n' "$output" | sed -n '/Speedtest by Ookla/,/Result URL:/p')"
+    if [[ -n "$filtered" ]]; then
+        printf '%s\n' "$filtered"
+    else
+        printf '%s\n' "$output"
+    fi
 }
 
 ipcheck_place() {
     header
-    echo -e "${YELLOW}[INFO]${NC} IP.Check.Place\n"
-    bash <(curl -Ls https://IP.Check.Place) -l en
+    stage "Проверяю IP.Check.Place"
+    if ! bash <(curl -Ls https://IP.Check.Place) -l en; then
+        warn "IP.Check.Place завершился с нестандартным кодом, вывод выше оставил как есть."
+    fi
 }
 
 ipcheck_region() {
     header
-    echo -e "${YELLOW}[INFO]${NC} IP Region Check\n"
-    bash <(wget -qO- https://github.com/Davoyan/ipregion/raw/main/ipregion.sh)
+    stage "Проверяю регион IP"
+    if ! bash <(wget -qO- https://github.com/Davoyan/ipregion/raw/main/ipregion.sh); then
+        warn "Region Check завершился с нестандартным кодом, вывод выше оставил как есть."
+    fi
 }
 
 container_running() {
@@ -707,13 +822,13 @@ container_running() {
 
 issue_ssl_certificate() {
     header
-    require_node_mode
+    require_hysteria2_profile
     need_root
     local domain email had_80=0 stopped=()
     domain="$(ask_domain "Введите домен для SSL")"
     email="admin@${domain}"
 
-    stage "SSL"
+    stage "Генерация SSL"
     apt_update_quiet
     apt_install_quiet cron socat curl openssl
     cmd "${SUDO[@]}" systemctl enable --now cron || true
@@ -771,7 +886,7 @@ install_haproxy() {
     local backend_ip
     backend_ip="$(ask_ipv4 "Введите выходной IP")"
 
-    stage "HAProxy"
+    stage "Настраиваю HAProxy"
     must "apt update" apt_update_quiet
     must "Установка HAProxy" apt_install_quiet haproxy
 
@@ -916,6 +1031,9 @@ show_status() {
 
     echo -e "${BOLD}${PURPLE}[ СЕТЬ ]${NC}"
     print_row "mode" "$MACHINE_MODE"
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        print_row "profile" "$(node_profile_label)"
+    fi
     print_row "BBR + FQ" "${cc} + ${qdisc}" "$([[ "$cc" == "bbr" && "$qdisc" == "fq" ]] && echo 1 || echo 0)"
     print_row "ports" "$(ufw_allowed_ports)"
 
@@ -953,14 +1071,16 @@ show_status() {
         print_row "remnanode" "not found" 0
     fi
 
-    echo
-    echo -e "${BOLD}${PURPLE}[ SSL ]${NC}"
-    print_row "privkey.key" "$CERT_DIR/privkey.key" "$(file_ok "$CERT_DIR/privkey.key")"
-    print_row "fullchain.pem" "$CERT_DIR/fullchain.pem" "$(file_ok "$CERT_DIR/fullchain.pem")"
-    if [[ -s "$CERT_DIR/fullchain.pem" ]]; then
-        cert_expiry="$(openssl x509 -enddate -noout -in "$CERT_DIR/fullchain.pem" 2>/dev/null | sed 's/notAfter=//' || true)"
-        cert_days="$(openssl x509 -checkend 1209600 -noout -in "$CERT_DIR/fullchain.pem" >/dev/null 2>&1 && echo 1 || echo 0)"
-        print_row "expires" "${cert_expiry:-unknown}" "$cert_days"
+    if [[ "$NODE_PROFILE" == "hysteria2" ]]; then
+        echo
+        echo -e "${BOLD}${PURPLE}[ SSL ]${NC}"
+        print_row "privkey.key" "$CERT_DIR/privkey.key" "$(file_ok "$CERT_DIR/privkey.key")"
+        print_row "fullchain.pem" "$CERT_DIR/fullchain.pem" "$(file_ok "$CERT_DIR/fullchain.pem")"
+        if [[ -s "$CERT_DIR/fullchain.pem" ]]; then
+            cert_expiry="$(openssl x509 -enddate -noout -in "$CERT_DIR/fullchain.pem" 2>/dev/null | sed 's/notAfter=//' || true)"
+            cert_days="$(openssl x509 -checkend 1209600 -noout -in "$CERT_DIR/fullchain.pem" >/dev/null 2>&1 && echo 1 || echo 0)"
+            print_row "expires" "${cert_expiry:-unknown}" "$cert_days"
+        fi
     fi
 
     print_kernel_status "$kernel"
@@ -969,6 +1089,9 @@ show_status() {
 menu() {
     header
     echo -e "${DIM}Режим: ${MACHINE_MODE}${NC}"
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        echo -e "${DIM}Профиль: $(node_profile_label)${NC}"
+    fi
     echo -e "1) Полная оптимизация"
     if [[ "$MACHINE_MODE" == "node" ]]; then
         echo -e "2) Установка ноды Remnawave"
@@ -979,9 +1102,9 @@ menu() {
     echo -e "6) Speedtest"
     echo -e "7) Проверка IP (IP.Check.Place)"
     echo -e "8) Проверка IP (Region Check)"
-    if [[ "$MACHINE_MODE" == "node" ]]; then
+    if [[ "$MACHINE_MODE" == "node" && "$NODE_PROFILE" == "hysteria2" ]]; then
         echo -e "9) Сгенерировать SSL-сертификат"
-    else
+    elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
         echo -e "10) HAProxy"
     fi
     echo -e "0) Выход"
@@ -999,7 +1122,7 @@ menu() {
         6) install_speedtest ;;
         7) ipcheck_place ;;
         8) ipcheck_region ;;
-        9) require_node_mode; issue_ssl_certificate ;;
+        9) require_hysteria2_profile; issue_ssl_certificate ;;
         10) require_whitelist_mode; install_haproxy ;;
         0) echo -e "${PURPLE}Выход.${NC}" ;;
         *) fail "Неверный выбор" ;;
