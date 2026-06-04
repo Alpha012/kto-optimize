@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.8"
+SCRIPT_VERSION="3.3.9"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -574,6 +574,20 @@ ask_domain() {
     done
 }
 
+ask_secret_key() {
+    local prompt="${1:-Введите SECRET_KEY для ноды}"
+    local secret
+    while true; do
+        read -r -s -p "$(echo -e "${PURPLE}>${NC} ${BOLD}${prompt}:${NC} ")" secret
+        echo
+        if [[ -n "$secret" ]]; then
+            echo "$secret"
+            return 0
+        fi
+        fail "SECRET_KEY не может быть пустым"
+    done
+}
+
 validate_ipv4() {
     local ip="$1" octet
     local octets=()
@@ -873,13 +887,9 @@ optimize_system() {
     ok "Время: $(format_duration "$duration")"
 }
 
-install_remnawave_node() {
-    header
-    require_node_mode
-    need_root
+do_install_remnawave_node() {
     local secret escaped
-    read -r -s -p "$(echo -e "${PURPLE}>${NC} ${BOLD}Введите SECRET_KEY для ноды:${NC} ")" secret
-    echo
+    secret="$1"
     if [[ -z "$secret" ]]; then
         fail "SECRET_KEY не может быть пустым"
         exit 1
@@ -949,13 +959,21 @@ EOF
     echo -e "Логи: ${BOLD}sudo docker logs -f remnanode${NC}"
 }
 
-install_selfsteal() {
+install_remnawave_node() {
     header
-    require_reality_profile
+    require_node_mode
     need_root
-    local domain
-    domain="$(ask_domain "Введите домен для SelfSteal")"
+    local secret
+    secret="$(ask_secret_key "Введите SECRET_KEY для ноды")"
+    do_install_remnawave_node "$secret"
+}
 
+do_install_selfsteal() {
+    local domain="$1"
+    if ! validate_domain "$domain"; then
+        fail "Некорректный домен для SelfSteal"
+        exit 1
+    fi
     stage "Устанавливаю SelfSteal"
     must "SelfSteal install" \
         "${SUDO[@]}" bash -c \
@@ -966,10 +984,16 @@ install_selfsteal() {
     ok "SelfSteal установлен"
 }
 
-install_warp_native() {
+install_selfsteal() {
     header
-    require_node_mode
+    require_reality_profile
     need_root
+    local domain
+    domain="$(ask_domain "Введите домен для SelfSteal")"
+    do_install_selfsteal "$domain"
+}
+
+do_install_warp_native() {
     stage "Устанавливаю WARP Native"
     local script
     script="$(mktemp)"
@@ -983,6 +1007,13 @@ install_warp_native() {
     rm -f "$script"
     echo
     ok "WARP установлен"
+}
+
+install_warp_native() {
+    header
+    require_node_mode
+    need_root
+    do_install_warp_native
 }
 
 speedtest_row() {
@@ -1081,12 +1112,13 @@ container_running() {
     command_exists docker && "${SUDO[@]}" docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
 }
 
-issue_ssl_certificate() {
-    header
-    require_hysteria2_profile
-    need_root
-    local domain email had_80=0 stopped=()
-    domain="$(ask_domain "Введите домен для SSL")"
+do_issue_ssl_certificate() {
+    local domain="$1"
+    local email had_80=0 stopped=()
+    if ! validate_domain "$domain"; then
+        fail "Некорректный домен для SSL"
+        exit 1
+    fi
     email="admin@${domain}"
 
     stage "Генерация SSL"
@@ -1125,6 +1157,7 @@ issue_ssl_certificate() {
     else
         fail "Не удалось выпустить сертификат. Проверь DNS и порт 80."
         tail -n 25 "$LOG_FILE" >&2 || true
+        return 1
     fi
 
     for c in "${stopped[@]:-}"; do
@@ -1138,6 +1171,52 @@ issue_ssl_certificate() {
     echo
     echo -e "Ключ:      ${BOLD}${CERT_DIR}/privkey.key${NC}"
     echo -e "Fullchain: ${BOLD}${CERT_DIR}/fullchain.pem${NC}"
+}
+
+issue_ssl_certificate() {
+    header
+    require_hysteria2_profile
+    need_root
+    local domain
+    domain="$(ask_domain "Введите домен для SSL")"
+    do_issue_ssl_certificate "$domain"
+}
+
+install_common_stack() {
+    header
+    require_node_mode
+    need_root
+    local secret domain started_at duration
+
+    secret="$(ask_secret_key "Введите SECRET_KEY для ноды")"
+    if [[ "$NODE_PROFILE" == "reality" ]]; then
+        domain="$(ask_domain "Введите домен для SelfSteal")"
+    else
+        domain="$(ask_domain "Введите домен для SSL")"
+    fi
+
+    started_at="$(date +%s)"
+    echo
+
+    if [[ "$NODE_PROFILE" == "reality" ]]; then
+        stage "Общее поднятие Reality"
+        do_install_remnawave_node "$secret"
+        do_install_selfsteal "$domain"
+        do_install_warp_native
+    elif [[ "$NODE_PROFILE" == "hysteria2" ]]; then
+        stage "Общее поднятие Hysteria2"
+        do_issue_ssl_certificate "$domain"
+        do_install_remnawave_node "$secret"
+        do_install_warp_native
+    else
+        fail "Неизвестный профиль node"
+        exit 1
+    fi
+
+    duration=$(( $(date +%s) - started_at ))
+    echo
+    ok "Общее поднятие завершено"
+    ok "Время: $(format_duration "$duration")"
 }
 
 install_haproxy() {
@@ -1360,6 +1439,8 @@ menu() {
     actions+=("optimize")
 
     if [[ "$MACHINE_MODE" == "node" ]]; then
+        labels+=("Общее поднятие")
+        actions+=("common")
         labels+=("Установка ноды Remnawave")
         actions+=("node")
         if [[ "$NODE_PROFILE" == "reality" ]]; then
@@ -1412,6 +1493,7 @@ menu() {
     action="${actions[$((choice - 1))]}"
     case "$action" in
         optimize) optimize_system ;;
+        common) install_common_stack ;;
         node) install_remnawave_node ;;
         selfsteal) install_selfsteal ;;
         warp) install_warp_native ;;
@@ -1434,6 +1516,7 @@ main() {
         menu) menu ;;
         mode|config|settings) reconfigure_machine_mode ;;
         optimize) optimize_system ;;
+        common|install-all|up) install_common_stack ;;
         node|install-node) install_remnawave_node ;;
         selfsteal) install_selfsteal ;;
         warp) install_warp_native ;;
