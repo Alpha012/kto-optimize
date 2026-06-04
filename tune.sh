@@ -4,12 +4,14 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.0"
+SCRIPT_VERSION="3.3.1"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
-CONFIG_FILE="/etc/kto-vpn.conf"
+CONFIG_FILE="/etc/kto-cfg.conf"
+LEGACY_CONFIG_FILE="/etc/kto-vpn.conf"
+CONFIG_SOURCE_FILE=""
 MACHINE_MODE="${KTO_MACHINE_MODE:-}"
 NODE_PROFILE="${KTO_NODE_PROFILE:-}"
 if [[ -n "${KTO_LOG_FILE:-}" ]]; then
@@ -213,7 +215,8 @@ node_profile_label() {
 }
 
 load_machine_mode() {
-    local saved_mode="" saved_profile=""
+    local saved_mode="" saved_profile="" source_file="$CONFIG_FILE"
+    CONFIG_SOURCE_FILE=""
 
     if [[ -n "$MACHINE_MODE" ]]; then
         if ! valid_machine_mode "$MACHINE_MODE"; then
@@ -229,12 +232,17 @@ load_machine_mode() {
         fi
     fi
 
-    saved_mode="$("${SUDO[@]}" awk -F= '$1=="MACHINE_MODE"{gsub(/"/,"",$2); print $2; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
+    if ! "${SUDO[@]}" test -f "$source_file" 2>/dev/null && "${SUDO[@]}" test -f "$LEGACY_CONFIG_FILE" 2>/dev/null; then
+        source_file="$LEGACY_CONFIG_FILE"
+    fi
+    CONFIG_SOURCE_FILE="$source_file"
+
+    saved_mode="$("${SUDO[@]}" awk -F= '$1=="MACHINE_MODE"{gsub(/"/,"",$2); print $2; exit}' "$source_file" 2>/dev/null || true)"
     if [[ -z "$MACHINE_MODE" ]] && valid_machine_mode "$saved_mode"; then
         MACHINE_MODE="$saved_mode"
     fi
 
-    saved_profile="$("${SUDO[@]}" awk -F= '$1=="NODE_PROFILE"{gsub(/"/,"",$2); print $2; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
+    saved_profile="$("${SUDO[@]}" awk -F= '$1=="NODE_PROFILE"{gsub(/"/,"",$2); print $2; exit}' "$source_file" 2>/dev/null || true)"
     if [[ -z "$NODE_PROFILE" ]] && valid_node_profile "$saved_profile"; then
         NODE_PROFILE="$saved_profile"
     fi
@@ -321,6 +329,9 @@ ensure_machine_mode() {
         select_machine_mode
     elif [[ "$MACHINE_MODE" == "node" ]] && ! valid_node_profile "$NODE_PROFILE"; then
         select_node_profile
+        need_root
+        save_machine_mode
+    elif [[ "$CONFIG_SOURCE_FILE" == "$LEGACY_CONFIG_FILE" ]]; then
         need_root
         save_machine_mode
     fi
@@ -770,6 +781,44 @@ install_warp_native() {
     ok "WARP установлен"
 }
 
+speedtest_row() {
+    local label="$1"
+    local value="$2"
+    [[ -n "$value" ]] || return 0
+    printf " %-11s %b\n" "$label" "$value"
+}
+
+print_speedtest_result() {
+    local output="$1"
+    local filtered server isp latency download download_detail upload upload_detail loss url
+
+    filtered="$(sed -n '/Speedtest by Ookla/,/Result URL:/p' <<< "$output")"
+    [[ -n "$filtered" ]] || return 1
+
+    server="$(awk '/^[[:space:]]*Server:/ {sub(/^[[:space:]]*Server:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
+    isp="$(awk '/^[[:space:]]*ISP:/ {sub(/^[[:space:]]*ISP:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
+    latency="$(awk '/^[[:space:]]*Idle Latency:/ {sub(/^[[:space:]]*Idle Latency:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
+    download="$(awk '/^[[:space:]]*Download:/ {sub(/^[[:space:]]*Download:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
+    download_detail="$(awk 'seen && /^[[:space:]]+[0-9.]+[[:space:]]+ms/ {sub(/^[[:space:]]+/,""); print; exit} /^[[:space:]]*Download:/ {seen=1}' <<< "$filtered")"
+    upload="$(awk '/^[[:space:]]*Upload:/ {sub(/^[[:space:]]*Upload:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
+    upload_detail="$(awk 'seen && /^[[:space:]]+[0-9.]+[[:space:]]+ms/ {sub(/^[[:space:]]+/,""); print; exit} /^[[:space:]]*Upload:/ {seen=1}' <<< "$filtered")"
+    loss="$(awk '/^[[:space:]]*Packet Loss:/ {sub(/^[[:space:]]*Packet Loss:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
+    url="$(awk '/^[[:space:]]*Result URL:/ {sub(/^[[:space:]]*Result URL:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
+
+    [[ -n "$download" || -n "$upload" || -n "$latency" ]] || return 1
+
+    echo -e "${BOLD}${PURPLE}[ SPEEDTEST BY OOKLA ]${NC}"
+    speedtest_row "Server" "$server"
+    speedtest_row "ISP" "$isp"
+    speedtest_row "Latency" "$latency"
+    speedtest_row "Download" "${GREEN}${download}${NC}"
+    speedtest_row "" "$download_detail"
+    speedtest_row "Upload" "${GREEN}${upload}${NC}"
+    speedtest_row "" "$upload_detail"
+    speedtest_row "Loss" "$loss"
+    speedtest_row "Result" "$url"
+}
+
 install_speedtest() {
     header
     need_root
@@ -791,7 +840,11 @@ install_speedtest() {
             return 1
         fi
     fi
-    filtered="$(printf '%s\n' "$output" | sed -n '/Speedtest by Ookla/,/Result URL:/p')"
+    if print_speedtest_result "$output"; then
+        return 0
+    fi
+
+    filtered="$(sed -n '/Speedtest by Ookla/,/Result URL:/p' <<< "$output")"
     if [[ -n "$filtered" ]]; then
         printf '%s\n' "$filtered"
     else
