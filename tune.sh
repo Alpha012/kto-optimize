@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.2.1"
+SCRIPT_VERSION="3.2.2"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -793,6 +793,17 @@ print_row() {
     fi
 }
 
+print_kernel_status() {
+    local kernel="$1"
+    echo
+    echo -e "${BOLD}${PURPLE}[ ЯДРО ]${NC}"
+    if [[ "$kernel" == *liquorix* ]]; then
+        print_row "kernel" "$kernel" 1
+    else
+        print_row "kernel" "$kernel" 0
+    fi
+}
+
 show_status() {
     header
     local cc qdisc kernel node_status docker_status cert_days cert_expiry
@@ -815,6 +826,7 @@ show_status() {
     print_row "fail2ban" "ssh guard" "$(service_ok fail2ban)"
 
     if [[ "$MACHINE_MODE" != "node" ]]; then
+        print_kernel_status "$kernel"
         return 0
     fi
 
@@ -848,13 +860,7 @@ show_status() {
         print_row "expires" "${cert_expiry:-unknown}" "$cert_days"
     fi
 
-    echo
-    echo -e "${BOLD}${PURPLE}[ ЯДРО ]${NC}"
-    if [[ "$kernel" == *liquorix* ]]; then
-        print_row "kernel" "$kernel" 1
-    else
-        print_row "kernel" "$kernel" 0
-    fi
+    print_kernel_status "$kernel"
 }
 
 menu() {
