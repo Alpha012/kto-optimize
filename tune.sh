@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.3.3"
+SCRIPT_VERSION="3.3.4"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -104,7 +104,25 @@ must() {
 PROGRESS_TOTAL=1
 PROGRESS_CURRENT=0
 PROGRESS_WIDTH=26
-PROGRESS_LINE_WIDTH=100
+PROGRESS_CLEAR=""
+PROGRESS_GREEN=""
+PROGRESS_PURPLE=""
+PROGRESS_RED=""
+PROGRESS_DIM=""
+PROGRESS_NC=""
+
+init_progress_style() {
+    [[ -t 1 ]] || return 0
+    command -v tput >/dev/null 2>&1 || return 0
+    [[ "${TERM:-}" != "dumb" ]] || return 0
+
+    PROGRESS_CLEAR="$(tput el 2>/dev/null || true)"
+    PROGRESS_GREEN="$(tput setaf 2 2>/dev/null || true)"
+    PROGRESS_PURPLE="$(tput setaf 5 2>/dev/null || true)"
+    PROGRESS_RED="$(tput setaf 1 2>/dev/null || true)"
+    PROGRESS_DIM="$(tput dim 2>/dev/null || true)"
+    PROGRESS_NC="$(tput sgr0 2>/dev/null || true)"
+}
 
 progress_bar() {
     local percent="$1"
@@ -122,23 +140,27 @@ progress_line() {
     local percent="$1"
     local title="$2"
     local frame="$3"
-    local text width
-    width="${COLUMNS:-80}"
-    if (( width < 40 )); then
-        width=79
-    else
-        width=$(( width - 1 ))
+    local frame_color="$PROGRESS_PURPLE"
+    local bar_color="$PROGRESS_GREEN"
+
+    if [[ "$frame" == "OK" ]]; then
+        frame_color="$PROGRESS_GREEN"
+    elif [[ "$frame" == "!" ]]; then
+        frame_color="$PROGRESS_RED"
     fi
-    if (( width > PROGRESS_LINE_WIDTH )); then
-        width="$PROGRESS_LINE_WIDTH"
-    fi
-    printf -v text '%s %3d%% [%s] %s' "$frame" "$percent" "$(progress_bar "$percent")" "$title"
-    printf '\r%-*s' "$width" "$text"
+
+    printf '\r%s%s%s%s %3d%% [%s%s%s] %s%s%s' \
+        "$PROGRESS_CLEAR" \
+        "$frame_color" "$frame" "$PROGRESS_NC" \
+        "$percent" \
+        "$bar_color" "$(progress_bar "$percent")" "$PROGRESS_NC" \
+        "$PROGRESS_DIM" "$title" "$PROGRESS_NC"
 }
 
 progress_start() {
     PROGRESS_TOTAL="$1"
     PROGRESS_CURRENT=0
+    init_progress_style
     echo
 }
 
