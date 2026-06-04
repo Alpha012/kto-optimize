@@ -4,11 +4,13 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.1.3"
+SCRIPT_VERSION="3.2.0"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
+CONFIG_FILE="/etc/kto-vpn.conf"
+MACHINE_MODE="${KTO_MACHINE_MODE:-}"
 if [[ -n "${KTO_LOG_FILE:-}" ]]; then
     LOG_FILE="$KTO_LOG_FILE"
 elif [[ ${EUID:-$(id -u)} -eq 0 ]]; then
@@ -107,6 +109,78 @@ write_root_file() {
     cat > "$tmp"
     "${SUDO[@]}" install -m 0644 "$tmp" "$path" >> "$LOG_FILE" 2>&1
     rm -f "$tmp"
+}
+
+valid_machine_mode() {
+    [[ "$1" == "node" || "$1" == "whitelist" ]]
+}
+
+load_machine_mode() {
+    local saved_mode=""
+
+    if [[ -n "$MACHINE_MODE" ]]; then
+        if valid_machine_mode "$MACHINE_MODE"; then
+            return 0
+        fi
+        warn "KTO_MACHINE_MODE должен быть node или whitelist. Игнорирую."
+        MACHINE_MODE=""
+    fi
+
+    saved_mode="$("${SUDO[@]}" awk -F= '$1=="MACHINE_MODE"{gsub(/"/,"",$2); print $2; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
+    if valid_machine_mode "$saved_mode"; then
+        MACHINE_MODE="$saved_mode"
+    fi
+}
+
+save_machine_mode() {
+    write_root_file "$CONFIG_FILE" <<EOF
+MACHINE_MODE="$MACHINE_MODE"
+EOF
+}
+
+select_machine_mode() {
+    local choice
+
+    while true; do
+        header
+        echo -e "${BOLD}${PURPLE}[ РЕЖИМ МАШИНЫ ]${NC}"
+        echo -e "1) node      - нода Remnawave, 443 + ${NODE_PORT}, SSL, Docker"
+        echo -e "2) whitelist - только сеть и 443, без ноды/докера/сертов"
+        echo -e "${PURPLE}==========================================${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите режим (1-2):${NC} "
+        read -r choice
+        case "$choice" in
+            1|node)
+                MACHINE_MODE="node"
+                break
+                ;;
+            2|whitelist)
+                MACHINE_MODE="whitelist"
+                break
+                ;;
+            *)
+                fail "Неверный выбор"
+                sleep 1
+                ;;
+        esac
+    done
+
+    need_root
+    save_machine_mode
+}
+
+ensure_machine_mode() {
+    load_machine_mode
+    if ! valid_machine_mode "$MACHINE_MODE"; then
+        select_machine_mode
+    fi
+}
+
+require_node_mode() {
+    if [[ "$MACHINE_MODE" != "node" ]]; then
+        fail "Этот пункт доступен только для режима node."
+        exit 1
+    fi
 }
 
 apt_update_quiet() {
@@ -257,7 +331,7 @@ EOF
 optimize_system() {
     header
     need_root
-    local ssh_port
+    local ssh_port packages
     ssh_port="$(detect_ssh_port)"
 
     stage "Подготовка системы"
@@ -271,23 +345,27 @@ optimize_system() {
     export NEEDRESTART_SUSPEND=1
 
     stage "Пакеты"
+    packages=(ca-certificates curl wget ufw openssl dnsutils)
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        packages+=(gnupg2 chrony cpufrequtils irqbalance software-properties-common logrotate tar xz-utils)
+    fi
     must "apt update" apt_update_quiet
-    must "Установка пакетов" apt_install_quiet \
-        ca-certificates curl wget gnupg2 chrony ufw cpufrequtils irqbalance \
-        software-properties-common logrotate openssl tar xz-utils dnsutils
+    must "Установка пакетов" apt_install_quiet "${packages[@]}"
 
-    stage "Liquorix kernel"
-    if [[ "$(uname -m)" == "x86_64" ]] && grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
-        cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y
-        cmd apt_update_quiet
-        for _ in 1 2 3; do
-            if apt_install_quiet linux-image-liquorix-amd64 linux-headers-liquorix-amd64; then
-                break
-            fi
-            sleep 2
-        done
-    else
-        echo "Liquorix skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        stage "Liquorix kernel"
+        if [[ "$(uname -m)" == "x86_64" ]] && grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
+            cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y
+            cmd apt_update_quiet
+            for _ in 1 2 3; do
+                if apt_install_quiet linux-image-liquorix-amd64 linux-headers-liquorix-amd64; then
+                    break
+                fi
+                sleep 2
+            done
+        else
+            echo "Liquorix skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
+        fi
     fi
 
     stage "Сеть и лимиты"
@@ -339,10 +417,12 @@ EOF
 [Manager]
 DefaultLimitNOFILE=1048576
 EOF
-    echo 'GOVERNOR="performance"' | "${SUDO[@]}" tee /etc/default/cpufrequtils >> "$LOG_FILE" 2>&1 || true
     cmd "${SUDO[@]}" systemctl daemon-reload || true
-    cmd "${SUDO[@]}" systemctl enable --now irqbalance chrony || true
-    cmd "${SUDO[@]}" systemctl restart cpufrequtils || true
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        echo 'GOVERNOR="performance"' | "${SUDO[@]}" tee /etc/default/cpufrequtils >> "$LOG_FILE" 2>&1 || true
+        cmd "${SUDO[@]}" systemctl enable --now irqbalance chrony || true
+        cmd "${SUDO[@]}" systemctl restart cpufrequtils || true
+    fi
 
     stage "Firewall"
     cmd "${SUDO[@]}" ufw --force reset
@@ -351,7 +431,9 @@ EOF
     cmd "${SUDO[@]}" ufw allow "${ssh_port}/tcp"
     cmd "${SUDO[@]}" ufw allow 443/tcp
     cmd "${SUDO[@]}" ufw allow 443/udp
-    cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
+    fi
     cmd "${SUDO[@]}" ufw --force enable
 
     install_antiscanner
@@ -373,6 +455,7 @@ EOF
 
 install_remnawave_node() {
     header
+    require_node_mode
     need_root
     local secret escaped
     read -r -s -p "$(echo -e "${PURPLE}>${NC} ${BOLD}Введите SECRET_KEY для ноды:${NC} ")" secret
@@ -425,6 +508,7 @@ EOF
 
 install_selfsteal() {
     header
+    require_node_mode
     need_root
     local domain
     domain="$(ask_domain "Введите домен для SelfSteal")"
@@ -441,6 +525,7 @@ install_selfsteal() {
 
 install_warp_native() {
     header
+    require_node_mode
     need_root
     stage "WARP Native"
     local script
@@ -491,6 +576,7 @@ container_running() {
 
 issue_ssl_certificate() {
     header
+    require_node_mode
     need_root
     local domain email had_80=0 stopped=()
     domain="$(ask_domain "Введите домен для SSL")"
@@ -584,6 +670,23 @@ antiscanner_rules_count() {
     fi
 }
 
+ufw_allowed_ports() {
+    local ports=""
+    if command_exists ufw; then
+        ports="$("${SUDO[@]}" ufw status 2>/dev/null \
+            | awk '/ALLOW/ && $0 !~ /AntiScanner-Block/ {print $1}' \
+            | sed 's/(v6)//g' \
+            | sort -u \
+            | xargs 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$ports" ]]; then
+        echo "$ports" | sed 's/ /, /g'
+    else
+        echo "-"
+    fi
+}
+
 print_row() {
     local name="$1"
     local value="$2"
@@ -597,26 +700,28 @@ print_row() {
 
 show_status() {
     header
-    local ssh_port cc qdisc kernel node_status docker_status cert_days cert_expiry
-    ssh_port="$(detect_ssh_port)"
+    local cc qdisc kernel node_status docker_status cert_days cert_expiry
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
     kernel="$(uname -r)"
 
     echo -e "${BOLD}${PURPLE}[ СЕТЬ ]${NC}"
+    print_row "mode" "$MACHINE_MODE"
     print_row "BBR + FQ" "${cc} + ${qdisc}" "$([[ "$cc" == "bbr" && "$qdisc" == "fq" ]] && echo 1 || echo 0)"
-    print_row "SSH ${ssh_port}/tcp" "listen" "$(tcp_listen "$ssh_port")"
-    print_row "TLS 443/tcp" "listen" "$(tcp_listen 443)"
-    print_row "Hysteria 443/udp" "listen" "$(udp_listen 443)"
-    print_row "Node ${NODE_PORT}/tcp" "listen" "$(tcp_listen "$NODE_PORT")"
+    print_row "ports" "$(ufw_allowed_ports)"
 
     echo
     echo -e "${BOLD}${PURPLE}[ СЛУЖБЫ ]${NC}"
     print_row "ufw" "firewall" "$(service_ok ufw)"
     print_row "antiscanner" "$(antiscanner_rules_count) rules" "$(file_ok "$ANTISCANNER_SCRIPT")"
+    print_row "fail2ban" "ssh guard" "$(service_ok fail2ban)"
+
+    if [[ "$MACHINE_MODE" != "node" ]]; then
+        return 0
+    fi
+
     print_row "chrony" "time sync" "$(service_ok chrony)"
     print_row "irqbalance" "irq" "$(service_ok irqbalance)"
-    print_row "fail2ban" "ssh guard" "$(service_ok fail2ban)"
 
     echo
     echo -e "${BOLD}${PURPLE}[ REMNAWAVE ]${NC}"
@@ -656,15 +761,20 @@ show_status() {
 
 menu() {
     header
+    echo -e "${DIM}Режим: ${MACHINE_MODE}${NC}"
     echo -e "1) Полная оптимизация"
-    echo -e "2) Установка ноды Remnawave"
-    echo -e "3) Установка SelfSteal"
-    echo -e "4) Установка WARP Native"
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        echo -e "2) Установка ноды Remnawave"
+        echo -e "3) Установка SelfSteal"
+        echo -e "4) Установка WARP Native"
+    fi
     echo -e "5) Панель состояния"
     echo -e "6) Speedtest"
     echo -e "7) Проверка IP (IP.Check.Place)"
     echo -e "8) Проверка IP (Region Check)"
-    echo -e "9) Сгенерировать SSL-сертификат"
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        echo -e "9) Сгенерировать SSL-сертификат"
+    fi
     echo -e "0) Выход"
     echo -e "${PURPLE}==========================================${NC}"
     echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие (0-9):${NC} "
@@ -673,14 +783,14 @@ menu() {
     read -r choice
     case "$choice" in
         1) optimize_system ;;
-        2) install_remnawave_node ;;
-        3) install_selfsteal ;;
-        4) install_warp_native ;;
+        2) require_node_mode; install_remnawave_node ;;
+        3) require_node_mode; install_selfsteal ;;
+        4) require_node_mode; install_warp_native ;;
         5) show_status ;;
         6) install_speedtest ;;
         7) ipcheck_place ;;
         8) ipcheck_region ;;
-        9) issue_ssl_certificate ;;
+        9) require_node_mode; issue_ssl_certificate ;;
         0) echo -e "${PURPLE}Выход.${NC}" ;;
         *) fail "Неверный выбор" ;;
     esac
@@ -688,8 +798,11 @@ menu() {
 
 main() {
     init_log
+    ensure_machine_mode
+
     case "${1:-menu}" in
         menu) menu ;;
+        mode) select_machine_mode ;;
         optimize) optimize_system ;;
         node|install-node) install_remnawave_node ;;
         selfsteal) install_selfsteal ;;
