@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.9"
+SCRIPT_VERSION="3.6.10"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -1383,17 +1383,17 @@ gcloud_node_inbound_tag() {
 
 gcloud_node_host_remark() {
     case "$1" in
-        fi) echo "🇫🇮 Supercell (DC-1) 2" ;;
-        ge) echo "🇩🇪 Supercell (DC-2) 2" ;;
-        sw) echo "🇸🇪 Supercell (DC-5) 2" ;;
+        fi) echo "🇫🇮 Supercell (DC-1)" ;;
+        ge) echo "🇩🇪 Supercell (DC-2)" ;;
+        sw) echo "🇸🇪 Supercell (DC-5)" ;;
     esac
 }
 
 gcloud_node_legacy_host_remark() {
     case "$1" in
-        fi) echo "🇫🇮 Supercell (DC-1)" ;;
-        ge) echo "🇩🇪 Supercell (DC-2)" ;;
-        sw) echo "🇸🇪 Supercell (DC-5)" ;;
+        fi) echo "🇫🇮 Supercell (DC-1) 2" ;;
+        ge) echo "🇩🇪 Supercell (DC-2) 2" ;;
+        sw) echo "🇸🇪 Supercell (DC-5) 2" ;;
     esac
 }
 
