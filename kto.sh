@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.4"
+SCRIPT_VERSION="3.6.5"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -1678,15 +1678,33 @@ zram_recommended() {
 }
 
 memory_oom_count() {
-    if command_exists journalctl; then
-        "${SUDO[@]}" journalctl -k -b --no-pager 2>/dev/null \
-            | grep -Eci 'out of memory|oom-killer|killed process' || true
-    elif command_exists dmesg; then
-        "${SUDO[@]}" dmesg 2>/dev/null \
-            | grep -Eci 'out of memory|oom-killer|killed process' || true
-    else
-        echo 0
+    local tmp rc count
+    tmp="$(mktemp)"
+
+    if command_exists timeout && command_exists journalctl; then
+        if "${SUDO[@]}" timeout 4s journalctl -k -b --no-pager -n 3000 > "$tmp" 2>/dev/null; then
+            count="$(grep -Eci 'out of memory|oom-killer|killed process' "$tmp" || true)"
+            rm -f "$tmp"
+            echo "${count:-0}"
+            return 0
+        fi
+        rc=$?
+        echo "OOM journalctl skipped: rc=${rc}" >> "$LOG_FILE" 2>/dev/null || true
     fi
+
+    if command_exists timeout && command_exists dmesg; then
+        if "${SUDO[@]}" timeout 4s dmesg > "$tmp" 2>/dev/null; then
+            count="$(tail -n 3000 "$tmp" | grep -Eci 'out of memory|oom-killer|killed process' || true)"
+            rm -f "$tmp"
+            echo "${count:-0}"
+            return 0
+        fi
+        rc=$?
+        echo "OOM dmesg skipped: rc=${rc}" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+
+    rm -f "$tmp"
+    echo "timeout"
 }
 
 ufw_active() {
@@ -1794,8 +1812,10 @@ system_check_memory() {
     oom_count="$(memory_oom_count)"
     if [[ "$oom_count" =~ ^[0-9]+$ && "$oom_count" -gt 0 ]]; then
         system_check_row warn "OOM" "${oom_count} events в текущей загрузке"
+    elif [[ "$oom_count" =~ ^[0-9]+$ ]]; then
+        system_check_row ok "OOM" "не найдено в последних kernel logs"
     else
-        system_check_row ok "OOM" "не найдено в текущей загрузке"
+        system_check_row skip "OOM" "проверка пропущена (${oom_count})"
     fi
 }
 
