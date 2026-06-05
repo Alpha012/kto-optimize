@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.10"
+SCRIPT_VERSION="3.6.11"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2847,8 +2847,9 @@ install_haproxy() {
     header
     require_whitelist_mode
     need_root
-    local backend_ip
+    local backend_ip allowed_sni
     backend_ip="$(ask_ipv4 "Введите выходной IP")"
+    allowed_sni="$(ask_domain "Введите разрешенный SNI")"
 
     stage "Настраиваю HAProxy"
     must "apt update" apt_update_quiet
@@ -2885,10 +2886,16 @@ defaults
 
 
 # -------------------------
-# FRONTEND : 8443
+# FRONTEND : 443
 # -------------------------
 frontend vless_in
     bind *:443
+    tcp-request inspect-delay 5s
+    acl clienthello req.ssl_hello_type 1
+    acl allowed_sni req.ssl_sni -i ${allowed_sni}
+    tcp-request content accept if clienthello allowed_sni
+    tcp-request content reject if clienthello !allowed_sni
+    tcp-request content reject if WAIT_END
     default_backend vless_pool
 
 backend vless_pool
@@ -2908,6 +2915,7 @@ EOF
     must "Перезапуск HAProxy" "${SUDO[@]}" systemctl restart haproxy
 
     ok "HAProxy установлен: 443 -> ${backend_ip}:443"
+    ok "Разрешенный SNI: ${allowed_sni}"
 }
 
 badge() {
