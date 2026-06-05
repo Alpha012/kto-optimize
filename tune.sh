@@ -798,11 +798,30 @@ remna_node_uuid_by_name() {
         | head -n 1
 }
 
+remna_node_uuid_by_address() {
+    local address="$1"
+    remna_api GET /api/nodes \
+        | jq -r --arg address "$address" '.response[]? | select(.address == $address) | .uuid' \
+        | head -n 1
+}
+
 remna_host_uuid_by_remark() {
     local remark="$1"
     remna_api GET /api/hosts \
         | jq -r --arg remark "$remark" '.response[]? | select(.remark == $remark) | .uuid' \
         | head -n 1
+}
+
+remna_host_uuid_by_address() {
+    local address="$1"
+    remna_api GET /api/hosts \
+        | jq -r --arg address "$address" '.response[]? | select(.address == $address) | .uuid' \
+        | head -n 1
+}
+
+remna_enable_node() {
+    local uuid="$1"
+    remna_api POST "/api/nodes/${uuid}/actions/enable" >/dev/null || true
 }
 
 build_gcloud_profile_config() {
@@ -895,6 +914,12 @@ upsert_gcloud_node() {
     local inbound_uuid="$3"
     local uuid payload response
     uuid="$(remna_node_uuid_by_name "$GCLOUD_NODE_NAME")"
+    if [[ -z "$uuid" ]]; then
+        uuid="$(remna_node_uuid_by_address "$ip")"
+        if [[ -n "$uuid" ]]; then
+            echo "Google Cloud node: reuse by address ${ip}: ${uuid}" >> "$LOG_FILE"
+        fi
+    fi
     payload="$(mktemp)"
 
     jq -n \
@@ -934,6 +959,12 @@ upsert_gcloud_host() {
     local node_uuid="$4"
     local uuid payload response
     uuid="$(remna_host_uuid_by_remark "$GCLOUD_HOST_REMARK")"
+    if [[ -z "$uuid" ]]; then
+        uuid="$(remna_host_uuid_by_address "$ip")"
+        if [[ -n "$uuid" ]]; then
+            echo "Google Cloud host: reuse by address ${ip}: ${uuid}" >> "$LOG_FILE"
+        fi
+    fi
     payload="$(mktemp)"
 
     jq -n \
@@ -1673,6 +1704,7 @@ install_google_cloud_stack() {
         fail "Не получил UUID ноды"
         exit 1
     fi
+    remna_enable_node "$node_uuid"
 
     do_install_remnawave_node "$secret"
     do_install_selfsteal "$domain"
