@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.1"
+SCRIPT_VERSION="3.6.2"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -633,6 +633,7 @@ settings_menu() {
         echo -e "${BOLD}${PURPLE}[ НАСТРОЙКИ ]${NC}"
         echo -e "1) Изменение режима"
         echo -e "2) Изменение редактируемых профилей"
+        echo -e "3) Проверка системы"
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -644,6 +645,9 @@ settings_menu() {
                 ;;
             2)
                 configure_gcloud_target_profiles
+                ;;
+            3)
+                system_check
                 ;;
             0)
                 return 0
@@ -1315,12 +1319,18 @@ opt_prepare_system() {
     fi
 }
 
-opt_install_packages() {
+optimization_packages() {
     local packages
     packages=(ca-certificates curl wget gnupg2 software-properties-common ufw openssl dnsutils)
     if [[ "$MACHINE_MODE" == "node" ]]; then
         packages+=(chrony cpufrequtils irqbalance logrotate tar xz-utils)
     fi
+    printf '%s\n' "${packages[@]}"
+}
+
+opt_install_packages() {
+    local packages
+    mapfile -t packages < <(optimization_packages)
     apt_update_quiet
     apt_install_quiet "${packages[@]}"
 }
@@ -1442,6 +1452,370 @@ findtime = 10m
 maxretry = 5
 EOF
     cmd "${SUDO[@]}" systemctl enable --now fail2ban || true
+}
+
+SYSTEM_CHECK_MISSING=0
+SYSTEM_CHECK_WARNINGS=0
+SYSTEM_CHECK_NEEDS_PREPARE=0
+SYSTEM_CHECK_NEEDS_PACKAGES=0
+SYSTEM_CHECK_NEEDS_KERNEL=0
+SYSTEM_CHECK_NEEDS_NETWORK=0
+SYSTEM_CHECK_NEEDS_FIREWALL=0
+SYSTEM_CHECK_NEEDS_ANTISCANNER=0
+SYSTEM_CHECK_NEEDS_FAIL2BAN=0
+
+system_check_reset() {
+    SYSTEM_CHECK_MISSING=0
+    SYSTEM_CHECK_WARNINGS=0
+    SYSTEM_CHECK_NEEDS_PREPARE=0
+    SYSTEM_CHECK_NEEDS_PACKAGES=0
+    SYSTEM_CHECK_NEEDS_KERNEL=0
+    SYSTEM_CHECK_NEEDS_NETWORK=0
+    SYSTEM_CHECK_NEEDS_FIREWALL=0
+    SYSTEM_CHECK_NEEDS_ANTISCANNER=0
+    SYSTEM_CHECK_NEEDS_FAIL2BAN=0
+}
+
+system_check_badge() {
+    local status="$1"
+    case "$status" in
+        ok) echo -e "${GREEN}OK${NC}" ;;
+        miss) echo -e "${RED}TODO${NC}" ;;
+        warn) echo -e "${YELLOW}WARN${NC}" ;;
+        skip) echo -e "${DIM}SKIP${NC}" ;;
+        *) echo -e "${RED}?${NC}" ;;
+    esac
+}
+
+system_check_row() {
+    local status="$1"
+    local name="$2"
+    local value="$3"
+
+    case "$status" in
+        miss) SYSTEM_CHECK_MISSING=$(( SYSTEM_CHECK_MISSING + 1 )) ;;
+        warn) SYSTEM_CHECK_WARNINGS=$(( SYSTEM_CHECK_WARNINGS + 1 )) ;;
+    esac
+
+    printf " %-22s %b %b\n" "$name" "$value" "$(system_check_badge "$status")"
+}
+
+system_check_join() {
+    local IFS=", "
+    echo "$*"
+}
+
+root_file_has_line() {
+    local file="$1"
+    local line="$2"
+    "${SUDO[@]}" test -f "$file" 2>/dev/null || return 1
+    "${SUDO[@]}" grep -Fqx "$line" "$file" 2>/dev/null
+}
+
+ufw_active() {
+    command_exists ufw && "${SUDO[@]}" ufw status 2>/dev/null | grep -q "Status: active"
+}
+
+ufw_rule_allowed() {
+    local rule="$1"
+    command_exists ufw || return 1
+    "${SUDO[@]}" ufw status 2>/dev/null \
+        | awk -v rule="$rule" '$0 ~ /ALLOW/ && $1 == rule {found=1} END{exit found ? 0 : 1}'
+}
+
+system_check_prepare_state() {
+    local issues=() dpkg_audit
+
+    if package_installed snapd; then
+        issues+=("snapd установлен")
+    fi
+    if "${SUDO[@]}" test -e /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
+        issues+=("старый Ookla apt source")
+    fi
+    if command_exists dpkg; then
+        dpkg_audit="$(dpkg --audit 2>/dev/null || true)"
+        if [[ -n "$dpkg_audit" ]]; then
+            issues+=("dpkg требует configure")
+        fi
+    fi
+
+    if (( ${#issues[@]} == 0 )); then
+        system_check_row ok "prepare" "очистка не требуется"
+    else
+        SYSTEM_CHECK_NEEDS_PREPARE=1
+        system_check_row miss "prepare" "$(system_check_join "${issues[@]}")"
+    fi
+}
+
+system_check_packages() {
+    local packages=() missing=() pkg
+    mapfile -t packages < <(optimization_packages)
+    for pkg in "${packages[@]}"; do
+        if ! package_installed "$pkg"; then
+            missing+=("$pkg")
+        fi
+    done
+
+    if (( ${#missing[@]} == 0 )); then
+        system_check_row ok "packages" "базовый набор установлен"
+    else
+        SYSTEM_CHECK_NEEDS_PACKAGES=1
+        system_check_row miss "packages" "нет: $(system_check_join "${missing[@]}")"
+    fi
+}
+
+system_check_kernel() {
+    local kernel
+    kernel="$(uname -r)"
+
+    if [[ "$(uname -m)" != "x86_64" ]] || ! grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
+        system_check_row skip "liquorix" "не Ubuntu amd64"
+        return 0
+    fi
+
+    if liquorix_installed; then
+        if [[ "$kernel" == *liquorix* ]]; then
+            system_check_row ok "liquorix" "$kernel"
+        else
+            system_check_row warn "liquorix" "пакеты стоят, текущее ядро: $kernel; нужен reboot"
+        fi
+        return 0
+    fi
+
+    SYSTEM_CHECK_NEEDS_KERNEL=1
+    if liquorix_source_configured; then
+        system_check_row miss "liquorix" "repo есть, пакеты не установлены"
+    else
+        system_check_row miss "liquorix" "repo и пакеты не установлены"
+    fi
+}
+
+system_check_network_limits() {
+    local cc qdisc limits_ok=1 sysctl_file_ok=1 service_issues=()
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
+    qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
+
+    if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
+        system_check_row ok "BBR + FQ" "${cc} + ${qdisc}"
+    else
+        SYSTEM_CHECK_NEEDS_NETWORK=1
+        system_check_row miss "BBR + FQ" "${cc} + ${qdisc}"
+    fi
+
+    root_file_has_line /etc/sysctl.d/99-vpn-tuning.conf "net.ipv4.tcp_congestion_control = bbr" || sysctl_file_ok=0
+    root_file_has_line /etc/sysctl.d/99-vpn-tuning.conf "net.core.default_qdisc = fq" || sysctl_file_ok=0
+    root_file_has_line /etc/sysctl.d/99-vpn-tuning.conf "fs.file-max = 2097152" || sysctl_file_ok=0
+    root_file_has_line /etc/sysctl.d/99-vpn-tuning.conf "vm.swappiness = 1" || sysctl_file_ok=0
+    if [[ "$sysctl_file_ok" == "1" ]]; then
+        system_check_row ok "sysctl file" "/etc/sysctl.d/99-vpn-tuning.conf"
+    else
+        SYSTEM_CHECK_NEEDS_NETWORK=1
+        system_check_row miss "sysctl file" "нет или неполный /etc/sysctl.d/99-vpn-tuning.conf"
+    fi
+
+    root_file_has_line /etc/security/limits.d/99-vpn-limits.conf "* soft nofile 1048576" || limits_ok=0
+    root_file_has_line /etc/security/limits.d/99-vpn-limits.conf "* hard nofile 1048576" || limits_ok=0
+    root_file_has_line /etc/systemd/system.conf.d/99-vpn-limits.conf "DefaultLimitNOFILE=1048576" || limits_ok=0
+    root_file_has_line /etc/systemd/user.conf.d/99-vpn-limits.conf "DefaultLimitNOFILE=1048576" || limits_ok=0
+    if [[ "$limits_ok" == "1" ]]; then
+        system_check_row ok "limits" "nofile 1048576"
+    else
+        SYSTEM_CHECK_NEEDS_NETWORK=1
+        system_check_row miss "limits" "nofile/systemd limits не настроены"
+    fi
+
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        [[ "$(service_ok chrony)" == "1" ]] || service_issues+=("chrony")
+        [[ "$(service_ok irqbalance)" == "1" ]] || service_issues+=("irqbalance")
+        root_file_has_line /etc/default/cpufrequtils 'GOVERNOR="performance"' || service_issues+=("cpufrequtils")
+        if (( ${#service_issues[@]} == 0 )); then
+            system_check_row ok "node services" "chrony, irqbalance, performance"
+        else
+            SYSTEM_CHECK_NEEDS_NETWORK=1
+            system_check_row miss "node services" "нет: $(system_check_join "${service_issues[@]}")"
+        fi
+    fi
+}
+
+system_check_firewall() {
+    local ssh_port="$1"
+    local missing=() extra=()
+
+    if ! command_exists ufw; then
+        SYSTEM_CHECK_NEEDS_FIREWALL=1
+        system_check_row miss "ufw" "не установлен"
+        return 0
+    fi
+
+    if ufw_active; then
+        system_check_row ok "ufw" "active"
+    else
+        SYSTEM_CHECK_NEEDS_FIREWALL=1
+        system_check_row miss "ufw" "не active"
+    fi
+
+    ufw_rule_allowed "${ssh_port}/tcp" || missing+=("${ssh_port}/tcp")
+    ufw_rule_allowed "443/tcp" || missing+=("443/tcp")
+    ufw_rule_allowed "443/udp" || missing+=("443/udp")
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        ufw_rule_allowed "${NODE_PORT}/tcp" || missing+=("${NODE_PORT}/tcp")
+    elif ufw_rule_allowed "${NODE_PORT}/tcp"; then
+        extra+=("${NODE_PORT}/tcp")
+    fi
+
+    if (( ${#missing[@]} == 0 && ${#extra[@]} == 0 )); then
+        system_check_row ok "ufw rules" "$(ufw_allowed_ports)"
+    else
+        SYSTEM_CHECK_NEEDS_FIREWALL=1
+        if (( ${#missing[@]} > 0 && ${#extra[@]} > 0 )); then
+            system_check_row miss "ufw rules" "нет: $(system_check_join "${missing[@]}"); лишние: $(system_check_join "${extra[@]}")"
+        elif (( ${#missing[@]} > 0 )); then
+            system_check_row miss "ufw rules" "нет: $(system_check_join "${missing[@]}")"
+        else
+            system_check_row miss "ufw rules" "лишние: $(system_check_join "${extra[@]}")"
+        fi
+    fi
+}
+
+system_check_antiscanner() {
+    local rules enabled=0 details=()
+    rules="$(antiscanner_rules_count)"
+    "${SUDO[@]}" systemctl is-enabled --quiet antiscanner-update.service 2>/dev/null && enabled=1 || true
+
+    [[ -x "$ANTISCANNER_SCRIPT" ]] || details+=("скрипт")
+    [[ "$rules" =~ ^[0-9]+$ && "$rules" -gt 0 ]] || details+=("rules=${rules}")
+    [[ "$enabled" == "1" ]] || details+=("systemd")
+
+    if (( ${#details[@]} == 0 )); then
+        system_check_row ok "antiscanner" "${rules} rules"
+    else
+        SYSTEM_CHECK_NEEDS_ANTISCANNER=1
+        system_check_row miss "antiscanner" "нет: $(system_check_join "${details[@]}")"
+    fi
+}
+
+system_check_fail2ban() {
+    local missing=()
+
+    package_installed fail2ban || missing+=("package")
+    [[ "$(service_ok fail2ban)" == "1" ]] || missing+=("service")
+    [[ "$(file_ok /etc/fail2ban/jail.d/99-kto-sshd.conf)" == "1" ]] || missing+=("jail")
+
+    if (( ${#missing[@]} == 0 )); then
+        system_check_row ok "fail2ban" "ssh guard"
+    else
+        SYSTEM_CHECK_NEEDS_FAIL2BAN=1
+        system_check_row miss "fail2ban" "нет: $(system_check_join "${missing[@]}")"
+    fi
+}
+
+system_check_apply_missing() {
+    local ssh_port="$1"
+    local steps=0 started_at duration
+
+    (( SYSTEM_CHECK_NEEDS_PREPARE == 1 )) && steps=$(( steps + 1 ))
+    (( SYSTEM_CHECK_NEEDS_PACKAGES == 1 )) && steps=$(( steps + 1 ))
+    (( SYSTEM_CHECK_NEEDS_KERNEL == 1 )) && steps=$(( steps + 1 ))
+    (( SYSTEM_CHECK_NEEDS_NETWORK == 1 )) && steps=$(( steps + 1 ))
+    (( SYSTEM_CHECK_NEEDS_FIREWALL == 1 )) && steps=$(( steps + 1 ))
+    (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && steps=$(( steps + 1 ))
+    (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )) && steps=$(( steps + 1 ))
+
+    if (( steps == 0 )); then
+        ok "Недостающих действий нет."
+        return 0
+    fi
+
+    export NEEDRESTART_MODE=a
+    export NEEDRESTART_SUSPEND=1
+
+    started_at="$(date +%s)"
+    progress_start "$steps"
+    (( SYSTEM_CHECK_NEEDS_PREPARE == 1 )) && progress_step "Готовлю систему" opt_prepare_system
+    (( SYSTEM_CHECK_NEEDS_PACKAGES == 1 )) && progress_step "Ставлю пакеты" opt_install_packages
+    (( SYSTEM_CHECK_NEEDS_KERNEL == 1 )) && progress_step "Обновляю kernel" opt_liquorix_kernel
+    (( SYSTEM_CHECK_NEEDS_NETWORK == 1 )) && progress_step "Настраиваю сеть" opt_network_limits
+    (( SYSTEM_CHECK_NEEDS_FIREWALL == 1 )) && progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
+    (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && progress_step "Подключаю AntiScanner" opt_antiscanner
+    (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )) && progress_step "Настраиваю Fail2ban" opt_fail2ban
+
+    echo
+    duration=$(( $(date +%s) - started_at ))
+    ok "Недостающие блоки применены"
+    ok "Время: $(format_duration "$duration")"
+}
+
+system_check_pause() {
+    local answer
+    echo
+    echo -ne "${PURPLE}>${NC} ${BOLD}Нажмите Enter, чтобы вернуться:${NC} "
+    read -r answer
+}
+
+system_check() {
+    header
+    need_root
+    system_check_reset
+
+    local ssh_port choice
+    ssh_port="$(detect_ssh_port)"
+
+    echo -e "${BOLD}${PURPLE}[ ПРОВЕРКА СИСТЕМЫ ]${NC}"
+    print_row "mode" "$MACHINE_MODE"
+    if [[ "$MACHINE_MODE" == "node" ]]; then
+        print_row "profile" "$(node_profile_label)"
+    fi
+    print_row "ssh port" "$ssh_port"
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ OPTIMIZATION AUDIT ]${NC}"
+    system_check_prepare_state
+    system_check_packages
+    system_check_kernel
+    system_check_network_limits
+    system_check_firewall "$ssh_port"
+    system_check_antiscanner
+    system_check_fail2ban
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ВЫВОД ]${NC}"
+    if (( SYSTEM_CHECK_MISSING == 0 )); then
+        ok "Критичных недостающих блоков не найдено."
+        if (( SYSTEM_CHECK_WARNINGS > 0 )); then
+            warn "Есть предупреждения, но автоматического исправления не требуется."
+        fi
+        system_check_pause
+        return 0
+    fi
+
+    warn "Найдено блоков к исправлению: ${SYSTEM_CHECK_MISSING}"
+    if (( SYSTEM_CHECK_WARNINGS > 0 )); then
+        warn "Предупреждений: ${SYSTEM_CHECK_WARNINGS}"
+    fi
+    echo
+    echo -e "1) Исправить только недостающее"
+    echo -e "2) Запустить полную оптимизацию"
+    echo -e "0) Ничего не делать"
+    echo -e "${PURPLE}==========================================${NC}"
+    echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+    read -r choice
+
+    case "$choice" in
+        1)
+            system_check_apply_missing "$ssh_port"
+            ;;
+        2)
+            optimize_system
+            ;;
+        0)
+            ok "Оставил систему без изменений."
+            ;;
+        *)
+            fail "Неверный выбор"
+            ;;
+    esac
+
+    system_check_pause
 }
 
 optimize_system() {
@@ -2196,6 +2570,7 @@ main() {
         menu) menu ;;
         mode|config) reconfigure_machine_mode ;;
         settings) settings_menu ;;
+        check|system-check) system_check ;;
         optimize) optimize_system ;;
         common|install-all|up) install_common_stack ;;
         node|install-node) install_remnawave_node ;;
