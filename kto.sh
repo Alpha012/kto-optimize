@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.8"
+SCRIPT_VERSION="3.6.9"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -1200,8 +1200,20 @@ upsert_gcloud_host() {
     local node_uuid="$4"
     local host_remark="${5:-$GCLOUD_HOST_REMARK}"
     local reuse_by_address="${6:-1}"
+    local is_hidden="${7:-true}"
+    local fallback_host_remark="${8:-}"
     local uuid payload response
+    case "$is_hidden" in
+        true|false) ;;
+        *) is_hidden="true" ;;
+    esac
     uuid="$(remna_host_uuid_by_remark "$host_remark")"
+    if [[ -z "$uuid" && -n "$fallback_host_remark" ]]; then
+        uuid="$(remna_host_uuid_by_remark "$fallback_host_remark")"
+        if [[ -n "$uuid" ]]; then
+            echo "Google Cloud host: reuse by legacy remark ${fallback_host_remark}: ${uuid}" >> "$LOG_FILE"
+        fi
+    fi
     if [[ -z "$uuid" && "$reuse_by_address" == "1" ]]; then
         uuid="$(remna_host_uuid_by_address "$ip")"
         if [[ -n "$uuid" ]]; then
@@ -1217,6 +1229,7 @@ upsert_gcloud_host() {
         --arg profileUuid "$profile_uuid" \
         --arg inboundUuid "$inbound_uuid" \
         --arg nodeUuid "$node_uuid" \
+        --argjson isHidden "$is_hidden" \
         '{
           remark: $remark,
           address: $address,
@@ -1227,7 +1240,7 @@ upsert_gcloud_host() {
           },
           nodes: [$nodeUuid],
           isDisabled: true,
-          isHidden: true,
+          isHidden: $isHidden,
           securityLayer: "DEFAULT"
         } + (if $uuid != "" then {uuid: $uuid} else {} end)' > "$payload"
 
@@ -1369,6 +1382,14 @@ gcloud_node_inbound_tag() {
 }
 
 gcloud_node_host_remark() {
+    case "$1" in
+        fi) echo "🇫🇮 Supercell (DC-1) 2" ;;
+        ge) echo "🇩🇪 Supercell (DC-2) 2" ;;
+        sw) echo "🇸🇪 Supercell (DC-5) 2" ;;
+    esac
+}
+
+gcloud_node_legacy_host_remark() {
     case "$1" in
         fi) echo "🇫🇮 Supercell (DC-1)" ;;
         ge) echo "🇩🇪 Supercell (DC-2)" ;;
@@ -2733,7 +2754,7 @@ install_google_cloud_node_stack() {
     require_reality_profile
     need_root
 
-    local dc label profile_name inbound_tag host_remark node_name country_code
+    local dc label profile_name inbound_tag host_remark legacy_host_remark node_name country_code
     local domain started_at duration secret ip key_json private_key
     local profile_uuid inbound_uuid node_uuid host_uuid
 
@@ -2746,6 +2767,7 @@ install_google_cloud_node_stack() {
     profile_name="$(gcloud_node_profile_name "$dc")"
     inbound_tag="$(gcloud_node_inbound_tag "$dc")"
     host_remark="$(gcloud_node_host_remark "$dc")"
+    legacy_host_remark="$(gcloud_node_legacy_host_remark "$dc")"
     node_name="$(gcloud_node_name "$dc")"
     country_code="$(gcloud_node_country_code "$dc")"
 
@@ -2795,7 +2817,7 @@ install_google_cloud_node_stack() {
     do_install_selfsteal "$domain"
 
     stage "Хост ${host_remark}"
-    host_uuid="$(upsert_gcloud_host "$ip" "$profile_uuid" "$inbound_uuid" "$node_uuid" "$host_remark" "0")"
+    host_uuid="$(upsert_gcloud_host "$ip" "$profile_uuid" "$inbound_uuid" "$node_uuid" "$host_remark" "0" "false" "$legacy_host_remark")"
     if [[ -z "$host_uuid" ]]; then
         fail "Не получил UUID хоста"
         exit 1
@@ -2812,7 +2834,7 @@ install_google_cloud_node_stack() {
     ok "Профиль: ${profile_name}"
     ok "Inbound: ${inbound_tag}"
     ok "Нода: ${node_name}"
-    ok "Хост: ${host_remark} (disabled, hidden)"
+    ok "Хост: ${host_remark} (disabled, visible)"
     ok "IP: ${ip}"
     ok "Время: $(format_duration "$duration")"
 }
