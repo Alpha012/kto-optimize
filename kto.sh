@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.11"
+SCRIPT_VERSION="3.6.12"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -826,7 +826,7 @@ ask_ipv4() {
     local prompt="${1:-Введите IP}"
     local ip
     while true; do
-        echo -e "${PURPLE}>${NC} ${BOLD}${prompt}${NC}" >&2
+        printf '%s: ' "$prompt" >&2
         read -r ip
         if validate_ipv4 "$ip"; then
             echo "$ip"
