@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.6"
+SCRIPT_VERSION="3.6.7"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -976,7 +976,7 @@ remna_enable_node() {
     remna_api POST "/api/nodes/${uuid}/actions/enable" >/dev/null || true
 }
 
-build_gcloud_profile_config() {
+build_gcloud_battles_profile_config() {
     local private_key="$1"
     local domain="$2"
     local inbound_tag="${3:-$GCLOUD_INBOUND_TAG}"
@@ -1031,16 +1031,97 @@ build_gcloud_profile_config() {
         }'
 }
 
+build_gcloud_node_profile_config() {
+    local private_key="$1"
+    local domain="$2"
+    local inbound_tag="$3"
+
+    jq -n \
+        --arg tag "$inbound_tag" \
+        --arg privateKey "$private_key" \
+        --arg domain "$domain" \
+        '{
+          log: {loglevel: "none"},
+          dns: {servers: ["1.1.1.1"]},
+          inbounds: [
+            {
+              tag: $tag,
+              port: 443,
+              listen: "0.0.0.0",
+              protocol: "vless",
+              settings: {clients: [], decryption: "none"},
+              sniffing: {enabled: false, destOverride: ["quic", "tls", "http"]},
+              streamSettings: {
+                network: "raw",
+                security: "reality",
+                realitySettings: {
+                  show: false,
+                  xver: 0,
+                  target: "127.0.0.1:9443",
+                  shortIds: [""],
+                  privateKey: $privateKey,
+                  fingerprint: "qq",
+                  serverNames: [$domain]
+                }
+              }
+            }
+          ],
+          outbounds: [
+            {tag: "DIRECT", protocol: "freedom", settings: {domainStrategy: "AsIs"}},
+            {tag: "BLOCK", protocol: "blackhole"},
+            {
+              tag: "WARP",
+              protocol: "freedom",
+              settings: {domainStrategy: "UseIP"},
+              streamSettings: {sockopt: {interface: "warp", tcpFastOpen: true}}
+            }
+          ],
+          routing: {
+            rules: [
+              {
+                domain: [
+                  "domain:game.brawlstarsgame.com",
+                  "domain:supercell.com",
+                  "domain:supercell.io",
+                  "keyword:brawlstars",
+                  "keyword:supercell",
+                  "regexp:supercell",
+                  "regexp:assets"
+                ],
+                outboundTag: "DIRECT"
+              },
+              {port: "9339", outboundTag: "DIRECT"},
+              {
+                domain: [
+                  "bsd.meowfox.net",
+                  "bsdtest.meowfox.net"
+                ],
+                outboundTag: "DIRECT"
+              },
+              {ip: ["geoip:private"], outboundTag: "BLOCK"},
+              {protocol: ["bittorrent"], outboundTag: "BLOCK"},
+              {network: "udp", outboundTag: "DIRECT"},
+              {network: "tcp", outboundTag: "BLOCK"}
+            ]
+          }
+        }'
+}
+
 upsert_gcloud_profile() {
     local profile_name="${1:-$GCLOUD_PROFILE_NAME}"
     local private_key="$2"
     local domain="$3"
     local inbound_tag="${4:-$GCLOUD_INBOUND_TAG}"
+    local profile_kind="${5:-battles}"
     local uuid config_file payload response
     uuid="$(remna_profile_uuid_by_name "$profile_name")"
     config_file="$(mktemp)"
     payload="$(mktemp)"
-    build_gcloud_profile_config "$private_key" "$domain" "$inbound_tag" > "$config_file"
+    if [[ "$profile_kind" == "node" ]]; then
+        build_gcloud_node_profile_config "$private_key" "$domain" "$inbound_tag" > "$config_file"
+    else
+        build_gcloud_battles_profile_config "$private_key" "$domain" "$inbound_tag" > "$config_file"
+    fi
 
     if [[ -n "$uuid" ]]; then
         jq -n --arg uuid "$uuid" --arg name "$profile_name" --slurpfile config "$config_file" \
@@ -2590,7 +2671,7 @@ install_google_cloud_battles_stack() {
     ip="$(external_ipv4)"
 
     stage "Профиль ${GCLOUD_PROFILE_NAME}"
-    profile_uuid="$(upsert_gcloud_profile "$GCLOUD_PROFILE_NAME" "$private_key" "$domain" "$GCLOUD_INBOUND_TAG")"
+    profile_uuid="$(upsert_gcloud_profile "$GCLOUD_PROFILE_NAME" "$private_key" "$domain" "$GCLOUD_INBOUND_TAG" "battles")"
     inbound_uuid="$(gcloud_inbound_uuid "$profile_uuid" "$GCLOUD_INBOUND_TAG")"
     if [[ -z "$profile_uuid" || -z "$inbound_uuid" ]]; then
         fail "Не получил inbound ${GCLOUD_INBOUND_TAG}"
@@ -2695,7 +2776,7 @@ install_google_cloud_node_stack() {
     ip="$(external_ipv4)"
 
     stage "Профиль ${profile_name}"
-    profile_uuid="$(upsert_gcloud_profile "$profile_name" "$private_key" "$domain" "$inbound_tag")"
+    profile_uuid="$(upsert_gcloud_profile "$profile_name" "$private_key" "$domain" "$inbound_tag" "node")"
     inbound_uuid="$(gcloud_inbound_uuid "$profile_uuid" "$inbound_tag")"
     if [[ -z "$profile_uuid" || -z "$inbound_uuid" ]]; then
         fail "Не получил inbound ${inbound_tag}"
