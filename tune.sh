@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.5.1"
+SCRIPT_VERSION="3.6.0"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -16,11 +16,13 @@ MACHINE_MODE="${KTO_MACHINE_MODE:-}"
 NODE_PROFILE="${KTO_NODE_PROFILE:-}"
 REMNA_API_URL="${KTO_REMNA_API_URL:-https://admin.ktoygaday.xyz}"
 REMNA_API_TOKEN="${KTO_REMNA_API_TOKEN:-}"
-GCLOUD_PROFILE_NAME="VLESS-Codex-Test"
-GCLOUD_INBOUND_TAG="VLESS_CODEX_TEST"
-GCLOUD_NODE_NAME="CODEX_FIN_TEST"
-GCLOUD_HOST_REMARK="Finland-Battles-Codex"
-GCLOUD_TARGET_PROFILE_NAME="VLESS-Test-DNS"
+GCLOUD_PROFILE_NAME="VLESS-GCloud-Codex"
+GCLOUD_INBOUND_TAG="VLESS_GCLOUD_CODEX"
+GCLOUD_NODE_NAME="🇫🇮 Google Cloud by Codex"
+GCLOUD_HOST_REMARK="Finland Battles by Codex"
+GCLOUD_TARGET_PROFILES_DEFAULT="VLESS-Test-DNS"
+GCLOUD_TARGET_PROFILES_NONE="__none__"
+GCLOUD_TARGET_PROFILES="${KTO_GCLOUD_TARGET_PROFILES:-}"
 GCLOUD_TARGET_OUTBOUND_TAG="Finland"
 GCLOUD_USERNAME="mash"
 if [[ -n "${KTO_LOG_FILE:-}" ]]; then
@@ -311,8 +313,46 @@ escape_config_value() {
     echo "$value"
 }
 
+gcloud_target_profiles_list() {
+    local raw="${GCLOUD_TARGET_PROFILES:-$GCLOUD_TARGET_PROFILES_DEFAULT}"
+    [[ "$raw" == "$GCLOUD_TARGET_PROFILES_NONE" ]] && return 0
+    printf '%s\n' "$raw" | tr '|' '\n' | sed '/^[[:space:]]*$/d'
+}
+
+gcloud_target_profiles_display() {
+    local profiles
+    profiles="$(gcloud_target_profiles_list | awk 'BEGIN{out=""} {out = out ? out ", " $0 : $0} END{print out}')"
+    echo "${profiles:-нет}"
+}
+
+gcloud_target_profile_exists() {
+    local name="$1"
+    gcloud_target_profiles_list | grep -Fxq "$name"
+}
+
+gcloud_add_target_profile() {
+    local name="$1"
+    [[ -n "$name" ]] || return 1
+    if gcloud_target_profile_exists "$name"; then
+        return 0
+    fi
+    if [[ -n "${GCLOUD_TARGET_PROFILES:-}" && "$GCLOUD_TARGET_PROFILES" != "$GCLOUD_TARGET_PROFILES_NONE" ]]; then
+        GCLOUD_TARGET_PROFILES="${GCLOUD_TARGET_PROFILES}|${name}"
+    else
+        GCLOUD_TARGET_PROFILES="$name"
+    fi
+}
+
+gcloud_remove_target_profile() {
+    local name="$1"
+    GCLOUD_TARGET_PROFILES="$(gcloud_target_profiles_list | awk -v name="$name" 'BEGIN{out=""} $0 != name {out = out ? out "|" $0 : $0} END{print out}')"
+    if [[ -z "$GCLOUD_TARGET_PROFILES" ]]; then
+        GCLOUD_TARGET_PROFILES="$GCLOUD_TARGET_PROFILES_NONE"
+    fi
+}
+
 load_machine_mode() {
-    local saved_mode="" saved_profile="" saved_api_url="" saved_api_token="" source_file="$CONFIG_FILE"
+    local saved_mode="" saved_profile="" saved_api_url="" saved_api_token="" saved_gcloud_targets="" source_file="$CONFIG_FILE"
     CONFIG_SOURCE_FILE=""
 
     if [[ -n "$MACHINE_MODE" ]]; then
@@ -354,23 +394,33 @@ load_machine_mode() {
         REMNA_API_TOKEN="$saved_api_token"
     fi
 
+    saved_gcloud_targets="$(config_get GCLOUD_TARGET_PROFILES "$source_file")"
+    if [[ -z "${KTO_GCLOUD_TARGET_PROFILES+x}" && -n "$saved_gcloud_targets" ]]; then
+        GCLOUD_TARGET_PROFILES="$saved_gcloud_targets"
+    fi
+    if [[ -z "${GCLOUD_TARGET_PROFILES:-}" ]]; then
+        GCLOUD_TARGET_PROFILES="$GCLOUD_TARGET_PROFILES_DEFAULT"
+    fi
+
     if [[ "$MACHINE_MODE" != "node" ]]; then
         NODE_PROFILE=""
     fi
 }
 
 save_machine_mode() {
-    local safe_mode safe_profile safe_url safe_token
+    local safe_mode safe_profile safe_url safe_token safe_gcloud_targets
     safe_mode="$(escape_config_value "$MACHINE_MODE")"
     safe_profile="$(escape_config_value "$NODE_PROFILE")"
     safe_url="$(escape_config_value "$REMNA_API_URL")"
     safe_token="$(escape_config_value "$REMNA_API_TOKEN")"
+    safe_gcloud_targets="$(escape_config_value "${GCLOUD_TARGET_PROFILES:-$GCLOUD_TARGET_PROFILES_DEFAULT}")"
 
     write_root_file_mode 0600 "$CONFIG_FILE" <<EOF
 MACHINE_MODE="$safe_mode"
 NODE_PROFILE="$safe_profile"
 REMNA_API_URL="$safe_url"
 REMNA_API_TOKEN="$safe_token"
+GCLOUD_TARGET_PROFILES="$safe_gcloud_targets"
 EOF
 }
 
@@ -510,6 +560,97 @@ reconfigure_machine_mode() {
         echo
         ok "Настройки не изменились"
     fi
+}
+
+configure_gcloud_target_profiles() {
+    local choice profile
+
+    need_root
+    while true; do
+        header
+        echo -e "${BOLD}${PURPLE}[ РЕДАКТИРУЕМЫЕ ПРОФИЛИ ]${NC}"
+        echo -e "Текущие: $(gcloud_target_profiles_display)"
+        echo
+        echo -e "1) Изменить"
+        echo -e "2) Удалить"
+        echo -e "0) Выйти"
+        echo -e "${PURPLE}==========================================${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+        read -r choice
+
+        case "$choice" in
+            1)
+                while true; do
+                    printf 'Добавить профиль: '
+                    read -r profile
+                    if [[ "$profile" == "0" ]]; then
+                        break
+                    fi
+                    if [[ -z "$profile" ]]; then
+                        fail "Название пустое"
+                        continue
+                    fi
+                    gcloud_add_target_profile "$profile"
+                    save_machine_mode
+                    ok "Добавлено: ${profile}"
+                done
+                ;;
+            2)
+                printf 'Удалить профиль: '
+                read -r profile
+                if [[ "$profile" == "0" ]]; then
+                    continue
+                fi
+                if [[ -z "$profile" ]]; then
+                    fail "Название пустое"
+                    sleep 1
+                    continue
+                fi
+                gcloud_remove_target_profile "$profile"
+                save_machine_mode
+                ok "Больше не меняю: ${profile}"
+                sleep 1
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                fail "Неверный выбор"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+settings_menu() {
+    local choice
+
+    while true; do
+        header
+        echo -e "${BOLD}${PURPLE}[ НАСТРОЙКИ ]${NC}"
+        echo -e "1) Изменение режима"
+        echo -e "2) Изменение редактируемых профилей"
+        echo -e "0) Выйти"
+        echo -e "${PURPLE}==========================================${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+        read -r choice
+
+        case "$choice" in
+            1)
+                reconfigure_machine_mode
+                ;;
+            2)
+                configure_gcloud_target_profiles
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                fail "Неверный выбор"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 ensure_machine_mode() {
@@ -983,7 +1124,8 @@ upsert_gcloud_host() {
             configProfileInboundUuid: $inboundUuid
           },
           nodes: [$nodeUuid],
-          isDisabled: false,
+          isDisabled: true,
+          isHidden: true,
           securityLayer: "DEFAULT"
         } + (if $uuid != "" then {uuid: $uuid} else {} end)' > "$payload"
 
@@ -1012,15 +1154,16 @@ remna_user_vless_uuid() {
 }
 
 patch_gcloud_target_profile() {
-    local ip="$1"
-    local public_key="$2"
-    local domain="$3"
-    local vless_uuid="$4"
+    local target_name="$1"
+    local ip="$2"
+    local public_key="$3"
+    local domain="$4"
+    local vless_uuid="$5"
     local profiles target_uuid target_config patched_config payload response
     profiles="$(remna_api GET /api/config-profiles)"
-    target_uuid="$(echo "$profiles" | jq -r --arg name "$GCLOUD_TARGET_PROFILE_NAME" '.response.configProfiles[]? | select(.name == $name) | .uuid' | head -n 1)"
+    target_uuid="$(echo "$profiles" | jq -r --arg name "$target_name" '.response.configProfiles[]? | select(.name == $name) | .uuid' | head -n 1)"
     if [[ -z "$target_uuid" ]]; then
-        fail "Профиль ${GCLOUD_TARGET_PROFILE_NAME} не найден"
+        fail "Профиль ${target_name} не найден"
         return 1
     fi
 
@@ -1028,12 +1171,12 @@ patch_gcloud_target_profile() {
     patched_config="$(mktemp)"
     payload="$(mktemp)"
 
-    echo "$profiles" | jq --arg name "$GCLOUD_TARGET_PROFILE_NAME" \
+    echo "$profiles" | jq --arg name "$target_name" \
         '.response.configProfiles[] | select(.name == $name) | .config' > "$target_config"
 
     if ! jq -e --arg tag "$GCLOUD_TARGET_OUTBOUND_TAG" '.outbounds[]? | select(.tag == $tag)' "$target_config" >/dev/null; then
         rm -f "$target_config" "$patched_config" "$payload"
-        fail "Outbound ${GCLOUD_TARGET_OUTBOUND_TAG} не найден в ${GCLOUD_TARGET_PROFILE_NAME}"
+        fail "Outbound ${GCLOUD_TARGET_OUTBOUND_TAG} не найден в ${target_name}"
         return 1
     fi
 
@@ -1059,7 +1202,7 @@ patch_gcloud_target_profile() {
           else . end
         )' "$target_config" > "$patched_config"
 
-    jq -n --arg uuid "$target_uuid" --arg name "$GCLOUD_TARGET_PROFILE_NAME" --slurpfile config "$patched_config" \
+    jq -n --arg uuid "$target_uuid" --arg name "$target_name" --slurpfile config "$patched_config" \
         '{uuid: $uuid, name: $name, config: $config[0]}' > "$payload"
     response="$(remna_api PATCH /api/config-profiles "$payload")"
     rm -f "$target_config" "$patched_config" "$payload"
@@ -1661,7 +1804,8 @@ install_google_cloud_stack() {
     require_reality_profile
     need_root
     local domain started_at duration secret ip key_json public_key private_key
-    local profile_uuid inbound_uuid node_uuid host_uuid vless_uuid
+    local profile_uuid inbound_uuid node_uuid host_uuid vless_uuid target_profile
+    local target_profiles=()
 
     domain="$(ask_domain "Введите домен")"
     started_at="$(date +%s)"
@@ -1721,20 +1865,28 @@ install_google_cloud_stack() {
         exit 1
     fi
 
-    stage "Патчу ${GCLOUD_TARGET_PROFILE_NAME}"
+    stage "Патчу профили"
     vless_uuid="$(remna_user_vless_uuid "$GCLOUD_USERNAME")"
     if [[ -z "$vless_uuid" ]]; then
         fail "Не получил VLESS UUID пользователя ${GCLOUD_USERNAME}"
         exit 1
     fi
-    patch_gcloud_target_profile "$ip" "$public_key" "$domain" "$vless_uuid"
+    mapfile -t target_profiles < <(gcloud_target_profiles_list)
+    if (( ${#target_profiles[@]} == 0 )); then
+        fail "Редактируемые профили не заданы"
+        exit 1
+    fi
+    for target_profile in "${target_profiles[@]}"; do
+        stage "Патчу ${target_profile}"
+        patch_gcloud_target_profile "$target_profile" "$ip" "$public_key" "$domain" "$vless_uuid"
+    done
 
     duration=$(( $(date +%s) - started_at ))
     echo
     ok "Google Cloud готов"
     ok "Нода: ${GCLOUD_NODE_NAME}"
     ok "Хост: ${GCLOUD_HOST_REMARK}"
-    ok "Патч: ${GCLOUD_TARGET_PROFILE_NAME} / ${GCLOUD_TARGET_OUTBOUND_TAG}"
+    ok "Патч: $(gcloud_target_profiles_display) / ${GCLOUD_TARGET_OUTBOUND_TAG}"
     ok "IP: ${ip}"
     ok "Время: $(format_duration "$duration")"
 }
@@ -2027,7 +2179,7 @@ menu() {
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
-        settings) reconfigure_machine_mode ;;
+        settings) settings_menu ;;
         google-cloud) install_google_cloud_stack ;;
         *) fail "Неверный выбор" ;;
     esac
@@ -2039,7 +2191,8 @@ main() {
 
     case "${1:-menu}" in
         menu) menu ;;
-        mode|config|settings) reconfigure_machine_mode ;;
+        mode|config) reconfigure_machine_mode ;;
+        settings) settings_menu ;;
         optimize) optimize_system ;;
         common|install-all|up) install_common_stack ;;
         node|install-node) install_remnawave_node ;;
