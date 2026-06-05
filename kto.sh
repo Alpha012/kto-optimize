@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.7"
+SCRIPT_VERSION="3.6.8"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -1405,14 +1405,14 @@ select_gcloud_node_dc() {
     fi
 
     while true; do
-        header
-        echo -e "${BOLD}${PURPLE}[ GOOGLE CLOUD NODE ]${NC}"
-        echo -e "1) Finland"
-        echo -e "2) Germany"
-        echo -e "3) Sweden"
-        echo -e "0) Выйти"
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите DC:${NC} "
+        header >&2
+        echo -e "${BOLD}${PURPLE}[ GOOGLE CLOUD NODE ]${NC}" >&2
+        echo -e "1) Finland" >&2
+        echo -e "2) Germany" >&2
+        echo -e "3) Sweden" >&2
+        echo -e "0) Выйти" >&2
+        echo -e "${PURPLE}==========================================${NC}" >&2
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите DC:${NC} " >&2
         read -r choice
 
         case "$choice" in
