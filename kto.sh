@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.5"
+SCRIPT_VERSION="3.6.6"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -979,9 +979,10 @@ remna_enable_node() {
 build_gcloud_profile_config() {
     local private_key="$1"
     local domain="$2"
+    local inbound_tag="${3:-$GCLOUD_INBOUND_TAG}"
 
     jq -n \
-        --arg tag "$GCLOUD_INBOUND_TAG" \
+        --arg tag "$inbound_tag" \
         --arg privateKey "$private_key" \
         --arg domain "$domain" \
         '{
@@ -1031,20 +1032,22 @@ build_gcloud_profile_config() {
 }
 
 upsert_gcloud_profile() {
-    local private_key="$1"
-    local domain="$2"
+    local profile_name="${1:-$GCLOUD_PROFILE_NAME}"
+    local private_key="$2"
+    local domain="$3"
+    local inbound_tag="${4:-$GCLOUD_INBOUND_TAG}"
     local uuid config_file payload response
-    uuid="$(remna_profile_uuid_by_name "$GCLOUD_PROFILE_NAME")"
+    uuid="$(remna_profile_uuid_by_name "$profile_name")"
     config_file="$(mktemp)"
     payload="$(mktemp)"
-    build_gcloud_profile_config "$private_key" "$domain" > "$config_file"
+    build_gcloud_profile_config "$private_key" "$domain" "$inbound_tag" > "$config_file"
 
     if [[ -n "$uuid" ]]; then
-        jq -n --arg uuid "$uuid" --arg name "$GCLOUD_PROFILE_NAME" --slurpfile config "$config_file" \
+        jq -n --arg uuid "$uuid" --arg name "$profile_name" --slurpfile config "$config_file" \
             '{uuid: $uuid, name: $name, config: $config[0]}' > "$payload"
         response="$(remna_api PATCH /api/config-profiles "$payload")"
     else
-        jq -n --arg name "$GCLOUD_PROFILE_NAME" --slurpfile config "$config_file" \
+        jq -n --arg name "$profile_name" --slurpfile config "$config_file" \
             '{name: $name, config: $config[0]}' > "$payload"
         response="$(remna_api POST /api/config-profiles "$payload")"
     fi
@@ -1055,8 +1058,9 @@ upsert_gcloud_profile() {
 
 gcloud_inbound_uuid() {
     local profile_uuid="$1"
+    local inbound_tag="${2:-$GCLOUD_INBOUND_TAG}"
     remna_api GET "/api/config-profiles/${profile_uuid}/inbounds" \
-        | jq -r --arg tag "$GCLOUD_INBOUND_TAG" '.response.inbounds[]? | select(.tag == $tag) | .uuid' \
+        | jq -r --arg tag "$inbound_tag" '.response.inbounds[]? | select(.tag == $tag) | .uuid' \
         | head -n 1
 }
 
@@ -1064,9 +1068,12 @@ upsert_gcloud_node() {
     local ip="$1"
     local profile_uuid="$2"
     local inbound_uuid="$3"
+    local node_name="${4:-$GCLOUD_NODE_NAME}"
+    local country_code="${5:-FI}"
+    local reuse_by_address="${6:-1}"
     local uuid payload response
-    uuid="$(remna_node_uuid_by_name "$GCLOUD_NODE_NAME")"
-    if [[ -z "$uuid" ]]; then
+    uuid="$(remna_node_uuid_by_name "$node_name")"
+    if [[ -z "$uuid" && "$reuse_by_address" == "1" ]]; then
         uuid="$(remna_node_uuid_by_address "$ip")"
         if [[ -n "$uuid" ]]; then
             echo "Google Cloud node: reuse by address ${ip}: ${uuid}" >> "$LOG_FILE"
@@ -1076,8 +1083,9 @@ upsert_gcloud_node() {
 
     jq -n \
         --arg uuid "$uuid" \
-        --arg name "$GCLOUD_NODE_NAME" \
+        --arg name "$node_name" \
         --arg address "$ip" \
+        --arg countryCode "$country_code" \
         --arg profileUuid "$profile_uuid" \
         --arg inboundUuid "$inbound_uuid" \
         --argjson port "$NODE_PORT" \
@@ -1085,7 +1093,7 @@ upsert_gcloud_node() {
           name: $name,
           address: $address,
           port: $port,
-          countryCode: "FI",
+          countryCode: $countryCode,
           isTrafficTrackingActive: false,
           configProfile: {
             activeConfigProfileUuid: $profileUuid,
@@ -1109,9 +1117,11 @@ upsert_gcloud_host() {
     local profile_uuid="$2"
     local inbound_uuid="$3"
     local node_uuid="$4"
+    local host_remark="${5:-$GCLOUD_HOST_REMARK}"
+    local reuse_by_address="${6:-1}"
     local uuid payload response
-    uuid="$(remna_host_uuid_by_remark "$GCLOUD_HOST_REMARK")"
-    if [[ -z "$uuid" ]]; then
+    uuid="$(remna_host_uuid_by_remark "$host_remark")"
+    if [[ -z "$uuid" && "$reuse_by_address" == "1" ]]; then
         uuid="$(remna_host_uuid_by_address "$ip")"
         if [[ -n "$uuid" ]]; then
             echo "Google Cloud host: reuse by address ${ip}: ${uuid}" >> "$LOG_FILE"
@@ -1121,7 +1131,7 @@ upsert_gcloud_host() {
 
     jq -n \
         --arg uuid "$uuid" \
-        --arg remark "$GCLOUD_HOST_REMARK" \
+        --arg remark "$host_remark" \
         --arg address "$ip" \
         --arg profileUuid "$profile_uuid" \
         --arg inboundUuid "$inbound_uuid" \
@@ -1231,8 +1241,110 @@ wait_gcloud_node_online() {
         fi
         sleep 5
     done
-    warn "Нода ${name} пока не online. Профиль Finland не трогаю."
+    warn "Нода ${name} пока не online."
     return 1
+}
+
+valid_gcloud_node_dc() {
+    case "$1" in
+        fi|finland|FI|Finland) return 0 ;;
+        ge|de|germany|GE|DE|Germany) return 0 ;;
+        sw|se|sweden|SW|SE|Sweden) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+normalize_gcloud_node_dc() {
+    case "$1" in
+        fi|finland|FI|Finland) echo "fi" ;;
+        ge|de|germany|GE|DE|Germany) echo "ge" ;;
+        sw|se|sweden|SW|SE|Sweden) echo "sw" ;;
+        *) return 1 ;;
+    esac
+}
+
+gcloud_node_dc_label() {
+    case "$1" in
+        fi) echo "Finland" ;;
+        ge) echo "Germany" ;;
+        sw) echo "Sweden" ;;
+    esac
+}
+
+gcloud_node_profile_name() {
+    case "$1" in
+        fi) echo "VLESS-GCloud-FI" ;;
+        ge) echo "VLESS-GCloud-GE" ;;
+        sw) echo "VLESS-GCloud-SW" ;;
+    esac
+}
+
+gcloud_node_inbound_tag() {
+    case "$1" in
+        fi) echo "VLESS_FINLAND_CODEX_GCLOUD" ;;
+        ge) echo "VLESS_GERMANY_CODEX_GCLOUD" ;;
+        sw) echo "VLESS_SWEDEN_CODEX_GCLOUD" ;;
+    esac
+}
+
+gcloud_node_host_remark() {
+    case "$1" in
+        fi) echo "🇫🇮 Supercell (DC-1)" ;;
+        ge) echo "🇩🇪 Supercell (DC-2)" ;;
+        sw) echo "🇸🇪 Supercell (DC-5)" ;;
+    esac
+}
+
+gcloud_node_name() {
+    case "$1" in
+        fi) echo "СУПЕРСЕЛЛ-ДЦ-F" ;;
+        ge) echo "СУПЕРСЕЛЛ-ДЦ-G" ;;
+        sw) echo "СУПЕРСЕЛЛ-ДЦ-S" ;;
+    esac
+}
+
+gcloud_node_country_code() {
+    case "$1" in
+        fi) echo "FI" ;;
+        ge) echo "DE" ;;
+        sw) echo "SE" ;;
+    esac
+}
+
+select_gcloud_node_dc() {
+    local preset="${1:-}"
+    local choice
+
+    if [[ -n "$preset" ]]; then
+        if ! normalize_gcloud_node_dc "$preset"; then
+            fail "DC должен быть fi, ge/de или sw/se."
+            return 1
+        fi
+        return 0
+    fi
+
+    while true; do
+        header
+        echo -e "${BOLD}${PURPLE}[ GOOGLE CLOUD NODE ]${NC}"
+        echo -e "1) Finland"
+        echo -e "2) Germany"
+        echo -e "3) Sweden"
+        echo -e "0) Выйти"
+        echo -e "${PURPLE}==========================================${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите DC:${NC} "
+        read -r choice
+
+        case "$choice" in
+            1) echo "fi"; return 0 ;;
+            2) echo "ge"; return 0 ;;
+            3) echo "sw"; return 0 ;;
+            0) return 1 ;;
+            *)
+                fail "Неверный выбор"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 install_antiscanner() {
@@ -2442,7 +2554,7 @@ install_common_stack() {
     ok "Время: $(format_duration "$duration")"
 }
 
-install_google_cloud_stack() {
+install_google_cloud_battles_stack() {
     header
     require_reality_profile
     need_root
@@ -2454,7 +2566,7 @@ install_google_cloud_stack() {
     started_at="$(date +%s)"
     echo
 
-    stage "Готовлю Google Cloud"
+    stage "Готовлю Google Cloud (Battles)"
     apt_update_quiet
     apt_install_quiet curl jq
     ensure_remna_api_config
@@ -2478,15 +2590,15 @@ install_google_cloud_stack() {
     ip="$(external_ipv4)"
 
     stage "Профиль ${GCLOUD_PROFILE_NAME}"
-    profile_uuid="$(upsert_gcloud_profile "$private_key" "$domain")"
-    inbound_uuid="$(gcloud_inbound_uuid "$profile_uuid")"
+    profile_uuid="$(upsert_gcloud_profile "$GCLOUD_PROFILE_NAME" "$private_key" "$domain" "$GCLOUD_INBOUND_TAG")"
+    inbound_uuid="$(gcloud_inbound_uuid "$profile_uuid" "$GCLOUD_INBOUND_TAG")"
     if [[ -z "$profile_uuid" || -z "$inbound_uuid" ]]; then
         fail "Не получил inbound ${GCLOUD_INBOUND_TAG}"
         exit 1
     fi
 
     stage "Нода ${GCLOUD_NODE_NAME}"
-    node_uuid="$(upsert_gcloud_node "$ip" "$profile_uuid" "$inbound_uuid")"
+    node_uuid="$(upsert_gcloud_node "$ip" "$profile_uuid" "$inbound_uuid" "$GCLOUD_NODE_NAME" "FI" "1")"
     if [[ -z "$node_uuid" ]]; then
         fail "Не получил UUID ноды"
         exit 1
@@ -2497,7 +2609,7 @@ install_google_cloud_stack() {
     do_install_selfsteal "$domain"
 
     stage "Хост ${GCLOUD_HOST_REMARK}"
-    host_uuid="$(upsert_gcloud_host "$ip" "$profile_uuid" "$inbound_uuid" "$node_uuid")"
+    host_uuid="$(upsert_gcloud_host "$ip" "$profile_uuid" "$inbound_uuid" "$node_uuid" "$GCLOUD_HOST_REMARK" "1")"
     if [[ -z "$host_uuid" ]]; then
         fail "Не получил UUID хоста"
         exit 1
@@ -2526,12 +2638,106 @@ install_google_cloud_stack() {
 
     duration=$(( $(date +%s) - started_at ))
     echo
-    ok "Google Cloud готов"
+    ok "Google Cloud (Battles) готов"
     ok "Нода: ${GCLOUD_NODE_NAME}"
     ok "Хост: ${GCLOUD_HOST_REMARK}"
     ok "Патч: $(gcloud_target_profiles_display) / ${GCLOUD_TARGET_OUTBOUND_TAG}"
     ok "IP: ${ip}"
     ok "Время: $(format_duration "$duration")"
+}
+
+install_google_cloud_node_stack() {
+    local preset_dc="${1:-}"
+    header
+    require_reality_profile
+    need_root
+
+    local dc label profile_name inbound_tag host_remark node_name country_code
+    local domain started_at duration secret ip key_json private_key
+    local profile_uuid inbound_uuid node_uuid host_uuid
+
+    if ! dc="$(select_gcloud_node_dc "$preset_dc")"; then
+        ok "Google Cloud (Node) отменен"
+        return 0
+    fi
+
+    label="$(gcloud_node_dc_label "$dc")"
+    profile_name="$(gcloud_node_profile_name "$dc")"
+    inbound_tag="$(gcloud_node_inbound_tag "$dc")"
+    host_remark="$(gcloud_node_host_remark "$dc")"
+    node_name="$(gcloud_node_name "$dc")"
+    country_code="$(gcloud_node_country_code "$dc")"
+
+    domain="$(ask_domain "Введите домен")"
+    started_at="$(date +%s)"
+    echo
+
+    stage "Готовлю Google Cloud (Node / ${label})"
+    apt_update_quiet
+    apt_install_quiet curl jq
+    ensure_remna_api_config
+    remna_api GET /api/system/health >/dev/null
+
+    stage "Генерирую ключи"
+    secret="$(remna_api GET /api/keygen | jq -r '.response.pubKey // empty')"
+    if [[ -z "$secret" ]]; then
+        fail "Не получил SECRET_KEY из панели"
+        exit 1
+    fi
+
+    key_json="$(remna_api GET /api/system/tools/x25519/generate)"
+    private_key="$(echo "$key_json" | jq -r '.response.keypairs[0].privateKey // empty')"
+    if [[ -z "$private_key" ]]; then
+        fail "Не получил Reality private key"
+        exit 1
+    fi
+
+    ip="$(external_ipv4)"
+
+    stage "Профиль ${profile_name}"
+    profile_uuid="$(upsert_gcloud_profile "$profile_name" "$private_key" "$domain" "$inbound_tag")"
+    inbound_uuid="$(gcloud_inbound_uuid "$profile_uuid" "$inbound_tag")"
+    if [[ -z "$profile_uuid" || -z "$inbound_uuid" ]]; then
+        fail "Не получил inbound ${inbound_tag}"
+        exit 1
+    fi
+
+    stage "Нода ${node_name}"
+    node_uuid="$(upsert_gcloud_node "$ip" "$profile_uuid" "$inbound_uuid" "$node_name" "$country_code" "0")"
+    if [[ -z "$node_uuid" ]]; then
+        fail "Не получил UUID ноды"
+        exit 1
+    fi
+    remna_enable_node "$node_uuid"
+
+    do_install_remnawave_node "$secret"
+    do_install_selfsteal "$domain"
+
+    stage "Хост ${host_remark}"
+    host_uuid="$(upsert_gcloud_host "$ip" "$profile_uuid" "$inbound_uuid" "$node_uuid" "$host_remark" "0")"
+    if [[ -z "$host_uuid" ]]; then
+        fail "Не получил UUID хоста"
+        exit 1
+    fi
+
+    stage "Жду online ноды"
+    if ! wait_gcloud_node_online "$node_name"; then
+        warn "Профиль/нода/хост созданы, но online пока не подтвержден."
+    fi
+
+    duration=$(( $(date +%s) - started_at ))
+    echo
+    ok "Google Cloud (Node / ${label}) готов"
+    ok "Профиль: ${profile_name}"
+    ok "Inbound: ${inbound_tag}"
+    ok "Нода: ${node_name}"
+    ok "Хост: ${host_remark} (disabled, hidden)"
+    ok "IP: ${ip}"
+    ok "Время: $(format_duration "$duration")"
+}
+
+install_google_cloud_stack() {
+    install_google_cloud_battles_stack
 }
 
 install_haproxy() {
@@ -2806,8 +3012,10 @@ menu() {
     labels+=("Настройки")
     actions+=("settings")
     if [[ "$MACHINE_MODE" == "node" && "$NODE_PROFILE" == "reality" ]]; then
-        labels+=("Google Cloud")
-        actions+=("google-cloud")
+        labels+=("Google Cloud (Battles)")
+        actions+=("google-cloud-battles")
+        labels+=("Google Cloud (Node)")
+        actions+=("google-cloud-node")
     fi
 
     for i in "${!labels[@]}"; do
@@ -2843,7 +3051,8 @@ menu() {
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
         settings) settings_menu ;;
-        google-cloud) install_google_cloud_stack ;;
+        google-cloud-battles) install_google_cloud_battles_stack ;;
+        google-cloud-node) install_google_cloud_node_stack ;;
         *) fail "Неверный выбор" ;;
     esac
 }
@@ -2869,7 +3078,8 @@ main() {
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
-        google-cloud|gcloud) install_google_cloud_stack ;;
+        google-cloud|gcloud|google-cloud-battles|gcloud-battles) install_google_cloud_battles_stack ;;
+        google-cloud-node|gcloud-node) install_google_cloud_node_stack "${2:-}" ;;
         *) menu ;;
     esac
 }
