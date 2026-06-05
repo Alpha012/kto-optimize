@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.5.0"
+SCRIPT_VERSION="3.5.1"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -1708,7 +1708,6 @@ install_google_cloud_stack() {
 
     do_install_remnawave_node "$secret"
     do_install_selfsteal "$domain"
-    do_install_warp_native
 
     stage "Хост ${GCLOUD_HOST_REMARK}"
     host_uuid="$(upsert_gcloud_host "$ip" "$profile_uuid" "$inbound_uuid" "$node_uuid")"
