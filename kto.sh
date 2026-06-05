@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.12"
+SCRIPT_VERSION="3.6.13"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -475,10 +475,11 @@ cleanup_runtime_state() {
 
     if command_exists ufw; then
         cmd "${SUDO[@]}" ufw allow 443/tcp || true
-        cmd "${SUDO[@]}" ufw allow 443/udp || true
         if [[ "$MACHINE_MODE" == "node" ]]; then
+            cmd "${SUDO[@]}" ufw allow 443/udp || true
             cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp" || true
         else
+            cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
             cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
         fi
         cmd "${SUDO[@]}" ufw --force delete allow 80/tcp || true
@@ -638,6 +639,9 @@ settings_menu() {
         echo -e "1) Изменение режима"
         echo -e "2) Изменение редактируемых профилей"
         echo -e "3) Проверка системы"
+        if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+            echo -e "4) Обновить HAProxy IP/SNI"
+        fi
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -652,6 +656,14 @@ settings_menu() {
                 ;;
             3)
                 system_check
+                ;;
+            4)
+                if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+                    configure_haproxy_backend
+                else
+                    fail "Этот пункт доступен только для режима whitelist."
+                    sleep 1
+                fi
                 ;;
             0)
                 return 0
@@ -1656,10 +1668,11 @@ opt_firewall() {
     cmd "${SUDO[@]}" ufw default allow outgoing
     cmd "${SUDO[@]}" ufw allow "${ssh_port}/tcp"
     cmd "${SUDO[@]}" ufw allow 443/tcp
-    cmd "${SUDO[@]}" ufw allow 443/udp
     if [[ "$MACHINE_MODE" == "node" ]]; then
+        cmd "${SUDO[@]}" ufw allow 443/udp
         cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
     else
+        cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
         cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
     fi
     cmd "${SUDO[@]}" ufw --force enable
@@ -2108,11 +2121,12 @@ system_check_firewall() {
 
     ufw_rule_allowed "${ssh_port}/tcp" || missing+=("${ssh_port}/tcp")
     ufw_rule_allowed "443/tcp" || missing+=("443/tcp")
-    ufw_rule_allowed "443/udp" || missing+=("443/udp")
     if [[ "$MACHINE_MODE" == "node" ]]; then
+        ufw_rule_allowed "443/udp" || missing+=("443/udp")
         ufw_rule_allowed "${NODE_PORT}/tcp" || missing+=("${NODE_PORT}/tcp")
-    elif ufw_rule_allowed "${NODE_PORT}/tcp"; then
-        extra+=("${NODE_PORT}/tcp")
+    else
+        ufw_rule_allowed "443/udp" && extra+=("443/udp")
+        ufw_rule_allowed "${NODE_PORT}/tcp" && extra+=("${NODE_PORT}/tcp")
     fi
 
     if (( ${#missing[@]} == 0 && ${#extra[@]} == 0 )); then
@@ -2843,18 +2857,11 @@ install_google_cloud_stack() {
     install_google_cloud_battles_stack
 }
 
-install_haproxy() {
-    header
-    require_whitelist_mode
-    need_root
-    local backend_ip allowed_sni
-    backend_ip="$(ask_ipv4 "Введите выходной IP")"
-    allowed_sni="$(ask_domain "Введите разрешенный SNI")"
+apply_haproxy_config() {
+    local backend_ip="$1"
+    local allowed_sni="$2"
 
     stage "Настраиваю HAProxy"
-    must "apt update" apt_update_quiet
-    must "Установка HAProxy" apt_install_quiet haproxy
-
     write_root_file /etc/haproxy/haproxy.cfg <<EOF
 global
     maxconn 200000
@@ -2916,6 +2923,41 @@ EOF
 
     ok "HAProxy установлен: 443 -> ${backend_ip}:443"
     ok "Разрешенный SNI: ${allowed_sni}"
+}
+
+ensure_haproxy_package() {
+    if command_exists haproxy; then
+        return 0
+    fi
+    stage "Устанавливаю HAProxy"
+    must "apt update" apt_update_quiet
+    must "Установка HAProxy" apt_install_quiet haproxy
+}
+
+harden_whitelist_haproxy_firewall() {
+    command_exists ufw || return 0
+    ufw_active || return 0
+
+    cmd "${SUDO[@]}" ufw allow 443/tcp || true
+    cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
+    cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+}
+
+configure_haproxy_backend() {
+    header
+    require_whitelist_mode
+    need_root
+    local backend_ip allowed_sni
+    backend_ip="$(ask_ipv4 "Введите выходной IP")"
+    allowed_sni="$(ask_domain "Введите разрешенный SNI")"
+
+    ensure_haproxy_package
+    apply_haproxy_config "$backend_ip" "$allowed_sni"
+    harden_whitelist_haproxy_firewall
+}
+
+install_haproxy() {
+    configure_haproxy_backend
 }
 
 badge() {
