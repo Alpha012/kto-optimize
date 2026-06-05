@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.2"
+SCRIPT_VERSION="3.6.3"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -1320,10 +1320,14 @@ opt_prepare_system() {
 }
 
 optimization_packages() {
-    local packages
+    local packages cpus
     packages=(ca-certificates curl wget gnupg2 software-properties-common ufw openssl dnsutils)
     if [[ "$MACHINE_MODE" == "node" ]]; then
-        packages+=(chrony cpufrequtils irqbalance logrotate tar xz-utils)
+        packages+=(chrony cpufrequtils logrotate tar xz-utils)
+        cpus="$(cpu_count)"
+        if (( cpus > 1 )); then
+            packages+=(irqbalance)
+        fi
     fi
     printf '%s\n' "${packages[@]}"
 }
@@ -1410,7 +1414,12 @@ EOF
     cmd "${SUDO[@]}" systemctl daemon-reload || true
     if [[ "$MACHINE_MODE" == "node" ]]; then
         echo 'GOVERNOR="performance"' | "${SUDO[@]}" tee /etc/default/cpufrequtils >> "$LOG_FILE" 2>&1 || true
-        cmd "${SUDO[@]}" systemctl enable --now irqbalance chrony || true
+        cmd "${SUDO[@]}" systemctl enable --now chrony || true
+        if (( $(cpu_count) > 1 )); then
+            cmd "${SUDO[@]}" systemctl enable --now irqbalance || true
+        else
+            echo "irqbalance skipped: single CPU" >> "$LOG_FILE"
+        fi
         cmd "${SUDO[@]}" systemctl restart cpufrequtils || true
     fi
 }
@@ -1512,6 +1521,13 @@ root_file_has_line() {
     "${SUDO[@]}" grep -Fqx "$line" "$file" 2>/dev/null
 }
 
+cpu_count() {
+    local count
+    count="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]] || count=1
+    echo "$count"
+}
+
 ufw_active() {
     command_exists ufw && "${SUDO[@]}" ufw status 2>/dev/null | grep -q "Status: active"
 }
@@ -1591,7 +1607,7 @@ system_check_kernel() {
 }
 
 system_check_network_limits() {
-    local cc qdisc limits_ok=1 sysctl_file_ok=1 service_issues=()
+    local cc qdisc limits_ok=1 sysctl_file_ok=1 service_issues=() cpus
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
 
@@ -1626,13 +1642,22 @@ system_check_network_limits() {
 
     if [[ "$MACHINE_MODE" == "node" ]]; then
         [[ "$(service_ok chrony)" == "1" ]] || service_issues+=("chrony")
-        [[ "$(service_ok irqbalance)" == "1" ]] || service_issues+=("irqbalance")
         root_file_has_line /etc/default/cpufrequtils 'GOVERNOR="performance"' || service_issues+=("cpufrequtils")
         if (( ${#service_issues[@]} == 0 )); then
-            system_check_row ok "node services" "chrony, irqbalance, performance"
+            system_check_row ok "node services" "chrony, performance"
         else
             SYSTEM_CHECK_NEEDS_NETWORK=1
             system_check_row miss "node services" "нет: $(system_check_join "${service_issues[@]}")"
+        fi
+
+        cpus="$(cpu_count)"
+        if (( cpus <= 1 )); then
+            system_check_row skip "irqbalance" "${cpus} CPU, балансировать нечего"
+        elif [[ "$(service_ok irqbalance)" == "1" ]]; then
+            system_check_row ok "irqbalance" "${cpus} CPU"
+        else
+            SYSTEM_CHECK_NEEDS_NETWORK=1
+            system_check_row miss "irqbalance" "не active, CPU: ${cpus}"
         fi
     fi
 }
@@ -2441,7 +2466,11 @@ show_status() {
     fi
 
     print_row "chrony" "time sync" "$(service_ok chrony)"
-    print_row "irqbalance" "irq" "$(service_ok irqbalance)"
+    if (( $(cpu_count) > 1 )); then
+        print_row "irqbalance" "irq" "$(service_ok irqbalance)"
+    else
+        print_row "irqbalance" "single CPU, skip"
+    fi
 
     echo
     echo -e "${BOLD}${PURPLE}[ REMNAWAVE ]${NC}"
