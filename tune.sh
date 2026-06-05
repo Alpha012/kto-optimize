@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.3"
+SCRIPT_VERSION="3.6.4"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -35,6 +35,10 @@ else
 fi
 ANTISCANNER_SCRIPT="/usr/local/bin/update-antiscanner.sh"
 ANTISCANNER_URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
+ZRAM_SETUP_SCRIPT="/usr/local/sbin/kto-zram-setup"
+ZRAM_SERVICE="kto-zram.service"
+ZRAM_PERCENT="${KTO_ZRAM_PERCENT:-50}"
+ZRAM_MAX_MB="${KTO_ZRAM_MAX_MB:-2048}"
 APT_UPDATED=0
 
 GREEN='\033[0;32m'
@@ -1463,6 +1467,82 @@ EOF
     cmd "${SUDO[@]}" systemctl enable --now fail2ban || true
 }
 
+opt_zram() {
+    need_root
+    local size
+
+    if zram_active; then
+        ok "ZRAM уже активен: $(zram_swap_summary)"
+        return 0
+    fi
+
+    if ! command_exists zramctl; then
+        apt_update_quiet
+        apt_install_quiet util-linux
+    fi
+    if ! command_exists zramctl; then
+        fail "zramctl не найден"
+        return 1
+    fi
+
+    size="$(recommended_zram_mb)"
+    stage "Настраиваю ZRAM ($(format_mb "$size"))"
+
+    write_root_file_mode 0755 "$ZRAM_SETUP_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SIZE_MB="\${KTO_ZRAM_SIZE_MB:-$size}"
+PREFERRED_ALGO="\${KTO_ZRAM_ALGO:-zstd}"
+
+if awk '\$1 ~ /^\\/dev\\/zram/ {found=1} END{exit found ? 0 : 1}' /proc/swaps 2>/dev/null; then
+    exit 0
+fi
+
+modprobe zram
+
+dev=""
+for algo in "\$PREFERRED_ALGO" lz4 lzo-rle lzo; do
+    if dev="\$(zramctl --find --size "\${SIZE_MB}M" --algorithm "\$algo" 2>/dev/null)"; then
+        break
+    fi
+done
+
+if [[ -z "\$dev" ]]; then
+    dev="\$(zramctl --find --size "\${SIZE_MB}M")"
+fi
+
+mkswap -f "\$dev" >/dev/null
+swapon -p 100 "\$dev"
+EOF
+
+    write_root_file "/etc/systemd/system/${ZRAM_SERVICE}" <<EOF
+[Unit]
+Description=kto ZRAM swap
+Documentation=man:zramctl(8) man:swapon(8)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${ZRAM_SETUP_SCRIPT}
+ExecStop=/bin/sh -c 'for dev in /dev/zram*; do [ -b "\$dev" ] || continue; swapoff "\$dev" 2>/dev/null || true; zramctl --reset "\$dev" 2>/dev/null || true; done'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cmd "${SUDO[@]}" systemctl daemon-reload
+    must "Включение ZRAM" "${SUDO[@]}" systemctl enable --now "$ZRAM_SERVICE"
+
+    if zram_active; then
+        ok "ZRAM включен: $(zram_swap_summary)"
+    else
+        fail "ZRAM service запустился, но swap не активен"
+        return 1
+    fi
+}
+
 SYSTEM_CHECK_MISSING=0
 SYSTEM_CHECK_WARNINGS=0
 SYSTEM_CHECK_NEEDS_PREPARE=0
@@ -1472,6 +1552,7 @@ SYSTEM_CHECK_NEEDS_NETWORK=0
 SYSTEM_CHECK_NEEDS_FIREWALL=0
 SYSTEM_CHECK_NEEDS_ANTISCANNER=0
 SYSTEM_CHECK_NEEDS_FAIL2BAN=0
+SYSTEM_CHECK_NEEDS_ZRAM=0
 
 system_check_reset() {
     SYSTEM_CHECK_MISSING=0
@@ -1483,6 +1564,7 @@ system_check_reset() {
     SYSTEM_CHECK_NEEDS_FIREWALL=0
     SYSTEM_CHECK_NEEDS_ANTISCANNER=0
     SYSTEM_CHECK_NEEDS_FAIL2BAN=0
+    SYSTEM_CHECK_NEEDS_ZRAM=0
 }
 
 system_check_badge() {
@@ -1526,6 +1608,85 @@ cpu_count() {
     count="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
     [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]] || count=1
     echo "$count"
+}
+
+meminfo_mb() {
+    local key="$1"
+    awk -v key="${key}:" '$1 == key {printf "%d\n", $2 / 1024; found=1; exit} END{if (!found) print 0}' /proc/meminfo 2>/dev/null
+}
+
+memory_total_mb() {
+    meminfo_mb MemTotal
+}
+
+memory_available_mb() {
+    meminfo_mb MemAvailable
+}
+
+swap_total_mb() {
+    meminfo_mb SwapTotal
+}
+
+format_mb() {
+    local mb="$1"
+    if (( mb >= 1024 )); then
+        awk -v mb="$mb" 'BEGIN{printf "%.1fG", mb / 1024}'
+    else
+        printf '%dM' "$mb"
+    fi
+}
+
+zram_active() {
+    awk '$1 ~ /^\/dev\/zram/ {found=1} END{exit found ? 0 : 1}' /proc/swaps 2>/dev/null
+}
+
+zram_swap_summary() {
+    local summary
+    summary="$(awk '$1 ~ /^\/dev\/zram/ {printf "%s %dM ", $1, int($3 / 1024)}' /proc/swaps 2>/dev/null | xargs 2>/dev/null || true)"
+    echo "${summary:-active}"
+}
+
+zram_percent() {
+    local percent="${ZRAM_PERCENT:-50}"
+    [[ "$percent" =~ ^[0-9]+$ && "$percent" -ge 10 && "$percent" -le 200 ]] || percent=50
+    echo "$percent"
+}
+
+zram_max_mb() {
+    local max_mb="${ZRAM_MAX_MB:-2048}"
+    [[ "$max_mb" =~ ^[0-9]+$ && "$max_mb" -ge 128 ]] || max_mb=2048
+    echo "$max_mb"
+}
+
+recommended_zram_mb() {
+    local total percent max_mb size
+    total="$(memory_total_mb)"
+    percent="$(zram_percent)"
+    max_mb="$(zram_max_mb)"
+    size=$(( total * percent / 100 ))
+    (( size < 128 )) && size=128
+    (( size > max_mb )) && size="$max_mb"
+    echo "$size"
+}
+
+zram_recommended() {
+    local total swap
+    total="$(memory_total_mb)"
+    swap="$(swap_total_mb)"
+    (( total > 0 && total < 4096 && swap == 0 )) || return 1
+    ! zram_active
+}
+
+memory_oom_count() {
+    if command_exists journalctl; then
+        "${SUDO[@]}" journalctl -k -b --no-pager 2>/dev/null \
+            | grep -Eci 'out of memory|oom-killer|killed process' || true
+    elif command_exists dmesg; then
+        "${SUDO[@]}" dmesg 2>/dev/null \
+            | grep -Eci 'out of memory|oom-killer|killed process' || true
+    else
+        echo 0
+    fi
 }
 
 ufw_active() {
@@ -1603,6 +1764,38 @@ system_check_kernel() {
         system_check_row miss "liquorix" "repo есть, пакеты не установлены"
     else
         system_check_row miss "liquorix" "repo и пакеты не установлены"
+    fi
+}
+
+system_check_memory() {
+    local total available swap zram_size oom_count
+    total="$(memory_total_mb)"
+    available="$(memory_available_mb)"
+    swap="$(swap_total_mb)"
+    zram_size="$(recommended_zram_mb)"
+
+    if (( total > 0 )); then
+        system_check_row ok "RAM" "$(format_mb "$available") available / $(format_mb "$total") total"
+    else
+        system_check_row warn "RAM" "не смог прочитать /proc/meminfo"
+    fi
+
+    if zram_active; then
+        system_check_row ok "zram" "$(zram_swap_summary)"
+    elif (( swap > 0 )); then
+        system_check_row ok "swap" "$(format_mb "$swap") active"
+    elif zram_recommended; then
+        SYSTEM_CHECK_NEEDS_ZRAM=1
+        system_check_row warn "swap/zram" "нет; рекомендую ZRAM $(format_mb "$zram_size")"
+    else
+        system_check_row skip "swap/zram" "нет; RAM $(format_mb "$total"), опционально"
+    fi
+
+    oom_count="$(memory_oom_count)"
+    if [[ "$oom_count" =~ ^[0-9]+$ && "$oom_count" -gt 0 ]]; then
+        system_check_row warn "OOM" "${oom_count} events в текущей загрузке"
+    else
+        system_check_row ok "OOM" "не найдено в текущей загрузке"
     fi
 }
 
@@ -1793,6 +1986,10 @@ system_check() {
     print_row "ssh port" "$ssh_port"
 
     echo
+    echo -e "${BOLD}${PURPLE}[ ПАМЯТЬ ]${NC}"
+    system_check_memory
+
+    echo
     echo -e "${BOLD}${PURPLE}[ OPTIMIZATION AUDIT ]${NC}"
     system_check_prepare_state
     system_check_packages
@@ -1804,7 +2001,7 @@ system_check() {
 
     echo
     echo -e "${BOLD}${PURPLE}[ ВЫВОД ]${NC}"
-    if (( SYSTEM_CHECK_MISSING == 0 )); then
+    if (( SYSTEM_CHECK_MISSING == 0 && SYSTEM_CHECK_NEEDS_ZRAM == 0 )); then
         ok "Критичных недостающих блоков не найдено."
         if (( SYSTEM_CHECK_WARNINGS > 0 )); then
             warn "Есть предупреждения, но автоматического исправления не требуется."
@@ -1813,13 +2010,22 @@ system_check() {
         return 0
     fi
 
-    warn "Найдено блоков к исправлению: ${SYSTEM_CHECK_MISSING}"
+    if (( SYSTEM_CHECK_MISSING > 0 )); then
+        warn "Найдено блоков к исправлению: ${SYSTEM_CHECK_MISSING}"
+    elif (( SYSTEM_CHECK_NEEDS_ZRAM == 1 )); then
+        warn "Критичных недостающих блоков нет, но для маленькой VPS рекомендую ZRAM."
+    fi
     if (( SYSTEM_CHECK_WARNINGS > 0 )); then
         warn "Предупреждений: ${SYSTEM_CHECK_WARNINGS}"
     fi
     echo
-    echo -e "1) Исправить только недостающее"
-    echo -e "2) Запустить полную оптимизацию"
+    if (( SYSTEM_CHECK_MISSING > 0 )); then
+        echo -e "1) Исправить только недостающее"
+        echo -e "2) Запустить полную оптимизацию"
+    fi
+    if (( SYSTEM_CHECK_NEEDS_ZRAM == 1 )); then
+        echo -e "3) Включить ZRAM ($(format_mb "$(recommended_zram_mb)"))"
+    fi
     echo -e "0) Ничего не делать"
     echo -e "${PURPLE}==========================================${NC}"
     echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -1827,10 +2033,25 @@ system_check() {
 
     case "$choice" in
         1)
-            system_check_apply_missing "$ssh_port"
+            if (( SYSTEM_CHECK_MISSING > 0 )); then
+                system_check_apply_missing "$ssh_port"
+            else
+                fail "Неверный выбор"
+            fi
             ;;
         2)
-            optimize_system
+            if (( SYSTEM_CHECK_MISSING > 0 )); then
+                optimize_system
+            else
+                fail "Неверный выбор"
+            fi
+            ;;
+        3)
+            if (( SYSTEM_CHECK_NEEDS_ZRAM == 1 )); then
+                opt_zram
+            else
+                fail "Неверный выбор"
+            fi
             ;;
         0)
             ok "Оставил систему без изменений."
@@ -2438,10 +2659,13 @@ print_kernel_status() {
 
 show_status() {
     header
-    local cc qdisc kernel node_status docker_status cert_days cert_expiry
+    local cc qdisc kernel node_status docker_status cert_days cert_expiry mem_total mem_available swap
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
     kernel="$(uname -r)"
+    mem_total="$(memory_total_mb)"
+    mem_available="$(memory_available_mb)"
+    swap="$(swap_total_mb)"
 
     echo -e "${BOLD}${PURPLE}[ СЕТЬ ]${NC}"
     print_row "mode" "$MACHINE_MODE"
@@ -2450,6 +2674,19 @@ show_status() {
     fi
     print_row "BBR + FQ" "${cc} + ${qdisc}" "$([[ "$cc" == "bbr" && "$qdisc" == "fq" ]] && echo 1 || echo 0)"
     print_row "ports" "$(ufw_allowed_ports)"
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ПАМЯТЬ ]${NC}"
+    print_row "RAM" "$(format_mb "$mem_available") / $(format_mb "$mem_total")"
+    if zram_active; then
+        print_row "zram" "$(zram_swap_summary)" 1
+    elif (( swap > 0 )); then
+        print_row "swap" "$(format_mb "$swap")" 1
+    elif zram_recommended; then
+        print_row "swap/zram" "none" 0
+    else
+        print_row "swap/zram" "none, optional"
+    fi
 
     echo
     echo -e "${BOLD}${PURPLE}[ СЛУЖБЫ ]${NC}"
@@ -2600,6 +2837,7 @@ main() {
         mode|config) reconfigure_machine_mode ;;
         settings) settings_menu ;;
         check|system-check) system_check ;;
+        zram|memory-guard) opt_zram ;;
         optimize) optimize_system ;;
         common|install-all|up) install_common_stack ;;
         node|install-node) install_remnawave_node ;;
