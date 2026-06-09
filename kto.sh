@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v102"
+SCRIPT_BUILD="v103"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2858,18 +2858,29 @@ send_telegram_request() {
     local label="$1"
     shift
     local extra=("$@")
-    local output rc
-    if output="$(curl -4 -fsS --connect-timeout 8 --max-time 25 --retry 2 --retry-delay 2 --retry-connrefused \
+    local response rc short_response
+    if response="$(curl -4 -sS --connect-timeout 8 --max-time 25 --retry 2 --retry-delay 2 --retry-connrefused \
         "${extra[@]}" \
         -X POST "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${KTO_TRAFFIC_CHAT_ID}" \
         -d "disable_web_page_preview=true" \
         -d "parse_mode=HTML" \
-        --data-urlencode "text=${message}" 2>&1 >/dev/null)"; then
-        return 0
+        --data-urlencode "text=${message}" 2>&1)"; then
+        if command -v jq >/dev/null 2>&1; then
+            if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+                return 0
+            fi
+        elif printf '%s' "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
+            return 0
+        fi
+
+        short_response="$(printf '%s' "$response" | tr '\n' ' ' | cut -c1-700)"
+        echo "telegram ${label}: bad response: ${short_response}" >&2
+        return 1
     fi
     rc=$?
-    echo "telegram ${label}: curl rc=${rc}: ${output}" >&2
+    short_response="$(printf '%s' "$response" | tr '\n' ' ' | cut -c1-700)"
+    echo "telegram ${label}: curl rc=${rc}: ${short_response}" >&2
     return "$rc"
 }
 
