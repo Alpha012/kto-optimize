@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v99"
+SCRIPT_BUILD="v100"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -637,6 +637,7 @@ package_installed() {
 
 wait_for_apt_locks() {
     local waited=0
+    local lock_info
     local locks=(
         /var/lib/apt/lists/lock
         /var/cache/apt/archives/lock
@@ -646,6 +647,12 @@ wait_for_apt_locks() {
 
     command_exists fuser || return 0
     while "${SUDO[@]}" fuser "${locks[@]}" >/dev/null 2>&1; do
+        if (( waited == 0 )); then
+            warn "apt занят другим процессом, жду освобождения lock."
+        elif (( waited % 30 == 0 )); then
+            lock_info="$("${SUDO[@]}" fuser "${locks[@]}" 2>/dev/null | tr '\n' ' ' | tr -s ' ' || true)"
+            warn "apt всё ещё занят (${waited}s). ${lock_info}"
+        fi
         if (( waited >= 600 )); then
             echo "apt lock wait timeout" >> "$LOG_FILE"
             return 1
@@ -674,6 +681,25 @@ apt_install_quiet() {
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" \
         "${missing[@]}" >> "$LOG_FILE" 2>&1
+}
+
+apt_install_with_update_if_missing() {
+    local missing=() pkg
+    for pkg in "$@"; do
+        if ! package_installed "$pkg"; then
+            missing+=("$pkg")
+        fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        echo "apt install skipped: already installed: $*" >> "$LOG_FILE"
+        return 0
+    fi
+
+    if ! apt_update_quiet; then
+        warn "apt update не прошёл, пробую ставить пакеты по текущему кешу apt."
+    fi
+    apt_install_quiet "${missing[@]}"
 }
 
 liquorix_installed() {
@@ -2877,10 +2903,7 @@ install_traffic_report() {
 
     stage "Устанавливаю статистику трафика"
     opt_dns_guard || true
-    if ! apt_update_quiet; then
-        warn "apt update не прошёл, пробую ставить пакеты по текущему кешу apt."
-    fi
-    must "Установка пакетов статистики" apt_install_quiet curl jq vnstat
+    must "Установка пакетов статистики" apt_install_with_update_if_missing curl jq vnstat
     cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
     cmd "${SUDO[@]}" systemctl enable --now vnstat || true
     cmd "${SUDO[@]}" systemctl restart vnstat || true
