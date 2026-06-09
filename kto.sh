@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v96"
+SCRIPT_BUILD="v97"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -34,6 +34,7 @@ STORAGE_GUARD_JOURNAL_CONF="/etc/systemd/journald.conf.d/99-kto-storage.conf"
 KTO_LOGROTATE_CONF="/etc/logrotate.d/kto-vpn"
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
+DNS_GUARD_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-kto-dns.conf"
 TRAFFIC_REPORT_CONFIG="/etc/kto-traffic-report.conf"
 TRAFFIC_REPORT_SCRIPT="/usr/local/bin/kto-traffic-report"
 TRAFFIC_REPORT_SERVICE="kto-traffic-report.service"
@@ -803,6 +804,63 @@ network_interface_exists() {
     ip link show dev "$iface" >/dev/null 2>&1
 }
 
+hosts_file_has_hostname() {
+    local host="$1"
+    "${SUDO[@]}" awk -v host="$host" '
+        /^[[:space:]]*#/ { next }
+        {
+            for (i = 2; i <= NF; i++) {
+                if ($i == host) {
+                    found = 1
+                }
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' /etc/hosts 2>/dev/null
+}
+
+hostname_hosts_configured() {
+    local host
+    host="$(hostname 2>/dev/null || true)"
+    [[ -n "$host" ]] || return 0
+    hosts_file_has_hostname "$host" || getent hosts "$host" >/dev/null 2>&1
+}
+
+ensure_hostname_hosts_entry() {
+    local host short tmp
+    host="$(hostname 2>/dev/null || true)"
+    [[ -n "$host" ]] || return 0
+    hostname_hosts_configured && return 0
+
+    short="${host%%.*}"
+    tmp="$(mktemp)"
+    {
+        printf '\n127.0.1.1\t%s' "$host"
+        if [[ -n "$short" && "$short" != "$host" ]]; then
+            printf ' %s' "$short"
+        fi
+        printf '\n'
+    } > "$tmp"
+    "${SUDO[@]}" tee -a /etc/hosts < "$tmp" >> "$LOG_FILE" 2>&1 || true
+    rm -f "$tmp"
+}
+
+systemd_resolved_available() {
+    command_exists systemctl && systemctl cat systemd-resolved.service >/dev/null 2>&1
+}
+
+resolved_dns_guard_configured() {
+    root_file_has_line "$DNS_GUARD_RESOLVED_CONF" "[Resolve]" &&
+        root_file_has_line "$DNS_GUARD_RESOLVED_CONF" "DNS=1.1.1.1 1.0.0.1 8.8.8.8" &&
+        root_file_has_line "$DNS_GUARD_RESOLVED_CONF" "FallbackDNS=9.9.9.9 8.8.4.4" &&
+        root_file_has_line "$DNS_GUARD_RESOLVED_CONF" "Cache=yes"
+}
+
+dns_resolution_ok() {
+    getent hosts api.telegram.org >/dev/null 2>&1 ||
+        getent hosts raw.githubusercontent.com >/dev/null 2>&1
+}
+
 escape_yaml_secret() {
     local value="$1"
     value="${value//$'\r'/}"
@@ -1057,6 +1115,33 @@ opt_install_packages() {
     apt_install_quiet "${packages[@]}"
 }
 
+opt_dns_guard() {
+    ensure_hostname_hosts_entry
+
+    if systemd_resolved_available; then
+        cmd "${SUDO[@]}" mkdir -p /etc/systemd/resolved.conf.d
+        write_root_file "$DNS_GUARD_RESOLVED_CONF" <<'EOF'
+[Resolve]
+DNS=1.1.1.1 1.0.0.1 8.8.8.8
+FallbackDNS=9.9.9.9 8.8.4.4
+DNSSEC=no
+DNSOverTLS=no
+Cache=yes
+EOF
+        cmd "${SUDO[@]}" systemctl enable --now systemd-resolved || true
+        cmd "${SUDO[@]}" systemctl restart systemd-resolved || true
+        if command_exists resolvectl; then
+            cmd "${SUDO[@]}" resolvectl flush-caches || true
+        fi
+    else
+        echo "DNS guard skipped: systemd-resolved service not found" >> "$LOG_FILE"
+    fi
+
+    if ! dns_resolution_ok; then
+        warn "DNS всё ещё не резолвит api.telegram.org/raw.githubusercontent.com. Проверь /etc/resolv.conf, провайдера или IPv6."
+    fi
+}
+
 configure_docker_log_rotation() {
     command_exists docker || return 0
 
@@ -1176,6 +1261,8 @@ opt_liquorix_kernel() {
 }
 
 opt_network_limits() {
+    opt_dns_guard
+
     cmd "${SUDO[@]}" modprobe tcp_bbr || true
     write_root_file /etc/sysctl.d/99-vpn-tuning.conf <<'EOF'
 fs.file-max = 2097152
@@ -1734,6 +1821,31 @@ system_check_network_limits() {
     local cc qdisc limits_ok=1 sysctl_file_ok=1 service_issues=() cpus
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
+
+    if hostname_hosts_configured; then
+        system_check_row ok "hostname" "$(hostname 2>/dev/null || echo "-")"
+    else
+        SYSTEM_CHECK_NEEDS_NETWORK=1
+        system_check_row miss "hostname" "нет записи в /etc/hosts"
+    fi
+
+    if systemd_resolved_available; then
+        if resolved_dns_guard_configured; then
+            system_check_row ok "dns guard" "systemd-resolved fallback"
+        else
+            SYSTEM_CHECK_NEEDS_NETWORK=1
+            system_check_row miss "dns guard" "fallback DNS не настроен"
+        fi
+    else
+        system_check_row skip "dns guard" "systemd-resolved не найден"
+    fi
+
+    if dns_resolution_ok; then
+        system_check_row ok "dns resolve" "api.telegram.org/raw.githubusercontent.com"
+    else
+        SYSTEM_CHECK_NEEDS_NETWORK=1
+        system_check_row miss "dns resolve" "внешние домены не резолвятся"
+    fi
 
     if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
         system_check_row ok "BBR + FQ" "${cc} + ${qdisc}"
@@ -2545,7 +2657,8 @@ $KTO_TRAFFIC_NAME
 MSG
 )"
 
-curl -fsS -X POST "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/sendMessage" \
+curl -4 -fsS --connect-timeout 10 --retry 2 --retry-delay 2 \
+    -X POST "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/sendMessage" \
     -d "chat_id=${KTO_TRAFFIC_CHAT_ID}" \
     -d "disable_web_page_preview=true" \
     --data-urlencode "text=${message}" >/dev/null
@@ -2578,6 +2691,7 @@ install_traffic_report() {
     safe_time="$(escape_config_value "$report_time")"
 
     stage "Устанавливаю статистику трафика"
+    opt_dns_guard || true
     if ! apt_update_quiet; then
         warn "apt update не прошёл, пробую ставить пакеты по текущему кешу apt."
     fi
@@ -2632,7 +2746,7 @@ EOF
     if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" >> "$LOG_FILE" 2>&1; then
         ok "Тестовый отчёт отправлен в Telegram"
     else
-        warn "Тестовый отчёт не отправился. Проверь Telegram token/chat_id и доступ к api.telegram.org."
+        warn "Тестовый отчёт не отправился. Проверь DNS, доступ к api.telegram.org и Telegram token/chat_id."
         tail -n 10 "$LOG_FILE" >&2 || true
     fi
 }
@@ -2964,6 +3078,7 @@ main() {
         mode|config) reconfigure_machine_mode ;;
         settings) settings_menu ;;
         check|system-check) system_check ;;
+        dns|dns-guard) need_root; opt_dns_guard ;;
         zram|memory-guard) opt_zram ;;
         optimize) optimize_system ;;
         common|install-all|up) install_common_stack ;;
