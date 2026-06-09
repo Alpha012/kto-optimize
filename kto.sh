@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v106"
+SCRIPT_BUILD="v107"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2851,7 +2851,18 @@ telegram_api_ips() {
                 | jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null || true
         fi
         printf '%s\n' 149.154.166.110
-    } | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && !seen[$1]++ {print}'
+    } | awk -F. '
+        NF == 4 {
+            valid = 1
+            for (i = 1; i <= 4; i++) {
+                if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) {
+                    valid = 0
+                }
+            }
+            if (valid && !seen[$0]++) {
+                print
+            }
+        }'
 }
 
 send_telegram_request() {
@@ -2920,10 +2931,11 @@ fi
 
 mapfile -t telegram_ips < <(telegram_api_ips)
 if (( ${#telegram_ips[@]} == 0 )); then
-    echo "telegram resolve: no IPv4 addresses for api.telegram.org" >&2
-    exit 1
+    telegram_ips=(149.154.166.110)
+    echo "telegram resolve: no IPv4 from DNS, using static fallback: ${telegram_ips[*]}" >&2
+else
+    echo "telegram resolve: ${telegram_ips[*]}" >&2
 fi
-echo "telegram resolve: ${telegram_ips[*]}" >&2
 
 while read -r telegram_ip; do
     [[ -n "$telegram_ip" ]] || continue
