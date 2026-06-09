@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v103"
+SCRIPT_BUILD="v104"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2858,7 +2858,7 @@ send_telegram_request() {
     local label="$1"
     shift
     local extra=("$@")
-    local response rc short_response
+    local response rc short_response message_id response_chat_id
     if response="$(curl -4 -sS --connect-timeout 8 --max-time 25 --retry 2 --retry-delay 2 --retry-connrefused \
         "${extra[@]}" \
         -X POST "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/sendMessage" \
@@ -2867,10 +2867,16 @@ send_telegram_request() {
         -d "parse_mode=HTML" \
         --data-urlencode "text=${message}" 2>&1)"; then
         if command -v jq >/dev/null 2>&1; then
-            if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+            if printf '%s' "$response" | jq -e '.ok == true and (.result.message_id != null)' >/dev/null 2>&1; then
+                message_id="$(printf '%s' "$response" | jq -r '.result.message_id')"
+                response_chat_id="$(printf '%s' "$response" | jq -r '.result.chat.id // "-"')"
+                echo "telegram ${label}: sent message_id=${message_id} chat_id=${response_chat_id}"
                 return 0
             fi
-        elif printf '%s' "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
+        elif printf '%s' "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' &&
+            printf '%s' "$response" | grep -Eq '"message_id"[[:space:]]*:'; then
+            message_id="$(printf '%s' "$response" | sed -n 's/.*"message_id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+            echo "telegram ${label}: sent message_id=${message_id:-unknown} chat_id=${KTO_TRAFFIC_CHAT_ID}"
             return 0
         fi
 
@@ -2912,6 +2918,9 @@ run_traffic_report_script_once() {
 
     if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" > "$tmp" 2>&1; then
         cat "$tmp" >> "$LOG_FILE" 2>/dev/null || true
+        if [[ -s "$tmp" ]]; then
+            cat "$tmp"
+        fi
         rm -f "$tmp"
         return 0
     fi
