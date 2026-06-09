@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.14"
+SCRIPT_VERSION="1.4.8.8 (v91)"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
