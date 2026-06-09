@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v98"
+SCRIPT_BUILD="v99"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -40,6 +40,7 @@ TRAFFIC_REPORT_CONFIG="/etc/kto-traffic-report.conf"
 TRAFFIC_REPORT_SCRIPT="/usr/local/bin/kto-traffic-report"
 TRAFFIC_REPORT_SERVICE="kto-traffic-report.service"
 TRAFFIC_REPORT_TIMER="kto-traffic-report.timer"
+TRAFFIC_REPORT_TZ_DEFAULT="Europe/Moscow"
 APT_UPDATED=0
 
 GREEN='\033[0;32m'
@@ -624,6 +625,7 @@ apt_update_quiet() {
 }
 
 apt_update_force() {
+    wait_for_apt_locks || true
     "${SUDO[@]}" apt-get -o DPkg::Lock::Timeout=600 update >> "$LOG_FILE" 2>&1
     APT_UPDATED=1
 }
@@ -631,6 +633,26 @@ apt_update_force() {
 package_installed() {
     local pkg="$1"
     dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"
+}
+
+wait_for_apt_locks() {
+    local waited=0
+    local locks=(
+        /var/lib/apt/lists/lock
+        /var/cache/apt/archives/lock
+        /var/lib/dpkg/lock
+        /var/lib/dpkg/lock-frontend
+    )
+
+    command_exists fuser || return 0
+    while "${SUDO[@]}" fuser "${locks[@]}" >/dev/null 2>&1; do
+        if (( waited >= 600 )); then
+            echo "apt lock wait timeout" >> "$LOG_FILE"
+            return 1
+        fi
+        sleep 2
+        waited=$(( waited + 2 ))
+    done
 }
 
 apt_install_quiet() {
@@ -646,6 +668,7 @@ apt_install_quiet() {
         return 0
     fi
 
+    wait_for_apt_locks || true
     "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive \
         apt-get -o DPkg::Lock::Timeout=600 install -y \
         -o Dpkg::Options::="--force-confdef" \
@@ -730,17 +753,26 @@ validate_time_hm() {
     [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]
 }
 
+normalize_time_hm() {
+    local value="$1"
+    value="${value//;/:}"
+    value="${value//./:}"
+    value="${value//,/:}"
+    echo "$value"
+}
+
 ask_time_hm() {
     local prompt="$1"
     local default="${2:-00:05}"
     local value
     while true; do
         value="$(ask_text "$prompt" "$default")"
+        value="$(normalize_time_hm "$value")"
         if validate_time_hm "$value"; then
             echo "$value"
             return 0
         fi
-        fail "Некорректное время. Пример: 00:05"
+        fail "Некорректное время. Пример: 00:05 или 23;59"
     done
 }
 
@@ -873,7 +905,7 @@ resolved_dns_guard_configured() {
 
 dns_guard_configured() {
     if systemd_resolved_available; then
-        resolved_dns_guard_configured && resolv_conf_uses_resolved
+        { resolved_dns_guard_configured && resolv_conf_uses_resolved; } || static_resolv_conf_configured
     else
         static_resolv_conf_configured
     fi
@@ -882,6 +914,16 @@ dns_guard_configured() {
 dns_resolution_ok() {
     getent hosts api.telegram.org >/dev/null 2>&1 ||
         getent hosts raw.githubusercontent.com >/dev/null 2>&1
+}
+
+wait_for_dns_resolution() {
+    local waited=0
+    while (( waited < 10 )); do
+        dns_resolution_ok && return 0
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    return 1
 }
 
 ipv6_sysctl_available() {
@@ -1154,6 +1196,23 @@ opt_install_packages() {
     apt_install_quiet "${packages[@]}"
 }
 
+backup_resolv_conf() {
+    if "${SUDO[@]}" test -e /etc/resolv.conf 2>/dev/null && ! "${SUDO[@]}" test -e /etc/resolv.conf.kto-backup 2>/dev/null; then
+        cmd "${SUDO[@]}" cp -a /etc/resolv.conf /etc/resolv.conf.kto-backup || true
+    fi
+}
+
+write_static_resolv_conf() {
+    backup_resolv_conf
+    cmd "${SUDO[@]}" rm -f /etc/resolv.conf || true
+    write_root_file /etc/resolv.conf <<'EOF'
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+nameserver 8.8.8.8
+options timeout:2 attempts:3 rotate
+EOF
+}
+
 opt_dns_guard() {
     ensure_hostname_hosts_entry
 
@@ -1172,29 +1231,22 @@ EOF
         cmd "${SUDO[@]}" systemctl enable --now systemd-resolved || true
         cmd "${SUDO[@]}" systemctl restart systemd-resolved || true
         if "${SUDO[@]}" test -e /run/systemd/resolve/stub-resolv.conf 2>/dev/null; then
-            if "${SUDO[@]}" test -e /etc/resolv.conf 2>/dev/null && ! "${SUDO[@]}" test -L /etc/resolv.conf 2>/dev/null; then
-                cmd "${SUDO[@]}" cp -a /etc/resolv.conf /etc/resolv.conf.kto-backup || true
-            fi
+            backup_resolv_conf
             cmd "${SUDO[@]}" ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
         elif "${SUDO[@]}" test -e /run/systemd/resolve/resolv.conf 2>/dev/null; then
-            if "${SUDO[@]}" test -e /etc/resolv.conf 2>/dev/null && ! "${SUDO[@]}" test -L /etc/resolv.conf 2>/dev/null; then
-                cmd "${SUDO[@]}" cp -a /etc/resolv.conf /etc/resolv.conf.kto-backup || true
-            fi
+            backup_resolv_conf
             cmd "${SUDO[@]}" ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf || true
         fi
         if command_exists resolvectl; then
             cmd "${SUDO[@]}" resolvectl flush-caches || true
         fi
     else
-        if "${SUDO[@]}" test -e /etc/resolv.conf 2>/dev/null && ! "${SUDO[@]}" test -L /etc/resolv.conf 2>/dev/null; then
-            cmd "${SUDO[@]}" cp -a /etc/resolv.conf /etc/resolv.conf.kto-backup || true
-        fi
-        write_root_file /etc/resolv.conf <<'EOF'
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-nameserver 8.8.8.8
-options timeout:2 attempts:3 rotate
-EOF
+        write_static_resolv_conf
+    fi
+
+    if ! wait_for_dns_resolution; then
+        echo "DNS guard fallback: static /etc/resolv.conf" >> "$LOG_FILE"
+        write_static_resolv_conf
     fi
 
     if ! dns_resolution_ok; then
@@ -1909,10 +1961,12 @@ system_check_network_limits() {
     fi
 
     if dns_guard_configured; then
-        if systemd_resolved_available; then
+        if systemd_resolved_available && resolved_dns_guard_configured && resolv_conf_uses_resolved; then
             system_check_row ok "dns guard" "forced через systemd-resolved"
-        else
+        elif static_resolv_conf_configured; then
             system_check_row ok "dns guard" "static /etc/resolv.conf"
+        else
+            system_check_row ok "dns guard" "настроен"
         fi
     else
         SYSTEM_CHECK_NEEDS_NETWORK=1
@@ -2690,6 +2744,7 @@ fi
 : "${KTO_TRAFFIC_IFACE:?KTO_TRAFFIC_IFACE is required}"
 : "${KTO_TRAFFIC_BOT_TOKEN:?KTO_TRAFFIC_BOT_TOKEN is required}"
 : "${KTO_TRAFFIC_CHAT_ID:?KTO_TRAFFIC_CHAT_ID is required}"
+: "${KTO_TRAFFIC_REPORT_TZ:=Europe/Moscow}"
 
 format_bytes() {
     local bytes="${1:-0}"
@@ -2746,15 +2801,50 @@ $KTO_TRAFFIC_NAME
 Вход: $(format_bytes "$month_rx")
 Выход: $(format_bytes "$month_tx")
 
-Обновлено: $(date '+%d.%m.%Y %H:%M')
+Обновлено: $(TZ="$KTO_TRAFFIC_REPORT_TZ" date '+%d.%m.%Y %H:%M %Z')
 MSG
 )"
 
-curl -4 -fsS --connect-timeout 10 --retry 2 --retry-delay 2 \
-    -X POST "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/sendMessage" \
-    -d "chat_id=${KTO_TRAFFIC_CHAT_ID}" \
-    -d "disable_web_page_preview=true" \
-    --data-urlencode "text=${message}" >/dev/null
+telegram_api_ips() {
+    {
+        getent ahostsv4 api.telegram.org 2>/dev/null | awk '{print $1}'
+        if command -v jq >/dev/null 2>&1; then
+            curl -4 -fsS --connect-timeout 5 --max-time 10 \
+                --resolve cloudflare-dns.com:443:1.1.1.1 \
+                -H 'accept: application/dns-json' \
+                'https://cloudflare-dns.com/dns-query?name=api.telegram.org&type=A' 2>/dev/null \
+                | jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null || true
+            curl -4 -fsS --connect-timeout 5 --max-time 10 \
+                --resolve dns.google:443:8.8.8.8 \
+                -H 'accept: application/dns-json' \
+                'https://dns.google/resolve?name=api.telegram.org&type=A' 2>/dev/null \
+                | jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null || true
+        fi
+    } | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && !seen[$1]++ {print}'
+}
+
+send_telegram_request() {
+    local extra=("$@")
+    curl -4 -fsS --connect-timeout 8 --max-time 25 --retry 2 --retry-delay 2 \
+        "${extra[@]}" \
+        -X POST "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${KTO_TRAFFIC_CHAT_ID}" \
+        -d "disable_web_page_preview=true" \
+        --data-urlencode "text=${message}" >/dev/null
+}
+
+if send_telegram_request; then
+    exit 0
+fi
+
+while read -r telegram_ip; do
+    [[ -n "$telegram_ip" ]] || continue
+    if send_telegram_request --resolve "api.telegram.org:443:${telegram_ip}"; then
+        exit 0
+    fi
+done < <(telegram_api_ips)
+
+exit 1
 EOF
 }
 
@@ -2763,8 +2853,8 @@ install_traffic_report() {
     require_whitelist_mode
     need_root
 
-    local default_iface machine_name iface bot_token chat_id report_time
-    local safe_name safe_iface safe_token safe_chat safe_time
+    local default_iface machine_name iface bot_token chat_id report_time report_tz
+    local safe_name safe_iface safe_token safe_chat safe_time safe_tz
 
     default_iface="$(default_network_interface)"
     machine_name="$(ask_text "Название машины")"
@@ -2775,13 +2865,15 @@ install_traffic_report() {
     fi
     bot_token="$(ask_secret_value "Введите Telegram Bot Token")"
     chat_id="$(ask_text "Введите Telegram Chat ID")"
-    report_time="$(ask_time_hm "Время ежедневного отчёта" "00:05")"
+    report_time="$(ask_time_hm "Время ежедневного отчёта по МСК" "00:05")"
+    report_tz="$TRAFFIC_REPORT_TZ_DEFAULT"
 
     safe_name="$(escape_config_value "$machine_name")"
     safe_iface="$(escape_config_value "$iface")"
     safe_token="$(escape_config_value "$bot_token")"
     safe_chat="$(escape_config_value "$chat_id")"
     safe_time="$(escape_config_value "$report_time")"
+    safe_tz="$(escape_config_value "$report_tz")"
 
     stage "Устанавливаю статистику трафика"
     opt_dns_guard || true
@@ -2799,6 +2891,7 @@ KTO_TRAFFIC_IFACE="$safe_iface"
 KTO_TRAFFIC_BOT_TOKEN="$safe_token"
 KTO_TRAFFIC_CHAT_ID="$safe_chat"
 KTO_TRAFFIC_REPORT_TIME="$safe_time"
+KTO_TRAFFIC_REPORT_TZ="$safe_tz"
 EOF
 
     write_traffic_report_script
@@ -2819,7 +2912,7 @@ EOF
 Description=kto whitelist traffic Telegram report timer
 
 [Timer]
-OnCalendar=*-*-* ${report_time}:00
+OnCalendar=*-*-* ${report_time}:00 ${report_tz}
 Persistent=true
 Unit=${TRAFFIC_REPORT_SERVICE}
 
@@ -2833,7 +2926,7 @@ EOF
     ok "Отчёт по трафику установлен"
     ok "Машина: ${machine_name}"
     ok "Интерфейс: ${iface}"
-    ok "Ежедневно: ${report_time}"
+    ok "Ежедневно: ${report_time} МСК"
 
     stage "Отправляю тестовый отчёт"
     if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" >> "$LOG_FILE" 2>&1; then
@@ -2849,14 +2942,21 @@ send_traffic_report() {
     require_whitelist_mode
     need_root
 
-    if ! "${SUDO[@]}" test -x "$TRAFFIC_REPORT_SCRIPT" 2>/dev/null || ! "${SUDO[@]}" test -f "$TRAFFIC_REPORT_CONFIG" 2>/dev/null; then
+    if ! "${SUDO[@]}" test -f "$TRAFFIC_REPORT_CONFIG" 2>/dev/null; then
         fail "Отчёт по трафику не настроен. Сначала установи его в меню."
-        return 1
+        return 0
     fi
 
     stage "Отправляю отчёт по трафику"
-    must "Отправка отчёта" "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT"
-    ok "Отчёт отправлен"
+    opt_dns_guard || true
+    write_traffic_report_script
+    if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" >> "$LOG_FILE" 2>&1; then
+        ok "Отчёт отправлен"
+    else
+        warn "Отчёт не отправился. DNS guard применён, но api.telegram.org всё ещё недоступен или Telegram token/chat_id неверные."
+        tail -n 15 "$LOG_FILE" >&2 || true
+        return 0
+    fi
 }
 
 traffic_report_status() {
@@ -2864,17 +2964,19 @@ traffic_report_status() {
     require_whitelist_mode
     need_root
 
-    local name iface report_time timer_state vnstat_state
+    local name iface report_time report_tz timer_state vnstat_state
     name="$(config_get KTO_TRAFFIC_NAME "$TRAFFIC_REPORT_CONFIG")"
     iface="$(config_get KTO_TRAFFIC_IFACE "$TRAFFIC_REPORT_CONFIG")"
     report_time="$(config_get KTO_TRAFFIC_REPORT_TIME "$TRAFFIC_REPORT_CONFIG")"
+    report_tz="$(config_get KTO_TRAFFIC_REPORT_TZ "$TRAFFIC_REPORT_CONFIG")"
+    report_tz="${report_tz:-$TRAFFIC_REPORT_TZ_DEFAULT}"
     timer_state="$(service_ok "$TRAFFIC_REPORT_TIMER")"
     vnstat_state="$(service_ok vnstat)"
 
     echo -e "${BOLD}${PURPLE}[ ТРАФИК WHITELIST ]${NC}"
     print_row "машина" "${name:-не настроено}" "$([[ -n "$name" ]] && echo 1 || echo 0)"
     print_row "интерфейс" "${iface:-не настроено}" "$([[ -n "$iface" ]] && echo 1 || echo 0)"
-    print_row "время отчёта" "${report_time:-не настроено}" "$([[ -n "$report_time" ]] && echo 1 || echo 0)"
+    print_row "время отчёта" "${report_time:-не настроено} ${report_tz}" "$([[ -n "$report_time" ]] && echo 1 || echo 0)"
     print_row "vnstat" "service" "$vnstat_state"
     print_row "timer" "$TRAFFIC_REPORT_TIMER" "$timer_state"
 }
