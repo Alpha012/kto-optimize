@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v114"
+SCRIPT_BUILD="v115"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -564,8 +564,9 @@ settings_menu() {
         echo -e "${BOLD}${PURPLE}[ НАСТРОЙКИ ]${NC}"
         echo -e "1) Изменение режима"
         echo -e "2) Проверка системы"
+        echo -e "3) Очистка диска"
         if [[ "$MACHINE_MODE" == "whitelist" ]]; then
-            echo -e "3) Обновить HAProxy IP/SNI"
+            echo -e "4) Обновить HAProxy IP/SNI"
         fi
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
@@ -580,6 +581,10 @@ settings_menu() {
                 system_check
                 ;;
             3)
+                clean_disk_now
+                system_check_pause
+                ;;
+            4)
                 if [[ "$MACHINE_MODE" == "whitelist" ]]; then
                     configure_haproxy_backend
                 else
@@ -1428,6 +1433,10 @@ EOF
 }
 
 opt_storage_guard() {
+    cmd "${SUDO[@]}" apt-get clean || true
+    cmd "${SUDO[@]}" apt-get autoclean || true
+    cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || true
+
     cmd "${SUDO[@]}" mkdir -p /etc/systemd/journald.conf.d /etc/logrotate.d
     write_root_file "$STORAGE_GUARD_JOURNAL_CONF" <<'EOF'
 [Journal]
@@ -1457,7 +1466,26 @@ EOF
         cmd "${SUDO[@]}" logrotate "$KTO_LOGROTATE_CONF" || true
     fi
 
+    cmd "${SUDO[@]}" find /tmp -xdev -mindepth 1 -mtime +2 -exec rm -rf -- {} + || true
+    cmd "${SUDO[@]}" find /var/tmp -xdev -mindepth 1 -mtime +7 -exec rm -rf -- {} + || true
+    cmd "${SUDO[@]}" find /var/crash -type f -delete || true
+    cmd "${SUDO[@]}" find /var/lib/systemd/coredump -type f -mtime +1 -delete || true
+    cmd "${SUDO[@]}" find /var/log -xdev -type f \( -name '*.gz' -o -name '*.old' -o -name '*.1' \) -mtime +14 -delete || true
+
     configure_docker_log_rotation
+}
+
+clean_disk_now() {
+    header
+    need_root
+
+    stage "Очищаю диск"
+    opt_storage_guard
+
+    ok "Очистка диска завершена"
+    print_row "root disk" "$(root_disk_used_percent)% used"
+    print_row "apt archives" "$(format_mb "$(apt_cache_usage_mb)")"
+    print_row "apt lists" "$(format_mb "$(apt_lists_usage_mb)")"
 }
 
 opt_memory_guard() {
@@ -1864,7 +1892,11 @@ root_disk_used_percent() {
 }
 
 apt_cache_usage_mb() {
-    "${SUDO[@]}" du -sm /var/cache/apt /var/lib/apt/lists 2>/dev/null | awk '{sum += $1} END{print sum + 0}'
+    "${SUDO[@]}" du -sm /var/cache/apt/archives 2>/dev/null | awk '{sum += $1} END{print sum + 0}'
+}
+
+apt_lists_usage_mb() {
+    "${SUDO[@]}" du -sm /var/lib/apt/lists 2>/dev/null | awk '{sum += $1} END{print sum + 0}'
 }
 
 journald_storage_guard_configured() {
@@ -2013,13 +2045,17 @@ system_check_memory() {
 }
 
 system_check_storage() {
-    local used cache
+    local used cache lists
     used="$(root_disk_used_percent)"
     cache="$(apt_cache_usage_mb)"
+    lists="$(apt_lists_usage_mb)"
 
-    if [[ "$used" =~ ^[0-9]+$ && "$used" -ge 90 ]]; then
+    if [[ "$used" =~ ^[0-9]+$ && "$used" -ge 95 ]]; then
         SYSTEM_CHECK_NEEDS_STORAGE=1
-        system_check_row miss "root disk" "${used}% used, нужна очистка"
+        system_check_row miss "root disk" "${used}% used, критично: автоочистка + ручной аудит"
+    elif [[ "$used" =~ ^[0-9]+$ && "$used" -ge 90 ]]; then
+        SYSTEM_CHECK_NEEDS_STORAGE=1
+        system_check_row miss "root disk" "${used}% used, запускаю безопасную очистку"
     elif [[ "$used" =~ ^[0-9]+$ && "$used" -ge 80 ]]; then
         system_check_row warn "root disk" "${used}% used"
     elif [[ "$used" =~ ^[0-9]+$ ]]; then
@@ -2030,9 +2066,19 @@ system_check_storage() {
 
     if [[ "$cache" =~ ^[0-9]+$ && "$cache" -ge 512 ]]; then
         SYSTEM_CHECK_NEEDS_STORAGE=1
-        system_check_row miss "apt cache" "$(format_mb "$cache"), можно чистить"
+        system_check_row miss "apt archives" "$(format_mb "$cache"), можно чистить"
+    elif [[ "$cache" =~ ^[0-9]+$ && "$cache" -ge 128 ]]; then
+        system_check_row warn "apt archives" "$(format_mb "$cache"), не критично"
     else
-        system_check_row ok "apt cache" "$(format_mb "${cache:-0}")"
+        system_check_row ok "apt archives" "$(format_mb "${cache:-0}")"
+    fi
+
+    if [[ "$lists" =~ ^[0-9]+$ && "$lists" -ge 512 ]]; then
+        system_check_row skip "apt lists" "$(format_mb "$lists"), индекс пакетов после apt update"
+    elif [[ "$lists" =~ ^[0-9]+$ ]]; then
+        system_check_row ok "apt lists" "$(format_mb "$lists")"
+    else
+        system_check_row skip "apt lists" "не смог прочитать"
     fi
 
     if journald_storage_guard_configured; then
@@ -2856,7 +2902,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v114"
+COLLECTOR_BUILD = "v115"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3411,7 +3457,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v114"
+PUSH_BUILD="v115"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3644,7 +3690,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v114"
+REPORT_SCRIPT_BUILD="v115"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3841,7 +3887,7 @@ write_traffic_stats_bot_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STATS_BOT_BUILD="v114"
+STATS_BOT_BUILD="v115"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 STATE_DIR="/var/lib/kto-traffic-stats-bot"
 STATE_FILE="${STATE_DIR}/last_update_id"
@@ -4784,6 +4830,7 @@ main() {
         mode|config) reconfigure_machine_mode ;;
         settings) settings_menu ;;
         check|system-check) system_check ;;
+        disk-clean|storage-clean|clean-disk) clean_disk_now ;;
         dns|dns-guard) need_root; opt_dns_guard ;;
         zram|memory-guard) opt_zram ;;
         optimize) optimize_system ;;
