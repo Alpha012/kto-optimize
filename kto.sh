@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v105"
+SCRIPT_BUILD="v106"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2859,6 +2859,10 @@ send_telegram_request() {
     shift
     local extra=("$@")
     local body_file err_file response errors http_code rc short_response message_id response_chat_id
+    response=""
+    errors=""
+    http_code=""
+    short_response=""
     body_file="$(mktemp)"
     err_file="$(mktemp)"
 
@@ -2938,11 +2942,15 @@ run_traffic_report_script_once() {
 
     if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" > "$tmp" 2>&1; then
         cat "$tmp" >> "$LOG_FILE" 2>/dev/null || true
-        if [[ -s "$tmp" ]]; then
+        if grep -Eq '^telegram .*: sent message_id=' "$tmp"; then
             cat "$tmp"
+            rm -f "$tmp"
+            return 0
         fi
+        tail -n 20 "$tmp" >&2 || true
+        warn "Telegram API не подтвердил message_id, не считаю отчёт отправленным."
         rm -f "$tmp"
-        return 0
+        return 1
     fi
 
     rc=$?
