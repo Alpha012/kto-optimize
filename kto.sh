@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v107"
+SCRIPT_BUILD="v108"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2757,6 +2757,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+REPORT_SCRIPT_BUILD="v108"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -2898,13 +2899,13 @@ send_telegram_request() {
             if printf '%s' "$response" | jq -e '.ok == true and (.result.message_id != null)' >/dev/null 2>&1; then
                 message_id="$(printf '%s' "$response" | jq -r '.result.message_id')"
                 response_chat_id="$(printf '%s' "$response" | jq -r '.result.chat.id // "-"')"
-                echo "telegram ${label}: sent message_id=${message_id} chat_id=${response_chat_id}"
+                echo "telegram ${REPORT_SCRIPT_BUILD} ${label}: sent message_id=${message_id} chat_id=${response_chat_id}"
                 return 0
             fi
         elif printf '%s' "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' &&
             printf '%s' "$response" | grep -Eq '"message_id"[[:space:]]*:'; then
             message_id="$(printf '%s' "$response" | sed -n 's/.*"message_id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
-            echo "telegram ${label}: sent message_id=${message_id:-unknown} chat_id=${KTO_TRAFFIC_CHAT_ID}"
+            echo "telegram ${REPORT_SCRIPT_BUILD} ${label}: sent message_id=${message_id:-unknown} chat_id=${KTO_TRAFFIC_CHAT_ID}"
             return 0
         fi
 
@@ -2914,14 +2915,14 @@ send_telegram_request() {
     errors="$(printf '%s' "$errors" | tr '\n' ' ' | cut -c1-500)"
     if (( rc != 0 )); then
         if [[ -n "$short_response" ]]; then
-            echo "telegram ${label}: curl rc=${rc} http=${http_code:-000}: ${errors}; body: ${short_response}" >&2
+            echo "telegram ${REPORT_SCRIPT_BUILD} ${label}: curl rc=${rc} http=${http_code:-000}: ${errors}; body: ${short_response}" >&2
         else
-            echo "telegram ${label}: curl rc=${rc} http=${http_code:-000}: ${errors}" >&2
+            echo "telegram ${REPORT_SCRIPT_BUILD} ${label}: curl rc=${rc} http=${http_code:-000}: ${errors}" >&2
         fi
         return "$rc"
     fi
 
-    echo "telegram ${label}: bad response http=${http_code:-000}: ${short_response:-empty}" >&2
+    echo "telegram ${REPORT_SCRIPT_BUILD} ${label}: bad response http=${http_code:-000}: ${short_response:-empty}" >&2
     return 1
 }
 
@@ -2954,7 +2955,7 @@ run_traffic_report_script_once() {
 
     if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" > "$tmp" 2>&1; then
         cat "$tmp" >> "$LOG_FILE" 2>/dev/null || true
-        if grep -Eq '^telegram .*: sent message_id=' "$tmp"; then
+        if grep -Eq '^telegram .* sent message_id=' "$tmp"; then
             cat "$tmp"
             rm -f "$tmp"
             return 0
@@ -3075,7 +3076,7 @@ send_traffic_report() {
     opt_dns_guard || true
     write_traffic_report_script
     if run_traffic_report_script_once; then
-        ok "Отчёт отправлен"
+        ok "Отчёт отправлен (${SCRIPT_BUILD})"
     else
         warn "Отчёт не отправился. DNS guard применён, но api.telegram.org всё ещё недоступен или Telegram token/chat_id неверные."
         return 0
