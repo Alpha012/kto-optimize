@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="3.6.13"
+SCRIPT_VERSION="3.6.14"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -39,6 +39,10 @@ ZRAM_SETUP_SCRIPT="/usr/local/sbin/kto-zram-setup"
 ZRAM_SERVICE="kto-zram.service"
 ZRAM_PERCENT="${KTO_ZRAM_PERCENT:-50}"
 ZRAM_MAX_MB="${KTO_ZRAM_MAX_MB:-2048}"
+STORAGE_GUARD_JOURNAL_CONF="/etc/systemd/journald.conf.d/99-kto-storage.conf"
+KTO_LOGROTATE_CONF="/etc/logrotate.d/kto-vpn"
+DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
 APT_UPDATED=0
 
 GREEN='\033[0;32m'
@@ -1540,6 +1544,12 @@ EOF
 opt_prepare_system() {
     cmd "${SUDO[@]}" systemctl stop unattended-upgrades || true
     cmd "${SUDO[@]}" dpkg --configure -a || true
+    cmd "${SUDO[@]}" apt-get clean || true
+    cmd "${SUDO[@]}" apt-get autoclean || true
+    cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || true
+    if command_exists journalctl; then
+        cmd "${SUDO[@]}" journalctl --vacuum-size=256M --vacuum-time=7d || true
+    fi
     cmd "${SUDO[@]}" rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list || true
     if package_installed snapd; then
         cmd "${SUDO[@]}" systemctl disable --now snapd.socket snapd.service || true
@@ -1551,9 +1561,9 @@ opt_prepare_system() {
 
 optimization_packages() {
     local packages cpus
-    packages=(ca-certificates curl wget gnupg2 software-properties-common ufw openssl dnsutils)
+    packages=(ca-certificates curl wget gnupg2 software-properties-common ufw openssl dnsutils jq logrotate)
     if [[ "$MACHINE_MODE" == "node" ]]; then
-        packages+=(chrony cpufrequtils logrotate tar xz-utils)
+        packages+=(chrony cpufrequtils tar xz-utils)
         cpus="$(cpu_count)"
         if (( cpus > 1 )); then
             packages+=(irqbalance)
@@ -1567,6 +1577,101 @@ opt_install_packages() {
     mapfile -t packages < <(optimization_packages)
     apt_update_quiet
     apt_install_quiet "${packages[@]}"
+}
+
+configure_docker_log_rotation() {
+    command_exists docker || return 0
+
+    local tmp backup
+    tmp="$(mktemp)"
+    cmd "${SUDO[@]}" mkdir -p /etc/docker
+
+    if "${SUDO[@]}" test -s "$DOCKER_DAEMON_JSON" 2>/dev/null && command_exists jq && "${SUDO[@]}" jq -e . "$DOCKER_DAEMON_JSON" >/dev/null 2>&1; then
+        if ! "${SUDO[@]}" jq '. + {"log-driver":"json-file"} | ."log-opts" = ((."log-opts" // {}) + {"max-size":"20m","max-file":"3"})' "$DOCKER_DAEMON_JSON" > "$tmp" 2>> "$LOG_FILE"; then
+            rm -f "$tmp"
+            echo "Docker log rotation skipped: jq merge failed" >> "$LOG_FILE"
+            return 0
+        fi
+    elif "${SUDO[@]}" test -f "$DOCKER_DAEMON_JSON" 2>/dev/null && ! command_exists jq; then
+        rm -f "$tmp"
+        echo "Docker log rotation skipped: jq not installed and daemon.json exists" >> "$LOG_FILE"
+        return 0
+    else
+        cat > "$tmp" <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "3"
+  }
+}
+EOF
+    fi
+
+    if "${SUDO[@]}" test -f "$DOCKER_DAEMON_JSON" 2>/dev/null; then
+        backup="${DOCKER_DAEMON_JSON}.kto-backup-$(date +%Y%m%d%H%M%S)"
+        cmd "${SUDO[@]}" cp -a "$DOCKER_DAEMON_JSON" "$backup" || true
+    fi
+    cmd "${SUDO[@]}" install -m 0644 "$tmp" "$DOCKER_DAEMON_JSON"
+    rm -f "$tmp"
+
+    cmd "${SUDO[@]}" find /var/lib/docker/containers -type f -name '*-json.log' -size +100M -exec truncate -s 0 {} + || true
+    cmd "${SUDO[@]}" docker image prune -af || true
+    cmd "${SUDO[@]}" docker builder prune -af || true
+    cmd "${SUDO[@]}" systemctl reload docker || true
+}
+
+opt_storage_guard() {
+    cmd "${SUDO[@]}" mkdir -p /etc/systemd/journald.conf.d /etc/logrotate.d
+    write_root_file "$STORAGE_GUARD_JOURNAL_CONF" <<'EOF'
+[Journal]
+SystemMaxUse=256M
+RuntimeMaxUse=64M
+MaxRetentionSec=7day
+MaxFileSec=1day
+EOF
+
+    if command_exists journalctl; then
+        cmd "${SUDO[@]}" journalctl --vacuum-size=256M --vacuum-time=7d || true
+    fi
+    cmd "${SUDO[@]}" systemctl restart systemd-journald || true
+
+    write_root_file "$KTO_LOGROTATE_CONF" <<EOF
+$LOG_FILE {
+    size 10M
+    rotate 5
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF
+    if command_exists logrotate; then
+        cmd "${SUDO[@]}" logrotate "$KTO_LOGROTATE_CONF" || true
+    fi
+
+    configure_docker_log_rotation
+}
+
+opt_memory_guard() {
+    local swappiness=10
+
+    if zram_recommended; then
+        opt_zram
+    fi
+    if zram_active; then
+        swappiness=100
+    fi
+
+    write_root_file "$MEMORY_GUARD_SYSCTL_CONF" <<EOF
+vm.swappiness = $swappiness
+vm.vfs_cache_pressure = 150
+vm.dirty_background_ratio = 5
+vm.dirty_ratio = 20
+vm.page-cluster = 0
+EOF
+    cmd "${SUDO[@]}" sysctl --system || true
 }
 
 opt_liquorix_kernel() {
@@ -1780,6 +1885,8 @@ SYSTEM_CHECK_NEEDS_FIREWALL=0
 SYSTEM_CHECK_NEEDS_ANTISCANNER=0
 SYSTEM_CHECK_NEEDS_FAIL2BAN=0
 SYSTEM_CHECK_NEEDS_ZRAM=0
+SYSTEM_CHECK_NEEDS_STORAGE=0
+SYSTEM_CHECK_NEEDS_MEMORY_GUARD=0
 
 system_check_reset() {
     SYSTEM_CHECK_MISSING=0
@@ -1792,6 +1899,8 @@ system_check_reset() {
     SYSTEM_CHECK_NEEDS_ANTISCANNER=0
     SYSTEM_CHECK_NEEDS_FAIL2BAN=0
     SYSTEM_CHECK_NEEDS_ZRAM=0
+    SYSTEM_CHECK_NEEDS_STORAGE=0
+    SYSTEM_CHECK_NEEDS_MEMORY_GUARD=0
 }
 
 system_check_badge() {
@@ -1828,6 +1937,13 @@ root_file_has_line() {
     local line="$2"
     "${SUDO[@]}" test -f "$file" 2>/dev/null || return 1
     "${SUDO[@]}" grep -Fqx "$line" "$file" 2>/dev/null
+}
+
+root_file_contains() {
+    local file="$1"
+    local pattern="$2"
+    "${SUDO[@]}" test -f "$file" 2>/dev/null || return 1
+    "${SUDO[@]}" grep -Eq "$pattern" "$file" 2>/dev/null
 }
 
 cpu_count() {
@@ -1934,6 +2050,39 @@ memory_oom_count() {
     echo "timeout"
 }
 
+root_disk_used_percent() {
+    df -P / 2>/dev/null | awk 'NR == 2 {gsub(/%/, "", $5); print $5; found=1} END{if (!found) print 0}'
+}
+
+apt_cache_usage_mb() {
+    "${SUDO[@]}" du -sm /var/cache/apt /var/lib/apt/lists 2>/dev/null | awk '{sum += $1} END{print sum + 0}'
+}
+
+journald_storage_guard_configured() {
+    root_file_has_line "$STORAGE_GUARD_JOURNAL_CONF" "SystemMaxUse=256M" &&
+        root_file_has_line "$STORAGE_GUARD_JOURNAL_CONF" "RuntimeMaxUse=64M" &&
+        root_file_has_line "$STORAGE_GUARD_JOURNAL_CONF" "MaxRetentionSec=7day"
+}
+
+kto_logrotate_configured() {
+    root_file_contains "$KTO_LOGROTATE_CONF" 'size[[:space:]]+10M' &&
+        root_file_contains "$KTO_LOGROTATE_CONF" 'rotate[[:space:]]+5' &&
+        root_file_contains "$KTO_LOGROTATE_CONF" 'copytruncate'
+}
+
+docker_log_rotation_configured() {
+    root_file_contains "$DOCKER_DAEMON_JSON" '"log-driver"[[:space:]]*:[[:space:]]*"json-file"' &&
+        root_file_contains "$DOCKER_DAEMON_JSON" '"max-size"[[:space:]]*:' &&
+        root_file_contains "$DOCKER_DAEMON_JSON" '"max-file"[[:space:]]*:'
+}
+
+memory_guard_configured() {
+    root_file_has_line "$MEMORY_GUARD_SYSCTL_CONF" "vm.vfs_cache_pressure = 150" &&
+        root_file_has_line "$MEMORY_GUARD_SYSCTL_CONF" "vm.dirty_background_ratio = 5" &&
+        root_file_has_line "$MEMORY_GUARD_SYSCTL_CONF" "vm.dirty_ratio = 20" &&
+        root_file_has_line "$MEMORY_GUARD_SYSCTL_CONF" "vm.page-cluster = 0"
+}
+
 ufw_active() {
     command_exists ufw && "${SUDO[@]}" ufw status 2>/dev/null | grep -q "Status: active"
 }
@@ -2013,7 +2162,7 @@ system_check_kernel() {
 }
 
 system_check_memory() {
-    local total available swap zram_size oom_count
+    local total available swap zram_size oom_count swappiness
     total="$(memory_total_mb)"
     available="$(memory_available_mb)"
     swap="$(swap_total_mb)"
@@ -2043,6 +2192,63 @@ system_check_memory() {
         system_check_row ok "OOM" "не найдено в последних kernel logs"
     else
         system_check_row skip "OOM" "проверка пропущена (${oom_count})"
+    fi
+
+    swappiness="$(sysctl -n vm.swappiness 2>/dev/null || echo "-")"
+    if memory_guard_configured; then
+        system_check_row ok "memory guard" "swappiness=${swappiness}"
+    else
+        SYSTEM_CHECK_NEEDS_MEMORY_GUARD=1
+        system_check_row miss "memory guard" "нет $MEMORY_GUARD_SYSCTL_CONF"
+    fi
+}
+
+system_check_storage() {
+    local used cache
+    used="$(root_disk_used_percent)"
+    cache="$(apt_cache_usage_mb)"
+
+    if [[ "$used" =~ ^[0-9]+$ && "$used" -ge 90 ]]; then
+        SYSTEM_CHECK_NEEDS_STORAGE=1
+        system_check_row miss "root disk" "${used}% used, нужна очистка"
+    elif [[ "$used" =~ ^[0-9]+$ && "$used" -ge 80 ]]; then
+        system_check_row warn "root disk" "${used}% used"
+    elif [[ "$used" =~ ^[0-9]+$ ]]; then
+        system_check_row ok "root disk" "${used}% used"
+    else
+        system_check_row warn "root disk" "не смог прочитать df"
+    fi
+
+    if [[ "$cache" =~ ^[0-9]+$ && "$cache" -ge 512 ]]; then
+        SYSTEM_CHECK_NEEDS_STORAGE=1
+        system_check_row miss "apt cache" "$(format_mb "$cache"), можно чистить"
+    else
+        system_check_row ok "apt cache" "$(format_mb "${cache:-0}")"
+    fi
+
+    if journald_storage_guard_configured; then
+        system_check_row ok "journald" "limit 256M / 7d"
+    else
+        SYSTEM_CHECK_NEEDS_STORAGE=1
+        system_check_row miss "journald" "лимит логов не настроен"
+    fi
+
+    if kto_logrotate_configured; then
+        system_check_row ok "kto logrotate" "size 10M, rotate 5"
+    else
+        SYSTEM_CHECK_NEEDS_STORAGE=1
+        system_check_row miss "kto logrotate" "нет ротации $LOG_FILE"
+    fi
+
+    if command_exists docker; then
+        if docker_log_rotation_configured; then
+            system_check_row ok "docker logs" "json-file max-size/max-file"
+        else
+            SYSTEM_CHECK_NEEDS_STORAGE=1
+            system_check_row miss "docker logs" "нет log rotation"
+        fi
+    else
+        system_check_row skip "docker logs" "docker не установлен"
     fi
 }
 
@@ -2186,6 +2392,8 @@ system_check_apply_missing() {
     (( SYSTEM_CHECK_NEEDS_FIREWALL == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )) && steps=$(( steps + 1 ))
+    (( SYSTEM_CHECK_NEEDS_STORAGE == 1 )) && steps=$(( steps + 1 ))
+    (( SYSTEM_CHECK_NEEDS_MEMORY_GUARD == 1 )) && steps=$(( steps + 1 ))
 
     if (( steps == 0 )); then
         ok "Недостающих действий нет."
@@ -2201,6 +2409,8 @@ system_check_apply_missing() {
     (( SYSTEM_CHECK_NEEDS_PACKAGES == 1 )) && progress_step "Ставлю пакеты" opt_install_packages
     (( SYSTEM_CHECK_NEEDS_KERNEL == 1 )) && progress_step "Обновляю kernel" opt_liquorix_kernel
     (( SYSTEM_CHECK_NEEDS_NETWORK == 1 )) && progress_step "Настраиваю сеть" opt_network_limits
+    (( SYSTEM_CHECK_NEEDS_STORAGE == 1 )) && progress_step "Настраиваю хранение" opt_storage_guard
+    (( SYSTEM_CHECK_NEEDS_MEMORY_GUARD == 1 )) && progress_step "Настраиваю память" opt_memory_guard
     (( SYSTEM_CHECK_NEEDS_FIREWALL == 1 )) && progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
     (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && progress_step "Подключаю AntiScanner" opt_antiscanner
     (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )) && progress_step "Настраиваю Fail2ban" opt_fail2ban
@@ -2236,6 +2446,10 @@ system_check() {
     echo
     echo -e "${BOLD}${PURPLE}[ ПАМЯТЬ ]${NC}"
     system_check_memory
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ДИСК ]${NC}"
+    system_check_storage
 
     echo
     echo -e "${BOLD}${PURPLE}[ OPTIMIZATION AUDIT ]${NC}"
@@ -2322,11 +2536,13 @@ optimize_system() {
     export NEEDRESTART_MODE=a
     export NEEDRESTART_SUSPEND=1
 
-    progress_start 7
+    progress_start 9
     progress_step "Готовлю систему" opt_prepare_system
     progress_step "Ставлю пакеты" opt_install_packages
+    progress_step "Настраиваю хранение" opt_storage_guard
     progress_step "Обновляю kernel" opt_liquorix_kernel
     progress_step "Настраиваю сеть" opt_network_limits
+    progress_step "Настраиваю память" opt_memory_guard
     progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
     progress_step "Подключаю AntiScanner" opt_antiscanner
     progress_step "Настраиваю Fail2ban" opt_fail2ban
