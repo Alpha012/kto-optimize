@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v108"
+SCRIPT_BUILD="v109"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -40,7 +40,10 @@ TRAFFIC_REPORT_CONFIG="/etc/kto-traffic-report.conf"
 TRAFFIC_REPORT_SCRIPT="/usr/local/bin/kto-traffic-report"
 TRAFFIC_REPORT_SERVICE="kto-traffic-report.service"
 TRAFFIC_REPORT_TIMER="kto-traffic-report.timer"
+TRAFFIC_STATS_BOT_SCRIPT="/usr/local/bin/kto-traffic-stats-bot"
+TRAFFIC_STATS_BOT_SERVICE="kto-traffic-stats-bot.service"
 TRAFFIC_REPORT_TZ_DEFAULT="Europe/Moscow"
+TRAFFIC_STATS_ALLOWED_USER_ID_DEFAULT="646296998"
 APT_UPDATED=0
 
 GREEN='\033[0;32m'
@@ -2757,7 +2760,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v108"
+REPORT_SCRIPT_BUILD="v109"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -2949,6 +2952,349 @@ exit 1
 EOF
 }
 
+write_traffic_stats_bot_script() {
+    write_root_file_mode 0755 "$TRAFFIC_STATS_BOT_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATS_BOT_BUILD="v109"
+CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
+STATE_DIR="/var/lib/kto-traffic-stats-bot"
+STATE_FILE="${STATE_DIR}/last_update_id"
+POLL_INTERVAL="${KTO_STATS_POLL_INTERVAL:-5}"
+POLL_LIMIT="${KTO_STATS_POLL_LIMIT:-20}"
+SEND_ATTEMPTS="${KTO_STATS_SEND_ATTEMPTS:-6}"
+SEND_DELAY="${KTO_STATS_SEND_DELAY:-10}"
+
+if [[ ! -r "$CONFIG" ]]; then
+    echo "Config not found: $CONFIG" >&2
+    exit 1
+fi
+
+# shellcheck source=/etc/kto-traffic-report.conf
+. "$CONFIG"
+
+: "${KTO_TRAFFIC_NAME:?KTO_TRAFFIC_NAME is required}"
+: "${KTO_TRAFFIC_IFACE:?KTO_TRAFFIC_IFACE is required}"
+: "${KTO_TRAFFIC_BOT_TOKEN:?KTO_TRAFFIC_BOT_TOKEN is required}"
+: "${KTO_TRAFFIC_CHAT_ID:?KTO_TRAFFIC_CHAT_ID is required}"
+: "${KTO_TRAFFIC_REPORT_TZ:=Europe/Moscow}"
+: "${KTO_STATS_ALLOWED_USER_ID:=646296998}"
+
+mkdir -p "$STATE_DIR"
+
+html_escape() {
+    local value="$1"
+    value="${value//&/&amp;}"
+    value="${value//</&lt;}"
+    value="${value//>/&gt;}"
+    echo "$value"
+}
+
+format_bytes() {
+    local bytes="${1:-0}"
+    LC_ALL=C awk -v bytes="$bytes" '
+        BEGIN {
+            split("B KB MB GB TB PB", units, " ")
+            value = bytes + 0
+            idx = 1
+            while (value >= 1024 && idx < 6) {
+                value = value / 1024
+                idx++
+            }
+            if (idx == 1) {
+                printf "%.0f %s", value, units[idx]
+            } else {
+                printf "%.1f %s", value, units[idx]
+            }
+        }'
+}
+
+telegram_api_ips() {
+    {
+        getent ahostsv4 api.telegram.org 2>/dev/null | awk '{print $1}'
+        if command -v jq >/dev/null 2>&1; then
+            curl -4 -fsS --connect-timeout 5 --max-time 10 \
+                --resolve cloudflare-dns.com:443:1.1.1.1 \
+                -H 'accept: application/dns-json' \
+                'https://cloudflare-dns.com/dns-query?name=api.telegram.org&type=A' 2>/dev/null \
+                | jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null || true
+            curl -4 -fsS --connect-timeout 5 --max-time 10 \
+                --resolve dns.google:443:8.8.8.8 \
+                -H 'accept: application/dns-json' \
+                'https://dns.google/resolve?name=api.telegram.org&type=A' 2>/dev/null \
+                | jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null || true
+        fi
+        printf '%s\n' 149.154.166.110
+    } | awk -F. '
+        NF == 4 {
+            valid = 1
+            for (i = 1; i <= 4; i++) {
+                if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) {
+                    valid = 0
+                }
+            }
+            if (valid && !seen[$0]++) {
+                print
+            }
+        }'
+}
+
+curl_telegram() {
+    local label="$1"
+    shift
+    local body_file err_file response errors http_code rc short_response
+    body_file="$(mktemp)"
+    err_file="$(mktemp)"
+
+    set +e
+    http_code="$(curl -4 -sS --connect-timeout 8 --max-time 20 \
+        "$@" \
+        -o "$body_file" \
+        -w '%{http_code}' 2>"$err_file")"
+    rc=$?
+    set -e
+
+    response="$(cat "$body_file" 2>/dev/null || true)"
+    errors="$(cat "$err_file" 2>/dev/null || true)"
+    rm -f "$body_file" "$err_file"
+
+    if (( rc != 0 )); then
+        errors="$(printf '%s' "$errors" | tr '\n' ' ' | cut -c1-500)"
+        echo "telegram ${STATS_BOT_BUILD} ${label}: curl rc=${rc} http=${http_code:-000}: ${errors}" >&2
+        return "$rc"
+    fi
+
+    if command -v jq >/dev/null 2>&1 && ! printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+        short_response="$(printf '%s' "$response" | tr '\n' ' ' | cut -c1-700)"
+        echo "telegram ${STATS_BOT_BUILD} ${label}: bad response http=${http_code:-000}: ${short_response:-empty}" >&2
+        return 1
+    fi
+
+    printf '%s' "$response"
+}
+
+telegram_call() {
+    local method="$1"
+    shift
+    local response telegram_ip
+
+    if response="$(curl_telegram "dns/${method}" "$@" "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/${method}")"; then
+        printf '%s' "$response"
+        return 0
+    fi
+
+    while read -r telegram_ip; do
+        [[ -n "$telegram_ip" ]] || continue
+        if response="$(curl_telegram "ip/${method}:${telegram_ip}" \
+            --resolve "api.telegram.org:443:${telegram_ip}" \
+            "$@" "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/${method}")"; then
+            printf '%s' "$response"
+            return 0
+        fi
+    done < <(telegram_api_ips)
+
+    return 1
+}
+
+send_stats_message_once() {
+    local message="$1"
+    local response message_id response_chat_id
+
+    response="$(telegram_call sendMessage \
+        -X POST \
+        -d "chat_id=${KTO_TRAFFIC_CHAT_ID}" \
+        -d "disable_web_page_preview=true" \
+        -d "parse_mode=HTML" \
+        --data-urlencode "text=${message}")" || return 1
+
+    if command -v jq >/dev/null 2>&1; then
+        if printf '%s' "$response" | jq -e '.ok == true and (.result.message_id != null)' >/dev/null 2>&1; then
+            message_id="$(printf '%s' "$response" | jq -r '.result.message_id')"
+            response_chat_id="$(printf '%s' "$response" | jq -r '.result.chat.id // "-"')"
+            echo "stats ${STATS_BOT_BUILD}: sent message_id=${message_id} chat_id=${response_chat_id}"
+            return 0
+        fi
+    elif printf '%s' "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' &&
+        printf '%s' "$response" | grep -Eq '"message_id"[[:space:]]*:'; then
+        message_id="$(printf '%s' "$response" | sed -n 's/.*"message_id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+        echo "stats ${STATS_BOT_BUILD}: sent message_id=${message_id:-unknown} chat_id=${KTO_TRAFFIC_CHAT_ID}"
+        return 0
+    fi
+
+    echo "stats ${STATS_BOT_BUILD}: Telegram API did not confirm message_id" >&2
+    return 1
+}
+
+send_stats_message() {
+    local message="$1"
+    local attempt
+    for (( attempt = 1; attempt <= SEND_ATTEMPTS; attempt++ )); do
+        if send_stats_message_once "$message"; then
+            return 0
+        fi
+        sleep "$SEND_DELAY"
+    done
+    return 1
+}
+
+build_stats_message() {
+    local error="" traffic_json stats
+    local day_rx=0 day_tx=0 month_rx=0 month_tx=0 day_total=0 month_total=0
+
+    if ! command -v jq >/dev/null 2>&1; then
+        error="jq не установлен"
+    elif ! command -v vnstat >/dev/null 2>&1; then
+        error="vnstat не установлен"
+    else
+        if ! traffic_json="$(vnstat -i "$KTO_TRAFFIC_IFACE" --json 2>&1)"; then
+            error="vnstat: ${traffic_json}"
+        elif [[ -z "$traffic_json" ]]; then
+            error="vnstat не вернул данные по интерфейсу ${KTO_TRAFFIC_IFACE}"
+        else
+            stats="$(printf '%s' "$traffic_json" | jq -r '
+                def day_key: (.date.year * 10000 + .date.month * 100 + .date.day);
+                def month_key: (.date.year * 100 + .date.month);
+                (.interfaces[0].traffic.day // []) as $days |
+                (.interfaces[0].traffic.month // []) as $months |
+                ($days | max_by(day_key) // {rx:0, tx:0}) as $day |
+                ($months | max_by(month_key) // {rx:0, tx:0}) as $month |
+                "\($day.rx // 0) \($day.tx // 0) \($month.rx // 0) \($month.tx // 0)"
+            ' 2>/dev/null || true)"
+            if [[ -z "$stats" ]]; then
+                error="jq не смог разобрать vnstat json"
+            else
+                set -- $stats
+                day_rx="${1:-0}"
+                day_tx="${2:-0}"
+                month_rx="${3:-0}"
+                month_tx="${4:-0}"
+                day_total=$(( day_rx + day_tx ))
+                month_total=$(( month_rx + month_tx ))
+            fi
+        fi
+    fi
+
+    if [[ -n "$error" ]]; then
+        cat <<MSG
+<b>$(html_escape "$KTO_TRAFFIC_NAME")</b>
+
+Сегодня: ошибка
+I/O: - | -
+
+Месяц: ошибка
+
+Ошибка: $(html_escape "$error")
+Обновлено: $(TZ="$KTO_TRAFFIC_REPORT_TZ" date '+%d.%m.%Y %H:%M')
+MSG
+        return 0
+    fi
+
+    cat <<MSG
+<b>$(html_escape "$KTO_TRAFFIC_NAME")</b>
+
+Сегодня: $(format_bytes "$day_total")
+I/O: $(format_bytes "$day_rx") | $(format_bytes "$day_tx")
+
+Месяц: $(format_bytes "$month_total")
+
+Обновлено: $(TZ="$KTO_TRAFFIC_REPORT_TZ" date '+%d.%m.%Y %H:%M')
+MSG
+}
+
+fetch_updates() {
+    telegram_call getUpdates \
+        -X POST \
+        -d "timeout=0" \
+        -d "limit=${POLL_LIMIT}" \
+        -d "offset=-${POLL_LIMIT}" \
+        --data-urlencode 'allowed_updates=["message"]'
+}
+
+last_update_id() {
+    if [[ -r "$STATE_FILE" ]]; then
+        cat "$STATE_FILE" 2>/dev/null || echo 0
+    else
+        echo 0
+    fi
+}
+
+save_last_update_id() {
+    local update_id="$1"
+    printf '%s\n' "$update_id" > "$STATE_FILE"
+}
+
+handle_updates() {
+    local updates="$1"
+    local last update_id message_id line message
+    last="$(last_update_id)"
+
+    command -v jq >/dev/null 2>&1 || {
+        echo "stats ${STATS_BOT_BUILD}: jq required for update parsing" >&2
+        return 0
+    }
+
+    while IFS=$'\t' read -r update_id message_id; do
+        [[ "$update_id" =~ ^[0-9]+$ ]] || continue
+        if (( update_id <= last )); then
+            continue
+        fi
+
+        save_last_update_id "$update_id"
+        last="$update_id"
+        message="$(build_stats_message)"
+        if ! send_stats_message "$message"; then
+            echo "stats ${STATS_BOT_BUILD}: failed to answer /stats update_id=${update_id} message_id=${message_id}" >&2
+        fi
+    done < <(printf '%s' "$updates" | jq -r \
+        --arg chat "$KTO_TRAFFIC_CHAT_ID" \
+        --arg user "$KTO_STATS_ALLOWED_USER_ID" '
+        .result[]? |
+        select(.message?) |
+        select((.message.chat.id | tostring) == $chat) |
+        select((.message.from.id | tostring) == $user) |
+        select((.message.text // "") | test("^/stats(@[A-Za-z0-9_]+)?($|[[:space:]])")) |
+        [.update_id, (.message.message_id // 0)] |
+        @tsv
+    ' 2>/dev/null || true)
+}
+
+echo "stats ${STATS_BOT_BUILD}: listening /stats for user ${KTO_STATS_ALLOWED_USER_ID} in chat ${KTO_TRAFFIC_CHAT_ID}"
+while true; do
+    if updates="$(fetch_updates)"; then
+        handle_updates "$updates"
+    fi
+    sleep "$POLL_INTERVAL"
+done
+EOF
+}
+
+write_traffic_stats_bot_service() {
+    write_root_file "/etc/systemd/system/${TRAFFIC_STATS_BOT_SERVICE}" <<EOF
+[Unit]
+Description=kto whitelist traffic /stats Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${TRAFFIC_STATS_BOT_SCRIPT}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+setup_traffic_stats_bot() {
+    write_traffic_stats_bot_script
+    write_traffic_stats_bot_service
+    cmd "${SUDO[@]}" systemctl daemon-reload
+    cmd "${SUDO[@]}" systemctl enable --now "$TRAFFIC_STATS_BOT_SERVICE"
+    cmd "${SUDO[@]}" systemctl restart "$TRAFFIC_STATS_BOT_SERVICE" || true
+}
+
 run_traffic_report_script_once() {
     local tmp rc
     tmp="$(mktemp)"
@@ -2978,8 +3324,8 @@ install_traffic_report() {
     require_whitelist_mode
     need_root
 
-    local default_iface machine_name iface bot_token chat_id report_time report_tz
-    local safe_name safe_iface safe_token safe_chat safe_time safe_tz
+    local default_iface machine_name iface bot_token chat_id report_time report_tz stats_allowed_user_id
+    local safe_name safe_iface safe_token safe_chat safe_time safe_tz safe_stats_user_id
 
     default_iface="$(default_network_interface)"
     machine_name="$(ask_text "Название машины")"
@@ -2992,6 +3338,7 @@ install_traffic_report() {
     chat_id="$(ask_text "Введите Telegram Chat ID")"
     report_time="$(ask_time_hm "Время ежедневного отчёта по МСК")"
     report_tz="$TRAFFIC_REPORT_TZ_DEFAULT"
+    stats_allowed_user_id="$TRAFFIC_STATS_ALLOWED_USER_ID_DEFAULT"
 
     safe_name="$(escape_config_value "$machine_name")"
     safe_iface="$(escape_config_value "$iface")"
@@ -2999,6 +3346,7 @@ install_traffic_report() {
     safe_chat="$(escape_config_value "$chat_id")"
     safe_time="$(escape_config_value "$report_time")"
     safe_tz="$(escape_config_value "$report_tz")"
+    safe_stats_user_id="$(escape_config_value "$stats_allowed_user_id")"
 
     stage "Устанавливаю статистику трафика"
     opt_dns_guard || true
@@ -3014,6 +3362,7 @@ KTO_TRAFFIC_BOT_TOKEN="$safe_token"
 KTO_TRAFFIC_CHAT_ID="$safe_chat"
 KTO_TRAFFIC_REPORT_TIME="$safe_time"
 KTO_TRAFFIC_REPORT_TZ="$safe_tz"
+KTO_STATS_ALLOWED_USER_ID="$safe_stats_user_id"
 EOF
 
     write_traffic_report_script
@@ -3048,11 +3397,13 @@ EOF
 
     cmd "${SUDO[@]}" systemctl daemon-reload
     cmd "${SUDO[@]}" systemctl enable --now "$TRAFFIC_REPORT_TIMER"
+    setup_traffic_stats_bot
 
     ok "Отчёт по трафику установлен"
     ok "Машина: ${machine_name}"
     ok "Интерфейс: ${iface}"
     ok "Ежедневно: ${report_time} МСК"
+    ok "/stats: user ${stats_allowed_user_id}"
 
     stage "Отправляю тестовый отчёт"
     if run_traffic_report_script_once; then
@@ -3083,12 +3434,28 @@ send_traffic_report() {
     fi
 }
 
+install_traffic_stats_bot() {
+    header
+    require_whitelist_mode
+    need_root
+
+    if ! "${SUDO[@]}" test -f "$TRAFFIC_REPORT_CONFIG" 2>/dev/null; then
+        fail "Отчёт по трафику не настроен. Сначала установи его в меню."
+        return 0
+    fi
+
+    stage "Устанавливаю /stats bot"
+    setup_traffic_stats_bot
+    ok "/stats bot установлен (${SCRIPT_BUILD})"
+    ok "Разрешенный user id: $(config_get KTO_STATS_ALLOWED_USER_ID "$TRAFFIC_REPORT_CONFIG")"
+}
+
 traffic_report_status() {
     header
     require_whitelist_mode
     need_root
 
-    local name iface report_time report_tz timer_state vnstat_state
+    local name iface report_time report_tz timer_state vnstat_state stats_bot_state
     name="$(config_get KTO_TRAFFIC_NAME "$TRAFFIC_REPORT_CONFIG")"
     iface="$(config_get KTO_TRAFFIC_IFACE "$TRAFFIC_REPORT_CONFIG")"
     report_time="$(config_get KTO_TRAFFIC_REPORT_TIME "$TRAFFIC_REPORT_CONFIG")"
@@ -3096,6 +3463,7 @@ traffic_report_status() {
     report_tz="${report_tz:-$TRAFFIC_REPORT_TZ_DEFAULT}"
     timer_state="$(service_ok "$TRAFFIC_REPORT_TIMER")"
     vnstat_state="$(service_ok vnstat)"
+    stats_bot_state="$(service_ok "$TRAFFIC_STATS_BOT_SERVICE")"
 
     echo -e "${BOLD}${PURPLE}[ ТРАФИК WHITELIST ]${NC}"
     print_row "машина" "${name:-не настроено}" "$([[ -n "$name" ]] && echo 1 || echo 0)"
@@ -3103,6 +3471,7 @@ traffic_report_status() {
     print_row "время отчёта" "${report_time:-не настроено} ${report_tz}" "$([[ -n "$report_time" ]] && echo 1 || echo 0)"
     print_row "vnstat" "service" "$vnstat_state"
     print_row "timer" "$TRAFFIC_REPORT_TIMER" "$timer_state"
+    print_row "/stats bot" "$TRAFFIC_STATS_BOT_SERVICE" "$stats_bot_state"
 }
 
 traffic_report_menu() {
@@ -3114,6 +3483,7 @@ traffic_report_menu() {
         echo -e "1) Настроить Telegram-отчёт"
         echo -e "2) Отправить отчёт сейчас"
         echo -e "3) Показать статус"
+        echo -e "4) Установить /stats bot"
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -3130,6 +3500,10 @@ traffic_report_menu() {
                 ;;
             3)
                 traffic_report_status
+                system_check_pause
+                ;;
+            4)
+                install_traffic_stats_bot
                 system_check_pause
                 ;;
             0)
@@ -3413,6 +3787,7 @@ main() {
         traffic|traffic-report) traffic_report_menu ;;
         traffic-install) install_traffic_report ;;
         traffic-send) send_traffic_report ;;
+        stats-bot|traffic-stats-bot) install_traffic_stats_bot ;;
         traffic-status) traffic_report_status ;;
         *) menu ;;
     esac
