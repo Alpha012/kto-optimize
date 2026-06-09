@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v100"
+SCRIPT_BUILD="v101"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -789,7 +789,7 @@ normalize_time_hm() {
 
 ask_time_hm() {
     local prompt="$1"
-    local default="${2:-00:05}"
+    local default="${2-}"
     local value
     while true; do
         value="$(ask_text "$prompt" "$default")"
@@ -2891,7 +2891,7 @@ install_traffic_report() {
     fi
     bot_token="$(ask_secret_value "Введите Telegram Bot Token")"
     chat_id="$(ask_text "Введите Telegram Chat ID")"
-    report_time="$(ask_time_hm "Время ежедневного отчёта по МСК" "00:05")"
+    report_time="$(ask_time_hm "Время ежедневного отчёта по МСК")"
     report_tz="$TRAFFIC_REPORT_TZ_DEFAULT"
 
     safe_name="$(escape_config_value "$machine_name")"
@@ -2924,10 +2924,14 @@ EOF
 Description=kto whitelist traffic Telegram report
 After=network-online.target vnstat.service
 Wants=network-online.target
+StartLimitIntervalSec=180
+StartLimitBurst=2
 
 [Service]
 Type=oneshot
 ExecStart=${TRAFFIC_REPORT_SCRIPT}
+Restart=on-failure
+RestartSec=60
 EOF
 
     write_root_file "/etc/systemd/system/${TRAFFIC_REPORT_TIMER}" <<EOF
