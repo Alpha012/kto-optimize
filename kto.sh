@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v95"
+SCRIPT_BUILD="v96"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -796,6 +796,11 @@ ask_ipv4() {
 
 default_network_interface() {
     ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+network_interface_exists() {
+    local iface="$1"
+    ip link show dev "$iface" >/dev/null 2>&1
 }
 
 escape_yaml_secret() {
@@ -2525,8 +2530,6 @@ day_total=$(( day_rx + day_tx ))
 month_total=$(( month_rx + month_tx ))
 
 message="$(cat <<MSG
-[ ТРАФИК WHITELIST ]
-
 $KTO_TRAFFIC_NAME
 Интерфейс: $KTO_TRAFFIC_IFACE
 
@@ -2558,8 +2561,12 @@ install_traffic_report() {
     local safe_name safe_iface safe_token safe_chat safe_time
 
     default_iface="$(default_network_interface)"
-    machine_name="$(ask_text "Название машины" "Обход №1")"
+    machine_name="$(ask_text "Название машины")"
     iface="$(ask_text "Интерфейс" "${default_iface:-eth0}")"
+    if ! network_interface_exists "$iface"; then
+        fail "Интерфейс ${iface} не найден. Проверь: ip -br link"
+        return 1
+    fi
     bot_token="$(ask_secret_value "Введите Telegram Bot Token")"
     chat_id="$(ask_text "Введите Telegram Chat ID")"
     report_time="$(ask_time_hm "Время ежедневного отчёта" "00:05")"
@@ -2571,9 +2578,13 @@ install_traffic_report() {
     safe_time="$(escape_config_value "$report_time")"
 
     stage "Устанавливаю статистику трафика"
-    apt_update_quiet
-    apt_install_quiet curl jq vnstat
+    if ! apt_update_quiet; then
+        warn "apt update не прошёл, пробую ставить пакеты по текущему кешу apt."
+    fi
+    must "Установка пакетов статистики" apt_install_quiet curl jq vnstat
+    cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
     cmd "${SUDO[@]}" systemctl enable --now vnstat || true
+    cmd "${SUDO[@]}" systemctl restart vnstat || true
 
     write_root_file_mode 0600 "$TRAFFIC_REPORT_CONFIG" <<EOF
 KTO_TRAFFIC_NAME="$safe_name"
