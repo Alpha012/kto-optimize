@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v113"
+SCRIPT_BUILD="v114"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2856,7 +2856,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v113"
+COLLECTOR_BUILD = "v114"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -2992,6 +2992,23 @@ def natural_sort_key(value):
     return key
 
 
+def canonical_node_key(value):
+    text = re.sub(r"[^\w]+", "", str(value or "").casefold(), flags=re.UNICODE)
+    parts = []
+    for part in re.split(r"(\d+)", text):
+        if not part:
+            continue
+        if part.isdigit():
+            parts.append(str(int(part)))
+        else:
+            parts.append(part)
+    return "".join(parts)
+
+
+def node_canonical_key(node):
+    return canonical_node_key(node.get("name") or node.get("id") or "")
+
+
 def tg_call(method, data=None, timeout=25):
     if not BOT_TOKEN:
         raise RuntimeError("telegram bot token is empty")
@@ -3054,7 +3071,13 @@ def node_message(node):
 
 def aggregate_message():
     with LOCK:
-        nodes = list(NODES.values())
+        deduped = {}
+        for node in NODES.values():
+            key = node_canonical_key(node)
+            current = deduped.get(key)
+            if current is None or int(node.get("last_seen", 0) or 0) > int(current.get("last_seen", 0) or 0):
+                deduped[key] = node
+        nodes = list(deduped.values())
     ts = now_ts()
     if not nodes:
         return "<b>Статистика обходов</b>\n\nНет данных от машин."
@@ -3103,8 +3126,16 @@ def update_node(payload):
     with LOCK:
         old = NODES.get(node_id, {})
         was_offline = bool(old.get("offline_alerted"))
+        canonical = node_canonical_key(record)
+        removed = []
+        for existing_id, existing_node in list(NODES.items()):
+            if existing_id != node_id and node_canonical_key(existing_node) == canonical:
+                del NODES[existing_id]
+                removed.append(existing_id)
         NODES[node_id] = record
         save_nodes()
+    if removed:
+        log(f"removed duplicate node records for {node_id}: {', '.join(removed)}")
     if was_offline:
         alert_online(node_id, record)
     return record
@@ -3380,7 +3411,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v113"
+PUSH_BUILD="v114"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3613,7 +3644,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v113"
+REPORT_SCRIPT_BUILD="v114"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3810,7 +3841,7 @@ write_traffic_stats_bot_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STATS_BOT_BUILD="v113"
+STATS_BOT_BUILD="v114"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 STATE_DIR="/var/lib/kto-traffic-stats-bot"
 STATE_FILE="${STATE_DIR}/last_update_id"
