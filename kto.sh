@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v111"
+SCRIPT_BUILD="v112"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -295,7 +295,7 @@ write_root_file() {
 }
 
 valid_machine_mode() {
-    [[ "$1" == "node" || "$1" == "whitelist" ]]
+    [[ "$1" == "node" || "$1" == "whitelist" || "$1" == "panel" ]]
 }
 
 valid_node_profile() {
@@ -348,7 +348,7 @@ load_machine_mode() {
 
     if [[ -n "$MACHINE_MODE" ]]; then
         if ! valid_machine_mode "$MACHINE_MODE"; then
-            warn "KTO_MACHINE_MODE должен быть node или whitelist. Игнорирую."
+            warn "KTO_MACHINE_MODE должен быть node, whitelist или panel. Игнорирую."
             MACHINE_MODE=""
         fi
     fi
@@ -496,8 +496,9 @@ select_machine_mode() {
         echo -e "${BOLD}${PURPLE}[ РЕЖИМ МАШИНЫ ]${NC}"
         echo -e "1) node"
         echo -e "2) whitelist"
+        echo -e "3) panel"
         echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите режим (1-2):${NC} "
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите режим (1-3):${NC} "
         read -r choice
         case "$choice" in
             1|node)
@@ -506,6 +507,11 @@ select_machine_mode() {
                 ;;
             2|whitelist)
                 MACHINE_MODE="whitelist"
+                NODE_PROFILE=""
+                break
+                ;;
+            3|panel)
+                MACHINE_MODE="panel"
                 NODE_PROFILE=""
                 break
                 ;;
@@ -533,11 +539,17 @@ reconfigure_machine_mode() {
     if [[ "$old_mode" != "$MACHINE_MODE" || "$old_profile" != "$NODE_PROFILE" ]]; then
         header
         stage "Применяю новый конфиг"
-        cleanup_runtime_state
+        if [[ "$MACHINE_MODE" == "panel" || "$old_mode" == "panel" ]]; then
+            warn "Автоочистка рантайма пропущена для режима panel."
+        else
+            cleanup_runtime_state
+        fi
         save_machine_mode
         echo
         ok "Конфиг обновлён: $(config_label)"
-        ok "Старая нода/SelfSteal очищены"
+        if [[ "$MACHINE_MODE" != "panel" && "$old_mode" != "panel" ]]; then
+            ok "Старая нода/SelfSteal очищены"
+        fi
     else
         echo
         ok "Настройки не изменились"
@@ -626,6 +638,13 @@ require_reality_profile() {
 require_whitelist_mode() {
     if [[ "$MACHINE_MODE" != "whitelist" ]]; then
         fail "Этот пункт доступен только для режима whitelist."
+        exit 1
+    fi
+}
+
+require_panel_mode() {
+    if [[ "$MACHINE_MODE" != "panel" ]]; then
+        fail "Этот пункт доступен только для режима panel."
         exit 1
     fi
 }
@@ -2836,7 +2855,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v111"
+COLLECTOR_BUILD = "v112"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3271,6 +3290,7 @@ EOF
 
 install_stats_collector() {
     header
+    require_panel_mode
     need_root
 
     local listen_host listen_port secret bot_token chat_id allowed_user stale_sec daily_report_time
@@ -3332,6 +3352,7 @@ EOF
 
 stats_collector_status() {
     header
+    require_panel_mode
     need_root
     local state
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
@@ -3345,7 +3366,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v111"
+PUSH_BUILD="v112"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3578,7 +3599,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v111"
+REPORT_SCRIPT_BUILD="v112"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3775,7 +3796,7 @@ write_traffic_stats_bot_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STATS_BOT_BUILD="v111"
+STATS_BOT_BUILD="v112"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 STATE_DIR="/var/lib/kto-traffic-stats-bot"
 STATE_FILE="${STATE_DIR}/last_update_id"
@@ -4410,16 +4431,10 @@ traffic_report_menu() {
 
     while true; do
         header
-        echo -e "${BOLD}${PURPLE}[ ТРАФИК WHITELIST ]${NC}"
-        echo -e "1) Настроить Telegram-отчёт"
-        echo -e "2) Отправить отчёт сейчас"
-        echo -e "3) Показать статус"
-        echo -e "4) Установить /stats bot"
-        echo -e "5) Тест /stats ответа"
-        echo -e "6) Диагностика /stats"
-        echo -e "7) Настроить push на коллектор"
-        echo -e "8) Отправить push сейчас"
-        echo -e "9) Статус push"
+        echo -e "${BOLD}${PURPLE}[ PUSH СТАТИСТИКИ ]${NC}"
+        echo -e "1) Настроить push на коллектор"
+        echo -e "2) Отправить push сейчас"
+        echo -e "3) Статус push"
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -4427,38 +4442,14 @@ traffic_report_menu() {
 
         case "$choice" in
             1)
-                install_traffic_report
-                system_check_pause
-                ;;
-            2)
-                send_traffic_report
-                system_check_pause
-                ;;
-            3)
-                traffic_report_status
-                system_check_pause
-                ;;
-            4)
-                install_traffic_stats_bot
-                system_check_pause
-                ;;
-            5)
-                run_traffic_stats_bot_command send
-                system_check_pause
-                ;;
-            6)
-                run_traffic_stats_bot_command debug
-                system_check_pause
-                ;;
-            7)
                 install_stats_push_client
                 system_check_pause
                 ;;
-            8)
+            2)
                 send_stats_push_once
                 system_check_pause
                 ;;
-            9)
+            3)
                 stats_push_status
                 system_check_pause
                 ;;
@@ -4471,6 +4462,13 @@ traffic_report_menu() {
                 ;;
         esac
     done
+}
+
+legacy_telegram_removed() {
+    fail "Прямые Telegram-отчёты и локальный /stats bot на whitelist убраны из рабочего сценария."
+    echo "На panel: collector-install"
+    echo "На whitelist: stats-push-install"
+    return 0
 }
 
 badge() {
@@ -4588,6 +4586,9 @@ show_status() {
         print_row "haproxy" "proxy" "$(service_ok haproxy)"
     fi
     print_row "fail2ban" "ssh guard" "$(service_ok fail2ban)"
+    if [[ "$MACHINE_MODE" == "panel" ]]; then
+        print_row "collector" "$STATS_COLLECTOR_SERVICE" "$(service_ok "$STATS_COLLECTOR_SERVICE")"
+    fi
 
     if [[ "$MACHINE_MODE" != "node" ]]; then
         print_kernel_status "$kernel"
@@ -4642,8 +4643,10 @@ menu() {
         echo -e "${DIM}Профиль: $(node_profile_label)${NC}"
     fi
 
-    labels+=("Полная оптимизация")
-    actions+=("optimize")
+    if [[ "$MACHINE_MODE" != "panel" ]]; then
+        labels+=("Полная оптимизация")
+        actions+=("optimize")
+    fi
 
     if [[ "$MACHINE_MODE" == "node" ]]; then
         labels+=("Общее поднятие")
@@ -4660,14 +4663,19 @@ menu() {
 
     labels+=("Панель состояния")
     actions+=("status")
-    labels+=("Коллектор статистики")
-    actions+=("stats-collector")
-    labels+=("Speedtest")
-    actions+=("speedtest")
-    labels+=("Проверка IP (IP.Check.Place)")
-    actions+=("ipcheck-place")
-    labels+=("Проверка IP (Region Check)")
-    actions+=("ipcheck-region")
+    if [[ "$MACHINE_MODE" == "panel" ]]; then
+        labels+=("Коллектор статистики")
+        actions+=("stats-collector")
+        labels+=("Статус коллектора")
+        actions+=("stats-collector-status")
+    else
+        labels+=("Speedtest")
+        actions+=("speedtest")
+        labels+=("Проверка IP (IP.Check.Place)")
+        actions+=("ipcheck-place")
+        labels+=("Проверка IP (Region Check)")
+        actions+=("ipcheck-region")
+    fi
 
     if [[ "$MACHINE_MODE" == "node" && "$NODE_PROFILE" == "hysteria2" ]]; then
         labels+=("Сгенерировать SSL-сертификат")
@@ -4675,7 +4683,7 @@ menu() {
     elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
         labels+=("HAProxy")
         actions+=("haproxy")
-        labels+=("Трафик whitelist")
+        labels+=("Push статистики")
         actions+=("traffic")
     fi
 
@@ -4710,6 +4718,7 @@ menu() {
         warp) install_warp_native ;;
         status) show_status ;;
         stats-collector) install_stats_collector ;;
+        stats-collector-status) stats_collector_status ;;
         speedtest) install_speedtest ;;
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
@@ -4746,16 +4755,12 @@ main() {
         collector|collector-install|stats-collector) install_stats_collector ;;
         collector-status|stats-collector-status) stats_collector_status ;;
         traffic|traffic-report) traffic_report_menu ;;
-        traffic-install) install_traffic_report ;;
-        traffic-send) send_traffic_report ;;
+        traffic-install|traffic-send) legacy_telegram_removed ;;
         stats-push|stats-push-install) install_stats_push_client ;;
         stats-push-send) send_stats_push_once ;;
         stats-push-status) stats_push_status ;;
-        stats-bot|traffic-stats-bot) install_traffic_stats_bot ;;
-        stats-test|traffic-stats-test) run_traffic_stats_bot_command send ;;
-        stats-debug|traffic-stats-debug) run_traffic_stats_bot_command debug ;;
-        stats-poll|traffic-stats-poll) run_traffic_stats_bot_command poll ;;
-        traffic-status) traffic_report_status ;;
+        stats-bot|traffic-stats-bot|stats-test|traffic-stats-test|stats-debug|traffic-stats-debug|stats-poll|traffic-stats-poll) legacy_telegram_removed ;;
+        traffic-status) stats_push_status ;;
         *) menu ;;
     esac
 }
