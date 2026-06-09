@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v97"
+SCRIPT_BUILD="v98"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -35,6 +35,7 @@ KTO_LOGROTATE_CONF="/etc/logrotate.d/kto-vpn"
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
 DNS_GUARD_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-kto-dns.conf"
+IPV6_WHITELIST_SYSCTL_CONF="/etc/sysctl.d/98-kto-whitelist-ipv6.conf"
 TRAFFIC_REPORT_CONFIG="/etc/kto-traffic-report.conf"
 TRAFFIC_REPORT_SCRIPT="/usr/local/bin/kto-traffic-report"
 TRAFFIC_REPORT_SERVICE="kto-traffic-report.service"
@@ -849,16 +850,54 @@ systemd_resolved_available() {
     command_exists systemctl && systemctl cat systemd-resolved.service >/dev/null 2>&1
 }
 
+resolv_conf_uses_resolved() {
+    local target
+    "${SUDO[@]}" test -L /etc/resolv.conf 2>/dev/null || return 1
+    target="$("${SUDO[@]}" readlink -f /etc/resolv.conf 2>/dev/null || true)"
+    [[ "$target" == "/run/systemd/resolve/stub-resolv.conf" || "$target" == "/run/systemd/resolve/resolv.conf" ]]
+}
+
+static_resolv_conf_configured() {
+    root_file_has_line /etc/resolv.conf "nameserver 1.1.1.1" &&
+        root_file_has_line /etc/resolv.conf "nameserver 1.0.0.1" &&
+        root_file_has_line /etc/resolv.conf "nameserver 8.8.8.8"
+}
+
 resolved_dns_guard_configured() {
     root_file_has_line "$DNS_GUARD_RESOLVED_CONF" "[Resolve]" &&
         root_file_has_line "$DNS_GUARD_RESOLVED_CONF" "DNS=1.1.1.1 1.0.0.1 8.8.8.8" &&
         root_file_has_line "$DNS_GUARD_RESOLVED_CONF" "FallbackDNS=9.9.9.9 8.8.4.4" &&
+        root_file_has_line "$DNS_GUARD_RESOLVED_CONF" "Domains=~." &&
         root_file_has_line "$DNS_GUARD_RESOLVED_CONF" "Cache=yes"
+}
+
+dns_guard_configured() {
+    if systemd_resolved_available; then
+        resolved_dns_guard_configured && resolv_conf_uses_resolved
+    else
+        static_resolv_conf_configured
+    fi
 }
 
 dns_resolution_ok() {
     getent hosts api.telegram.org >/dev/null 2>&1 ||
         getent hosts raw.githubusercontent.com >/dev/null 2>&1
+}
+
+ipv6_sysctl_available() {
+    sysctl -n net.ipv6.conf.all.disable_ipv6 >/dev/null 2>&1
+}
+
+whitelist_ipv6_disabled() {
+    local all default lo
+    if ! ipv6_sysctl_available; then
+        return 0
+    fi
+
+    all="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)"
+    default="$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo 0)"
+    lo="$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || echo 0)"
+    [[ "$all" == "1" && "$default" == "1" && "$lo" == "1" ]]
 }
 
 escape_yaml_secret() {
@@ -1124,21 +1163,60 @@ opt_dns_guard() {
 [Resolve]
 DNS=1.1.1.1 1.0.0.1 8.8.8.8
 FallbackDNS=9.9.9.9 8.8.4.4
+Domains=~.
 DNSSEC=no
 DNSOverTLS=no
+DNSStubListener=yes
 Cache=yes
 EOF
         cmd "${SUDO[@]}" systemctl enable --now systemd-resolved || true
         cmd "${SUDO[@]}" systemctl restart systemd-resolved || true
+        if "${SUDO[@]}" test -e /run/systemd/resolve/stub-resolv.conf 2>/dev/null; then
+            if "${SUDO[@]}" test -e /etc/resolv.conf 2>/dev/null && ! "${SUDO[@]}" test -L /etc/resolv.conf 2>/dev/null; then
+                cmd "${SUDO[@]}" cp -a /etc/resolv.conf /etc/resolv.conf.kto-backup || true
+            fi
+            cmd "${SUDO[@]}" ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
+        elif "${SUDO[@]}" test -e /run/systemd/resolve/resolv.conf 2>/dev/null; then
+            if "${SUDO[@]}" test -e /etc/resolv.conf 2>/dev/null && ! "${SUDO[@]}" test -L /etc/resolv.conf 2>/dev/null; then
+                cmd "${SUDO[@]}" cp -a /etc/resolv.conf /etc/resolv.conf.kto-backup || true
+            fi
+            cmd "${SUDO[@]}" ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf || true
+        fi
         if command_exists resolvectl; then
             cmd "${SUDO[@]}" resolvectl flush-caches || true
         fi
     else
-        echo "DNS guard skipped: systemd-resolved service not found" >> "$LOG_FILE"
+        if "${SUDO[@]}" test -e /etc/resolv.conf 2>/dev/null && ! "${SUDO[@]}" test -L /etc/resolv.conf 2>/dev/null; then
+            cmd "${SUDO[@]}" cp -a /etc/resolv.conf /etc/resolv.conf.kto-backup || true
+        fi
+        write_root_file /etc/resolv.conf <<'EOF'
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+nameserver 8.8.8.8
+options timeout:2 attempts:3 rotate
+EOF
     fi
 
     if ! dns_resolution_ok; then
         warn "DNS всё ещё не резолвит api.telegram.org/raw.githubusercontent.com. Проверь /etc/resolv.conf, провайдера или IPv6."
+    fi
+}
+
+opt_ipv6_mode_guard() {
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        write_root_file "$IPV6_WHITELIST_SYSCTL_CONF" <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+        cmd "${SUDO[@]}" sysctl -w net.ipv6.conf.all.disable_ipv6=1 || true
+        cmd "${SUDO[@]}" sysctl -w net.ipv6.conf.default.disable_ipv6=1 || true
+        cmd "${SUDO[@]}" sysctl -w net.ipv6.conf.lo.disable_ipv6=1 || true
+    elif "${SUDO[@]}" test -f "$IPV6_WHITELIST_SYSCTL_CONF" 2>/dev/null; then
+        cmd "${SUDO[@]}" rm -f "$IPV6_WHITELIST_SYSCTL_CONF"
+        cmd "${SUDO[@]}" sysctl -w net.ipv6.conf.all.disable_ipv6=0 || true
+        cmd "${SUDO[@]}" sysctl -w net.ipv6.conf.default.disable_ipv6=0 || true
+        cmd "${SUDO[@]}" sysctl -w net.ipv6.conf.lo.disable_ipv6=0 || true
     fi
 }
 
@@ -1262,6 +1340,7 @@ opt_liquorix_kernel() {
 
 opt_network_limits() {
     opt_dns_guard
+    opt_ipv6_mode_guard
 
     cmd "${SUDO[@]}" modprobe tcp_bbr || true
     write_root_file /etc/sysctl.d/99-vpn-tuning.conf <<'EOF'
@@ -1829,15 +1908,15 @@ system_check_network_limits() {
         system_check_row miss "hostname" "нет записи в /etc/hosts"
     fi
 
-    if systemd_resolved_available; then
-        if resolved_dns_guard_configured; then
-            system_check_row ok "dns guard" "systemd-resolved fallback"
+    if dns_guard_configured; then
+        if systemd_resolved_available; then
+            system_check_row ok "dns guard" "forced через systemd-resolved"
         else
-            SYSTEM_CHECK_NEEDS_NETWORK=1
-            system_check_row miss "dns guard" "fallback DNS не настроен"
+            system_check_row ok "dns guard" "static /etc/resolv.conf"
         fi
     else
-        system_check_row skip "dns guard" "systemd-resolved не найден"
+        SYSTEM_CHECK_NEEDS_NETWORK=1
+        system_check_row miss "dns guard" "принудительный DNS не настроен"
     fi
 
     if dns_resolution_ok; then
@@ -1845,6 +1924,20 @@ system_check_network_limits() {
     else
         SYSTEM_CHECK_NEEDS_NETWORK=1
         system_check_row miss "dns resolve" "внешние домены не резолвятся"
+    fi
+
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        if whitelist_ipv6_disabled; then
+            system_check_row ok "ipv6" "disabled для whitelist"
+        else
+            SYSTEM_CHECK_NEEDS_NETWORK=1
+            system_check_row miss "ipv6" "на whitelist должен быть выключен"
+        fi
+    elif "${SUDO[@]}" test -f "$IPV6_WHITELIST_SYSCTL_CONF" 2>/dev/null; then
+        SYSTEM_CHECK_NEEDS_NETWORK=1
+        system_check_row miss "ipv6" "найден whitelist-disable, уберу"
+    else
+        system_check_row skip "ipv6" "node: не отключаю"
     fi
 
     if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
