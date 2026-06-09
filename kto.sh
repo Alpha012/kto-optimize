@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v104"
+SCRIPT_BUILD="v105"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2858,14 +2858,27 @@ send_telegram_request() {
     local label="$1"
     shift
     local extra=("$@")
-    local response rc short_response message_id response_chat_id
-    if response="$(curl -4 -sS --connect-timeout 8 --max-time 25 --retry 2 --retry-delay 2 --retry-connrefused \
+    local body_file err_file response errors http_code rc short_response message_id response_chat_id
+    body_file="$(mktemp)"
+    err_file="$(mktemp)"
+
+    set +e
+    http_code="$(curl -4 -sS --connect-timeout 8 --max-time 20 \
         "${extra[@]}" \
         -X POST "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${KTO_TRAFFIC_CHAT_ID}" \
         -d "disable_web_page_preview=true" \
         -d "parse_mode=HTML" \
-        --data-urlencode "text=${message}" 2>&1)"; then
+        --data-urlencode "text=${message}" \
+        -o "$body_file" \
+        -w '%{http_code}' 2>"$err_file")"
+    rc=$?
+    set -e
+    response="$(cat "$body_file" 2>/dev/null || true)"
+    errors="$(cat "$err_file" 2>/dev/null || true)"
+    rm -f "$body_file" "$err_file"
+
+    if [[ -n "$response" ]]; then
         if command -v jq >/dev/null 2>&1; then
             if printf '%s' "$response" | jq -e '.ok == true and (.result.message_id != null)' >/dev/null 2>&1; then
                 message_id="$(printf '%s' "$response" | jq -r '.result.message_id')"
@@ -2881,13 +2894,20 @@ send_telegram_request() {
         fi
 
         short_response="$(printf '%s' "$response" | tr '\n' ' ' | cut -c1-700)"
-        echo "telegram ${label}: bad response: ${short_response}" >&2
-        return 1
     fi
-    rc=$?
-    short_response="$(printf '%s' "$response" | tr '\n' ' ' | cut -c1-700)"
-    echo "telegram ${label}: curl rc=${rc}: ${short_response}" >&2
-    return "$rc"
+
+    errors="$(printf '%s' "$errors" | tr '\n' ' ' | cut -c1-500)"
+    if (( rc != 0 )); then
+        if [[ -n "$short_response" ]]; then
+            echo "telegram ${label}: curl rc=${rc} http=${http_code:-000}: ${errors}; body: ${short_response}" >&2
+        else
+            echo "telegram ${label}: curl rc=${rc} http=${http_code:-000}: ${errors}" >&2
+        fi
+        return "$rc"
+    fi
+
+    echo "telegram ${label}: bad response http=${http_code:-000}: ${short_response:-empty}" >&2
+    return 1
 }
 
 if send_telegram_request "dns"; then
