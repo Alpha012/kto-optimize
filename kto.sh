@@ -4,7 +4,8 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.8.8 (v92)"
+SCRIPT_VERSION="1.4.8.8"
+SCRIPT_BUILD="v93"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -71,7 +72,7 @@ init_log() {
         fi
     fi
 
-    echo "===== kto VPN v${SCRIPT_VERSION} $(date -Is) =====" >> "$LOG_FILE" 2>/dev/null || true
+    echo "===== kto VPN v${SCRIPT_VERSION} ${SCRIPT_BUILD} $(date -Is) =====" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 header_center_line() {
@@ -92,6 +93,7 @@ header() {
     echo -e "${PURPLE}==========================================${NC}"
     header_center_line "kto VPN" "${BOLD}${GREEN}"
     header_center_line "v${SCRIPT_VERSION}" "$DIM"
+    header_center_line "$SCRIPT_BUILD" "$DIM"
     echo -e "${PURPLE}==========================================${NC}"
 }
 
