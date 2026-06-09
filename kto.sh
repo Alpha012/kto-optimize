@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v115"
+SCRIPT_BUILD="v116"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -1475,17 +1475,39 @@ EOF
     configure_docker_log_rotation
 }
 
+print_disk_usage_top() {
+    echo
+    echo -e "${BOLD}${PURPLE}[ КРУПНЕЙШЕЕ НА ДИСКЕ ]${NC}"
+    if command_exists timeout; then
+        "${SUDO[@]}" timeout 30s du -xhd1 / 2>/dev/null | sort -hr | head -n 12 || true
+    else
+        "${SUDO[@]}" du -xhd1 / 2>/dev/null | sort -hr | head -n 12 || true
+    fi
+
+    if command_exists docker; then
+        echo
+        echo -e "${BOLD}${PURPLE}[ DOCKER DISK ]${NC}"
+        "${SUDO[@]}" docker system df 2>/dev/null || true
+    fi
+}
+
 clean_disk_now() {
     header
     need_root
+    local used
 
     stage "Очищаю диск"
     opt_storage_guard
 
+    used="$(root_disk_used_percent)"
     ok "Очистка диска завершена"
-    print_row "root disk" "$(root_disk_used_percent)% used"
+    print_row "root disk" "${used}% used"
     print_row "apt archives" "$(format_mb "$(apt_cache_usage_mb)")"
     print_row "apt lists" "$(format_mb "$(apt_lists_usage_mb)")"
+    if [[ "$used" =~ ^[0-9]+$ && "$used" -ge 90 ]]; then
+        warn "Диск всё ещё забит. Авточистка уже сделала безопасное; дальше надо смотреть крупнейшие директории."
+        print_disk_usage_top
+    fi
 }
 
 opt_memory_guard() {
@@ -2054,8 +2076,7 @@ system_check_storage() {
         SYSTEM_CHECK_NEEDS_STORAGE=1
         system_check_row miss "root disk" "${used}% used, критично: автоочистка + ручной аудит"
     elif [[ "$used" =~ ^[0-9]+$ && "$used" -ge 90 ]]; then
-        SYSTEM_CHECK_NEEDS_STORAGE=1
-        system_check_row miss "root disk" "${used}% used, запускаю безопасную очистку"
+        system_check_row warn "root disk" "${used}% used, мало места; запусти очистку/аудит"
     elif [[ "$used" =~ ^[0-9]+$ && "$used" -ge 80 ]]; then
         system_check_row warn "root disk" "${used}% used"
     elif [[ "$used" =~ ^[0-9]+$ ]]; then
@@ -2902,7 +2923,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v115"
+COLLECTOR_BUILD = "v116"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3457,7 +3478,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v115"
+PUSH_BUILD="v116"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3690,7 +3711,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v115"
+REPORT_SCRIPT_BUILD="v116"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3887,7 +3908,7 @@ write_traffic_stats_bot_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STATS_BOT_BUILD="v115"
+STATS_BOT_BUILD="v116"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 STATE_DIR="/var/lib/kto-traffic-stats-bot"
 STATE_FILE="${STATE_DIR}/last_update_id"
@@ -4831,6 +4852,7 @@ main() {
         settings) settings_menu ;;
         check|system-check) system_check ;;
         disk-clean|storage-clean|clean-disk) clean_disk_now ;;
+        disk-audit|disk-usage|storage-audit) header; need_root; print_disk_usage_top ;;
         dns|dns-guard) need_root; opt_dns_guard ;;
         zram|memory-guard) opt_zram ;;
         optimize) optimize_system ;;
