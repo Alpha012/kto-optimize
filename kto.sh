@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v93"
+SCRIPT_BUILD="v94"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -75,25 +75,19 @@ init_log() {
     echo "===== kto VPN v${SCRIPT_VERSION} ${SCRIPT_BUILD} $(date -Is) =====" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-header_center_line() {
+header_line() {
     local text="$1"
     local style="${2:-}"
-    local width=42 len left right
-    len="${#text}"
-    if (( len > width )); then
-        width="$len"
-    fi
-    left=$(( (width - len) / 2 ))
-    right=$(( width - len - left ))
-    printf '%b%*s%s%*s%b\n' "$style" "$left" "" "$text" "$right" "" "$NC"
+    local indent=17
+    printf '%b%*s%s%b\n' "$style" "$indent" "" "$text" "$NC"
 }
 
 header() {
     printf '\033c'
     echo -e "${PURPLE}==========================================${NC}"
-    header_center_line "kto VPN" "${BOLD}${GREEN}"
-    header_center_line "v${SCRIPT_VERSION}" "$DIM"
-    header_center_line "$SCRIPT_BUILD" "$DIM"
+    header_line "kto VPN" "${BOLD}${GREEN}"
+    header_line "v${SCRIPT_VERSION}" "$DIM"
+    header_line "$SCRIPT_BUILD" "$DIM"
     echo -e "${PURPLE}==========================================${NC}"
 }
 
