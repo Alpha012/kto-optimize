@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v101"
+SCRIPT_BUILD="v102"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2791,6 +2791,14 @@ format_bytes() {
         }'
 }
 
+html_escape() {
+    local value="$1"
+    value="${value//&/&amp;}"
+    value="${value//</&lt;}"
+    value="${value//>/&gt;}"
+    echo "$value"
+}
+
 traffic_json="$(vnstat -i "$KTO_TRAFFIC_IFACE" --json 2>/dev/null || true)"
 if [[ -z "$traffic_json" ]]; then
     echo "vnstat has no data for interface: $KTO_TRAFFIC_IFACE" >&2
@@ -2816,18 +2824,14 @@ day_total=$(( day_rx + day_tx ))
 month_total=$(( month_rx + month_tx ))
 
 message="$(cat <<MSG
-$KTO_TRAFFIC_NAME
-Интерфейс: $KTO_TRAFFIC_IFACE
+<b>$(html_escape "$KTO_TRAFFIC_NAME")</b>
 
 Сегодня: $(format_bytes "$day_total")
-Вход: $(format_bytes "$day_rx")
-Выход: $(format_bytes "$day_tx")
+I/O: $(format_bytes "$day_rx") | $(format_bytes "$day_tx")
 
 Месяц: $(format_bytes "$month_total")
-Вход: $(format_bytes "$month_rx")
-Выход: $(format_bytes "$month_tx")
 
-Обновлено: $(TZ="$KTO_TRAFFIC_REPORT_TZ" date '+%d.%m.%Y %H:%M %Z')
+Обновлено: $(TZ="$KTO_TRAFFIC_REPORT_TZ" date '+%d.%m.%Y %H:%M')
 MSG
 )"
 
@@ -2846,32 +2850,66 @@ telegram_api_ips() {
                 'https://dns.google/resolve?name=api.telegram.org&type=A' 2>/dev/null \
                 | jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null || true
         fi
+        printf '%s\n' 149.154.166.110
     } | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && !seen[$1]++ {print}'
 }
 
 send_telegram_request() {
+    local label="$1"
+    shift
     local extra=("$@")
-    curl -4 -fsS --connect-timeout 8 --max-time 25 --retry 2 --retry-delay 2 \
+    local output rc
+    if output="$(curl -4 -fsS --connect-timeout 8 --max-time 25 --retry 2 --retry-delay 2 --retry-connrefused \
         "${extra[@]}" \
         -X POST "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${KTO_TRAFFIC_CHAT_ID}" \
         -d "disable_web_page_preview=true" \
-        --data-urlencode "text=${message}" >/dev/null
+        -d "parse_mode=HTML" \
+        --data-urlencode "text=${message}" 2>&1 >/dev/null)"; then
+        return 0
+    fi
+    rc=$?
+    echo "telegram ${label}: curl rc=${rc}: ${output}" >&2
+    return "$rc"
 }
 
-if send_telegram_request; then
+if send_telegram_request "dns"; then
     exit 0
 fi
 
+mapfile -t telegram_ips < <(telegram_api_ips)
+if (( ${#telegram_ips[@]} == 0 )); then
+    echo "telegram resolve: no IPv4 addresses for api.telegram.org" >&2
+    exit 1
+fi
+echo "telegram resolve: ${telegram_ips[*]}" >&2
+
 while read -r telegram_ip; do
     [[ -n "$telegram_ip" ]] || continue
-    if send_telegram_request --resolve "api.telegram.org:443:${telegram_ip}"; then
+    if send_telegram_request "ip:${telegram_ip}" --resolve "api.telegram.org:443:${telegram_ip}"; then
         exit 0
     fi
-done < <(telegram_api_ips)
+done < <(printf '%s\n' "${telegram_ips[@]}")
 
 exit 1
 EOF
+}
+
+run_traffic_report_script_once() {
+    local tmp rc
+    tmp="$(mktemp)"
+
+    if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" > "$tmp" 2>&1; then
+        cat "$tmp" >> "$LOG_FILE" 2>/dev/null || true
+        rm -f "$tmp"
+        return 0
+    fi
+
+    rc=$?
+    cat "$tmp" >> "$LOG_FILE" 2>/dev/null || true
+    tail -n 20 "$tmp" >&2 || true
+    rm -f "$tmp"
+    return "$rc"
 }
 
 install_traffic_report() {
@@ -2956,11 +2994,10 @@ EOF
     ok "Ежедневно: ${report_time} МСК"
 
     stage "Отправляю тестовый отчёт"
-    if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" >> "$LOG_FILE" 2>&1; then
+    if run_traffic_report_script_once; then
         ok "Тестовый отчёт отправлен в Telegram"
     else
         warn "Тестовый отчёт не отправился. Проверь DNS, доступ к api.telegram.org и Telegram token/chat_id."
-        tail -n 10 "$LOG_FILE" >&2 || true
     fi
 }
 
@@ -2977,11 +3014,10 @@ send_traffic_report() {
     stage "Отправляю отчёт по трафику"
     opt_dns_guard || true
     write_traffic_report_script
-    if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" >> "$LOG_FILE" 2>&1; then
+    if run_traffic_report_script_once; then
         ok "Отчёт отправлен"
     else
         warn "Отчёт не отправился. DNS guard применён, но api.telegram.org всё ещё недоступен или Telegram token/chat_id неверные."
-        tail -n 15 "$LOG_FILE" >&2 || true
         return 0
     fi
 }
