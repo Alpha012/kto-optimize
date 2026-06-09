@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v94"
+SCRIPT_BUILD="v95"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -34,6 +34,10 @@ STORAGE_GUARD_JOURNAL_CONF="/etc/systemd/journald.conf.d/99-kto-storage.conf"
 KTO_LOGROTATE_CONF="/etc/logrotate.d/kto-vpn"
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
+TRAFFIC_REPORT_CONFIG="/etc/kto-traffic-report.conf"
+TRAFFIC_REPORT_SCRIPT="/usr/local/bin/kto-traffic-report"
+TRAFFIC_REPORT_SERVICE="kto-traffic-report.service"
+TRAFFIC_REPORT_TIMER="kto-traffic-report.timer"
 APT_UPDATED=0
 
 GREEN='\033[0;32m'
@@ -685,6 +689,59 @@ ask_domain() {
     done
 }
 
+ask_text() {
+    local prompt="$1"
+    local default="${2:-}"
+    local value
+    while true; do
+        if [[ -n "$default" ]]; then
+            printf '%s [%s]: ' "$prompt" "$default" >&2
+        else
+            printf '%s: ' "$prompt" >&2
+        fi
+        read -r value
+        value="${value:-$default}"
+        if [[ -n "$value" ]]; then
+            echo "$value"
+            return 0
+        fi
+        fail "Значение не может быть пустым"
+    done
+}
+
+ask_secret_value() {
+    local prompt="$1"
+    local value
+    while true; do
+        printf '%s: ' "$prompt" >&2
+        read -r -s value
+        printf '\n' >&2
+        if [[ -n "$value" ]]; then
+            echo "$value"
+            return 0
+        fi
+        fail "Значение не может быть пустым"
+    done
+}
+
+validate_time_hm() {
+    [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]
+}
+
+ask_time_hm() {
+    local prompt="$1"
+    local default="${2:-00:05}"
+    local value
+    while true; do
+        value="$(ask_text "$prompt" "$default")"
+        if validate_time_hm "$value"; then
+            echo "$value"
+            return 0
+        fi
+        fail "Некорректное время. Пример: 00:05"
+    done
+}
+
 ask_secret_key() {
     local secret
     while true; do
@@ -735,6 +792,10 @@ ask_ipv4() {
         fi
         fail "Некорректный IPv4. Пример: 1.2.3.4"
     done
+}
+
+default_network_interface() {
+    ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}'
 }
 
 escape_yaml_secret() {
@@ -2401,6 +2462,243 @@ install_haproxy() {
     configure_haproxy_backend
 }
 
+write_traffic_report_script() {
+    write_root_file_mode 0755 "$TRAFFIC_REPORT_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
+if [[ ! -r "$CONFIG" ]]; then
+    echo "Config not found: $CONFIG" >&2
+    exit 1
+fi
+
+# shellcheck source=/etc/kto-traffic-report.conf
+. "$CONFIG"
+
+: "${KTO_TRAFFIC_NAME:?KTO_TRAFFIC_NAME is required}"
+: "${KTO_TRAFFIC_IFACE:?KTO_TRAFFIC_IFACE is required}"
+: "${KTO_TRAFFIC_BOT_TOKEN:?KTO_TRAFFIC_BOT_TOKEN is required}"
+: "${KTO_TRAFFIC_CHAT_ID:?KTO_TRAFFIC_CHAT_ID is required}"
+
+format_bytes() {
+    local bytes="${1:-0}"
+    LC_ALL=C awk -v bytes="$bytes" '
+        BEGIN {
+            split("B KB MB GB TB PB", units, " ")
+            value = bytes + 0
+            idx = 1
+            while (value >= 1024 && idx < 6) {
+                value = value / 1024
+                idx++
+            }
+            if (idx == 1) {
+                printf "%.0f %s", value, units[idx]
+            } else {
+                printf "%.1f %s", value, units[idx]
+            }
+        }'
+}
+
+traffic_json="$(vnstat -i "$KTO_TRAFFIC_IFACE" --json 2>/dev/null || true)"
+if [[ -z "$traffic_json" ]]; then
+    echo "vnstat has no data for interface: $KTO_TRAFFIC_IFACE" >&2
+    exit 1
+fi
+
+stats="$(printf '%s' "$traffic_json" | jq -r '
+    def day_key: (.date.year * 10000 + .date.month * 100 + .date.day);
+    def month_key: (.date.year * 100 + .date.month);
+    (.interfaces[0].traffic.day // []) as $days |
+    (.interfaces[0].traffic.month // []) as $months |
+    ($days | max_by(day_key) // {rx:0, tx:0}) as $day |
+    ($months | max_by(month_key) // {rx:0, tx:0}) as $month |
+    "\($day.rx // 0) \($day.tx // 0) \($month.rx // 0) \($month.tx // 0)"
+' 2>/dev/null || echo "0 0 0 0")"
+
+set -- $stats
+day_rx="${1:-0}"
+day_tx="${2:-0}"
+month_rx="${3:-0}"
+month_tx="${4:-0}"
+day_total=$(( day_rx + day_tx ))
+month_total=$(( month_rx + month_tx ))
+
+message="$(cat <<MSG
+[ ТРАФИК WHITELIST ]
+
+$KTO_TRAFFIC_NAME
+Интерфейс: $KTO_TRAFFIC_IFACE
+
+Сегодня: $(format_bytes "$day_total")
+Вход: $(format_bytes "$day_rx")
+Выход: $(format_bytes "$day_tx")
+
+Месяц: $(format_bytes "$month_total")
+Вход: $(format_bytes "$month_rx")
+Выход: $(format_bytes "$month_tx")
+
+Обновлено: $(date '+%d.%m.%Y %H:%M')
+MSG
+)"
+
+curl -fsS -X POST "https://api.telegram.org/bot${KTO_TRAFFIC_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${KTO_TRAFFIC_CHAT_ID}" \
+    -d "disable_web_page_preview=true" \
+    --data-urlencode "text=${message}" >/dev/null
+EOF
+}
+
+install_traffic_report() {
+    header
+    require_whitelist_mode
+    need_root
+
+    local default_iface machine_name iface bot_token chat_id report_time
+    local safe_name safe_iface safe_token safe_chat safe_time
+
+    default_iface="$(default_network_interface)"
+    machine_name="$(ask_text "Название машины" "Обход №1")"
+    iface="$(ask_text "Интерфейс" "${default_iface:-eth0}")"
+    bot_token="$(ask_secret_value "Введите Telegram Bot Token")"
+    chat_id="$(ask_text "Введите Telegram Chat ID")"
+    report_time="$(ask_time_hm "Время ежедневного отчёта" "00:05")"
+
+    safe_name="$(escape_config_value "$machine_name")"
+    safe_iface="$(escape_config_value "$iface")"
+    safe_token="$(escape_config_value "$bot_token")"
+    safe_chat="$(escape_config_value "$chat_id")"
+    safe_time="$(escape_config_value "$report_time")"
+
+    stage "Устанавливаю статистику трафика"
+    apt_update_quiet
+    apt_install_quiet curl jq vnstat
+    cmd "${SUDO[@]}" systemctl enable --now vnstat || true
+
+    write_root_file_mode 0600 "$TRAFFIC_REPORT_CONFIG" <<EOF
+KTO_TRAFFIC_NAME="$safe_name"
+KTO_TRAFFIC_IFACE="$safe_iface"
+KTO_TRAFFIC_BOT_TOKEN="$safe_token"
+KTO_TRAFFIC_CHAT_ID="$safe_chat"
+KTO_TRAFFIC_REPORT_TIME="$safe_time"
+EOF
+
+    write_traffic_report_script
+
+    write_root_file "/etc/systemd/system/${TRAFFIC_REPORT_SERVICE}" <<EOF
+[Unit]
+Description=kto whitelist traffic Telegram report
+After=network-online.target vnstat.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${TRAFFIC_REPORT_SCRIPT}
+EOF
+
+    write_root_file "/etc/systemd/system/${TRAFFIC_REPORT_TIMER}" <<EOF
+[Unit]
+Description=kto whitelist traffic Telegram report timer
+
+[Timer]
+OnCalendar=*-*-* ${report_time}:00
+Persistent=true
+Unit=${TRAFFIC_REPORT_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    cmd "${SUDO[@]}" systemctl daemon-reload
+    cmd "${SUDO[@]}" systemctl enable --now "$TRAFFIC_REPORT_TIMER"
+
+    ok "Отчёт по трафику установлен"
+    ok "Машина: ${machine_name}"
+    ok "Интерфейс: ${iface}"
+    ok "Ежедневно: ${report_time}"
+
+    stage "Отправляю тестовый отчёт"
+    if "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT" >> "$LOG_FILE" 2>&1; then
+        ok "Тестовый отчёт отправлен в Telegram"
+    else
+        warn "Тестовый отчёт не отправился. Проверь Telegram token/chat_id и доступ к api.telegram.org."
+        tail -n 10 "$LOG_FILE" >&2 || true
+    fi
+}
+
+send_traffic_report() {
+    header
+    require_whitelist_mode
+    need_root
+
+    if ! "${SUDO[@]}" test -x "$TRAFFIC_REPORT_SCRIPT" 2>/dev/null || ! "${SUDO[@]}" test -f "$TRAFFIC_REPORT_CONFIG" 2>/dev/null; then
+        fail "Отчёт по трафику не настроен. Сначала установи его в меню."
+        return 1
+    fi
+
+    stage "Отправляю отчёт по трафику"
+    must "Отправка отчёта" "${SUDO[@]}" "$TRAFFIC_REPORT_SCRIPT"
+    ok "Отчёт отправлен"
+}
+
+traffic_report_status() {
+    header
+    require_whitelist_mode
+    need_root
+
+    local name iface report_time timer_state vnstat_state
+    name="$(config_get KTO_TRAFFIC_NAME "$TRAFFIC_REPORT_CONFIG")"
+    iface="$(config_get KTO_TRAFFIC_IFACE "$TRAFFIC_REPORT_CONFIG")"
+    report_time="$(config_get KTO_TRAFFIC_REPORT_TIME "$TRAFFIC_REPORT_CONFIG")"
+    timer_state="$(service_ok "$TRAFFIC_REPORT_TIMER")"
+    vnstat_state="$(service_ok vnstat)"
+
+    echo -e "${BOLD}${PURPLE}[ ТРАФИК WHITELIST ]${NC}"
+    print_row "машина" "${name:-не настроено}" "$([[ -n "$name" ]] && echo 1 || echo 0)"
+    print_row "интерфейс" "${iface:-не настроено}" "$([[ -n "$iface" ]] && echo 1 || echo 0)"
+    print_row "время отчёта" "${report_time:-не настроено}" "$([[ -n "$report_time" ]] && echo 1 || echo 0)"
+    print_row "vnstat" "service" "$vnstat_state"
+    print_row "timer" "$TRAFFIC_REPORT_TIMER" "$timer_state"
+}
+
+traffic_report_menu() {
+    local choice
+
+    while true; do
+        header
+        echo -e "${BOLD}${PURPLE}[ ТРАФИК WHITELIST ]${NC}"
+        echo -e "1) Настроить Telegram-отчёт"
+        echo -e "2) Отправить отчёт сейчас"
+        echo -e "3) Показать статус"
+        echo -e "0) Выйти"
+        echo -e "${PURPLE}==========================================${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+        read -r choice
+
+        case "$choice" in
+            1)
+                install_traffic_report
+                system_check_pause
+                ;;
+            2)
+                send_traffic_report
+                system_check_pause
+                ;;
+            3)
+                traffic_report_status
+                system_check_pause
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                fail "Неверный выбор"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 badge() {
     local ok_flag="$1"
     if [[ "$ok_flag" == "1" ]]; then
@@ -2601,6 +2899,8 @@ menu() {
     elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
         labels+=("HAProxy")
         actions+=("haproxy")
+        labels+=("Трафик whitelist")
+        actions+=("traffic")
     fi
 
     labels+=("Настройки")
@@ -2638,6 +2938,7 @@ menu() {
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
+        traffic) traffic_report_menu ;;
         settings) settings_menu ;;
         *) fail "Неверный выбор" ;;
     esac
@@ -2664,6 +2965,10 @@ main() {
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
+        traffic|traffic-report) traffic_report_menu ;;
+        traffic-install) install_traffic_report ;;
+        traffic-send) send_traffic_report ;;
+        traffic-status) traffic_report_status ;;
         *) menu ;;
     esac
 }
