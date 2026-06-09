@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v112"
+SCRIPT_BUILD="v113"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2845,6 +2845,7 @@ write_stats_collector_script() {
 import html
 import json
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -2855,7 +2856,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v112"
+COLLECTOR_BUILD = "v113"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -2978,6 +2979,19 @@ def fmt_time(ts):
         return "-"
 
 
+def natural_sort_key(value):
+    text = str(value or "").casefold()
+    key = []
+    for part in re.split(r"(\d+)", text):
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((1, int(part)))
+        else:
+            key.append((0, part))
+    return key
+
+
 def tg_call(method, data=None, timeout=25):
     if not BOT_TOKEN:
         raise RuntimeError("telegram bot token is empty")
@@ -3044,7 +3058,7 @@ def aggregate_message():
     ts = now_ts()
     if not nodes:
         return "<b>Статистика обходов</b>\n\nНет данных от машин."
-    nodes.sort(key=lambda item: str(item.get("name") or item.get("id") or ""))
+    nodes.sort(key=lambda item: natural_sort_key(item.get("name") or item.get("id") or ""))
     parts = ["<b>Статистика обходов</b>"]
     for node in nodes:
         age = ts - int(node.get("last_seen", 0) or 0)
@@ -3366,7 +3380,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v112"
+PUSH_BUILD="v113"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3599,7 +3613,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v112"
+REPORT_SCRIPT_BUILD="v113"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3796,7 +3810,7 @@ write_traffic_stats_bot_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STATS_BOT_BUILD="v112"
+STATS_BOT_BUILD="v113"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 STATE_DIR="/var/lib/kto-traffic-stats-bot"
 STATE_FILE="${STATE_DIR}/last_update_id"
