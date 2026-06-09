@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v110"
+SCRIPT_BUILD="v111"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -44,6 +44,17 @@ TRAFFIC_STATS_BOT_SCRIPT="/usr/local/bin/kto-traffic-stats-bot"
 TRAFFIC_STATS_BOT_SERVICE="kto-traffic-stats-bot.service"
 TRAFFIC_REPORT_TZ_DEFAULT="Europe/Moscow"
 TRAFFIC_STATS_ALLOWED_USER_ID_DEFAULT="646296998"
+STATS_COLLECTOR_CONFIG="/etc/kto-stats-collector.conf"
+STATS_COLLECTOR_SCRIPT="/usr/local/bin/kto-stats-collector"
+STATS_COLLECTOR_SERVICE="kto-stats-collector.service"
+STATS_COLLECTOR_STATE_DIR="/var/lib/kto-stats-collector"
+STATS_PUSH_CONFIG="/etc/kto-stats-push.conf"
+STATS_PUSH_SCRIPT="/usr/local/bin/kto-stats-push"
+STATS_PUSH_SERVICE="kto-stats-push.service"
+STATS_PUSH_TIMER="kto-stats-push.timer"
+STATS_COLLECTOR_PORT_DEFAULT="9788"
+STATS_PUSH_INTERVAL_DEFAULT="15"
+STATS_COLLECTOR_STALE_SEC_DEFAULT="60"
 APT_UPDATED=0
 
 GREEN='\033[0;32m'
@@ -763,6 +774,45 @@ ask_text() {
     done
 }
 
+ask_optional_text() {
+    local prompt="$1"
+    local default="${2:-}"
+    local value
+    if [[ -n "$default" ]]; then
+        printf '%s [%s]: ' "$prompt" "$default" >&2
+    else
+        printf '%s: ' "$prompt" >&2
+    fi
+    read -r value
+    echo "${value:-$default}"
+}
+
+ask_int() {
+    local prompt="$1"
+    local default="$2"
+    local min="${3:-1}"
+    local max="${4:-2147483647}"
+    local value
+    while true; do
+        value="$(ask_text "$prompt" "$default")"
+        if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= min && value <= max )); then
+            echo "$value"
+            return 0
+        fi
+        fail "Некорректное число. Диапазон: ${min}-${max}"
+    done
+}
+
+generate_secret() {
+    if command_exists openssl; then
+        openssl rand -hex 32 2>/dev/null && return 0
+    fi
+    if command_exists od; then
+        od -An -N32 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' && echo && return 0
+    fi
+    date +%s%N
+}
+
 ask_secret_value() {
     local prompt="$1"
     local value
@@ -798,6 +848,21 @@ ask_time_hm() {
         value="$(ask_text "$prompt" "$default")"
         value="$(normalize_time_hm "$value")"
         if validate_time_hm "$value"; then
+            echo "$value"
+            return 0
+        fi
+        fail "Некорректное время. Пример: 00:05 или 23;59"
+    done
+}
+
+ask_optional_time_hm() {
+    local prompt="$1"
+    local default="${2-}"
+    local value
+    while true; do
+        value="$(ask_optional_text "$prompt" "$default")"
+        value="$(normalize_time_hm "$value")"
+        if [[ -z "$value" ]] || validate_time_hm "$value"; then
             echo "$value"
             return 0
         fi
@@ -2755,12 +2820,765 @@ install_haproxy() {
     configure_haproxy_backend
 }
 
+write_stats_collector_script() {
+    write_root_file_mode 0755 "$STATS_COLLECTOR_SCRIPT" <<'EOF'
+#!/usr/bin/env python3
+import html
+import json
+import os
+import socket
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+COLLECTOR_BUILD = "v111"
+CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
+
+
+def load_config(path):
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                value = value.strip()
+                if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                    value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+                data[key.strip()] = value
+    except FileNotFoundError:
+        pass
+    return data
+
+
+cfg = load_config(CONFIG)
+LISTEN_HOST = cfg.get("KTO_COLLECTOR_LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(cfg.get("KTO_COLLECTOR_LISTEN_PORT", "9788"))
+SECRET = cfg.get("KTO_COLLECTOR_SECRET", "")
+BOT_TOKEN = cfg.get("KTO_COLLECTOR_BOT_TOKEN", "")
+CHAT_ID = cfg.get("KTO_COLLECTOR_CHAT_ID", "")
+ALLOWED_USER_ID = str(cfg.get("KTO_COLLECTOR_ALLOWED_USER_ID", "646296998"))
+STATE_DIR = cfg.get("KTO_COLLECTOR_STATE_DIR", "/var/lib/kto-stats-collector")
+STALE_SEC = int(cfg.get("KTO_COLLECTOR_STALE_SEC", "60"))
+CHECK_INTERVAL = int(cfg.get("KTO_COLLECTOR_CHECK_INTERVAL", "30"))
+TZ_NAME = cfg.get("KTO_COLLECTOR_TZ", "Europe/Moscow")
+DAILY_REPORT_TIME = cfg.get("KTO_COLLECTOR_DAILY_REPORT_TIME", "").strip()
+
+NODES_FILE = os.path.join(STATE_DIR, "nodes.json")
+OFFSET_FILE = os.path.join(STATE_DIR, "telegram_offset")
+DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
+LOCK = threading.RLock()
+NODES = {}
+
+if TZ_NAME:
+    os.environ["TZ"] = TZ_NAME
+    try:
+        time.tzset()
+    except AttributeError:
+        pass
+
+_getaddrinfo = socket.getaddrinfo
+
+
+def getaddrinfo_ipv4(host, port, family=0, socktype=0, proto=0, flags=0):
+    return _getaddrinfo(host, port, socket.AF_INET, socktype, proto, flags)
+
+
+socket.getaddrinfo = getaddrinfo_ipv4
+
+
+def log(message):
+    print(f"collector {COLLECTOR_BUILD}: {message}", flush=True)
+
+
+def now_ts():
+    return int(time.time())
+
+
+def atomic_write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    os.replace(tmp, path)
+
+
+def load_nodes():
+    global NODES
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(NODES_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                NODES = loaded
+    except Exception:
+        NODES = {}
+
+
+def save_nodes():
+    atomic_write(NODES_FILE, json.dumps(NODES, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def format_bytes(value):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    idx = 0
+    while value >= 1024 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{value:.0f} {units[idx]}"
+    return f"{value:.1f} {units[idx]}"
+
+
+def format_age(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    return f"{hours}h {minutes % 60}m"
+
+
+def fmt_time(ts):
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return "-"
+
+
+def tg_call(method, data=None, timeout=25):
+    if not BOT_TOKEN:
+        raise RuntimeError("telegram bot token is empty")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    encoded = urllib.parse.urlencode(data or {}).encode("utf-8")
+    req = urllib.request.Request(url, data=encoded, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    parsed = json.loads(body)
+    if not parsed.get("ok"):
+        raise RuntimeError(body[:700])
+    return parsed
+
+
+def send_message(text):
+    if not CHAT_ID:
+        log("telegram chat id is empty")
+        return False
+    try:
+        result = tg_call("sendMessage", {
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        })
+        msg = result.get("result", {})
+        log(f"telegram sent message_id={msg.get('message_id')} chat_id={msg.get('chat', {}).get('id')}")
+        return True
+    except Exception as exc:
+        log(f"telegram send failed: {exc}")
+        return False
+
+
+def node_message(node):
+    name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
+    error = str(node.get("error") or "")
+    updated = node.get("updated_at") or node.get("last_seen") or 0
+    lines = [f"<b>{name}</b>", ""]
+    if error:
+        lines += [
+            "Сегодня: ошибка",
+            "I/O: - | -",
+            "",
+            "Месяц: ошибка",
+            "",
+            f"Ошибка: {html.escape(error)[:800]}",
+            f"Обновлено: {fmt_time(updated)}",
+        ]
+        return "\n".join(lines)
+    lines += [
+        f"Сегодня: {format_bytes(node.get('day_total', 0))}",
+        f"I/O: {format_bytes(node.get('day_rx', 0))} | {format_bytes(node.get('day_tx', 0))}",
+        "",
+        f"Месяц: {format_bytes(node.get('month_total', 0))}",
+        "",
+        f"Обновлено: {fmt_time(updated)}",
+    ]
+    return "\n".join(lines)
+
+
+def aggregate_message():
+    with LOCK:
+        nodes = list(NODES.values())
+    ts = now_ts()
+    if not nodes:
+        return "<b>Статистика обходов</b>\n\nНет данных от машин."
+    nodes.sort(key=lambda item: str(item.get("name") or item.get("id") or ""))
+    parts = ["<b>Статистика обходов</b>"]
+    for node in nodes:
+        age = ts - int(node.get("last_seen", 0) or 0)
+        status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
+        parts.append("")
+        parts.append(node_message(node))
+        parts.append(f"Статус: {status}")
+    return "\n".join(parts)
+
+
+def alert_offline(node_id, node, age):
+    name = html.escape(str(node.get("name") or node_id))
+    send_message(f"<b>{name}</b>\n\nНе присылал стату: {format_age(age)}")
+
+
+def alert_online(node_id, node):
+    name = html.escape(str(node.get("name") or node_id))
+    send_message(f"<b>{name}</b>\n\nСнова онлайн")
+
+
+def update_node(payload):
+    node_id = str(payload.get("id") or payload.get("name") or payload.get("hostname") or "").strip()
+    if not node_id:
+        raise ValueError("id/name is required")
+    current = now_ts()
+    record = {
+        "id": node_id,
+        "name": str(payload.get("name") or node_id),
+        "iface": str(payload.get("iface") or ""),
+        "hostname": str(payload.get("hostname") or ""),
+        "day_total": int(payload.get("day_total") or 0),
+        "day_rx": int(payload.get("day_rx") or 0),
+        "day_tx": int(payload.get("day_tx") or 0),
+        "month_total": int(payload.get("month_total") or 0),
+        "month_rx": int(payload.get("month_rx") or 0),
+        "month_tx": int(payload.get("month_tx") or 0),
+        "error": str(payload.get("error") or ""),
+        "updated_at": int(payload.get("updated_at") or current),
+        "last_seen": current,
+        "offline_alerted": False,
+    }
+    with LOCK:
+        old = NODES.get(node_id, {})
+        was_offline = bool(old.get("offline_alerted"))
+        NODES[node_id] = record
+        save_nodes()
+    if was_offline:
+        alert_online(node_id, record)
+    return record
+
+
+def authorized(headers):
+    if not SECRET:
+        return False
+    value = headers.get("Authorization", "")
+    return value == f"Bearer {SECRET}" or value == SECRET
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        log(fmt % args)
+
+    def send_json(self, code, data):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/health":
+            self.send_json(200, {"ok": True, "build": COLLECTOR_BUILD})
+            return
+        if path == "/nodes":
+            if not authorized(self.headers):
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            with LOCK:
+                self.send_json(200, {"ok": True, "nodes": NODES})
+            return
+        self.send_json(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path != "/push":
+            self.send_json(404, {"ok": False, "error": "not found"})
+            return
+        if not authorized(self.headers):
+            self.send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 65536:
+                raise ValueError("bad content length")
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            node = update_node(payload)
+            self.send_json(200, {"ok": True, "id": node["id"], "last_seen": node["last_seen"]})
+        except Exception as exc:
+            self.send_json(400, {"ok": False, "error": str(exc)})
+
+
+def offline_loop():
+    while True:
+        time.sleep(CHECK_INTERVAL)
+        current = now_ts()
+        changed = False
+        alerts = []
+        with LOCK:
+            for node_id, node in NODES.items():
+                age = current - int(node.get("last_seen", 0) or 0)
+                if age > STALE_SEC and not node.get("offline_alerted"):
+                    node["offline_alerted"] = True
+                    alerts.append((node_id, dict(node), age))
+                    changed = True
+            if changed:
+                save_nodes()
+        for node_id, node, age in alerts:
+            alert_offline(node_id, node, age)
+
+
+def load_offset():
+    try:
+        with open(OFFSET_FILE, "r", encoding="utf-8") as fh:
+            return int(fh.read().strip())
+    except Exception:
+        return None
+
+
+def save_offset(offset):
+    atomic_write(OFFSET_FILE, str(offset))
+
+
+def load_daily_date():
+    try:
+        with open(DAILY_FILE, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except Exception:
+        return ""
+
+
+def save_daily_date(value):
+    atomic_write(DAILY_FILE, value)
+
+
+def daily_report_loop():
+    last_sent = load_daily_date()
+    log(f"daily report time={DAILY_REPORT_TIME} tz={TZ_NAME}")
+    while True:
+        try:
+            current = datetime.now()
+            today = current.strftime("%Y-%m-%d")
+            if current.strftime("%H:%M") == DAILY_REPORT_TIME and last_sent != today:
+                if send_message(aggregate_message()):
+                    last_sent = today
+                    save_daily_date(today)
+                time.sleep(70)
+            else:
+                time.sleep(20)
+        except Exception as exc:
+            log(f"daily report failed: {exc}")
+            time.sleep(20)
+
+
+def bot_loop():
+    offset = load_offset()
+    try:
+        info = tg_call("getWebhookInfo")
+        webhook_url = info.get("result", {}).get("url") or ""
+        if webhook_url:
+            log(f"deleteWebhook: {webhook_url}")
+            tg_call("deleteWebhook", {"drop_pending_updates": "false"})
+    except Exception as exc:
+        log(f"webhook check failed: {exc}")
+    if offset is None:
+        try:
+            recent = tg_call("getUpdates", {"timeout": 0, "limit": 1, "offset": -1})
+            result = recent.get("result") or []
+            if result:
+                offset = int(result[-1]["update_id"]) + 1
+                save_offset(offset)
+        except Exception as exc:
+            log(f"initial getUpdates failed: {exc}")
+    while True:
+        try:
+            params = {"timeout": 25, "limit": 20, "allowed_updates": json.dumps(["message"])}
+            if offset is not None:
+                params["offset"] = offset
+            updates = tg_call("getUpdates", params, timeout=35).get("result") or []
+            for item in updates:
+                update_id = int(item.get("update_id", 0))
+                offset = update_id + 1
+                save_offset(offset)
+                message = item.get("message") or {}
+                chat_id = str((message.get("chat") or {}).get("id", ""))
+                from_id = str((message.get("from") or {}).get("id", ""))
+                text = str(message.get("text") or "")
+                command = text.split()[0].split("@", 1)[0].lower() if text.split() else ""
+                if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats":
+                    send_message(aggregate_message())
+        except Exception as exc:
+            log(f"bot loop failed: {exc}")
+            time.sleep(5)
+
+
+def main():
+    if not SECRET:
+        raise SystemExit("KTO_COLLECTOR_SECRET is empty")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    load_nodes()
+    threading.Thread(target=offline_loop, daemon=True).start()
+    threading.Thread(target=bot_loop, daemon=True).start()
+    if DAILY_REPORT_TIME:
+        threading.Thread(target=daily_report_loop, daemon=True).start()
+    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    log(f"listening http://{LISTEN_HOST}:{LISTEN_PORT}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+}
+
+write_stats_collector_service() {
+    write_root_file "/etc/systemd/system/${STATS_COLLECTOR_SERVICE}" <<EOF
+[Unit]
+Description=kto stats collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${STATS_COLLECTOR_SCRIPT}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_stats_collector() {
+    header
+    need_root
+
+    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec daily_report_time
+    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_tz safe_daily
+
+    listen_host="$(ask_text "IP прослушивания коллектора" "0.0.0.0")"
+    listen_port="$(ask_int "Порт коллектора" "$STATS_COLLECTOR_PORT_DEFAULT" 1 65535)"
+    secret="$(ask_text "Секрет коллектора" "$(generate_secret)")"
+    bot_token="$(ask_secret_value "Введите Telegram Bot Token")"
+    chat_id="$(ask_text "Введите Telegram Chat ID")"
+    allowed_user="$(ask_int "Разрешенный Telegram user id" "$TRAFFIC_STATS_ALLOWED_USER_ID_DEFAULT" 1 999999999999)"
+    stale_sec="$(ask_int "Алерт offline после секунд" "$STATS_COLLECTOR_STALE_SEC_DEFAULT" 30 86400)"
+    daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
+
+    safe_host="$(escape_config_value "$listen_host")"
+    safe_port="$(escape_config_value "$listen_port")"
+    safe_secret="$(escape_config_value "$secret")"
+    safe_bot="$(escape_config_value "$bot_token")"
+    safe_chat="$(escape_config_value "$chat_id")"
+    safe_user="$(escape_config_value "$allowed_user")"
+    safe_stale="$(escape_config_value "$stale_sec")"
+    safe_tz="$(escape_config_value "$TRAFFIC_REPORT_TZ_DEFAULT")"
+    safe_daily="$(escape_config_value "$daily_report_time")"
+
+    stage "Устанавливаю коллектор статистики"
+    must "Установка Python" apt_install_with_update_if_missing python3
+    cmd "${SUDO[@]}" mkdir -p "$STATS_COLLECTOR_STATE_DIR"
+    write_root_file_mode 0600 "$STATS_COLLECTOR_CONFIG" <<EOF
+KTO_COLLECTOR_LISTEN_HOST="$safe_host"
+KTO_COLLECTOR_LISTEN_PORT="$safe_port"
+KTO_COLLECTOR_SECRET="$safe_secret"
+KTO_COLLECTOR_BOT_TOKEN="$safe_bot"
+KTO_COLLECTOR_CHAT_ID="$safe_chat"
+KTO_COLLECTOR_ALLOWED_USER_ID="$safe_user"
+KTO_COLLECTOR_STATE_DIR="$STATS_COLLECTOR_STATE_DIR"
+KTO_COLLECTOR_STALE_SEC="$safe_stale"
+KTO_COLLECTOR_TZ="$safe_tz"
+KTO_COLLECTOR_DAILY_REPORT_TIME="$safe_daily"
+EOF
+    write_stats_collector_script
+    write_stats_collector_service
+    cmd "${SUDO[@]}" systemctl daemon-reload
+    cmd "${SUDO[@]}" systemctl enable --now "$STATS_COLLECTOR_SERVICE"
+    cmd "${SUDO[@]}" systemctl restart "$STATS_COLLECTOR_SERVICE" || true
+    if ufw_active; then
+        cmd "${SUDO[@]}" ufw allow "${listen_port}/tcp" || true
+    fi
+
+    ok "Коллектор установлен (${SCRIPT_BUILD})"
+    ok "Адрес: ${listen_host}:${listen_port}"
+    ok "Секрет: ${secret}"
+    ok "Telegram user id: ${allowed_user}"
+    if [[ -n "$daily_report_time" ]]; then
+        ok "Ежедневный отчёт: ${daily_report_time} МСК"
+    else
+        ok "Ежедневный отчёт: выключен"
+    fi
+}
+
+stats_collector_status() {
+    header
+    need_root
+    local state
+    state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
+    print_row "коллектор" "$STATS_COLLECTOR_SERVICE" "$state"
+    print_row "конфиг" "$STATS_COLLECTOR_CONFIG" "$([[ -s "$STATS_COLLECTOR_CONFIG" ]] && echo 1 || echo 0)"
+    print_row "данные" "$STATS_COLLECTOR_STATE_DIR" "$([[ -d "$STATS_COLLECTOR_STATE_DIR" ]] && echo 1 || echo 0)"
+}
+
+write_stats_push_script() {
+    write_root_file_mode 0755 "$STATS_PUSH_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PUSH_BUILD="v111"
+CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
+if [[ ! -r "$CONFIG" ]]; then
+    echo "Config not found: $CONFIG" >&2
+    exit 1
+fi
+
+# shellcheck source=/etc/kto-stats-push.conf
+. "$CONFIG"
+
+: "${KTO_PUSH_NODE_ID:?KTO_PUSH_NODE_ID is required}"
+: "${KTO_PUSH_NODE_NAME:?KTO_PUSH_NODE_NAME is required}"
+: "${KTO_PUSH_IFACE:?KTO_PUSH_IFACE is required}"
+: "${KTO_PUSH_COLLECTOR_URL:?KTO_PUSH_COLLECTOR_URL is required}"
+: "${KTO_PUSH_SECRET:?KTO_PUSH_SECRET is required}"
+
+collector_url="${KTO_PUSH_COLLECTOR_URL%/}/push"
+hostname_value="$(hostname 2>/dev/null || echo unknown)"
+updated_at="$(date +%s)"
+error=""
+day_rx=0
+day_tx=0
+month_rx=0
+month_tx=0
+
+if ! command -v jq >/dev/null 2>&1; then
+    error="jq не установлен"
+elif ! command -v vnstat >/dev/null 2>&1; then
+    error="vnstat не установлен"
+else
+    if ! traffic_json="$(vnstat -i "$KTO_PUSH_IFACE" --json 2>&1)"; then
+        error="vnstat: ${traffic_json}"
+    elif [[ -z "$traffic_json" ]]; then
+        error="vnstat не вернул данные по интерфейсу ${KTO_PUSH_IFACE}"
+    else
+        stats="$(printf '%s' "$traffic_json" | jq -r '
+            def day_key: (.date.year * 10000 + .date.month * 100 + .date.day);
+            def month_key: (.date.year * 100 + .date.month);
+            (.interfaces[0].traffic.day // []) as $days |
+            (.interfaces[0].traffic.month // []) as $months |
+            ($days | max_by(day_key) // {rx:0, tx:0}) as $day |
+            ($months | max_by(month_key) // {rx:0, tx:0}) as $month |
+            "\($day.rx // 0) \($day.tx // 0) \($month.rx // 0) \($month.tx // 0)"
+        ' 2>/dev/null || true)"
+        if [[ -z "$stats" ]]; then
+            error="jq не смог разобрать vnstat json"
+        else
+            set -- $stats
+            day_rx="${1:-0}"
+            day_tx="${2:-0}"
+            month_rx="${3:-0}"
+            month_tx="${4:-0}"
+        fi
+    fi
+fi
+
+day_total=$(( day_rx + day_tx ))
+month_total=$(( month_rx + month_tx ))
+
+payload="$(jq -n \
+    --arg id "$KTO_PUSH_NODE_ID" \
+    --arg name "$KTO_PUSH_NODE_NAME" \
+    --arg iface "$KTO_PUSH_IFACE" \
+    --arg hostname "$hostname_value" \
+    --arg error "$error" \
+    --argjson day_rx "$day_rx" \
+    --argjson day_tx "$day_tx" \
+    --argjson day_total "$day_total" \
+    --argjson month_rx "$month_rx" \
+    --argjson month_tx "$month_tx" \
+    --argjson month_total "$month_total" \
+    --argjson updated_at "$updated_at" \
+    '{
+        id: $id,
+        name: $name,
+        iface: $iface,
+        hostname: $hostname,
+        day_rx: $day_rx,
+        day_tx: $day_tx,
+        day_total: $day_total,
+        month_rx: $month_rx,
+        month_tx: $month_tx,
+        month_total: $month_total,
+        error: $error,
+        updated_at: $updated_at
+    }')"
+
+response="$(curl -4 -fsS --connect-timeout 8 --max-time 20 --retry 2 --retry-delay 2 \
+    -X POST "$collector_url" \
+    -H "Authorization: Bearer ${KTO_PUSH_SECRET}" \
+    -H "Content-Type: application/json" \
+    --data "$payload")"
+
+if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+    echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME}"
+else
+    echo "push ${PUSH_BUILD}: bad response: ${response}" >&2
+    exit 1
+fi
+EOF
+}
+
+write_stats_push_service() {
+    local interval="$1"
+    write_root_file "/etc/systemd/system/${STATS_PUSH_SERVICE}" <<EOF
+[Unit]
+Description=kto stats push
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${STATS_PUSH_SCRIPT}
+EOF
+
+    write_root_file "/etc/systemd/system/${STATS_PUSH_TIMER}" <<EOF
+[Unit]
+Description=kto stats push timer
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=${interval}s
+AccuracySec=5s
+Unit=${STATS_PUSH_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+install_stats_push_client() {
+    header
+    require_whitelist_mode
+    need_root
+
+    local default_iface default_name node_name node_id iface collector_url secret interval
+    local safe_name safe_id safe_iface safe_url safe_secret safe_interval
+
+    default_iface="$(config_get KTO_TRAFFIC_IFACE "$TRAFFIC_REPORT_CONFIG")"
+    default_iface="${default_iface:-$(default_network_interface)}"
+    default_name="$(config_get KTO_TRAFFIC_NAME "$TRAFFIC_REPORT_CONFIG")"
+    default_name="${default_name:-$(hostname 2>/dev/null || echo whitelist)}"
+
+    node_name="$(ask_text "Название машины" "$default_name")"
+    node_id="$(ask_text "ID машины" "$node_name")"
+    iface="$(ask_text "Интерфейс" "${default_iface:-eth0}")"
+    if ! network_interface_exists "$iface"; then
+        fail "Интерфейс ${iface} не найден. Проверь: ip -br link"
+        return 1
+    fi
+    collector_url="$(ask_text "URL коллектора")"
+    if [[ ! "$collector_url" =~ ^https?:// ]]; then
+        fail "URL коллектора должен начинаться с http:// или https://"
+        return 1
+    fi
+    secret="$(ask_secret_value "Секрет коллектора")"
+    interval="$(ask_int "Интервал push, сек" "$STATS_PUSH_INTERVAL_DEFAULT" 15 3600)"
+
+    safe_name="$(escape_config_value "$node_name")"
+    safe_id="$(escape_config_value "$node_id")"
+    safe_iface="$(escape_config_value "$iface")"
+    safe_url="$(escape_config_value "$collector_url")"
+    safe_secret="$(escape_config_value "$secret")"
+    safe_interval="$(escape_config_value "$interval")"
+
+    stage "Устанавливаю push статистики"
+    must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat
+    cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
+    cmd "${SUDO[@]}" systemctl enable --now vnstat || true
+    cmd "${SUDO[@]}" systemctl restart vnstat || true
+    cmd "${SUDO[@]}" systemctl disable --now "$TRAFFIC_STATS_BOT_SERVICE" "$TRAFFIC_REPORT_TIMER" "$TRAFFIC_REPORT_SERVICE" || true
+
+    write_root_file_mode 0600 "$STATS_PUSH_CONFIG" <<EOF
+KTO_PUSH_NODE_ID="$safe_id"
+KTO_PUSH_NODE_NAME="$safe_name"
+KTO_PUSH_IFACE="$safe_iface"
+KTO_PUSH_COLLECTOR_URL="$safe_url"
+KTO_PUSH_SECRET="$safe_secret"
+KTO_PUSH_INTERVAL="$safe_interval"
+EOF
+    write_stats_push_script
+    write_stats_push_service "$interval"
+    cmd "${SUDO[@]}" systemctl daemon-reload
+    cmd "${SUDO[@]}" systemctl enable --now "$STATS_PUSH_TIMER"
+
+    ok "Пуш статистики установлен (${SCRIPT_BUILD})"
+    ok "Машина: ${node_name}"
+    ok "Коллектор: ${collector_url}"
+    ok "Интервал: ${interval}s"
+    ok "Старые прямые Telegram-задачи на whitelist выключены"
+
+    stage "Тестовый push"
+    if "${SUDO[@]}" "$STATS_PUSH_SCRIPT" >> "$LOG_FILE" 2>&1; then
+        ok "Push отправлен"
+    else
+        warn "Push не отправился. Проверь URL/secret/доступ до коллектора."
+        tail -n 15 "$LOG_FILE" >&2 || true
+    fi
+}
+
+send_stats_push_once() {
+    header
+    require_whitelist_mode
+    need_root
+    if ! "${SUDO[@]}" test -f "$STATS_PUSH_CONFIG" 2>/dev/null; then
+        fail "Push статистики не настроен."
+        return 0
+    fi
+    write_stats_push_script
+    stage "Отправляю push"
+    if "${SUDO[@]}" "$STATS_PUSH_SCRIPT"; then
+        ok "Push отправлен (${SCRIPT_BUILD})"
+    else
+        warn "Push не отправился."
+    fi
+}
+
+stats_push_status() {
+    header
+    require_whitelist_mode
+    need_root
+    local timer_state config_ok
+    timer_state="$(service_ok "$STATS_PUSH_TIMER")"
+    config_ok="$([[ -s "$STATS_PUSH_CONFIG" ]] && echo 1 || echo 0)"
+    print_row "push конфиг" "$STATS_PUSH_CONFIG" "$config_ok"
+    print_row "push timer" "$STATS_PUSH_TIMER" "$timer_state"
+}
+
 write_traffic_report_script() {
     write_root_file_mode 0755 "$TRAFFIC_REPORT_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v110"
+REPORT_SCRIPT_BUILD="v111"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -2957,7 +3775,7 @@ write_traffic_stats_bot_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STATS_BOT_BUILD="v110"
+STATS_BOT_BUILD="v111"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 STATE_DIR="/var/lib/kto-traffic-stats-bot"
 STATE_FILE="${STATE_DIR}/last_update_id"
@@ -3599,6 +4417,9 @@ traffic_report_menu() {
         echo -e "4) Установить /stats bot"
         echo -e "5) Тест /stats ответа"
         echo -e "6) Диагностика /stats"
+        echo -e "7) Настроить push на коллектор"
+        echo -e "8) Отправить push сейчас"
+        echo -e "9) Статус push"
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -3627,6 +4448,18 @@ traffic_report_menu() {
                 ;;
             6)
                 run_traffic_stats_bot_command debug
+                system_check_pause
+                ;;
+            7)
+                install_stats_push_client
+                system_check_pause
+                ;;
+            8)
+                send_stats_push_once
+                system_check_pause
+                ;;
+            9)
+                stats_push_status
                 system_check_pause
                 ;;
             0)
@@ -3827,6 +4660,8 @@ menu() {
 
     labels+=("Панель состояния")
     actions+=("status")
+    labels+=("Коллектор статистики")
+    actions+=("stats-collector")
     labels+=("Speedtest")
     actions+=("speedtest")
     labels+=("Проверка IP (IP.Check.Place)")
@@ -3874,6 +4709,7 @@ menu() {
         selfsteal) install_selfsteal ;;
         warp) install_warp_native ;;
         status) show_status ;;
+        stats-collector) install_stats_collector ;;
         speedtest) install_speedtest ;;
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
@@ -3907,9 +4743,14 @@ main() {
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
+        collector|collector-install|stats-collector) install_stats_collector ;;
+        collector-status|stats-collector-status) stats_collector_status ;;
         traffic|traffic-report) traffic_report_menu ;;
         traffic-install) install_traffic_report ;;
         traffic-send) send_traffic_report ;;
+        stats-push|stats-push-install) install_stats_push_client ;;
+        stats-push-send) send_stats_push_once ;;
+        stats-push-status) stats_push_status ;;
         stats-bot|traffic-stats-bot) install_traffic_stats_bot ;;
         stats-test|traffic-stats-test) run_traffic_stats_bot_command send ;;
         stats-debug|traffic-stats-debug) run_traffic_stats_bot_command debug ;;
