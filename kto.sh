@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v116"
+SCRIPT_BUILD="v117"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -1432,6 +1432,15 @@ EOF
     cmd "${SUDO[@]}" systemctl reload docker || true
 }
 
+truncate_large_var_logs() {
+    cmd "${SUDO[@]}" find /var/log -xdev -type f -size +256M \
+        ! -path '/var/log/journal/*' \
+        -printf 'truncate large log: %s %p\n' || true
+    cmd "${SUDO[@]}" find /var/log -xdev -type f -size +256M \
+        ! -path '/var/log/journal/*' \
+        -exec truncate -s 0 {} + || true
+}
+
 opt_storage_guard() {
     cmd "${SUDO[@]}" apt-get clean || true
     cmd "${SUDO[@]}" apt-get autoclean || true
@@ -1471,6 +1480,7 @@ EOF
     cmd "${SUDO[@]}" find /var/crash -type f -delete || true
     cmd "${SUDO[@]}" find /var/lib/systemd/coredump -type f -mtime +1 -delete || true
     cmd "${SUDO[@]}" find /var/log -xdev -type f \( -name '*.gz' -o -name '*.old' -o -name '*.1' \) -mtime +14 -delete || true
+    truncate_large_var_logs
 
     configure_docker_log_rotation
 }
@@ -1482,6 +1492,22 @@ print_disk_usage_top() {
         "${SUDO[@]}" timeout 30s du -xhd1 / 2>/dev/null | sort -hr | head -n 12 || true
     else
         "${SUDO[@]}" du -xhd1 / 2>/dev/null | sort -hr | head -n 12 || true
+    fi
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ КРУПНЕЙШЕЕ В /VAR ]${NC}"
+    if command_exists timeout; then
+        "${SUDO[@]}" timeout 30s du -xhd1 /var 2>/dev/null | sort -hr | head -n 12 || true
+    else
+        "${SUDO[@]}" du -xhd1 /var 2>/dev/null | sort -hr | head -n 12 || true
+    fi
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ КРУПНЫЕ ЛОГИ ]${NC}"
+    if command_exists timeout; then
+        "${SUDO[@]}" timeout 30s du -ahx /var/log 2>/dev/null | sort -hr | head -n 20 || true
+    else
+        "${SUDO[@]}" du -ahx /var/log 2>/dev/null | sort -hr | head -n 20 || true
     fi
 
     if command_exists docker; then
@@ -2923,7 +2949,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v116"
+COLLECTOR_BUILD = "v117"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3478,7 +3504,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v116"
+PUSH_BUILD="v117"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3711,7 +3737,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v116"
+REPORT_SCRIPT_BUILD="v117"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3908,7 +3934,7 @@ write_traffic_stats_bot_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STATS_BOT_BUILD="v116"
+STATS_BOT_BUILD="v117"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 STATE_DIR="/var/lib/kto-traffic-stats-bot"
 STATE_FILE="${STATE_DIR}/last_update_id"
