@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.8.8 (v91)"
+SCRIPT_VERSION="1.4.8.8 (v92)"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -16,16 +16,6 @@ MACHINE_MODE="${KTO_MACHINE_MODE:-}"
 NODE_PROFILE="${KTO_NODE_PROFILE:-}"
 REMNA_API_URL="${KTO_REMNA_API_URL:-https://admin.ktoygaday.xyz}"
 REMNA_API_TOKEN="${KTO_REMNA_API_TOKEN:-}"
-GCLOUD_PROFILE_NAME="VLESS-GCloud-Codex"
-GCLOUD_INBOUND_TAG="VLESS_GCLOUD_CODEX"
-GCLOUD_NODE_NAME="🇫🇮 Google Cloud by Codex"
-GCLOUD_HOST_REMARK="Finland Battles by Codex"
-GCLOUD_TARGET_PROFILES_LEGACY_DEFAULT="VLESS-Test-DNS"
-GCLOUD_TARGET_PROFILES_DEFAULT="Hysteria-Petersburg-DNS|VLESS-Moscow-DNS|VLESS-Novosibirsk-DNS"
-GCLOUD_TARGET_PROFILES_NONE="__none__"
-GCLOUD_TARGET_PROFILES="${KTO_GCLOUD_TARGET_PROFILES:-}"
-GCLOUD_TARGET_OUTBOUND_TAG="Finland"
-GCLOUD_USERNAME="mash"
 if [[ -n "${KTO_LOG_FILE:-}" ]]; then
     LOG_FILE="$KTO_LOG_FILE"
 elif [[ ${EUID:-$(id -u)} -eq 0 ]]; then
@@ -84,11 +74,24 @@ init_log() {
     echo "===== kto VPN v${SCRIPT_VERSION} $(date -Is) =====" >> "$LOG_FILE" 2>/dev/null || true
 }
 
+header_center_line() {
+    local text="$1"
+    local style="${2:-}"
+    local width=42 len left right
+    len="${#text}"
+    if (( len > width )); then
+        width="$len"
+    fi
+    left=$(( (width - len) / 2 ))
+    right=$(( width - len - left ))
+    printf '%b%*s%s%*s%b\n' "$style" "$left" "" "$text" "$right" "" "$NC"
+}
+
 header() {
     printf '\033c'
     echo -e "${PURPLE}==========================================${NC}"
-    echo -e "${BOLD}${GREEN}                 kto VPN                  ${NC}"
-    echo -e "${DIM}                  v${SCRIPT_VERSION}${NC}"
+    header_center_line "kto VPN" "${BOLD}${GREEN}"
+    header_center_line "v${SCRIPT_VERSION}" "$DIM"
     echo -e "${PURPLE}==========================================${NC}"
 }
 
@@ -322,46 +325,8 @@ escape_config_value() {
     echo "$value"
 }
 
-gcloud_target_profiles_list() {
-    local raw="${GCLOUD_TARGET_PROFILES:-$GCLOUD_TARGET_PROFILES_DEFAULT}"
-    [[ "$raw" == "$GCLOUD_TARGET_PROFILES_NONE" ]] && return 0
-    printf '%s\n' "$raw" | tr '|' '\n' | sed '/^[[:space:]]*$/d'
-}
-
-gcloud_target_profiles_display() {
-    local profiles
-    profiles="$(gcloud_target_profiles_list | awk 'BEGIN{out=""} {out = out ? out ", " $0 : $0} END{print out}')"
-    echo "${profiles:-нет}"
-}
-
-gcloud_target_profile_exists() {
-    local name="$1"
-    gcloud_target_profiles_list | grep -Fxq "$name"
-}
-
-gcloud_add_target_profile() {
-    local name="$1"
-    [[ -n "$name" ]] || return 1
-    if gcloud_target_profile_exists "$name"; then
-        return 0
-    fi
-    if [[ -n "${GCLOUD_TARGET_PROFILES:-}" && "$GCLOUD_TARGET_PROFILES" != "$GCLOUD_TARGET_PROFILES_NONE" ]]; then
-        GCLOUD_TARGET_PROFILES="${GCLOUD_TARGET_PROFILES}|${name}"
-    else
-        GCLOUD_TARGET_PROFILES="$name"
-    fi
-}
-
-gcloud_remove_target_profile() {
-    local name="$1"
-    GCLOUD_TARGET_PROFILES="$(gcloud_target_profiles_list | awk -v name="$name" 'BEGIN{out=""} $0 != name {out = out ? out "|" $0 : $0} END{print out}')"
-    if [[ -z "$GCLOUD_TARGET_PROFILES" ]]; then
-        GCLOUD_TARGET_PROFILES="$GCLOUD_TARGET_PROFILES_NONE"
-    fi
-}
-
 load_machine_mode() {
-    local saved_mode="" saved_profile="" saved_api_url="" saved_api_token="" saved_gcloud_targets="" source_file="$CONFIG_FILE"
+    local saved_mode="" saved_profile="" saved_api_url="" saved_api_token="" source_file="$CONFIG_FILE"
     CONFIG_SOURCE_FILE=""
 
     if [[ -n "$MACHINE_MODE" ]]; then
@@ -403,35 +368,23 @@ load_machine_mode() {
         REMNA_API_TOKEN="$saved_api_token"
     fi
 
-    saved_gcloud_targets="$(config_get GCLOUD_TARGET_PROFILES "$source_file")"
-    if [[ -z "${KTO_GCLOUD_TARGET_PROFILES+x}" && -n "$saved_gcloud_targets" ]]; then
-        GCLOUD_TARGET_PROFILES="$saved_gcloud_targets"
-    fi
-    if [[ -z "${GCLOUD_TARGET_PROFILES:-}" ]]; then
-        GCLOUD_TARGET_PROFILES="$GCLOUD_TARGET_PROFILES_DEFAULT"
-    elif [[ "$GCLOUD_TARGET_PROFILES" == "$GCLOUD_TARGET_PROFILES_LEGACY_DEFAULT" ]]; then
-        GCLOUD_TARGET_PROFILES="$GCLOUD_TARGET_PROFILES_DEFAULT"
-    fi
-
     if [[ "$MACHINE_MODE" != "node" ]]; then
         NODE_PROFILE=""
     fi
 }
 
 save_machine_mode() {
-    local safe_mode safe_profile safe_url safe_token safe_gcloud_targets
+    local safe_mode safe_profile safe_url safe_token
     safe_mode="$(escape_config_value "$MACHINE_MODE")"
     safe_profile="$(escape_config_value "$NODE_PROFILE")"
     safe_url="$(escape_config_value "$REMNA_API_URL")"
     safe_token="$(escape_config_value "$REMNA_API_TOKEN")"
-    safe_gcloud_targets="$(escape_config_value "${GCLOUD_TARGET_PROFILES:-$GCLOUD_TARGET_PROFILES_DEFAULT}")"
 
     write_root_file_mode 0600 "$CONFIG_FILE" <<EOF
 MACHINE_MODE="$safe_mode"
 NODE_PROFILE="$safe_profile"
 REMNA_API_URL="$safe_url"
 REMNA_API_TOKEN="$safe_token"
-GCLOUD_TARGET_PROFILES="$safe_gcloud_targets"
 EOF
 }
 
@@ -574,66 +527,6 @@ reconfigure_machine_mode() {
     fi
 }
 
-configure_gcloud_target_profiles() {
-    local choice profile
-
-    need_root
-    while true; do
-        header
-        echo -e "${BOLD}${PURPLE}[ РЕДАКТИРУЕМЫЕ ПРОФИЛИ ]${NC}"
-        echo -e "Текущие: $(gcloud_target_profiles_display)"
-        echo
-        echo -e "1) Изменить"
-        echo -e "2) Удалить"
-        echo -e "0) Выйти"
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
-        read -r choice
-
-        case "$choice" in
-            1)
-                while true; do
-                    printf 'Добавить профиль: '
-                    read -r profile
-                    if [[ "$profile" == "0" ]]; then
-                        break
-                    fi
-                    if [[ -z "$profile" ]]; then
-                        fail "Название пустое"
-                        continue
-                    fi
-                    gcloud_add_target_profile "$profile"
-                    save_machine_mode
-                    ok "Добавлено: ${profile}"
-                done
-                ;;
-            2)
-                printf 'Удалить профиль: '
-                read -r profile
-                if [[ "$profile" == "0" ]]; then
-                    continue
-                fi
-                if [[ -z "$profile" ]]; then
-                    fail "Название пустое"
-                    sleep 1
-                    continue
-                fi
-                gcloud_remove_target_profile "$profile"
-                save_machine_mode
-                ok "Больше не меняю: ${profile}"
-                sleep 1
-                ;;
-            0)
-                return 0
-                ;;
-            *)
-                fail "Неверный выбор"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
 settings_menu() {
     local choice
 
@@ -641,10 +534,9 @@ settings_menu() {
         header
         echo -e "${BOLD}${PURPLE}[ НАСТРОЙКИ ]${NC}"
         echo -e "1) Изменение режима"
-        echo -e "2) Изменение редактируемых профилей"
-        echo -e "3) Проверка системы"
+        echo -e "2) Проверка системы"
         if [[ "$MACHINE_MODE" == "whitelist" ]]; then
-            echo -e "4) Обновить HAProxy IP/SNI"
+            echo -e "3) Обновить HAProxy IP/SNI"
         fi
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
@@ -656,12 +548,9 @@ settings_menu() {
                 reconfigure_machine_mode
                 ;;
             2)
-                configure_gcloud_target_profiles
-                ;;
-            3)
                 system_check
                 ;;
-            4)
+            3)
                 if [[ "$MACHINE_MODE" == "whitelist" ]]; then
                     configure_haproxy_backend
                 else
@@ -990,479 +879,6 @@ remna_host_uuid_by_address() {
 remna_enable_node() {
     local uuid="$1"
     remna_api POST "/api/nodes/${uuid}/actions/enable" >/dev/null || true
-}
-
-build_gcloud_battles_profile_config() {
-    local private_key="$1"
-    local domain="$2"
-    local inbound_tag="${3:-$GCLOUD_INBOUND_TAG}"
-
-    jq -n \
-        --arg tag "$inbound_tag" \
-        --arg privateKey "$private_key" \
-        --arg domain "$domain" \
-        '{
-          log: {loglevel: "none"},
-          dns: {servers: ["1.1.1.1"]},
-          inbounds: [
-            {
-              tag: $tag,
-              port: 443,
-              listen: "0.0.0.0",
-              protocol: "vless",
-              settings: {clients: [], decryption: "none"},
-              sniffing: {enabled: false, destOverride: ["quic", "tls", "http"]},
-              streamSettings: {
-                network: "raw",
-                security: "reality",
-                realitySettings: {
-                  show: false,
-                  xver: 0,
-                  target: "127.0.0.1:9443",
-                  shortIds: [""],
-                  privateKey: $privateKey,
-                  fingerprint: "qq",
-                  serverNames: [$domain]
-                }
-              }
-            }
-          ],
-          outbounds: [
-            {tag: "DIRECT", protocol: "freedom", settings: {domainStrategy: "AsIs"}},
-            {tag: "BLOCK", protocol: "blackhole"},
-            {
-              tag: "WARP",
-              protocol: "freedom",
-              settings: {domainStrategy: "UseIP"},
-              streamSettings: {sockopt: {interface: "warp", tcpFastOpen: true}}
-            }
-          ],
-          routing: {
-            rules: [
-              {ip: ["geoip:private"], outboundTag: "BLOCK"},
-              {protocol: ["bittorrent"], outboundTag: "BLOCK"},
-              {network: "udp", outboundTag: "DIRECT"}
-            ]
-          }
-        }'
-}
-
-build_gcloud_node_profile_config() {
-    local private_key="$1"
-    local domain="$2"
-    local inbound_tag="$3"
-
-    jq -n \
-        --arg tag "$inbound_tag" \
-        --arg privateKey "$private_key" \
-        --arg domain "$domain" \
-        '{
-          log: {loglevel: "none"},
-          dns: {servers: ["1.1.1.1"]},
-          inbounds: [
-            {
-              tag: $tag,
-              port: 443,
-              listen: "0.0.0.0",
-              protocol: "vless",
-              settings: {clients: [], decryption: "none"},
-              sniffing: {enabled: false, destOverride: ["quic", "tls", "http"]},
-              streamSettings: {
-                network: "raw",
-                security: "reality",
-                realitySettings: {
-                  show: false,
-                  xver: 0,
-                  target: "127.0.0.1:9443",
-                  shortIds: [""],
-                  privateKey: $privateKey,
-                  fingerprint: "qq",
-                  serverNames: [$domain]
-                }
-              }
-            }
-          ],
-          outbounds: [
-            {tag: "DIRECT", protocol: "freedom", settings: {domainStrategy: "AsIs"}},
-            {tag: "BLOCK", protocol: "blackhole"},
-            {
-              tag: "WARP",
-              protocol: "freedom",
-              settings: {domainStrategy: "UseIP"},
-              streamSettings: {sockopt: {interface: "warp", tcpFastOpen: true}}
-            }
-          ],
-          routing: {
-            rules: [
-              {
-                domain: [
-                  "domain:game.brawlstarsgame.com",
-                  "domain:supercell.com",
-                  "domain:supercell.io",
-                  "keyword:brawlstars",
-                  "keyword:supercell",
-                  "regexp:supercell",
-                  "regexp:assets"
-                ],
-                outboundTag: "DIRECT"
-              },
-              {port: "9339", outboundTag: "DIRECT"},
-              {
-                domain: [
-                  "bsd.meowfox.net",
-                  "bsdtest.meowfox.net"
-                ],
-                outboundTag: "DIRECT"
-              },
-              {ip: ["geoip:private"], outboundTag: "BLOCK"},
-              {protocol: ["bittorrent"], outboundTag: "BLOCK"},
-              {network: "udp", outboundTag: "DIRECT"},
-              {network: "tcp", outboundTag: "BLOCK"}
-            ]
-          }
-        }'
-}
-
-upsert_gcloud_profile() {
-    local profile_name="${1:-$GCLOUD_PROFILE_NAME}"
-    local private_key="$2"
-    local domain="$3"
-    local inbound_tag="${4:-$GCLOUD_INBOUND_TAG}"
-    local profile_kind="${5:-battles}"
-    local uuid config_file payload response
-    uuid="$(remna_profile_uuid_by_name "$profile_name")"
-    config_file="$(mktemp)"
-    payload="$(mktemp)"
-    if [[ "$profile_kind" == "node" ]]; then
-        build_gcloud_node_profile_config "$private_key" "$domain" "$inbound_tag" > "$config_file"
-    else
-        build_gcloud_battles_profile_config "$private_key" "$domain" "$inbound_tag" > "$config_file"
-    fi
-
-    if [[ -n "$uuid" ]]; then
-        jq -n --arg uuid "$uuid" --arg name "$profile_name" --slurpfile config "$config_file" \
-            '{uuid: $uuid, name: $name, config: $config[0]}' > "$payload"
-        response="$(remna_api PATCH /api/config-profiles "$payload")"
-    else
-        jq -n --arg name "$profile_name" --slurpfile config "$config_file" \
-            '{name: $name, config: $config[0]}' > "$payload"
-        response="$(remna_api POST /api/config-profiles "$payload")"
-    fi
-
-    rm -f "$config_file" "$payload"
-    echo "$response" | jq -r '.response.uuid'
-}
-
-gcloud_inbound_uuid() {
-    local profile_uuid="$1"
-    local inbound_tag="${2:-$GCLOUD_INBOUND_TAG}"
-    remna_api GET "/api/config-profiles/${profile_uuid}/inbounds" \
-        | jq -r --arg tag "$inbound_tag" '.response.inbounds[]? | select(.tag == $tag) | .uuid' \
-        | head -n 1
-}
-
-upsert_gcloud_node() {
-    local ip="$1"
-    local profile_uuid="$2"
-    local inbound_uuid="$3"
-    local node_name="${4:-$GCLOUD_NODE_NAME}"
-    local country_code="${5:-FI}"
-    local reuse_by_address="${6:-1}"
-    local uuid payload response
-    uuid="$(remna_node_uuid_by_name "$node_name")"
-    if [[ -z "$uuid" && "$reuse_by_address" == "1" ]]; then
-        uuid="$(remna_node_uuid_by_address "$ip")"
-        if [[ -n "$uuid" ]]; then
-            echo "Google Cloud node: reuse by address ${ip}: ${uuid}" >> "$LOG_FILE"
-        fi
-    fi
-    payload="$(mktemp)"
-
-    jq -n \
-        --arg uuid "$uuid" \
-        --arg name "$node_name" \
-        --arg address "$ip" \
-        --arg countryCode "$country_code" \
-        --arg profileUuid "$profile_uuid" \
-        --arg inboundUuid "$inbound_uuid" \
-        --argjson port "$NODE_PORT" \
-        '{
-          name: $name,
-          address: $address,
-          port: $port,
-          countryCode: $countryCode,
-          isTrafficTrackingActive: false,
-          configProfile: {
-            activeConfigProfileUuid: $profileUuid,
-            activeInbounds: [$inboundUuid]
-          },
-          tags: ["CODEX", "GOOGLE_CLOUD"]
-        } + (if $uuid != "" then {uuid: $uuid} else {} end)' > "$payload"
-
-    if [[ -n "$uuid" ]]; then
-        response="$(remna_api PATCH /api/nodes "$payload")"
-    else
-        response="$(remna_api POST /api/nodes "$payload")"
-    fi
-
-    rm -f "$payload"
-    echo "$response" | jq -r '.response.uuid'
-}
-
-upsert_gcloud_host() {
-    local ip="$1"
-    local profile_uuid="$2"
-    local inbound_uuid="$3"
-    local node_uuid="$4"
-    local host_remark="${5:-$GCLOUD_HOST_REMARK}"
-    local reuse_by_address="${6:-1}"
-    local is_hidden="${7:-true}"
-    local fallback_host_remark="${8:-}"
-    local uuid payload response
-    case "$is_hidden" in
-        true|false) ;;
-        *) is_hidden="true" ;;
-    esac
-    uuid="$(remna_host_uuid_by_remark "$host_remark")"
-    if [[ -z "$uuid" && -n "$fallback_host_remark" ]]; then
-        uuid="$(remna_host_uuid_by_remark "$fallback_host_remark")"
-        if [[ -n "$uuid" ]]; then
-            echo "Google Cloud host: reuse by legacy remark ${fallback_host_remark}: ${uuid}" >> "$LOG_FILE"
-        fi
-    fi
-    if [[ -z "$uuid" && "$reuse_by_address" == "1" ]]; then
-        uuid="$(remna_host_uuid_by_address "$ip")"
-        if [[ -n "$uuid" ]]; then
-            echo "Google Cloud host: reuse by address ${ip}: ${uuid}" >> "$LOG_FILE"
-        fi
-    fi
-    payload="$(mktemp)"
-
-    jq -n \
-        --arg uuid "$uuid" \
-        --arg remark "$host_remark" \
-        --arg address "$ip" \
-        --arg profileUuid "$profile_uuid" \
-        --arg inboundUuid "$inbound_uuid" \
-        --arg nodeUuid "$node_uuid" \
-        --argjson isHidden "$is_hidden" \
-        '{
-          remark: $remark,
-          address: $address,
-          port: 443,
-          inbound: {
-            configProfileUuid: $profileUuid,
-            configProfileInboundUuid: $inboundUuid
-          },
-          nodes: [$nodeUuid],
-          isDisabled: true,
-          isHidden: $isHidden,
-          securityLayer: "DEFAULT"
-        } + (if $uuid != "" then {uuid: $uuid} else {} end)' > "$payload"
-
-    if [[ -n "$uuid" ]]; then
-        response="$(remna_api PATCH /api/hosts "$payload")"
-    else
-        response="$(remna_api POST /api/hosts "$payload")"
-    fi
-
-    rm -f "$payload"
-    echo "$response" | jq -r '.response.uuid'
-}
-
-remna_user_vless_uuid() {
-    local username="$1"
-    local user_json sub_json vless_uuid
-    user_json="$(remna_api GET "/api/users/by-username/${username}")"
-    vless_uuid="$(echo "$user_json" | jq -r '.response.vlessUuid // empty')"
-    if [[ -n "$vless_uuid" ]]; then
-        echo "$vless_uuid"
-        return 0
-    fi
-
-    sub_json="$(remna_api GET "/api/subscriptions/by-username/${username}")"
-    echo "$sub_json" | jq -r '.response.links[]? | capture("^vless://(?<id>[^@]+)@").id' | head -n 1
-}
-
-patch_gcloud_target_profile() {
-    local target_name="$1"
-    local ip="$2"
-    local public_key="$3"
-    local domain="$4"
-    local vless_uuid="$5"
-    local profiles target_uuid target_config patched_config payload response
-    profiles="$(remna_api GET /api/config-profiles)"
-    target_uuid="$(echo "$profiles" | jq -r --arg name "$target_name" '.response.configProfiles[]? | select(.name == $name) | .uuid' | head -n 1)"
-    if [[ -z "$target_uuid" ]]; then
-        fail "Профиль ${target_name} не найден"
-        return 1
-    fi
-
-    target_config="$(mktemp)"
-    patched_config="$(mktemp)"
-    payload="$(mktemp)"
-
-    echo "$profiles" | jq --arg name "$target_name" \
-        '.response.configProfiles[] | select(.name == $name) | .config' > "$target_config"
-
-    if ! jq -e --arg tag "$GCLOUD_TARGET_OUTBOUND_TAG" '.outbounds[]? | select(.tag == $tag)' "$target_config" >/dev/null; then
-        rm -f "$target_config" "$patched_config" "$payload"
-        fail "Outbound ${GCLOUD_TARGET_OUTBOUND_TAG} не найден в ${target_name}"
-        return 1
-    fi
-
-    jq \
-        --arg tag "$GCLOUD_TARGET_OUTBOUND_TAG" \
-        --arg ip "$ip" \
-        --arg id "$vless_uuid" \
-        --arg publicKey "$public_key" \
-        --arg domain "$domain" \
-        '.outbounds |= map(
-          if .tag == $tag then
-            .settings.vnext[0].address = $ip
-            | .settings.vnext[0].port = 443
-            | .settings.vnext[0].users[0].id = $id
-            | .settings.vnext[0].users[0].flow = "xtls-rprx-vision"
-            | .settings.vnext[0].users[0].encryption = "none"
-            | .streamSettings.network = "raw"
-            | .streamSettings.security = "reality"
-            | .streamSettings.realitySettings.shortId = ""
-            | .streamSettings.realitySettings.publicKey = $publicKey
-            | .streamSettings.realitySettings.serverName = $domain
-            | .streamSettings.realitySettings.fingerprint = "qq"
-          else . end
-        )' "$target_config" > "$patched_config"
-
-    jq -n --arg uuid "$target_uuid" --arg name "$target_name" --slurpfile config "$patched_config" \
-        '{uuid: $uuid, name: $name, config: $config[0]}' > "$payload"
-    response="$(remna_api PATCH /api/config-profiles "$payload")"
-    rm -f "$target_config" "$patched_config" "$payload"
-
-    echo "$response" | jq -r '.response.uuid' >/dev/null
-}
-
-wait_gcloud_node_online() {
-    local name="$1"
-    local node_json
-    for _ in {1..60}; do
-        node_json="$(remna_api GET /api/nodes)"
-        if echo "$node_json" | jq -e --arg name "$name" '.response[]? | select(.name == $name and .isConnected == true and .isDisabled == false)' >/dev/null; then
-            return 0
-        fi
-        sleep 5
-    done
-    warn "Нода ${name} пока не online."
-    return 1
-}
-
-valid_gcloud_node_dc() {
-    case "$1" in
-        fi|finland|FI|Finland) return 0 ;;
-        ge|de|germany|GE|DE|Germany) return 0 ;;
-        sw|se|sweden|SW|SE|Sweden) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-normalize_gcloud_node_dc() {
-    case "$1" in
-        fi|finland|FI|Finland) echo "fi" ;;
-        ge|de|germany|GE|DE|Germany) echo "ge" ;;
-        sw|se|sweden|SW|SE|Sweden) echo "sw" ;;
-        *) return 1 ;;
-    esac
-}
-
-gcloud_node_dc_label() {
-    case "$1" in
-        fi) echo "Finland" ;;
-        ge) echo "Germany" ;;
-        sw) echo "Sweden" ;;
-    esac
-}
-
-gcloud_node_profile_name() {
-    case "$1" in
-        fi) echo "VLESS-GCloud-FI" ;;
-        ge) echo "VLESS-GCloud-GE" ;;
-        sw) echo "VLESS-GCloud-SW" ;;
-    esac
-}
-
-gcloud_node_inbound_tag() {
-    case "$1" in
-        fi) echo "VLESS_FINLAND_CODEX_GCLOUD" ;;
-        ge) echo "VLESS_GERMANY_CODEX_GCLOUD" ;;
-        sw) echo "VLESS_SWEDEN_CODEX_GCLOUD" ;;
-    esac
-}
-
-gcloud_node_host_remark() {
-    case "$1" in
-        fi) echo "🇫🇮 Supercell (DC-1)" ;;
-        ge) echo "🇩🇪 Supercell (DC-2)" ;;
-        sw) echo "🇸🇪 Supercell (DC-5)" ;;
-    esac
-}
-
-gcloud_node_legacy_host_remark() {
-    case "$1" in
-        fi) echo "🇫🇮 Supercell (DC-1) 2" ;;
-        ge) echo "🇩🇪 Supercell (DC-2) 2" ;;
-        sw) echo "🇸🇪 Supercell (DC-5) 2" ;;
-    esac
-}
-
-gcloud_node_name() {
-    case "$1" in
-        fi) echo "СУПЕРСЕЛЛ-ДЦ-F" ;;
-        ge) echo "СУПЕРСЕЛЛ-ДЦ-G" ;;
-        sw) echo "СУПЕРСЕЛЛ-ДЦ-S" ;;
-    esac
-}
-
-gcloud_node_country_code() {
-    case "$1" in
-        fi) echo "FI" ;;
-        ge) echo "DE" ;;
-        sw) echo "SE" ;;
-    esac
-}
-
-select_gcloud_node_dc() {
-    local preset="${1:-}"
-    local choice
-
-    if [[ -n "$preset" ]]; then
-        if ! normalize_gcloud_node_dc "$preset"; then
-            fail "DC должен быть fi, ge/de или sw/se."
-            return 1
-        fi
-        return 0
-    fi
-
-    while true; do
-        header >&2
-        echo -e "${BOLD}${PURPLE}[ GOOGLE CLOUD NODE ]${NC}" >&2
-        echo -e "1) Finland" >&2
-        echo -e "2) Germany" >&2
-        echo -e "3) Sweden" >&2
-        echo -e "0) Выйти" >&2
-        echo -e "${PURPLE}==========================================${NC}" >&2
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите DC:${NC} " >&2
-        read -r choice
-
-        case "$choice" in
-            1) echo "fi"; return 0 ;;
-            2) echo "ge"; return 0 ;;
-            3) echo "sw"; return 0 ;;
-            0) return 1 ;;
-            *)
-                fail "Неверный выбор"
-                sleep 1
-                ;;
-        esac
-    done
 }
 
 install_antiscanner() {
@@ -2886,193 +2302,6 @@ install_common_stack() {
     ok "Время: $(format_duration "$duration")"
 }
 
-install_google_cloud_battles_stack() {
-    header
-    require_reality_profile
-    need_root
-    local domain started_at duration secret ip key_json public_key private_key
-    local profile_uuid inbound_uuid node_uuid host_uuid vless_uuid target_profile
-    local target_profiles=()
-
-    domain="$(ask_domain "Введите домен")"
-    started_at="$(date +%s)"
-    echo
-
-    stage "Готовлю Google Cloud (Battles)"
-    apt_update_quiet
-    apt_install_quiet curl jq
-    ensure_remna_api_config
-    remna_api GET /api/system/health >/dev/null
-
-    stage "Генерирую ключи"
-    secret="$(remna_api GET /api/keygen | jq -r '.response.pubKey // empty')"
-    if [[ -z "$secret" ]]; then
-        fail "Не получил SECRET_KEY из панели"
-        exit 1
-    fi
-
-    key_json="$(remna_api GET /api/system/tools/x25519/generate)"
-    public_key="$(echo "$key_json" | jq -r '.response.keypairs[0].publicKey // empty')"
-    private_key="$(echo "$key_json" | jq -r '.response.keypairs[0].privateKey // empty')"
-    if [[ -z "$public_key" || -z "$private_key" ]]; then
-        fail "Не получил Reality keypair"
-        exit 1
-    fi
-
-    ip="$(external_ipv4)"
-
-    stage "Профиль ${GCLOUD_PROFILE_NAME}"
-    profile_uuid="$(upsert_gcloud_profile "$GCLOUD_PROFILE_NAME" "$private_key" "$domain" "$GCLOUD_INBOUND_TAG" "battles")"
-    inbound_uuid="$(gcloud_inbound_uuid "$profile_uuid" "$GCLOUD_INBOUND_TAG")"
-    if [[ -z "$profile_uuid" || -z "$inbound_uuid" ]]; then
-        fail "Не получил inbound ${GCLOUD_INBOUND_TAG}"
-        exit 1
-    fi
-
-    stage "Нода ${GCLOUD_NODE_NAME}"
-    node_uuid="$(upsert_gcloud_node "$ip" "$profile_uuid" "$inbound_uuid" "$GCLOUD_NODE_NAME" "FI" "1")"
-    if [[ -z "$node_uuid" ]]; then
-        fail "Не получил UUID ноды"
-        exit 1
-    fi
-    remna_enable_node "$node_uuid"
-
-    do_install_remnawave_node "$secret"
-    do_install_selfsteal "$domain"
-
-    stage "Хост ${GCLOUD_HOST_REMARK}"
-    host_uuid="$(upsert_gcloud_host "$ip" "$profile_uuid" "$inbound_uuid" "$node_uuid" "$GCLOUD_HOST_REMARK" "1")"
-    if [[ -z "$host_uuid" ]]; then
-        fail "Не получил UUID хоста"
-        exit 1
-    fi
-
-    stage "Жду online ноды"
-    if ! wait_gcloud_node_online "$GCLOUD_NODE_NAME"; then
-        exit 1
-    fi
-
-    stage "Патчу профили"
-    vless_uuid="$(remna_user_vless_uuid "$GCLOUD_USERNAME")"
-    if [[ -z "$vless_uuid" ]]; then
-        fail "Не получил VLESS UUID пользователя ${GCLOUD_USERNAME}"
-        exit 1
-    fi
-    mapfile -t target_profiles < <(gcloud_target_profiles_list)
-    if (( ${#target_profiles[@]} == 0 )); then
-        fail "Редактируемые профили не заданы"
-        exit 1
-    fi
-    for target_profile in "${target_profiles[@]}"; do
-        stage "Патчу ${target_profile}"
-        patch_gcloud_target_profile "$target_profile" "$ip" "$public_key" "$domain" "$vless_uuid"
-    done
-
-    duration=$(( $(date +%s) - started_at ))
-    echo
-    ok "Google Cloud (Battles) готов"
-    ok "Нода: ${GCLOUD_NODE_NAME}"
-    ok "Хост: ${GCLOUD_HOST_REMARK}"
-    ok "Патч: $(gcloud_target_profiles_display) / ${GCLOUD_TARGET_OUTBOUND_TAG}"
-    ok "IP: ${ip}"
-    ok "Время: $(format_duration "$duration")"
-}
-
-install_google_cloud_node_stack() {
-    local preset_dc="${1:-}"
-    header
-    require_reality_profile
-    need_root
-
-    local dc label profile_name inbound_tag host_remark legacy_host_remark node_name country_code
-    local domain started_at duration secret ip key_json private_key
-    local profile_uuid inbound_uuid node_uuid host_uuid
-
-    if ! dc="$(select_gcloud_node_dc "$preset_dc")"; then
-        ok "Google Cloud (Node) отменен"
-        return 0
-    fi
-
-    label="$(gcloud_node_dc_label "$dc")"
-    profile_name="$(gcloud_node_profile_name "$dc")"
-    inbound_tag="$(gcloud_node_inbound_tag "$dc")"
-    host_remark="$(gcloud_node_host_remark "$dc")"
-    legacy_host_remark="$(gcloud_node_legacy_host_remark "$dc")"
-    node_name="$(gcloud_node_name "$dc")"
-    country_code="$(gcloud_node_country_code "$dc")"
-
-    domain="$(ask_domain "Введите домен")"
-    started_at="$(date +%s)"
-    echo
-
-    stage "Готовлю Google Cloud (Node / ${label})"
-    apt_update_quiet
-    apt_install_quiet curl jq
-    ensure_remna_api_config
-    remna_api GET /api/system/health >/dev/null
-
-    stage "Генерирую ключи"
-    secret="$(remna_api GET /api/keygen | jq -r '.response.pubKey // empty')"
-    if [[ -z "$secret" ]]; then
-        fail "Не получил SECRET_KEY из панели"
-        exit 1
-    fi
-
-    key_json="$(remna_api GET /api/system/tools/x25519/generate)"
-    private_key="$(echo "$key_json" | jq -r '.response.keypairs[0].privateKey // empty')"
-    if [[ -z "$private_key" ]]; then
-        fail "Не получил Reality private key"
-        exit 1
-    fi
-
-    ip="$(external_ipv4)"
-
-    stage "Профиль ${profile_name}"
-    profile_uuid="$(upsert_gcloud_profile "$profile_name" "$private_key" "$domain" "$inbound_tag" "node")"
-    inbound_uuid="$(gcloud_inbound_uuid "$profile_uuid" "$inbound_tag")"
-    if [[ -z "$profile_uuid" || -z "$inbound_uuid" ]]; then
-        fail "Не получил inbound ${inbound_tag}"
-        exit 1
-    fi
-
-    stage "Нода ${node_name}"
-    node_uuid="$(upsert_gcloud_node "$ip" "$profile_uuid" "$inbound_uuid" "$node_name" "$country_code" "0")"
-    if [[ -z "$node_uuid" ]]; then
-        fail "Не получил UUID ноды"
-        exit 1
-    fi
-    remna_enable_node "$node_uuid"
-
-    do_install_remnawave_node "$secret"
-    do_install_selfsteal "$domain"
-
-    stage "Хост ${host_remark}"
-    host_uuid="$(upsert_gcloud_host "$ip" "$profile_uuid" "$inbound_uuid" "$node_uuid" "$host_remark" "0" "false" "$legacy_host_remark")"
-    if [[ -z "$host_uuid" ]]; then
-        fail "Не получил UUID хоста"
-        exit 1
-    fi
-
-    stage "Жду online ноды"
-    if ! wait_gcloud_node_online "$node_name"; then
-        warn "Профиль/нода/хост созданы, но online пока не подтвержден."
-    fi
-
-    duration=$(( $(date +%s) - started_at ))
-    echo
-    ok "Google Cloud (Node / ${label}) готов"
-    ok "Профиль: ${profile_name}"
-    ok "Inbound: ${inbound_tag}"
-    ok "Нода: ${node_name}"
-    ok "Хост: ${host_remark} (disabled, visible)"
-    ok "IP: ${ip}"
-    ok "Время: $(format_duration "$duration")"
-}
-
-install_google_cloud_stack() {
-    install_google_cloud_battles_stack
-}
-
 apply_haproxy_config() {
     local backend_ip="$1"
     local allowed_sni="$2"
@@ -3380,12 +2609,6 @@ menu() {
 
     labels+=("Настройки")
     actions+=("settings")
-    if [[ "$MACHINE_MODE" == "node" && "$NODE_PROFILE" == "reality" ]]; then
-        labels+=("Google Cloud (Battles)")
-        actions+=("google-cloud-battles")
-        labels+=("Google Cloud (Node)")
-        actions+=("google-cloud-node")
-    fi
 
     for i in "${!labels[@]}"; do
         echo -e "$((i + 1))) ${labels[$i]}"
@@ -3420,8 +2643,6 @@ menu() {
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
         settings) settings_menu ;;
-        google-cloud-battles) install_google_cloud_battles_stack ;;
-        google-cloud-node) install_google_cloud_node_stack ;;
         *) fail "Неверный выбор" ;;
     esac
 }
@@ -3447,8 +2668,6 @@ main() {
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
-        google-cloud|gcloud|google-cloud-battles|gcloud-battles) install_google_cloud_battles_stack ;;
-        google-cloud-node|gcloud-node) install_google_cloud_node_stack "${2:-}" ;;
         *) menu ;;
     esac
 }
