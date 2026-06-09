@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v117"
+SCRIPT_BUILD="v118"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -99,14 +99,16 @@ init_log() {
 header_line() {
     local text="$1"
     local style="${2:-}"
-    local indent=17
+    local width=42
+    local indent=$(( (width - ${#text}) / 2 ))
+    (( indent < 0 )) && indent=0
     printf '%b%*s%s%b\n' "$style" "$indent" "" "$text" "$NC"
 }
 
 header() {
     printf '\033c'
     echo -e "${PURPLE}==========================================${NC}"
-    header_line "kto VPN" "${BOLD}${GREEN}"
+    header_line "kto  VPN" "${BOLD}${GREEN}"
     header_line "v${SCRIPT_VERSION}" "$DIM"
     header_line "$SCRIPT_BUILD" "$DIM"
     echo -e "${PURPLE}==========================================${NC}"
@@ -2949,7 +2951,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v117"
+COLLECTOR_BUILD = "v118"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3504,7 +3506,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v117"
+PUSH_BUILD="v118"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3737,7 +3739,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v117"
+REPORT_SCRIPT_BUILD="v118"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3934,7 +3936,7 @@ write_traffic_stats_bot_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STATS_BOT_BUILD="v117"
+STATS_BOT_BUILD="v118"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 STATE_DIR="/var/lib/kto-traffic-stats-bot"
 STATE_FILE="${STATE_DIR}/last_update_id"
