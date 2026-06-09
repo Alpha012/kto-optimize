@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v109"
+SCRIPT_BUILD="v110"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2760,7 +2760,7 @@ write_traffic_report_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPORT_SCRIPT_BUILD="v109"
+REPORT_SCRIPT_BUILD="v110"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -2957,7 +2957,7 @@ write_traffic_stats_bot_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STATS_BOT_BUILD="v109"
+STATS_BOT_BUILD="v110"
 CONFIG="${KTO_TRAFFIC_CONFIG:-/etc/kto-traffic-report.conf}"
 STATE_DIR="/var/lib/kto-traffic-stats-bot"
 STATE_FILE="${STATE_DIR}/last_update_id"
@@ -3259,13 +3259,94 @@ handle_updates() {
     ' 2>/dev/null || true)
 }
 
-echo "stats ${STATS_BOT_BUILD}: listening /stats for user ${KTO_STATS_ALLOWED_USER_ID} in chat ${KTO_TRAFFIC_CHAT_ID}"
-while true; do
+send_stats_once() {
+    local message
+    message="$(build_stats_message)"
+    send_stats_message "$message"
+}
+
+poll_once() {
+    local updates
     if updates="$(fetch_updates)"; then
         handle_updates "$updates"
+        return 0
     fi
-    sleep "$POLL_INTERVAL"
-done
+    return 1
+}
+
+debug_state() {
+    local response updates last count
+    echo "stats ${STATS_BOT_BUILD}: config=${CONFIG}"
+    echo "stats ${STATS_BOT_BUILD}: machine=${KTO_TRAFFIC_NAME}"
+    echo "stats ${STATS_BOT_BUILD}: chat_id=${KTO_TRAFFIC_CHAT_ID}"
+    echo "stats ${STATS_BOT_BUILD}: allowed_user_id=${KTO_STATS_ALLOWED_USER_ID}"
+    echo "stats ${STATS_BOT_BUILD}: iface=${KTO_TRAFFIC_IFACE}"
+    echo "stats ${STATS_BOT_BUILD}: last_update_id=$(last_update_id)"
+
+    if response="$(telegram_call getMe -X POST)"; then
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s\n' "$response" | jq -r '"getMe: ok=\(.ok) username=\(.result.username // "-") id=\(.result.id // "-")"'
+        else
+            echo "getMe: ${response}"
+        fi
+    else
+        echo "getMe: failed"
+    fi
+
+    if response="$(telegram_call getWebhookInfo -X POST)"; then
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s\n' "$response" | jq -r '"webhook: url=\(.result.url // "") pending=\(.result.pending_update_count // 0) last_error=\(.result.last_error_message // "-")"'
+        else
+            echo "webhook: ${response}"
+        fi
+    else
+        echo "webhook: failed"
+    fi
+
+    if updates="$(fetch_updates)"; then
+        if command -v jq >/dev/null 2>&1; then
+            count="$(printf '%s' "$updates" | jq -r '.result | length' 2>/dev/null || echo 0)"
+            echo "updates: count=${count}"
+            printf '%s' "$updates" | jq -r '
+                .result[]? |
+                {
+                    update_id,
+                    chat_id: (.message.chat.id // "-"),
+                    from_id: (.message.from.id // "-"),
+                    text: (.message.text // "-")
+                } |
+                "update=\(.update_id) chat=\(.chat_id) from=\(.from_id) text=\(.text)"
+            ' 2>/dev/null || true
+        else
+            echo "updates: ${updates}"
+        fi
+    else
+        echo "updates: failed"
+    fi
+}
+
+case "${1:-listen}" in
+    listen)
+        echo "stats ${STATS_BOT_BUILD}: listening /stats for user ${KTO_STATS_ALLOWED_USER_ID} in chat ${KTO_TRAFFIC_CHAT_ID}"
+        while true; do
+            poll_once || true
+            sleep "$POLL_INTERVAL"
+        done
+        ;;
+    send|send-once)
+        send_stats_once
+        ;;
+    poll-once)
+        poll_once
+        ;;
+    debug)
+        debug_state
+        ;;
+    *)
+        echo "Usage: $0 [listen|send|poll-once|debug]" >&2
+        exit 2
+        ;;
+esac
 EOF
 }
 
@@ -3450,6 +3531,38 @@ install_traffic_stats_bot() {
     ok "Разрешенный user id: $(config_get KTO_STATS_ALLOWED_USER_ID "$TRAFFIC_REPORT_CONFIG")"
 }
 
+run_traffic_stats_bot_command() {
+    local mode="$1"
+    header
+    require_whitelist_mode
+    need_root
+
+    if ! "${SUDO[@]}" test -f "$TRAFFIC_REPORT_CONFIG" 2>/dev/null; then
+        fail "Отчёт по трафику не настроен. Сначала установи его в меню."
+        return 0
+    fi
+
+    write_traffic_stats_bot_script
+    case "$mode" in
+        debug)
+            stage "Диагностика /stats bot"
+            "${SUDO[@]}" "$TRAFFIC_STATS_BOT_SCRIPT" debug || true
+            ;;
+        send)
+            stage "Тестовая отправка /stats"
+            if "${SUDO[@]}" "$TRAFFIC_STATS_BOT_SCRIPT" send; then
+                ok "/stats ответ отправлен (${SCRIPT_BUILD})"
+            else
+                warn "/stats ответ не отправился. Смотри вывод выше."
+            fi
+            ;;
+        poll)
+            stage "Проверяю последние /stats команды"
+            "${SUDO[@]}" "$TRAFFIC_STATS_BOT_SCRIPT" poll-once || true
+            ;;
+    esac
+}
+
 traffic_report_status() {
     header
     require_whitelist_mode
@@ -3484,6 +3597,8 @@ traffic_report_menu() {
         echo -e "2) Отправить отчёт сейчас"
         echo -e "3) Показать статус"
         echo -e "4) Установить /stats bot"
+        echo -e "5) Тест /stats ответа"
+        echo -e "6) Диагностика /stats"
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -3504,6 +3619,14 @@ traffic_report_menu() {
                 ;;
             4)
                 install_traffic_stats_bot
+                system_check_pause
+                ;;
+            5)
+                run_traffic_stats_bot_command send
+                system_check_pause
+                ;;
+            6)
+                run_traffic_stats_bot_command debug
                 system_check_pause
                 ;;
             0)
@@ -3788,6 +3911,9 @@ main() {
         traffic-install) install_traffic_report ;;
         traffic-send) send_traffic_report ;;
         stats-bot|traffic-stats-bot) install_traffic_stats_bot ;;
+        stats-test|traffic-stats-test) run_traffic_stats_bot_command send ;;
+        stats-debug|traffic-stats-debug) run_traffic_stats_bot_command debug ;;
+        stats-poll|traffic-stats-poll) run_traffic_stats_bot_command poll ;;
         traffic-status) traffic_report_status ;;
         *) menu ;;
     esac
