@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v124"
+SCRIPT_BUILD="v125"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2945,7 +2945,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v124"
+COLLECTOR_BUILD = "v125"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3131,39 +3131,45 @@ def send_message(text):
         return False
 
 
-def node_message(node):
+def node_message(node, status=None):
     name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
     error = str(node.get("error") or "")
     updated = node.get("updated_at") or node.get("last_seen") or 0
     metrics_ok = bool(node.get("metrics_ok"))
-    lines = [f"<b>{name}</b>", ""]
-    if error:
-        lines += [
-            "Сегодня: ошибка",
-            "I/O: - | -",
-            "",
-            "Месяц: ошибка",
-            "",
-            f"Ошибка: {html.escape(error)[:800]}",
-            f"Обновлено: {fmt_time(updated)}",
-        ]
-        return "\n".join(lines)
+    status_text = html.escape(str(status or "OK"))
+    footer = f"<i>Обновлено: {fmt_time(updated)} | Статус: {status_text}</i>"
     ram_line = "Забитость ОЗУ: ?% | ? / ?"
     cpu_line = "Нагруженность процессора: ?%"
     if metrics_ok:
         ram_line = f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}"
         cpu_line = f"Нагруженность процессора: {int(node.get('cpu_percent', 0) or 0)}%"
+    lines = [f"<code>{name}</code>", ""]
+    if error:
+        lines += [
+            "<b>Сегодня: ошибка",
+            "I/O: - | -",
+            "Вчера: -",
+            "",
+            "Месяц: ошибка</b>",
+            "",
+            f"<b><i>{ram_line}",
+            f"{cpu_line}</i></b>",
+            "",
+            f"Ошибка: {html.escape(error)[:800]}",
+            "",
+            footer,
+        ]
+        return "\n".join(lines)
     lines += [
-        f"Сегодня: {format_bytes(node.get('day_total', 0))}",
+        f"<b>Сегодня: {format_bytes(node.get('day_total', 0))}",
         f"I/O: {format_bytes(node.get('day_rx', 0))} | {format_bytes(node.get('day_tx', 0))}",
         f"Вчера: {format_bytes(node.get('yesterday_total', 0))}",
+        f"Месяц: {format_bytes(node.get('month_total', 0))}</b>",
         "",
-        f"Месяц: {format_bytes(node.get('month_total', 0))}",
+        f"<b><i>{ram_line}",
+        f"{cpu_line}</i></b>",
         "",
-        ram_line,
-        cpu_line,
-        "",
-        f"Обновлено: {fmt_time(updated)}",
+        footer,
     ]
     return "\n".join(lines)
 
@@ -3186,8 +3192,7 @@ def aggregate_message():
         age = ts - int(node.get("last_seen", 0) or 0)
         status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
         parts.append("")
-        parts.append(node_message(node))
-        parts.append(f"Статус: {status}")
+        parts.append(node_message(node, status))
     return "\n".join(parts)
 
 
@@ -3577,7 +3582,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v124"
+PUSH_BUILD="v125"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
