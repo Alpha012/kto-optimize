@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v121"
+SCRIPT_BUILD="v122"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2945,7 +2945,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v121"
+COLLECTOR_BUILD = "v122"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3553,7 +3553,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v121"
+PUSH_BUILD="v122"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3670,12 +3670,12 @@ else
             error="jq не смог разобрать vnstat json"
         else
             read -r day_rx day_tx yesterday_rx yesterday_tx month_rx month_tx <<< "$stats"
-            day_rx="${day_rx:-0}"
-            day_tx="${day_tx:-0}"
-            yesterday_rx="${yesterday_rx:-0}"
-            yesterday_tx="${yesterday_tx:-0}"
-            month_rx="${month_rx:-0}"
-            month_tx="${month_tx:-0}"
+            day_rx="$(int_or_zero "$day_rx")"
+            day_tx="$(int_or_zero "$day_tx")"
+            yesterday_rx="$(int_or_zero "$yesterday_rx")"
+            yesterday_tx="$(int_or_zero "$yesterday_tx")"
+            month_rx="$(int_or_zero "$month_rx")"
+            month_tx="$(int_or_zero "$month_tx")"
         fi
     fi
 fi
@@ -3850,7 +3850,9 @@ install_stats_push_client() {
         stage "Устанавливаю push статистики"
     fi
     must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat
-    cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
+    if ! "${SUDO[@]}" vnstat --json -i "$iface" >/dev/null 2>&1; then
+        cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
+    fi
     cmd "${SUDO[@]}" systemctl enable --now vnstat || true
     cmd "${SUDO[@]}" systemctl restart vnstat || true
     local legacy_unit
@@ -3889,12 +3891,17 @@ EOF
     ok "Старые прямые Telegram-задачи на whitelist удалены"
 
     stage "Тестовый push"
-    if "${SUDO[@]}" "$STATS_PUSH_SCRIPT" >> "$LOG_FILE" 2>&1; then
+    local push_test_log
+    push_test_log="$(mktemp)"
+    if "${SUDO[@]}" "$STATS_PUSH_SCRIPT" >"$push_test_log" 2>&1; then
+        cat "$push_test_log" >> "$LOG_FILE" 2>/dev/null || true
         ok "Push отправлен"
     else
         warn "Push не отправился. Проверь URL/secret/доступ до коллектора."
-        tail -n 15 "$LOG_FILE" >&2 || true
+        cat "$push_test_log" >> "$LOG_FILE" 2>/dev/null || true
+        sed -n '1,80p' "$push_test_log" >&2 || true
     fi
+    rm -f "$push_test_log"
 }
 
 send_stats_push_once() {
@@ -3925,6 +3932,80 @@ stats_push_status() {
     print_row "push timer" "$STATS_PUSH_TIMER" "$timer_state"
 }
 
+run_stats_push_debug() {
+    header
+    require_whitelist_mode
+    need_root
+
+    if ! "${SUDO[@]}" test -s "$STATS_PUSH_CONFIG" 2>/dev/null; then
+        fail "Push статистики не настроен."
+        return 0
+    fi
+
+    local node_id node_name iface collector_url secret interval health_url debug_log rc iface_ok interval_label
+    node_id="$(config_get KTO_PUSH_NODE_ID "$STATS_PUSH_CONFIG")"
+    node_name="$(config_get KTO_PUSH_NODE_NAME "$STATS_PUSH_CONFIG")"
+    iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
+    collector_url="$(config_get KTO_PUSH_COLLECTOR_URL "$STATS_PUSH_CONFIG")"
+    secret="$(config_get KTO_PUSH_SECRET "$STATS_PUSH_CONFIG")"
+    interval="$(config_get KTO_PUSH_INTERVAL "$STATS_PUSH_CONFIG")"
+
+    if network_interface_exists "$iface"; then
+        iface_ok=1
+    else
+        iface_ok=0
+    fi
+    if [[ -n "$interval" ]]; then
+        interval_label="${interval}s"
+    else
+        interval_label="empty"
+    fi
+
+    echo -e "${BOLD}${PURPLE}[ PUSH DEBUG ]${NC}"
+    print_row "config" "$STATS_PUSH_CONFIG" "$([[ -s "$STATS_PUSH_CONFIG" ]] && echo 1 || echo 0)"
+    print_row "node id" "${node_id:-empty}" "$([[ -n "$node_id" ]] && echo 1 || echo 0)"
+    print_row "machine" "${node_name:-empty}" "$([[ -n "$node_name" ]] && echo 1 || echo 0)"
+    print_row "iface" "${iface:-empty}" "$([[ -n "$iface" && "$iface_ok" == "1" ]] && echo 1 || echo 0)"
+    print_row "collector" "${collector_url:-empty}" "$([[ "$collector_url" =~ ^https?:// ]] && echo 1 || echo 0)"
+    print_row "interval" "$interval_label" "$([[ -n "$interval" ]] && echo 1 || echo 0)"
+    print_row "secret" "$([[ -n "$secret" ]] && echo set || echo empty)" "$([[ -n "$secret" ]] && echo 1 || echo 0)"
+
+    if [[ -z "$collector_url" || -z "$secret" ]]; then
+        fail "В конфиге нет URL коллектора или секрета."
+        return 1
+    fi
+
+    echo
+    stage "Проверяю health коллектора"
+    health_url="${collector_url%/}/health"
+    debug_log="$(mktemp)"
+    if curl -4 -fsS --connect-timeout 5 --max-time 10 "$health_url" >"$debug_log" 2>&1; then
+        ok "Коллектор отвечает: $(tr '\n' ' ' < "$debug_log")"
+    else
+        rc=$?
+        warn "Health коллектора не ответил rc=${rc}: $(tr '\n' ' ' < "$debug_log")"
+    fi
+    rm -f "$debug_log"
+
+    write_stats_push_script
+    echo
+    stage "Запускаю push"
+    debug_log="$(mktemp)"
+    if "${SUDO[@]}" "$STATS_PUSH_SCRIPT" >"$debug_log" 2>&1; then
+        ok "Push успешен"
+        sed -n '1,120p' "$debug_log" || true
+    else
+        rc=$?
+        warn "Push упал rc=${rc}"
+        sed -n '1,120p' "$debug_log" || true
+        echo
+        warn "Последний статус systemd:"
+        "${SUDO[@]}" systemctl status "$STATS_PUSH_SERVICE" --no-pager -l 2>&1 | sed -n '1,60p' || true
+    fi
+    cat "$debug_log" >> "$LOG_FILE" 2>/dev/null || true
+    rm -f "$debug_log"
+}
+
 stats_push_menu() {
     local choice
 
@@ -3934,6 +4015,7 @@ stats_push_menu() {
         echo -e "1) Настроить push на коллектор"
         echo -e "2) Отправить push сейчас"
         echo -e "3) Статус push"
+        echo -e "4) Диагностика push"
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -3950,6 +4032,10 @@ stats_push_menu() {
                 ;;
             3)
                 stats_push_status
+                system_check_pause
+                ;;
+            4)
+                run_stats_push_debug
                 system_check_pause
                 ;;
             0)
@@ -4251,6 +4337,7 @@ main() {
         stats-push|stats-push-install|stats-push-update) install_stats_push_client ;;
         stats-push-send) send_stats_push_once ;;
         stats-push-status) stats_push_status ;;
+        stats-push-debug|push-debug) run_stats_push_debug ;;
         *) menu ;;
     esac
 }
