@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v128"
+SCRIPT_BUILD="v129"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2945,7 +2945,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v128"
+COLLECTOR_BUILD = "v129"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3591,7 +3591,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v128"
+PUSH_BUILD="v129"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
@@ -3709,8 +3709,8 @@ ram_total="$(int_or_zero "$ram_total")"
 ram_percent="$(int_or_zero "$ram_percent")"
 cpu_sample_percent="$(number_or_zero "$(cpu_usage_percent)")"
 cpu_load_percent_value="$(number_or_zero "$(cpu_load_percent)")"
-cpu_percent="$(awk -v sample="$cpu_sample_percent" -v load="$cpu_load_percent_value" 'BEGIN {
-    value = sample > load ? sample : load
+cpu_percent="$(awk -v sample="$cpu_sample_percent" -v load_value="$cpu_load_percent_value" 'BEGIN {
+    value = sample > load_value ? sample : load_value
     if (value < 0) value = 0
     printf "%.1f\n", value
 }')"
