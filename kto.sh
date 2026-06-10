@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v120"
+SCRIPT_BUILD="v121"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2945,7 +2945,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v120"
+COLLECTOR_BUILD = "v121"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3135,6 +3135,7 @@ def node_message(node):
     name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
     error = str(node.get("error") or "")
     updated = node.get("updated_at") or node.get("last_seen") or 0
+    metrics_ok = bool(node.get("metrics_ok"))
     lines = [f"<b>{name}</b>", ""]
     if error:
         lines += [
@@ -3147,6 +3148,11 @@ def node_message(node):
             f"Обновлено: {fmt_time(updated)}",
         ]
         return "\n".join(lines)
+    ram_line = "Забитость ОЗУ: ?% | ? / ?"
+    cpu_line = "Нагруженность процессора: ?%"
+    if metrics_ok:
+        ram_line = f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}"
+        cpu_line = f"Нагруженность процессора: {int(node.get('cpu_percent', 0) or 0)}%"
     lines += [
         f"Сегодня: {format_bytes(node.get('day_total', 0))}",
         f"I/O: {format_bytes(node.get('day_rx', 0))} | {format_bytes(node.get('day_tx', 0))}",
@@ -3154,8 +3160,8 @@ def node_message(node):
         "",
         f"Месяц: {format_bytes(node.get('month_total', 0))}",
         "",
-        f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}",
-        f"Нагруженность процессора: {int(node.get('cpu_percent', 0) or 0)}%",
+        ram_line,
+        cpu_line,
         "",
         f"Обновлено: {fmt_time(updated)}",
     ]
@@ -3218,6 +3224,7 @@ def update_node(payload):
         "ram_used": int(payload.get("ram_used") or 0),
         "ram_percent": int(payload.get("ram_percent") or 0),
         "cpu_percent": int(payload.get("cpu_percent") or 0),
+        "metrics_ok": bool(payload.get("metrics_ok")),
         "error": str(payload.get("error") or ""),
         "updated_at": int(payload.get("updated_at") or current),
         "last_seen": current,
@@ -3546,7 +3553,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v120"
+PUSH_BUILD="v121"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3576,6 +3583,16 @@ ram_total=0
 ram_used=0
 ram_percent=0
 cpu_percent=0
+metrics_ok=false
+
+int_or_zero() {
+    local value="${1:-0}"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+    else
+        echo 0
+    fi
+}
 
 memory_stats() {
     awk '
@@ -3619,7 +3636,13 @@ cpu_usage_percent() {
 }
 
 read -r ram_used ram_total ram_percent < <(memory_stats)
-cpu_percent="$(cpu_usage_percent)"
+ram_used="$(int_or_zero "$ram_used")"
+ram_total="$(int_or_zero "$ram_total")"
+ram_percent="$(int_or_zero "$ram_percent")"
+cpu_percent="$(int_or_zero "$(cpu_usage_percent)")"
+if (( ram_total > 0 )); then
+    metrics_ok=true
+fi
 
 if ! command -v jq >/dev/null 2>&1; then
     error="jq не установлен"
@@ -3637,8 +3660,9 @@ else
             (.interfaces[0].traffic.day // []) as $days |
             (.interfaces[0].traffic.month // []) as $months |
             ($days | sort_by(day_key)) as $sorted_days |
-            ($sorted_days[-1] // {rx:0, tx:0}) as $day |
-            ($sorted_days[-2] // {rx:0, tx:0}) as $yesterday |
+            ($sorted_days | length) as $days_len |
+            (if $days_len > 0 then $sorted_days[$days_len - 1] else {rx:0, tx:0} end) as $day |
+            (if $days_len > 1 then $sorted_days[$days_len - 2] else {rx:0, tx:0} end) as $yesterday |
             ($months | max_by(month_key) // {rx:0, tx:0}) as $month |
             "\($day.rx // 0) \($day.tx // 0) \($yesterday.rx // 0) \($yesterday.tx // 0) \($month.rx // 0) \($month.tx // 0)"
         ' 2>/dev/null || true)"
@@ -3660,7 +3684,7 @@ day_total=$(( day_rx + day_tx ))
 yesterday_total=$(( yesterday_rx + yesterday_tx ))
 month_total=$(( month_rx + month_tx ))
 
-payload="$(jq -n \
+if ! payload="$(jq -n \
     --arg id "$KTO_PUSH_NODE_ID" \
     --arg name "$KTO_PUSH_NODE_NAME" \
     --arg iface "$KTO_PUSH_IFACE" \
@@ -3679,6 +3703,7 @@ payload="$(jq -n \
     --argjson ram_total "$ram_total" \
     --argjson ram_percent "$ram_percent" \
     --argjson cpu_percent "$cpu_percent" \
+    --argjson metrics_ok "$metrics_ok" \
     --argjson updated_at "$updated_at" \
     '{
         id: $id,
@@ -3698,18 +3723,31 @@ payload="$(jq -n \
         ram_total: $ram_total,
         ram_percent: $ram_percent,
         cpu_percent: $cpu_percent,
+        metrics_ok: $metrics_ok,
         error: $error,
         updated_at: $updated_at
-    }')"
+    }' 2>&1)"; then
+    echo "push ${PUSH_BUILD}: jq payload failed: ${payload}" >&2
+    exit 1
+fi
 
-response="$(curl -4 -fsS --connect-timeout 8 --max-time 20 --retry 2 --retry-delay 2 \
+curl_errors="$(mktemp)"
+if response="$(curl -4 -fsS --connect-timeout 8 --max-time 20 --retry 2 --retry-delay 2 \
     -X POST "$collector_url" \
     -H "Authorization: Bearer ${KTO_PUSH_SECRET}" \
     -H "Content-Type: application/json" \
-    --data "$payload")"
+    --data "$payload" 2>"$curl_errors")"; then
+    :
+else
+    rc=$?
+    echo "push ${PUSH_BUILD}: curl failed rc=${rc}: $(tr '\n' ' ' < "$curl_errors")" >&2
+    rm -f "$curl_errors"
+    exit "$rc"
+fi
+rm -f "$curl_errors"
 
 if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
-    echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME}"
+    echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}%"
 else
     echo "push ${PUSH_BUILD}: bad response: ${response}" >&2
     exit 1
@@ -3815,7 +3853,12 @@ install_stats_push_client() {
     cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
     cmd "${SUDO[@]}" systemctl enable --now vnstat || true
     cmd "${SUDO[@]}" systemctl restart vnstat || true
-    cmd "${SUDO[@]}" systemctl disable --now kto-traffic-stats-bot.service kto-traffic-report.timer kto-traffic-report.service || true
+    local legacy_unit
+    for legacy_unit in kto-traffic-stats-bot.service kto-traffic-report.timer kto-traffic-report.service; do
+        if "${SUDO[@]}" systemctl cat "$legacy_unit" >/dev/null 2>&1; then
+            cmd "${SUDO[@]}" systemctl disable --now "$legacy_unit" || true
+        fi
+    done
     cmd "${SUDO[@]}" rm -f /usr/local/bin/kto-traffic-stats-bot /usr/local/bin/kto-traffic-report \
         /etc/systemd/system/kto-traffic-stats-bot.service \
         /etc/systemd/system/kto-traffic-report.service \
