@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v129"
+SCRIPT_BUILD="v130"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -49,6 +49,7 @@ STATS_PUSH_INTERVAL_DEFAULT="15"
 STATS_COLLECTOR_STALE_SEC_DEFAULT="60"
 STATS_COLLECTOR_TZ_DEFAULT="Europe/Moscow"
 STATS_ALLOWED_USER_ID_DEFAULT="646296998"
+STATS_EXPECTED_NODES_DEFAULT="10"
 APT_UPDATED=0
 
 GREEN='\033[0;32m'
@@ -2945,7 +2946,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v129"
+COLLECTOR_BUILD = "v130"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -2979,12 +2980,20 @@ STALE_SEC = int(cfg.get("KTO_COLLECTOR_STALE_SEC", "60"))
 CHECK_INTERVAL = int(cfg.get("KTO_COLLECTOR_CHECK_INTERVAL", "30"))
 TZ_NAME = cfg.get("KTO_COLLECTOR_TZ", "Europe/Moscow")
 DAILY_REPORT_TIME = cfg.get("KTO_COLLECTOR_DAILY_REPORT_TIME", "").strip()
+try:
+    EXPECTED_NODES = int(cfg.get("KTO_COLLECTOR_EXPECTED_NODES", "10") or "10")
+except Exception:
+    EXPECTED_NODES = 10
+if EXPECTED_NODES < 1:
+    EXPECTED_NODES = 10
 
 NODES_FILE = os.path.join(STATE_DIR, "nodes.json")
+FALLS_FILE = os.path.join(STATE_DIR, "falls.json")
 OFFSET_FILE = os.path.join(STATE_DIR, "telegram_offset")
 DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
 LOCK = threading.RLock()
 NODES = {}
+FALLS = {}
 
 if TZ_NAME:
     os.environ["TZ"] = TZ_NAME
@@ -3035,6 +3044,48 @@ def save_nodes():
     atomic_write(NODES_FILE, json.dumps(NODES, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def load_falls():
+    global FALLS
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(FALLS_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                FALLS = loaded
+    except Exception:
+        FALLS = {}
+
+
+def save_falls():
+    atomic_write(FALLS_FILE, json.dumps(FALLS, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def today_key():
+    return datetime.fromtimestamp(now_ts()).strftime("%Y-%m-%d")
+
+
+def ensure_today_falls():
+    day = today_key()
+    if FALLS.get("date") != day:
+        FALLS.clear()
+        FALLS.update({"date": day, "total": 0, "nodes": {}})
+    elif not isinstance(FALLS.get("nodes"), dict):
+        FALLS["nodes"] = {}
+    return FALLS
+
+
+def record_fall(node):
+    falls = ensure_today_falls()
+    name = str(node.get("name") or node.get("id") or "unknown")
+    falls["total"] = int(falls.get("total", 0) or 0) + 1
+    nodes = falls.setdefault("nodes", {})
+    nodes[name] = int(nodes.get(name, 0) or 0) + 1
+    try:
+        save_falls()
+    except Exception as exc:
+        log(f"save falls failed: {exc}")
+
+
 def format_bytes(value):
     try:
         value = float(value)
@@ -3073,6 +3124,38 @@ def format_age(seconds):
         return f"{minutes}m"
     hours = minutes // 60
     return f"{hours}h {minutes % 60}m"
+
+
+def plural_ru(value, one, few, many):
+    value = abs(int(value))
+    last_two = value % 100
+    last = value % 10
+    if 11 <= last_two <= 14:
+        return many
+    if last == 1:
+        return one
+    if 2 <= last <= 4:
+        return few
+    return many
+
+
+def format_duration_ru(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} {plural_ru(seconds, 'секунда', 'секунды', 'секунд')}"
+    minutes = seconds // 60
+    rest_seconds = seconds % 60
+    if minutes < 60:
+        result = f"{minutes} {plural_ru(minutes, 'минута', 'минуты', 'минут')}"
+        if rest_seconds:
+            result += f" {rest_seconds} {plural_ru(rest_seconds, 'секунда', 'секунды', 'секунд')}"
+        return result
+    hours = minutes // 60
+    rest_minutes = minutes % 60
+    result = f"{hours} {plural_ru(hours, 'час', 'часа', 'часов')}"
+    if rest_minutes:
+        result += f" {rest_minutes} {plural_ru(rest_minutes, 'минута', 'минуты', 'минут')}"
+    return result
 
 
 def fmt_time(ts):
@@ -3183,6 +3266,54 @@ def node_message(node, status=None):
     return "\n".join(lines)
 
 
+def status_summary(nodes, ts):
+    expected_total = max(EXPECTED_NODES, len(nodes), 1)
+    dead_items = []
+    live_count = 0
+    for node in nodes:
+        last_seen = int(node.get("last_seen", 0) or 0)
+        age = ts - last_seen
+        if age <= STALE_SEC:
+            live_count += 1
+        else:
+            dead_items.append((node, age))
+
+    lines = [
+        "",
+        "<blockquote>На данный момент:</blockquote>",
+        f"<b>Живо: {live_count}/{expected_total}</b>",
+        "Мертво:",
+    ]
+    if dead_items:
+        dead_items.sort(key=lambda item: natural_sort_key(item[0].get("name") or item[0].get("id") or ""))
+        for node, age in dead_items:
+            name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
+            last_seen = int(node.get("last_seen", 0) or 0)
+            lines += [
+                f"<blockquote><b>{name}</b>",
+                f"Последнее удачное обновление: {fmt_time(last_seen)}",
+                f"В даунтайме: {format_duration_ru(age)}</blockquote>",
+            ]
+    else:
+        lines.append("нет")
+
+    with LOCK:
+        falls = dict(ensure_today_falls())
+        falls_nodes = dict(falls.get("nodes") or {})
+    total_falls = int(falls.get("total", 0) or 0)
+    lines += [
+        "",
+        f"<b>Общее кол-во падений за сегодня: {total_falls}</b>",
+    ]
+    if falls_nodes:
+        lines.append("Топ лист машин которые падали:")
+        for name, count in sorted(falls_nodes.items(), key=lambda item: (-int(item[1]), natural_sort_key(item[0]))):
+            lines.append(f"{html.escape(str(name))}: {int(count)} раз")
+    else:
+        lines.append("Топ лист машин которые падали: нет")
+    return "\n".join(lines)
+
+
 def aggregate_message():
     with LOCK:
         deduped = {}
@@ -3202,6 +3333,7 @@ def aggregate_message():
         status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
         parts.append("")
         parts.append(node_message(node, status))
+    parts.append(status_summary(nodes, ts))
     return "\n".join(parts)
 
 
@@ -3325,6 +3457,8 @@ def offline_loop():
                 age = current - int(node.get("last_seen", 0) or 0)
                 if age > STALE_SEC and not node.get("offline_alerted"):
                     node["offline_alerted"] = True
+                    node["offline_since"] = current
+                    record_fall(node)
                     alerts.append((node_id, dict(node), age))
                     changed = True
             if changed:
@@ -3422,6 +3556,7 @@ def main():
         raise SystemExit("KTO_COLLECTOR_SECRET is empty")
     os.makedirs(STATE_DIR, exist_ok=True)
     load_nodes()
+    load_falls()
     threading.Thread(target=offline_loop, daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
     if DAILY_REPORT_TIME:
@@ -3459,8 +3594,8 @@ install_stats_collector() {
     require_panel_mode
     need_root
 
-    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec daily_report_time existing_config=0
-    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_tz safe_daily
+    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec expected_nodes daily_report_time existing_config=0
+    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_expected safe_tz safe_daily
 
     if "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
         listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -3470,6 +3605,7 @@ install_stats_collector() {
         chat_id="$(config_get KTO_COLLECTOR_CHAT_ID "$STATS_COLLECTOR_CONFIG")"
         allowed_user="$(config_get KTO_COLLECTOR_ALLOWED_USER_ID "$STATS_COLLECTOR_CONFIG")"
         stale_sec="$(config_get KTO_COLLECTOR_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
+        expected_nodes="$(config_get KTO_COLLECTOR_EXPECTED_NODES "$STATS_COLLECTOR_CONFIG")"
         daily_report_time="$(config_get KTO_COLLECTOR_DAILY_REPORT_TIME "$STATS_COLLECTOR_CONFIG")"
         if [[ -n "$secret" && -n "$bot_token" && -n "$chat_id" ]]; then
             existing_config=1
@@ -3483,6 +3619,7 @@ install_stats_collector() {
         listen_port="${listen_port:-$STATS_COLLECTOR_PORT_DEFAULT}"
         allowed_user="${allowed_user:-$STATS_ALLOWED_USER_ID_DEFAULT}"
         stale_sec="${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}"
+        expected_nodes="${expected_nodes:-$STATS_EXPECTED_NODES_DEFAULT}"
     else
         listen_host="$(ask_text "IP прослушивания коллектора" "0.0.0.0")"
         listen_port="$(ask_int "Порт коллектора" "$STATS_COLLECTOR_PORT_DEFAULT" 1 65535)"
@@ -3491,6 +3628,7 @@ install_stats_collector() {
         chat_id="$(ask_text "Введите Telegram Chat ID")"
         allowed_user="$(ask_int "Разрешенный Telegram user id" "$STATS_ALLOWED_USER_ID_DEFAULT" 1 999999999999)"
         stale_sec="$(ask_int "Алерт offline после секунд" "$STATS_COLLECTOR_STALE_SEC_DEFAULT" 30 86400)"
+        expected_nodes="$(ask_int "Ожидаемое кол-во обходов" "$STATS_EXPECTED_NODES_DEFAULT" 1 9999)"
         daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
     fi
 
@@ -3501,6 +3639,7 @@ install_stats_collector() {
     safe_chat="$(escape_config_value "$chat_id")"
     safe_user="$(escape_config_value "$allowed_user")"
     safe_stale="$(escape_config_value "$stale_sec")"
+    safe_expected="$(escape_config_value "$expected_nodes")"
     safe_tz="$(escape_config_value "$STATS_COLLECTOR_TZ_DEFAULT")"
     safe_daily="$(escape_config_value "$daily_report_time")"
 
@@ -3520,6 +3659,7 @@ KTO_COLLECTOR_CHAT_ID="$safe_chat"
 KTO_COLLECTOR_ALLOWED_USER_ID="$safe_user"
 KTO_COLLECTOR_STATE_DIR="$STATS_COLLECTOR_STATE_DIR"
 KTO_COLLECTOR_STALE_SEC="$safe_stale"
+KTO_COLLECTOR_EXPECTED_NODES="$safe_expected"
 KTO_COLLECTOR_TZ="$safe_tz"
 KTO_COLLECTOR_DAILY_REPORT_TIME="$safe_daily"
 EOF
@@ -3538,6 +3678,7 @@ EOF
         ok "Коллектор установлен (${SCRIPT_BUILD})"
     fi
     ok "Адрес: ${listen_host}:${listen_port}"
+    ok "Ожидаемо обходов: ${expected_nodes}"
     if (( existing_config == 1 )); then
         ok "Секрет: сохранён"
     else
@@ -3591,7 +3732,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v129"
+PUSH_BUILD="v130"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
