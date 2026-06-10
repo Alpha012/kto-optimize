@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v119"
+SCRIPT_BUILD="v120"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2945,7 +2945,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v119"
+COLLECTOR_BUILD = "v120"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3150,8 +3150,12 @@ def node_message(node):
     lines += [
         f"Сегодня: {format_bytes(node.get('day_total', 0))}",
         f"I/O: {format_bytes(node.get('day_rx', 0))} | {format_bytes(node.get('day_tx', 0))}",
+        f"Вчера: {format_bytes(node.get('yesterday_total', 0))}",
         "",
         f"Месяц: {format_bytes(node.get('month_total', 0))}",
+        "",
+        f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}",
+        f"Нагруженность процессора: {int(node.get('cpu_percent', 0) or 0)}%",
         "",
         f"Обновлено: {fmt_time(updated)}",
     ]
@@ -3204,9 +3208,16 @@ def update_node(payload):
         "day_total": int(payload.get("day_total") or 0),
         "day_rx": int(payload.get("day_rx") or 0),
         "day_tx": int(payload.get("day_tx") or 0),
+        "yesterday_total": int(payload.get("yesterday_total") or 0),
+        "yesterday_rx": int(payload.get("yesterday_rx") or 0),
+        "yesterday_tx": int(payload.get("yesterday_tx") or 0),
         "month_total": int(payload.get("month_total") or 0),
         "month_rx": int(payload.get("month_rx") or 0),
         "month_tx": int(payload.get("month_tx") or 0),
+        "ram_total": int(payload.get("ram_total") or 0),
+        "ram_used": int(payload.get("ram_used") or 0),
+        "ram_percent": int(payload.get("ram_percent") or 0),
+        "cpu_percent": int(payload.get("cpu_percent") or 0),
         "error": str(payload.get("error") or ""),
         "updated_at": int(payload.get("updated_at") or current),
         "last_seen": current,
@@ -3427,17 +3438,40 @@ install_stats_collector() {
     require_panel_mode
     need_root
 
-    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec daily_report_time
+    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec daily_report_time existing_config=0
     local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_tz safe_daily
 
-    listen_host="$(ask_text "IP прослушивания коллектора" "0.0.0.0")"
-    listen_port="$(ask_int "Порт коллектора" "$STATS_COLLECTOR_PORT_DEFAULT" 1 65535)"
-    secret="$(ask_text "Секрет коллектора" "$(generate_secret)")"
-    bot_token="$(ask_secret_value "Введите Telegram Bot Token")"
-    chat_id="$(ask_text "Введите Telegram Chat ID")"
-    allowed_user="$(ask_int "Разрешенный Telegram user id" "$STATS_ALLOWED_USER_ID_DEFAULT" 1 999999999999)"
-    stale_sec="$(ask_int "Алерт offline после секунд" "$STATS_COLLECTOR_STALE_SEC_DEFAULT" 30 86400)"
-    daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
+    if "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
+        listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
+        listen_port="$(config_get KTO_COLLECTOR_LISTEN_PORT "$STATS_COLLECTOR_CONFIG")"
+        secret="$(config_get KTO_COLLECTOR_SECRET "$STATS_COLLECTOR_CONFIG")"
+        bot_token="$(config_get KTO_COLLECTOR_BOT_TOKEN "$STATS_COLLECTOR_CONFIG")"
+        chat_id="$(config_get KTO_COLLECTOR_CHAT_ID "$STATS_COLLECTOR_CONFIG")"
+        allowed_user="$(config_get KTO_COLLECTOR_ALLOWED_USER_ID "$STATS_COLLECTOR_CONFIG")"
+        stale_sec="$(config_get KTO_COLLECTOR_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
+        daily_report_time="$(config_get KTO_COLLECTOR_DAILY_REPORT_TIME "$STATS_COLLECTOR_CONFIG")"
+        if [[ -n "$secret" && -n "$bot_token" && -n "$chat_id" ]]; then
+            existing_config=1
+        else
+            warn "Конфиг коллектора неполный, пройду настройку заново."
+        fi
+    fi
+
+    if (( existing_config == 1 )); then
+        listen_host="${listen_host:-0.0.0.0}"
+        listen_port="${listen_port:-$STATS_COLLECTOR_PORT_DEFAULT}"
+        allowed_user="${allowed_user:-$STATS_ALLOWED_USER_ID_DEFAULT}"
+        stale_sec="${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}"
+    else
+        listen_host="$(ask_text "IP прослушивания коллектора" "0.0.0.0")"
+        listen_port="$(ask_int "Порт коллектора" "$STATS_COLLECTOR_PORT_DEFAULT" 1 65535)"
+        secret="$(ask_text "Секрет коллектора" "$(generate_secret)")"
+        bot_token="$(ask_secret_value "Введите Telegram Bot Token")"
+        chat_id="$(ask_text "Введите Telegram Chat ID")"
+        allowed_user="$(ask_int "Разрешенный Telegram user id" "$STATS_ALLOWED_USER_ID_DEFAULT" 1 999999999999)"
+        stale_sec="$(ask_int "Алерт offline после секунд" "$STATS_COLLECTOR_STALE_SEC_DEFAULT" 30 86400)"
+        daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
+    fi
 
     safe_host="$(escape_config_value "$listen_host")"
     safe_port="$(escape_config_value "$listen_port")"
@@ -3449,7 +3483,11 @@ install_stats_collector() {
     safe_tz="$(escape_config_value "$STATS_COLLECTOR_TZ_DEFAULT")"
     safe_daily="$(escape_config_value "$daily_report_time")"
 
-    stage "Устанавливаю коллектор статистики"
+    if (( existing_config == 1 )); then
+        stage "Обновляю коллектор статистики"
+    else
+        stage "Устанавливаю коллектор статистики"
+    fi
     must "Установка Python" apt_install_with_update_if_missing python3
     cmd "${SUDO[@]}" mkdir -p "$STATS_COLLECTOR_STATE_DIR"
     write_root_file_mode 0600 "$STATS_COLLECTOR_CONFIG" <<EOF
@@ -3473,9 +3511,17 @@ EOF
         cmd "${SUDO[@]}" ufw allow "${listen_port}/tcp" || true
     fi
 
-    ok "Коллектор установлен (${SCRIPT_BUILD})"
+    if (( existing_config == 1 )); then
+        ok "Коллектор обновлён (${SCRIPT_BUILD})"
+    else
+        ok "Коллектор установлен (${SCRIPT_BUILD})"
+    fi
     ok "Адрес: ${listen_host}:${listen_port}"
-    ok "Секрет: ${secret}"
+    if (( existing_config == 1 )); then
+        ok "Секрет: сохранён"
+    else
+        ok "Секрет: ${secret}"
+    fi
     ok "Telegram user id: ${allowed_user}"
     if [[ -n "$daily_report_time" ]]; then
         ok "Ежедневный отчёт: ${daily_report_time} МСК"
@@ -3500,7 +3546,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v119"
+PUSH_BUILD="v120"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
@@ -3522,8 +3568,58 @@ updated_at="$(date +%s)"
 error=""
 day_rx=0
 day_tx=0
+yesterday_rx=0
+yesterday_tx=0
 month_rx=0
 month_tx=0
+ram_total=0
+ram_used=0
+ram_percent=0
+cpu_percent=0
+
+memory_stats() {
+    awk '
+        $1 == "MemTotal:" { total = $2 }
+        $1 == "MemAvailable:" { available = $2 }
+        END {
+            if (total > 0) {
+                used = total - available
+                printf "%d %d %d", used * 1024, total * 1024, int((used * 100) / total)
+            } else {
+                printf "0 0 0"
+            }
+        }
+    ' /proc/meminfo 2>/dev/null || echo "0 0 0"
+}
+
+read_cpu_totals() {
+    awk '
+        /^cpu / {
+            idle = $5 + $6
+            total = 0
+            for (i = 2; i <= NF; i++) total += $i
+            print total, idle
+            exit
+        }
+    ' /proc/stat 2>/dev/null || echo "0 0"
+}
+
+cpu_usage_percent() {
+    local total1 idle1 total2 idle2 total_delta idle_delta
+    read -r total1 idle1 < <(read_cpu_totals)
+    sleep 0.2
+    read -r total2 idle2 < <(read_cpu_totals)
+    total_delta=$(( ${total2:-0} - ${total1:-0} ))
+    idle_delta=$(( ${idle2:-0} - ${idle1:-0} ))
+    if (( total_delta <= 0 )); then
+        echo 0
+    else
+        echo $(( (100 * (total_delta - idle_delta)) / total_delta ))
+    fi
+}
+
+read -r ram_used ram_total ram_percent < <(memory_stats)
+cpu_percent="$(cpu_usage_percent)"
 
 if ! command -v jq >/dev/null 2>&1; then
     error="jq не установлен"
@@ -3540,23 +3636,28 @@ else
             def month_key: (.date.year * 100 + .date.month);
             (.interfaces[0].traffic.day // []) as $days |
             (.interfaces[0].traffic.month // []) as $months |
-            ($days | max_by(day_key) // {rx:0, tx:0}) as $day |
+            ($days | sort_by(day_key)) as $sorted_days |
+            ($sorted_days[-1] // {rx:0, tx:0}) as $day |
+            ($sorted_days[-2] // {rx:0, tx:0}) as $yesterday |
             ($months | max_by(month_key) // {rx:0, tx:0}) as $month |
-            "\($day.rx // 0) \($day.tx // 0) \($month.rx // 0) \($month.tx // 0)"
+            "\($day.rx // 0) \($day.tx // 0) \($yesterday.rx // 0) \($yesterday.tx // 0) \($month.rx // 0) \($month.tx // 0)"
         ' 2>/dev/null || true)"
         if [[ -z "$stats" ]]; then
             error="jq не смог разобрать vnstat json"
         else
-            set -- $stats
-            day_rx="${1:-0}"
-            day_tx="${2:-0}"
-            month_rx="${3:-0}"
-            month_tx="${4:-0}"
+            read -r day_rx day_tx yesterday_rx yesterday_tx month_rx month_tx <<< "$stats"
+            day_rx="${day_rx:-0}"
+            day_tx="${day_tx:-0}"
+            yesterday_rx="${yesterday_rx:-0}"
+            yesterday_tx="${yesterday_tx:-0}"
+            month_rx="${month_rx:-0}"
+            month_tx="${month_tx:-0}"
         fi
     fi
 fi
 
 day_total=$(( day_rx + day_tx ))
+yesterday_total=$(( yesterday_rx + yesterday_tx ))
 month_total=$(( month_rx + month_tx ))
 
 payload="$(jq -n \
@@ -3568,9 +3669,16 @@ payload="$(jq -n \
     --argjson day_rx "$day_rx" \
     --argjson day_tx "$day_tx" \
     --argjson day_total "$day_total" \
+    --argjson yesterday_rx "$yesterday_rx" \
+    --argjson yesterday_tx "$yesterday_tx" \
+    --argjson yesterday_total "$yesterday_total" \
     --argjson month_rx "$month_rx" \
     --argjson month_tx "$month_tx" \
     --argjson month_total "$month_total" \
+    --argjson ram_used "$ram_used" \
+    --argjson ram_total "$ram_total" \
+    --argjson ram_percent "$ram_percent" \
+    --argjson cpu_percent "$cpu_percent" \
     --argjson updated_at "$updated_at" \
     '{
         id: $id,
@@ -3580,9 +3688,16 @@ payload="$(jq -n \
         day_rx: $day_rx,
         day_tx: $day_tx,
         day_total: $day_total,
+        yesterday_rx: $yesterday_rx,
+        yesterday_tx: $yesterday_tx,
+        yesterday_total: $yesterday_total,
         month_rx: $month_rx,
         month_tx: $month_tx,
         month_total: $month_total,
+        ram_used: $ram_used,
+        ram_total: $ram_total,
+        ram_percent: $ram_percent,
+        cpu_percent: $cpu_percent,
         error: $error,
         updated_at: $updated_at
     }')"
@@ -3635,7 +3750,7 @@ install_stats_push_client() {
     require_whitelist_mode
     need_root
 
-    local default_iface default_name node_name node_id iface collector_url secret interval
+    local default_iface default_name node_name node_id iface collector_url secret interval existing_config=0
     local safe_name safe_id safe_iface safe_url safe_secret safe_interval
 
     default_iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
@@ -3643,20 +3758,46 @@ install_stats_push_client() {
     default_name="$(config_get KTO_PUSH_NODE_NAME "$STATS_PUSH_CONFIG")"
     default_name="${default_name:-$(hostname 2>/dev/null || echo whitelist)}"
 
-    node_name="$(ask_text "Название машины" "$default_name")"
-    node_id="$(ask_text "ID машины" "$node_name")"
-    iface="$(ask_text "Интерфейс" "${default_iface:-eth0}")"
-    if ! network_interface_exists "$iface"; then
-        fail "Интерфейс ${iface} не найден. Проверь: ip -br link"
-        return 1
+    if "${SUDO[@]}" test -s "$STATS_PUSH_CONFIG" 2>/dev/null; then
+        node_id="$(config_get KTO_PUSH_NODE_ID "$STATS_PUSH_CONFIG")"
+        node_name="$(config_get KTO_PUSH_NODE_NAME "$STATS_PUSH_CONFIG")"
+        iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
+        collector_url="$(config_get KTO_PUSH_COLLECTOR_URL "$STATS_PUSH_CONFIG")"
+        secret="$(config_get KTO_PUSH_SECRET "$STATS_PUSH_CONFIG")"
+        interval="$(config_get KTO_PUSH_INTERVAL "$STATS_PUSH_CONFIG")"
+        if [[ -n "$node_id" && -n "$node_name" && -n "$iface" && -n "$collector_url" && -n "$secret" ]]; then
+            existing_config=1
+        else
+            warn "Конфиг push неполный, пройду настройку заново."
+        fi
     fi
-    collector_url="$(ask_text "URL коллектора")"
-    if [[ ! "$collector_url" =~ ^https?:// ]]; then
-        fail "URL коллектора должен начинаться с http:// или https://"
-        return 1
+
+    if (( existing_config == 1 )); then
+        interval="${interval:-$STATS_PUSH_INTERVAL_DEFAULT}"
+        if ! network_interface_exists "$iface"; then
+            fail "Интерфейс ${iface} из конфига не найден. Проверь: ip -br link"
+            return 1
+        fi
+        if [[ ! "$collector_url" =~ ^https?:// ]]; then
+            fail "URL коллектора в конфиге должен начинаться с http:// или https://"
+            return 1
+        fi
+    else
+        node_name="$(ask_text "Название машины" "$default_name")"
+        node_id="$(ask_text "ID машины" "$node_name")"
+        iface="$(ask_text "Интерфейс" "${default_iface:-eth0}")"
+        if ! network_interface_exists "$iface"; then
+            fail "Интерфейс ${iface} не найден. Проверь: ip -br link"
+            return 1
+        fi
+        collector_url="$(ask_text "URL коллектора")"
+        if [[ ! "$collector_url" =~ ^https?:// ]]; then
+            fail "URL коллектора должен начинаться с http:// или https://"
+            return 1
+        fi
+        secret="$(ask_secret_value "Секрет коллектора")"
+        interval="$(ask_int "Интервал push, сек" "$STATS_PUSH_INTERVAL_DEFAULT" 15 3600)"
     fi
-    secret="$(ask_secret_value "Секрет коллектора")"
-    interval="$(ask_int "Интервал push, сек" "$STATS_PUSH_INTERVAL_DEFAULT" 15 3600)"
 
     safe_name="$(escape_config_value "$node_name")"
     safe_id="$(escape_config_value "$node_id")"
@@ -3665,7 +3806,11 @@ install_stats_push_client() {
     safe_secret="$(escape_config_value "$secret")"
     safe_interval="$(escape_config_value "$interval")"
 
-    stage "Устанавливаю push статистики"
+    if (( existing_config == 1 )); then
+        stage "Обновляю push статистики"
+    else
+        stage "Устанавливаю push статистики"
+    fi
     must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat
     cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
     cmd "${SUDO[@]}" systemctl enable --now vnstat || true
@@ -3690,7 +3835,11 @@ EOF
     cmd "${SUDO[@]}" systemctl daemon-reload
     cmd "${SUDO[@]}" systemctl enable --now "$STATS_PUSH_TIMER"
 
-    ok "Пуш статистики установлен (${SCRIPT_BUILD})"
+    if (( existing_config == 1 )); then
+        ok "Пуш статистики обновлён (${SCRIPT_BUILD})"
+    else
+        ok "Пуш статистики установлен (${SCRIPT_BUILD})"
+    fi
     ok "Машина: ${node_name}"
     ok "Коллектор: ${collector_url}"
     ok "Интервал: ${interval}s"
@@ -4053,10 +4202,10 @@ main() {
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
-        collector|collector-install|stats-collector) install_stats_collector ;;
+        collector|collector-install|collector-update|stats-collector|stats-collector-update) install_stats_collector ;;
         collector-status|stats-collector-status) stats_collector_status ;;
         push-menu|stats-push-menu) stats_push_menu ;;
-        stats-push|stats-push-install) install_stats_push_client ;;
+        stats-push|stats-push-install|stats-push-update) install_stats_push_client ;;
         stats-push-send) send_stats_push_once ;;
         stats-push-status) stats_push_status ;;
         *) menu ;;
