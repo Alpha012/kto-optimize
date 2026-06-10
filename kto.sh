@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v122"
+SCRIPT_BUILD="v123"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2945,7 +2945,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v122"
+COLLECTOR_BUILD = "v123"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3541,11 +3541,35 @@ stats_collector_status() {
     header
     require_panel_mode
     need_root
-    local state
+    local state listen_host listen_port health_host health_log rc
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
+    listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
+    listen_port="$(config_get KTO_COLLECTOR_LISTEN_PORT "$STATS_COLLECTOR_CONFIG")"
+    listen_host="${listen_host:-0.0.0.0}"
+    listen_port="${listen_port:-$STATS_COLLECTOR_PORT_DEFAULT}"
+    if [[ "$listen_host" == "0.0.0.0" || "$listen_host" == "::" ]]; then
+        health_host="127.0.0.1"
+    else
+        health_host="$listen_host"
+    fi
+
     print_row "коллектор" "$STATS_COLLECTOR_SERVICE" "$state"
     print_row "конфиг" "$STATS_COLLECTOR_CONFIG" "$([[ -s "$STATS_COLLECTOR_CONFIG" ]] && echo 1 || echo 0)"
     print_row "данные" "$STATS_COLLECTOR_STATE_DIR" "$([[ -d "$STATS_COLLECTOR_STATE_DIR" ]] && echo 1 || echo 0)"
+    print_row "адрес" "${listen_host}:${listen_port}" "$([[ -n "$listen_port" ]] && echo 1 || echo 0)"
+
+    if command_exists curl; then
+        health_log="$(mktemp)"
+        if curl -4 -fsS --connect-timeout 3 --max-time 5 "http://${health_host}:${listen_port}/health" >"$health_log" 2>&1; then
+            print_row "local health" "$(tr '\n' ' ' < "$health_log")" 1
+        else
+            rc=$?
+            print_row "local health" "rc=${rc}: $(tr '\n' ' ' < "$health_log")" 0
+        fi
+        rm -f "$health_log"
+    else
+        print_row "local health" "curl не установлен" 0
+    fi
 }
 
 write_stats_push_script() {
@@ -3553,8 +3577,16 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v122"
+PUSH_BUILD="v123"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
+
+push_error_trap() {
+    local rc="$?" line="${BASH_LINENO[0]:-?}" command="${BASH_COMMAND:-unknown}"
+    echo "push ${PUSH_BUILD}: internal error rc=${rc} line=${line}: ${command}" >&2
+    exit "$rc"
+}
+trap push_error_trap ERR
+
 if [[ ! -r "$CONFIG" ]]; then
     echo "Config not found: $CONFIG" >&2
     exit 1
@@ -3984,6 +4016,7 @@ run_stats_push_debug() {
     else
         rc=$?
         warn "Health коллектора не ответил rc=${rc}: $(tr '\n' ' ' < "$debug_log")"
+        warn "Проверь на панели: systemctl status kto-stats-collector && ss -lntp | grep ':1337'"
     fi
     rm -f "$debug_log"
 
@@ -3997,7 +4030,11 @@ run_stats_push_debug() {
     else
         rc=$?
         warn "Push упал rc=${rc}"
-        sed -n '1,120p' "$debug_log" || true
+        if [[ -s "$debug_log" ]]; then
+            sed -n '1,120p' "$debug_log" || true
+        else
+            warn "Push не вывел текст ошибки. Запусти stats-push-update до v123 и повтори debug."
+        fi
         echo
         warn "Последний статус systemd:"
         "${SUDO[@]}" systemctl status "$STATS_PUSH_SERVICE" --no-pager -l 2>&1 | sed -n '1,60p' || true
