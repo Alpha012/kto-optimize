@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v123"
+SCRIPT_BUILD="v124"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2945,7 +2945,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v123"
+COLLECTOR_BUILD = "v124"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3577,7 +3577,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v123"
+PUSH_BUILD="v124"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
@@ -3633,9 +3633,9 @@ memory_stats() {
         END {
             if (total > 0) {
                 used = total - available
-                printf "%d %d %d", used * 1024, total * 1024, int((used * 100) / total)
+                printf "%d %d %d\n", used * 1024, total * 1024, int((used * 100) / total)
             } else {
-                printf "0 0 0"
+                printf "0 0 0\n"
             }
         }
     ' /proc/meminfo 2>/dev/null || echo "0 0 0"
@@ -3929,7 +3929,7 @@ EOF
         cat "$push_test_log" >> "$LOG_FILE" 2>/dev/null || true
         ok "Push отправлен"
     else
-        warn "Push не отправился. Проверь URL/secret/доступ до коллектора."
+        warn "Push не отправился. Ниже точная причина:"
         cat "$push_test_log" >> "$LOG_FILE" 2>/dev/null || true
         sed -n '1,80p' "$push_test_log" >&2 || true
     fi
