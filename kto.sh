@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v126"
+SCRIPT_BUILD="v127"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2945,7 +2945,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v126"
+COLLECTOR_BUILD = "v127"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3143,7 +3143,7 @@ def node_message(node, status=None):
     if metrics_ok:
         ram_line = f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}"
         cpu_line = f"Нагруженность процессора: {int(node.get('cpu_percent', 0) or 0)}%"
-    lines = [f"<b>{name}</b>", ""]
+    lines = [f"<blockquote><b>{name}</b></blockquote>", ""]
     if error:
         lines += [
             "I/O: - | -",
@@ -3577,7 +3577,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v126"
+PUSH_BUILD="v127"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
