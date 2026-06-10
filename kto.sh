@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v131"
+SCRIPT_BUILD="v132"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2946,7 +2946,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v131"
+COLLECTOR_BUILD = "v132"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3296,7 +3296,7 @@ def status_summary(nodes, ts):
         "",
         "<blockquote>На данный момент:</blockquote>",
         f"<b>Живо: {live_count}/{expected_total}</b>",
-        "Мертво:",
+        "<b>Мертво:</b>",
     ]
     if dead_items:
         dead_items.sort(key=lambda item: natural_sort_key(item[0].get("name") or item[0].get("id") or ""))
@@ -3327,11 +3327,13 @@ def status_summary(nodes, ts):
         f"<b>Общее время даунтайма за сегодня: {format_duration_ru(total_downtime)}</b>",
     ]
     if falls_nodes:
-        lines.append("Топ лист машин которые падали:")
+        lines.append("<b>Топ лист машин которые падали:</b>")
+        top_lines = []
         for name, count in sorted(falls_nodes.items(), key=lambda item: (-int(item[1]), natural_sort_key(item[0]))):
-            lines.append(f"{html.escape(str(name))}: {int(count)} раз")
+            top_lines.append(f"{html.escape(str(name))}: {int(count)} раз")
+        lines.append(f"<blockquote>{chr(10).join(top_lines)}</blockquote>")
     else:
-        lines.append("Топ лист машин которые падали: нет")
+        lines.append("<b>Топ лист машин которые падали:</b> нет")
     return "\n".join(lines)
 
 
@@ -3756,7 +3758,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v131"
+PUSH_BUILD="v132"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
