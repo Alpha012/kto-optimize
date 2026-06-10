@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v130"
+SCRIPT_BUILD="v131"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2946,7 +2946,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v130"
+COLLECTOR_BUILD = "v131"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3068,9 +3068,11 @@ def ensure_today_falls():
     day = today_key()
     if FALLS.get("date") != day:
         FALLS.clear()
-        FALLS.update({"date": day, "total": 0, "nodes": {}})
+        FALLS.update({"date": day, "total": 0, "downtime_sec": 0, "nodes": {}})
     elif not isinstance(FALLS.get("nodes"), dict):
         FALLS["nodes"] = {}
+    if "downtime_sec" not in FALLS:
+        FALLS["downtime_sec"] = 0
     return FALLS
 
 
@@ -3084,6 +3086,18 @@ def record_fall(node):
         save_falls()
     except Exception as exc:
         log(f"save falls failed: {exc}")
+
+
+def record_downtime(seconds):
+    seconds = max(0, int(seconds or 0))
+    if seconds <= 0:
+        return
+    falls = ensure_today_falls()
+    falls["downtime_sec"] = int(falls.get("downtime_sec", 0) or 0) + seconds
+    try:
+        save_falls()
+    except Exception as exc:
+        log(f"save downtime failed: {exc}")
 
 
 def format_bytes(value):
@@ -3301,9 +3315,16 @@ def status_summary(nodes, ts):
         falls = dict(ensure_today_falls())
         falls_nodes = dict(falls.get("nodes") or {})
     total_falls = int(falls.get("total", 0) or 0)
+    completed_downtime = int(falls.get("downtime_sec", 0) or 0)
+    active_downtime = 0
+    for node, age in dead_items:
+        offline_since = int(node.get("offline_since") or node.get("last_seen") or ts)
+        active_downtime += max(0, ts - offline_since)
+    total_downtime = completed_downtime + active_downtime
     lines += [
         "",
         f"<b>Общее кол-во падений за сегодня: {total_falls}</b>",
+        f"<b>Общее время даунтайма за сегодня: {format_duration_ru(total_downtime)}</b>",
     ]
     if falls_nodes:
         lines.append("Топ лист машин которые падали:")
@@ -3379,6 +3400,9 @@ def update_node(payload):
     with LOCK:
         old = NODES.get(node_id, {})
         was_offline = bool(old.get("offline_alerted"))
+        if was_offline:
+            offline_since = int(old.get("offline_since") or old.get("last_seen") or current)
+            record_downtime(current - offline_since)
         canonical = node_canonical_key(record)
         removed = []
         for existing_id, existing_node in list(NODES.items()):
@@ -3732,7 +3756,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v130"
+PUSH_BUILD="v131"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
