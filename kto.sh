@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v127"
+SCRIPT_BUILD="v128"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2945,7 +2945,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v127"
+COLLECTOR_BUILD = "v128"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3050,6 +3050,20 @@ def format_bytes(value):
     return f"{value:.1f} {units[idx]}"
 
 
+def format_percent(value):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    if value <= 0:
+        return "0%"
+    if value < 0.1:
+        return "<0.1%"
+    if value >= 10:
+        return f"{value:.0f}%"
+    return f"{value:.1f}%"
+
+
 def format_age(seconds):
     seconds = max(0, int(seconds))
     if seconds < 60:
@@ -3142,7 +3156,7 @@ def node_message(node, status=None):
     cpu_line = "Нагруженность процессора: ?%"
     if metrics_ok:
         ram_line = f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}"
-        cpu_line = f"Нагруженность процессора: {int(node.get('cpu_percent', 0) or 0)}%"
+        cpu_line = f"Нагруженность процессора: {format_percent(node.get('cpu_percent', 0))}"
     lines = [f"<blockquote><b>{name}</b></blockquote>", ""]
     if error:
         lines += [
@@ -3223,7 +3237,7 @@ def update_node(payload):
         "ram_total": int(payload.get("ram_total") or 0),
         "ram_used": int(payload.get("ram_used") or 0),
         "ram_percent": int(payload.get("ram_percent") or 0),
-        "cpu_percent": int(payload.get("cpu_percent") or 0),
+        "cpu_percent": float(payload.get("cpu_percent") or 0),
         "metrics_ok": bool(payload.get("metrics_ok")),
         "error": str(payload.get("error") or ""),
         "updated_at": int(payload.get("updated_at") or current),
@@ -3577,7 +3591,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v127"
+PUSH_BUILD="v128"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
@@ -3626,6 +3640,15 @@ int_or_zero() {
     fi
 }
 
+number_or_zero() {
+    local value="${1:-0}"
+    if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "$value"
+    else
+        echo 0
+    fi
+}
+
 memory_stats() {
     awk '
         $1 == "MemTotal:" { total = $2 }
@@ -3656,22 +3679,41 @@ read_cpu_totals() {
 cpu_usage_percent() {
     local total1 idle1 total2 idle2 total_delta idle_delta
     read -r total1 idle1 < <(read_cpu_totals)
-    sleep 0.2
+    sleep 0.8
     read -r total2 idle2 < <(read_cpu_totals)
     total_delta=$(( ${total2:-0} - ${total1:-0} ))
     idle_delta=$(( ${idle2:-0} - ${idle1:-0} ))
     if (( total_delta <= 0 )); then
         echo 0
     else
-        echo $(( (100 * (total_delta - idle_delta)) / total_delta ))
+        awk -v total="$total_delta" -v idle="$idle_delta" 'BEGIN {
+            used = (100 * (total - idle)) / total
+            if (used < 0) used = 0
+            printf "%.1f\n", used
+        }'
     fi
+}
+
+cpu_load_percent() {
+    local cores
+    cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    if [[ ! "$cores" =~ ^[0-9]+$ ]] || (( cores < 1 )); then
+        cores=1
+    fi
+    awk -v cores="$cores" '{ printf "%.1f\n", ($1 / cores) * 100 }' /proc/loadavg 2>/dev/null || echo 0
 }
 
 read -r ram_used ram_total ram_percent < <(memory_stats)
 ram_used="$(int_or_zero "$ram_used")"
 ram_total="$(int_or_zero "$ram_total")"
 ram_percent="$(int_or_zero "$ram_percent")"
-cpu_percent="$(int_or_zero "$(cpu_usage_percent)")"
+cpu_sample_percent="$(number_or_zero "$(cpu_usage_percent)")"
+cpu_load_percent_value="$(number_or_zero "$(cpu_load_percent)")"
+cpu_percent="$(awk -v sample="$cpu_sample_percent" -v load="$cpu_load_percent_value" 'BEGIN {
+    value = sample > load ? sample : load
+    if (value < 0) value = 0
+    printf "%.1f\n", value
+}')"
 if (( ram_total > 0 )); then
     metrics_ok=true
 fi
