@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v134"
+SCRIPT_BUILD="v135"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2946,7 +2946,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v134"
+COLLECTOR_BUILD = "v135"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3391,12 +3391,12 @@ def aggregate_message():
 
 def alert_offline(node_id, node, age):
     name = html.escape(str(node.get("name") or node_id))
-    send_message(f"<b>{name}</b>\n\nНе присылал стату: {format_age(age)}")
+    return send_message(f"<b>{name}</b>\n\nНе присылал стату: {format_age(age)}")
 
 
 def alert_online(node_id, node):
     name = html.escape(str(node.get("name") or node_id))
-    send_message(f"<b>{name}</b>\n\nСнова онлайн")
+    return send_message(f"<b>{name}</b>\n\nСнова онлайн")
 
 
 def update_node(payload, remote_ip=""):
@@ -3446,6 +3446,7 @@ def update_node(payload, remote_ip=""):
     if removed:
         log(f"removed duplicate node records for {node_id}: {', '.join(removed)}")
     if was_offline:
+        log(f"node online: {node_id}")
         alert_online(node_id, record)
     return record
 
@@ -3505,23 +3506,28 @@ class Handler(BaseHTTPRequestHandler):
 
 def offline_loop():
     while True:
-        time.sleep(CHECK_INTERVAL)
-        current = now_ts()
-        changed = False
-        alerts = []
-        with LOCK:
-            for node_id, node in NODES.items():
-                age = current - int(node.get("last_seen", 0) or 0)
-                if age > STALE_SEC and not node.get("offline_alerted"):
-                    node["offline_alerted"] = True
-                    node["offline_since"] = current
-                    record_fall(node)
-                    alerts.append((node_id, dict(node), age))
-                    changed = True
-            if changed:
-                save_nodes()
-        for node_id, node, age in alerts:
-            alert_offline(node_id, node, age)
+        try:
+            time.sleep(CHECK_INTERVAL)
+            current = now_ts()
+            changed = False
+            alerts = []
+            with LOCK:
+                for node_id, node in NODES.items():
+                    age = current - int(node.get("last_seen", 0) or 0)
+                    if age > STALE_SEC and not node.get("offline_alerted"):
+                        node["offline_alerted"] = True
+                        node["offline_since"] = current
+                        record_fall(node)
+                        alerts.append((node_id, dict(node), age))
+                        changed = True
+                if changed:
+                    save_nodes()
+            for node_id, node, age in alerts:
+                log(f"node offline: {node_id} age={age}s")
+                alert_offline(node_id, node, age)
+        except Exception as exc:
+            log(f"offline loop failed: {exc}")
+            time.sleep(5)
 
 
 def load_offset():
@@ -3652,6 +3658,8 @@ def bot_loop():
                     send_message(aggregate_message())
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statsrevoke":
                     handle_statsrevoke(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statstest":
+                    send_message("<b>Проверка алертов</b>\n\nКоллектор жив, Telegram отправка работает.")
         except Exception as exc:
             log(f"bot loop failed: {exc}")
             time.sleep(5)
@@ -3838,7 +3846,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v134"
+PUSH_BUILD="v135"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
