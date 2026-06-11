@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v132"
+SCRIPT_BUILD="v133"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2946,7 +2946,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v132"
+COLLECTOR_BUILD = "v133"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3068,11 +3068,13 @@ def ensure_today_falls():
     day = today_key()
     if FALLS.get("date") != day:
         FALLS.clear()
-        FALLS.update({"date": day, "total": 0, "downtime_sec": 0, "nodes": {}})
+        FALLS.update({"date": day, "total": 0, "downtime_sec": 0, "downtime_revoke_sec": 0, "nodes": {}})
     elif not isinstance(FALLS.get("nodes"), dict):
         FALLS["nodes"] = {}
     if "downtime_sec" not in FALLS:
         FALLS["downtime_sec"] = 0
+    if "downtime_revoke_sec" not in FALLS:
+        FALLS["downtime_revoke_sec"] = 0
     return FALLS
 
 
@@ -3098,6 +3100,18 @@ def record_downtime(seconds):
         save_falls()
     except Exception as exc:
         log(f"save downtime failed: {exc}")
+
+
+def revoke_downtime(seconds):
+    seconds = max(0, int(seconds or 0))
+    if seconds <= 0:
+        return
+    falls = ensure_today_falls()
+    falls["downtime_revoke_sec"] = int(falls.get("downtime_revoke_sec", 0) or 0) + seconds
+    try:
+        save_falls()
+    except Exception as exc:
+        log(f"save downtime revoke failed: {exc}")
 
 
 def format_bytes(value):
@@ -3280,17 +3294,44 @@ def node_message(node, status=None):
     return "\n".join(lines)
 
 
+def downtime_totals(nodes, ts):
+    dead_items = []
+    active_downtime = 0
+    for node in nodes:
+        last_seen = int(node.get("last_seen", 0) or 0)
+        age = ts - last_seen
+        if age > STALE_SEC:
+            dead_items.append((node, age))
+            offline_since = int(node.get("offline_since") or last_seen or ts)
+            active_downtime += max(0, ts - offline_since)
+    with LOCK:
+        falls = dict(ensure_today_falls())
+        falls_nodes = dict(falls.get("nodes") or {})
+    completed_downtime = int(falls.get("downtime_sec", 0) or 0)
+    revoked_downtime = int(falls.get("downtime_revoke_sec", 0) or 0)
+    total_downtime = max(0, completed_downtime + active_downtime - revoked_downtime)
+    return dead_items, falls, falls_nodes, total_downtime
+
+
+def dedupe_nodes(values):
+    deduped = {}
+    for node in values:
+        key = node_canonical_key(node)
+        current = deduped.get(key)
+        if current is None or int(node.get("last_seen", 0) or 0) > int(current.get("last_seen", 0) or 0):
+            deduped[key] = node
+    return list(deduped.values())
+
+
 def status_summary(nodes, ts):
     expected_total = max(EXPECTED_NODES, len(nodes), 1)
-    dead_items = []
     live_count = 0
     for node in nodes:
         last_seen = int(node.get("last_seen", 0) or 0)
         age = ts - last_seen
         if age <= STALE_SEC:
             live_count += 1
-        else:
-            dead_items.append((node, age))
+    dead_items, falls, falls_nodes, total_downtime = downtime_totals(nodes, ts)
 
     lines = [
         "",
@@ -3311,16 +3352,7 @@ def status_summary(nodes, ts):
     else:
         lines.append("нет")
 
-    with LOCK:
-        falls = dict(ensure_today_falls())
-        falls_nodes = dict(falls.get("nodes") or {})
     total_falls = int(falls.get("total", 0) or 0)
-    completed_downtime = int(falls.get("downtime_sec", 0) or 0)
-    active_downtime = 0
-    for node, age in dead_items:
-        offline_since = int(node.get("offline_since") or node.get("last_seen") or ts)
-        active_downtime += max(0, ts - offline_since)
-    total_downtime = completed_downtime + active_downtime
     lines += [
         "",
         f"<b>Общее кол-во падений за сегодня: {total_falls}</b>",
@@ -3339,13 +3371,7 @@ def status_summary(nodes, ts):
 
 def aggregate_message():
     with LOCK:
-        deduped = {}
-        for node in NODES.values():
-            key = node_canonical_key(node)
-            current = deduped.get(key)
-            if current is None or int(node.get("last_seen", 0) or 0) > int(current.get("last_seen", 0) or 0):
-                deduped[key] = node
-        nodes = list(deduped.values())
+        nodes = dedupe_nodes(NODES.values())
     ts = now_ts()
     if not nodes:
         return "<b>Статистика обходов</b>\n\nНет данных от машин."
@@ -3536,6 +3562,53 @@ def daily_report_loop():
             time.sleep(20)
 
 
+def parse_duration_arg(value):
+    text = re.sub(r"\s+", "", str(value or "").lower())
+    if not text:
+        raise ValueError("empty duration")
+    units = {
+        "d": 86400, "day": 86400, "days": 86400, "д": 86400, "день": 86400, "дня": 86400, "дней": 86400,
+        "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600, "ч": 3600, "час": 3600, "часа": 3600, "часов": 3600,
+        "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60, "м": 60, "мин": 60, "минута": 60, "минуты": 60, "минут": 60,
+        "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1, "с": 1, "сек": 1, "секунда": 1, "секунды": 1, "секунд": 1,
+    }
+    total = 0
+    pos = 0
+    for match in re.finditer(r"(\d+)([a-zа-я]+)", text):
+        if match.start() != pos:
+            raise ValueError("bad duration")
+        amount = int(match.group(1))
+        unit = match.group(2)
+        if unit not in units:
+            raise ValueError("bad unit")
+        total += amount * units[unit]
+        pos = match.end()
+    if pos != len(text) or total <= 0:
+        raise ValueError("bad duration")
+    return total
+
+
+def handle_statsrevoke(text):
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        send_message("<b>Пример:</b> /statsrevoke 50h\nМожно: 90m, 30s, 1h30m, 2ч")
+        return
+    try:
+        seconds = parse_duration_arg(parts[1])
+    except Exception:
+        send_message("<b>Не понял время.</b>\nПример: /statsrevoke 50h\nМожно: 90m, 30s, 1h30m, 2ч")
+        return
+    with LOCK:
+        revoke_downtime(seconds)
+        nodes = dedupe_nodes(NODES.values())
+    _, _, _, total_downtime = downtime_totals(nodes, now_ts())
+    send_message(
+        "<b>Downtime скорректирован</b>\n\n"
+        f"Вычел: {format_duration_ru(seconds)}\n"
+        f"Теперь за сегодня: {format_duration_ru(total_downtime)}"
+    )
+
+
 def bot_loop():
     offset = load_offset()
     try:
@@ -3572,6 +3645,8 @@ def bot_loop():
                 command = text.split()[0].split("@", 1)[0].lower() if text.split() else ""
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats":
                     send_message(aggregate_message())
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statsrevoke":
+                    handle_statsrevoke(text)
         except Exception as exc:
             log(f"bot loop failed: {exc}")
             time.sleep(5)
@@ -3758,7 +3833,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v132"
+PUSH_BUILD="v133"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
