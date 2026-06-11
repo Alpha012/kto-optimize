@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v135"
+SCRIPT_BUILD="v136"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2946,7 +2946,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v135"
+COLLECTOR_BUILD = "v136"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3259,6 +3259,8 @@ def send_message(text):
 def node_message(node, status=None):
     name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
     ip = html.escape(str(node.get("ip") or "-"))
+    uptime_sec = int(node.get("uptime_sec") or 0)
+    uptime_text = format_duration_ru(uptime_sec) if uptime_sec > 0 else "-"
     error = str(node.get("error") or "")
     updated = node.get("updated_at") or node.get("last_seen") or 0
     metrics_ok = bool(node.get("metrics_ok"))
@@ -3269,7 +3271,7 @@ def node_message(node, status=None):
     if metrics_ok:
         ram_line = f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}"
         cpu_line = f"Нагруженность процессора: {format_percent(node.get('cpu_percent', 0))}"
-    lines = [f"<blockquote><b>{name}</b>\nIP: {ip}</blockquote>", ""]
+    lines = [f"<blockquote><b>{name}</b>\nIP: {ip}\nАптайм: {uptime_text}</blockquote>", ""]
     if error:
         lines += [
             "I/O: - | -",
@@ -3345,10 +3347,13 @@ def status_summary(nodes, ts):
         for node, age in dead_items:
             name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
             ip = html.escape(str(node.get("ip") or "-"))
+            uptime_sec = int(node.get("uptime_sec") or 0)
+            uptime_text = format_duration_ru(uptime_sec) if uptime_sec > 0 else "-"
             last_seen = int(node.get("last_seen", 0) or 0)
             lines += [
                 f"<blockquote><b>{name}</b>",
                 f"IP: {ip}",
+                f"Аптайм: {uptime_text}",
                 f"Последнее удачное обновление: {fmt_time(last_seen)}",
                 f"В даунтайме: {format_duration_ru(age)}</blockquote>",
             ]
@@ -3408,6 +3413,7 @@ def update_node(payload, remote_ip=""):
         "id": node_id,
         "name": str(payload.get("name") or node_id),
         "ip": str(remote_ip or payload.get("ip") or ""),
+        "uptime_sec": int(payload.get("uptime_sec") or 0),
         "iface": str(payload.get("iface") or ""),
         "hostname": str(payload.get("hostname") or ""),
         "day_total": int(payload.get("day_total") or 0),
@@ -3846,7 +3852,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v135"
+PUSH_BUILD="v136"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
@@ -3884,6 +3890,7 @@ ram_total=0
 ram_used=0
 ram_percent=0
 cpu_percent=0
+uptime_sec=0
 metrics_ok=false
 
 int_or_zero() {
@@ -3958,10 +3965,15 @@ cpu_load_percent() {
     awk -v cores="$cores" '{ printf "%.1f\n", ($1 / cores) * 100 }' /proc/loadavg 2>/dev/null || echo 0
 }
 
+system_uptime_seconds() {
+    awk '{ printf "%d\n", $1 }' /proc/uptime 2>/dev/null || echo 0
+}
+
 read -r ram_used ram_total ram_percent < <(memory_stats)
 ram_used="$(int_or_zero "$ram_used")"
 ram_total="$(int_or_zero "$ram_total")"
 ram_percent="$(int_or_zero "$ram_percent")"
+uptime_sec="$(int_or_zero "$(system_uptime_seconds)")"
 cpu_sample_percent="$(number_or_zero "$(cpu_usage_percent)")"
 cpu_load_percent_value="$(number_or_zero "$(cpu_load_percent)")"
 cpu_percent="$(awk -v sample="$cpu_sample_percent" -v load_value="$cpu_load_percent_value" 'BEGIN {
@@ -4032,6 +4044,7 @@ if ! payload="$(jq -n \
     --argjson ram_total "$ram_total" \
     --argjson ram_percent "$ram_percent" \
     --argjson cpu_percent "$cpu_percent" \
+    --argjson uptime_sec "$uptime_sec" \
     --argjson metrics_ok "$metrics_ok" \
     --argjson updated_at "$updated_at" \
     '{
@@ -4052,6 +4065,7 @@ if ! payload="$(jq -n \
         ram_total: $ram_total,
         ram_percent: $ram_percent,
         cpu_percent: $cpu_percent,
+        uptime_sec: $uptime_sec,
         metrics_ok: $metrics_ok,
         error: $error,
         updated_at: $updated_at
@@ -4076,7 +4090,7 @@ fi
 rm -f "$curl_errors"
 
 if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
-    echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}%"
+    echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}% uptime=${uptime_sec}s"
 else
     echo "push ${PUSH_BUILD}: bad response: ${response}" >&2
     exit 1
