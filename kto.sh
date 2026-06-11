@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v133"
+SCRIPT_BUILD="v134"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2946,7 +2946,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v133"
+COLLECTOR_BUILD = "v134"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3258,6 +3258,7 @@ def send_message(text):
 
 def node_message(node, status=None):
     name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
+    ip = html.escape(str(node.get("ip") or "-"))
     error = str(node.get("error") or "")
     updated = node.get("updated_at") or node.get("last_seen") or 0
     metrics_ok = bool(node.get("metrics_ok"))
@@ -3268,7 +3269,7 @@ def node_message(node, status=None):
     if metrics_ok:
         ram_line = f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}"
         cpu_line = f"Нагруженность процессора: {format_percent(node.get('cpu_percent', 0))}"
-    lines = [f"<blockquote><b>{name}</b></blockquote>", ""]
+    lines = [f"<blockquote><b>{name}</b>\nIP: {ip}</blockquote>", ""]
     if error:
         lines += [
             "I/O: - | -",
@@ -3343,9 +3344,11 @@ def status_summary(nodes, ts):
         dead_items.sort(key=lambda item: natural_sort_key(item[0].get("name") or item[0].get("id") or ""))
         for node, age in dead_items:
             name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
+            ip = html.escape(str(node.get("ip") or "-"))
             last_seen = int(node.get("last_seen", 0) or 0)
             lines += [
                 f"<blockquote><b>{name}</b>",
+                f"IP: {ip}",
                 f"Последнее удачное обновление: {fmt_time(last_seen)}",
                 f"В даунтайме: {format_duration_ru(age)}</blockquote>",
             ]
@@ -3396,7 +3399,7 @@ def alert_online(node_id, node):
     send_message(f"<b>{name}</b>\n\nСнова онлайн")
 
 
-def update_node(payload):
+def update_node(payload, remote_ip=""):
     node_id = str(payload.get("id") or payload.get("name") or payload.get("hostname") or "").strip()
     if not node_id:
         raise ValueError("id/name is required")
@@ -3404,6 +3407,7 @@ def update_node(payload):
     record = {
         "id": node_id,
         "name": str(payload.get("name") or node_id),
+        "ip": str(remote_ip or payload.get("ip") or ""),
         "iface": str(payload.get("iface") or ""),
         "hostname": str(payload.get("hostname") or ""),
         "day_total": int(payload.get("day_total") or 0),
@@ -3492,7 +3496,8 @@ class Handler(BaseHTTPRequestHandler):
             if length <= 0 or length > 65536:
                 raise ValueError("bad content length")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            node = update_node(payload)
+            remote_ip = self.client_address[0] if self.client_address else ""
+            node = update_node(payload, remote_ip)
             self.send_json(200, {"ok": True, "id": node["id"], "last_seen": node["last_seen"]})
         except Exception as exc:
             self.send_json(400, {"ok": False, "error": str(exc)})
@@ -3833,7 +3838,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v133"
+PUSH_BUILD="v134"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
