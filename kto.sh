@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v136"
+SCRIPT_BUILD="v137"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2946,7 +2946,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v136"
+COLLECTOR_BUILD = "v137"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3112,6 +3112,25 @@ def revoke_downtime(seconds):
         save_falls()
     except Exception as exc:
         log(f"save downtime revoke failed: {exc}")
+
+
+def reset_daily_falls(nodes, ts):
+    active_downtime = 0
+    for node in nodes:
+        last_seen = int(node.get("last_seen", 0) or 0)
+        age = ts - last_seen
+        if age > STALE_SEC:
+            offline_since = int(node.get("offline_since") or last_seen or ts)
+            active_downtime += max(0, ts - offline_since)
+    falls = ensure_today_falls()
+    falls["total"] = 0
+    falls["nodes"] = {}
+    falls["downtime_sec"] = 0
+    falls["downtime_revoke_sec"] = active_downtime
+    try:
+        save_falls()
+    except Exception as exc:
+        log(f"save full revoke failed: {exc}")
 
 
 def format_bytes(value):
@@ -3608,12 +3627,25 @@ def parse_duration_arg(value):
 def handle_statsrevoke(text):
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
-        send_message("<b>Пример:</b> /statsrevoke 50h\nМожно: 90m, 30s, 1h30m, 2ч")
+        send_message("<b>Пример:</b> /statsrevoke 50h\nМожно: 90m, 30s, 1h30m, 2ч, full")
+        return
+    arg = parts[1].strip().lower()
+    if arg == "full":
+        ts = now_ts()
+        with LOCK:
+            nodes = dedupe_nodes(NODES.values())
+            reset_daily_falls(nodes, ts)
+        send_message(
+            "<b>Стата за сегодня сброшена</b>\n\n"
+            "Downtime: 0 секунд\n"
+            "Падений: 0\n"
+            "Топ машин: пусто"
+        )
         return
     try:
-        seconds = parse_duration_arg(parts[1])
+        seconds = parse_duration_arg(arg)
     except Exception:
-        send_message("<b>Не понял время.</b>\nПример: /statsrevoke 50h\nМожно: 90m, 30s, 1h30m, 2ч")
+        send_message("<b>Не понял время.</b>\nПример: /statsrevoke 50h\nМожно: 90m, 30s, 1h30m, 2ч, full")
         return
     with LOCK:
         revoke_downtime(seconds)
@@ -3852,7 +3884,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v136"
+PUSH_BUILD="v137"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
