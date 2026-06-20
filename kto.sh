@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v137"
+SCRIPT_BUILD="v138"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -50,6 +50,8 @@ STATS_COLLECTOR_STALE_SEC_DEFAULT="60"
 STATS_COLLECTOR_TZ_DEFAULT="Europe/Moscow"
 STATS_ALLOWED_USER_ID_DEFAULT="646296998"
 STATS_EXPECTED_NODES_DEFAULT="10"
+SPEEDTEST_TIMEOUT="${KTO_SPEEDTEST_TIMEOUT:-240}"
+SPEEDTEST_DOWNLOAD_TIMEOUT="${KTO_SPEEDTEST_DOWNLOAD_TIMEOUT:-180}"
 APT_UPDATED=0
 
 GREEN='\033[0;32m'
@@ -153,6 +155,21 @@ must() {
         tail -n 25 "$LOG_FILE" >&2 || true
         return 1
     fi
+}
+
+run_live_capture_timeout() {
+    local timeout_sec="$1"
+    local output_file="$2"
+    shift 2
+
+    : > "$output_file"
+    if command_exists timeout; then
+        timeout --foreground "${timeout_sec}s" "$@" 2>&1 | tee -a "$LOG_FILE" "$output_file"
+        return "${PIPESTATUS[0]}"
+    fi
+
+    "$@" 2>&1 | tee -a "$LOG_FILE" "$output_file"
+    return "${PIPESTATUS[0]}"
 }
 
 PROGRESS_TOTAL=1
@@ -2638,6 +2655,8 @@ print_speedtest_result() {
     local output="$1"
     local filtered server isp latency download download_detail upload upload_detail loss url
 
+    output="${output//$'\r'/$'\n'}"
+    output="$(sed -r 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' <<< "$output")"
     filtered="$(sed -n '/Speedtest by Ookla/,/Result URL:/p' <<< "$output")"
     [[ -n "$filtered" ]] || return 1
 
@@ -2668,32 +2687,86 @@ print_speedtest_result() {
 install_speedtest() {
     header
     need_root
-    local output filtered
+    local output filtered output_file archive arch url rc
     stage "Готовлю Speedtest"
+    if [[ -x /usr/local/bin/speedtest ]] && command_exists timeout; then
+        if ! timeout --foreground 10s /usr/local/bin/speedtest --version >> "$LOG_FILE" 2>&1; then
+            warn "Speedtest binary не отвечает, переустановлю."
+            cmd "${SUDO[@]}" rm -f /usr/local/bin/speedtest || true
+        fi
+    fi
     if ! [[ -x /usr/local/bin/speedtest ]]; then
         cmd "${SUDO[@]}" apt-get remove -y speedtest-cli || true
         cmd "${SUDO[@]}" rm -f /usr/bin/speedtest /usr/local/bin/speedtest || true
-        if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
-            curl -fsSL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz | "${SUDO[@]}" tar xz -C /usr/local/bin speedtest >> "$LOG_FILE" 2>&1
+        arch="$(uname -m)"
+        if [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
+            url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
         else
-            curl -fsSL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz | "${SUDO[@]}" tar xz -C /usr/local/bin speedtest >> "$LOG_FILE" 2>&1
+            url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
         fi
+        archive="$(mktemp)"
+        output_file="$(mktemp)"
+        stage "Скачиваю Ookla CLI"
+        if run_live_capture_timeout "$SPEEDTEST_DOWNLOAD_TIMEOUT" "$output_file" \
+            curl -fL --progress-bar --connect-timeout 10 --retry 2 --retry-delay 2 --max-time "$SPEEDTEST_DOWNLOAD_TIMEOUT" \
+            -o "$archive" "$url"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        if (( rc != 0 )); then
+            rm -f "$archive" "$output_file"
+            fail "Скачивание Speedtest"
+            if (( rc == 124 )); then
+                warn "Скачивание зависло дольше ${SPEEDTEST_DOWNLOAD_TIMEOUT}s."
+            fi
+            return 1
+        fi
+        rm -f "$output_file"
+        must "Распаковка Speedtest" "${SUDO[@]}" tar xzf "$archive" -C /usr/local/bin speedtest
+        rm -f "$archive"
     else
         echo "Speedtest binary skipped: already installed" >> "$LOG_FILE"
     fi
     echo
-    stage "Запускаю Ookla"
-    if ! output="$(/usr/local/bin/speedtest --accept-license --accept-gdpr --progress=no 2>&1)"; then
-        if ! output="$(/usr/local/bin/speedtest --accept-license --accept-gdpr 2>&1)"; then
-            fail "Speedtest"
-            printf '%s\n' "$output" >&2
+    stage "Запускаю Ookla (живой вывод, таймаут ${SPEEDTEST_TIMEOUT}s)"
+    output_file="$(mktemp)"
+    if run_live_capture_timeout "$SPEEDTEST_TIMEOUT" "$output_file" \
+        /usr/local/bin/speedtest --accept-license --accept-gdpr --progress=yes; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if (( rc != 0 )); then
+        output="$(cat "$output_file" 2>/dev/null || true)"
+        if (( rc == 124 )); then
+            rm -f "$output_file"
+            fail "Speedtest завис дольше ${SPEEDTEST_TIMEOUT}s"
             return 1
         fi
+        warn "Ookla завершился с кодом ${rc}, пробую повтор без progress."
+        : > "$output_file"
+        if run_live_capture_timeout "$SPEEDTEST_TIMEOUT" "$output_file" \
+            /usr/local/bin/speedtest --accept-license --accept-gdpr --progress=no; then
+            rc=0
+        else
+            rc=$?
+        fi
+        if (( rc != 0 )); then
+            output="$(cat "$output_file" 2>/dev/null || true)"
+            rm -f "$output_file"
+            fail "Speedtest"
+            printf '%s\n' "$output" >&2
+            return "$rc"
+        fi
     fi
+    output="$(cat "$output_file" 2>/dev/null || true)"
+    rm -f "$output_file"
     if print_speedtest_result "$output"; then
         return 0
     fi
 
+    warn "Не смог красиво распарсить результат, оставляю сырой вывод."
     filtered="$(sed -n '/Speedtest by Ookla/,/Result URL:/p' <<< "$output")"
     if [[ -n "$filtered" ]]; then
         printf '%s\n' "$filtered"
@@ -2946,7 +3019,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v137"
+COLLECTOR_BUILD = "v138"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3884,7 +3957,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v137"
+PUSH_BUILD="v138"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
