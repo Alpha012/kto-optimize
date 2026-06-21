@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v139"
+SCRIPT_BUILD="v140"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2651,13 +2651,83 @@ speedtest_row() {
     printf " %-11s %b\n" "$label" "$value"
 }
 
+speedtest_clean_output() {
+    local output="$1"
+    output="${output//$'\r'/$'\n'}"
+    output="$(sed -r 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' <<< "$output")"
+    sed -E '/^[[:space:]]*(Download|Upload):.*\[[^]]*\][[:space:]]*[0-9]+%/d' <<< "$output"
+}
+
+speedtest_live_status() {
+    local output_file="$1"
+    local elapsed="$2"
+    local output server latency download upload
+
+    output="$(cat "$output_file" 2>/dev/null || true)"
+    output="${output//$'\r'/$'\n'}"
+    output="$(sed -r 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' <<< "$output")"
+
+    server="$(awk '/^[[:space:]]*Server:/ {sub(/^[[:space:]]*Server:[[:space:]]*/, ""); print; exit}' <<< "$output")"
+    latency="$(awk '/^[[:space:]]*Idle Latency:/ {sub(/^[[:space:]]*Idle Latency:[[:space:]]*/, ""); sub(/[[:space:]]+\(.*/, ""); print; exit}' <<< "$output")"
+    download="$(awk '
+        /^[[:space:]]*Download:.*\(data used:/ {line=$0}
+        END {sub(/^[[:space:]]*Download:[[:space:]]*/, "", line); sub(/[[:space:]]+\(data used:.*/, "", line); print line}
+    ' <<< "$output")"
+    upload="$(awk '
+        /^[[:space:]]*Upload:.*\(data used:/ {line=$0}
+        END {sub(/^[[:space:]]*Upload:[[:space:]]*/, "", line); sub(/[[:space:]]+\(data used:.*/, "", line); print line}
+    ' <<< "$output")"
+
+    if [[ -z "$download" ]] && grep -Eq '^[[:space:]]*Download:' <<< "$output"; then
+        download="идёт"
+    fi
+    if [[ -z "$upload" ]] && grep -Eq '^[[:space:]]*Upload:' <<< "$output"; then
+        upload="идёт"
+    fi
+
+    printf '[..] Speedtest %ss' "$elapsed"
+    [[ -n "$server" ]] && printf ' | server: %.36s' "$server"
+    [[ -n "$latency" ]] && printf ' | ping: %s' "$latency"
+    [[ -n "$download" ]] && printf ' | down: %s' "$download"
+    [[ -n "$upload" ]] && printf ' | up: %s' "$upload"
+}
+
+run_speedtest_live() {
+    local output_file="$1"
+    shift
+    local pid rc start now elapsed
+
+    : > "$output_file"
+    if command_exists timeout; then
+        timeout --foreground "${SPEEDTEST_TIMEOUT}s" "$@" > "$output_file" 2>&1 &
+    else
+        "$@" > "$output_file" 2>&1 &
+    fi
+    pid=$!
+    start="$(date +%s)"
+
+    while kill -0 "$pid" 2>/dev/null; do
+        now="$(date +%s)"
+        elapsed=$(( now - start ))
+        printf '\r\033[K%s' "$(speedtest_live_status "$output_file" "$elapsed")"
+        sleep 1
+    done
+
+    if wait "$pid"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    printf '\r\033[K'
+    cat "$output_file" >> "$LOG_FILE" 2>/dev/null || true
+    return "$rc"
+}
+
 print_speedtest_result() {
     local output="$1"
     local filtered server isp latency download download_detail upload upload_detail loss url
 
-    output="${output//$'\r'/$'\n'}"
-    output="$(sed -r 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' <<< "$output")"
-    output="$(sed -E '/^[[:space:]]*(Download|Upload):.*\[[^]]*\][[:space:]]*[0-9]+%/d' <<< "$output")"
+    output="$(speedtest_clean_output "$output")"
     filtered="$(sed -n '/Speedtest by Ookla/,/Result URL:/p' <<< "$output")"
     [[ -n "$filtered" ]] || return 1
 
@@ -2738,16 +2808,21 @@ install_speedtest() {
         echo "Speedtest binary skipped: already installed" >> "$LOG_FILE"
     fi
     echo
-    stage "Запускаю Ookla (живой вывод, таймаут ${SPEEDTEST_TIMEOUT}s)"
+    stage "Запускаю Speedtest"
     output_file="$(mktemp)"
-    if run_live_capture_timeout "$SPEEDTEST_TIMEOUT" "$output_file" \
+    if run_speedtest_live "$output_file" \
         /usr/local/bin/speedtest --accept-license --accept-gdpr --progress=yes; then
         rc=0
     else
         rc=$?
     fi
+    echo
+    output="$(cat "$output_file" 2>/dev/null || true)"
+    if print_speedtest_result "$output"; then
+        rm -f "$output_file"
+        return 0
+    fi
     if (( rc != 0 )); then
-        output="$(cat "$output_file" 2>/dev/null || true)"
         if (( rc == 124 )); then
             rm -f "$output_file"
             fail "Speedtest завис дольше ${SPEEDTEST_TIMEOUT}s"
@@ -2755,27 +2830,29 @@ install_speedtest() {
         fi
         warn "Ookla завершился с кодом ${rc}, пробую повтор без progress."
         : > "$output_file"
-        if run_live_capture_timeout "$SPEEDTEST_TIMEOUT" "$output_file" \
+        if run_speedtest_live "$output_file" \
             /usr/local/bin/speedtest --accept-license --accept-gdpr --progress=no; then
             rc=0
         else
             rc=$?
         fi
+        echo
+        output="$(cat "$output_file" 2>/dev/null || true)"
+        if print_speedtest_result "$output"; then
+            rm -f "$output_file"
+            return 0
+        fi
         if (( rc != 0 )); then
-            output="$(cat "$output_file" 2>/dev/null || true)"
             rm -f "$output_file"
             fail "Speedtest"
-            printf '%s\n' "$output" >&2
+            printf '%s\n' "$(speedtest_clean_output "$output")" >&2
             return "$rc"
         fi
     fi
-    output="$(cat "$output_file" 2>/dev/null || true)"
     rm -f "$output_file"
-    if print_speedtest_result "$output"; then
-        return 0
-    fi
 
     warn "Не смог красиво распарсить результат, оставляю сырой вывод."
+    output="$(speedtest_clean_output "$output")"
     filtered="$(sed -n '/Speedtest by Ookla/,/Result URL:/p' <<< "$output")"
     if [[ -n "$filtered" ]]; then
         printf '%s\n' "$filtered"
@@ -3028,7 +3105,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v139"
+COLLECTOR_BUILD = "v140"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3966,7 +4043,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v139"
+PUSH_BUILD="v140"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
