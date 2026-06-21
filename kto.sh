@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v140"
+SCRIPT_BUILD="v141"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2766,7 +2766,15 @@ print_speedtest_result() {
 install_speedtest() {
     header
     need_root
-    local output filtered output_file archive arch url rc
+    local output filtered output_file archive arch url rc server_id
+    local -a speedtest_args speedtest_retry_args
+
+    server_id="${1:-${KTO_SPEEDTEST_SERVER_ID:-}}"
+    if [[ -n "$server_id" ]] && ! [[ "$server_id" =~ ^[0-9]+$ ]]; then
+        fail "Speedtest server id должен быть числом"
+        return 1
+    fi
+
     stage "Готовлю Speedtest"
     if [[ -x /usr/local/bin/speedtest ]] && command_exists timeout; then
         if ! timeout --foreground 10s /usr/local/bin/speedtest --version >> "$LOG_FILE" 2>&1; then
@@ -2807,11 +2815,19 @@ install_speedtest() {
     else
         echo "Speedtest binary skipped: already installed" >> "$LOG_FILE"
     fi
+
+    speedtest_args=(/usr/local/bin/speedtest --accept-license --accept-gdpr --progress=yes)
+    speedtest_retry_args=(/usr/local/bin/speedtest --accept-license --accept-gdpr --progress=no)
+    if [[ -n "$server_id" ]]; then
+        speedtest_args+=(--server-id="$server_id")
+        speedtest_retry_args+=(--server-id="$server_id")
+        ok "Сервер Speedtest: ${server_id}"
+    fi
+
     echo
     stage "Запускаю Speedtest"
     output_file="$(mktemp)"
-    if run_speedtest_live "$output_file" \
-        /usr/local/bin/speedtest --accept-license --accept-gdpr --progress=yes; then
+    if run_speedtest_live "$output_file" "${speedtest_args[@]}"; then
         rc=0
     else
         rc=$?
@@ -2830,8 +2846,7 @@ install_speedtest() {
         fi
         warn "Ookla завершился с кодом ${rc}, пробую повтор без progress."
         : > "$output_file"
-        if run_speedtest_live "$output_file" \
-            /usr/local/bin/speedtest --accept-license --accept-gdpr --progress=no; then
+        if run_speedtest_live "$output_file" "${speedtest_retry_args[@]}"; then
             rc=0
         else
             rc=$?
@@ -3105,7 +3120,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v140"
+COLLECTOR_BUILD = "v141"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4043,7 +4058,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v140"
+PUSH_BUILD="v141"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
@@ -4865,7 +4880,7 @@ main() {
         selfsteal) install_selfsteal ;;
         warp) install_warp_native ;;
         status) show_status ;;
-        speedtest) install_speedtest ;;
+        speedtest) install_speedtest "${2:-}" ;;
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
