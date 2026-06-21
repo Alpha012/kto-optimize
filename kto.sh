@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v138"
+SCRIPT_BUILD="v139"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2657,16 +2657,25 @@ print_speedtest_result() {
 
     output="${output//$'\r'/$'\n'}"
     output="$(sed -r 's/\x1B\[[0-9;?]*[ -/]*[@-~]//g' <<< "$output")"
+    output="$(sed -E '/^[[:space:]]*(Download|Upload):.*\[[^]]*\][[:space:]]*[0-9]+%/d' <<< "$output")"
     filtered="$(sed -n '/Speedtest by Ookla/,/Result URL:/p' <<< "$output")"
     [[ -n "$filtered" ]] || return 1
 
     server="$(awk '/^[[:space:]]*Server:/ {sub(/^[[:space:]]*Server:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
     isp="$(awk '/^[[:space:]]*ISP:/ {sub(/^[[:space:]]*ISP:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
     latency="$(awk '/^[[:space:]]*Idle Latency:/ {sub(/^[[:space:]]*Idle Latency:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
-    download="$(awk '/^[[:space:]]*Download:/ {sub(/^[[:space:]]*Download:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
-    download_detail="$(awk 'seen && /^[[:space:]]+[0-9.]+[[:space:]]+ms/ {sub(/^[[:space:]]+/,""); print; exit} /^[[:space:]]*Download:/ {seen=1}' <<< "$filtered")"
-    upload="$(awk '/^[[:space:]]*Upload:/ {sub(/^[[:space:]]*Upload:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
-    upload_detail="$(awk 'seen && /^[[:space:]]+[0-9.]+[[:space:]]+ms/ {sub(/^[[:space:]]+/,""); print; exit} /^[[:space:]]*Upload:/ {seen=1}' <<< "$filtered")"
+    download="$(awk '/^[[:space:]]*Download:/ {line=$0} END {sub(/^[[:space:]]*Download:[[:space:]]*/, "", line); print line}' <<< "$filtered")"
+    download_detail="$(awk '
+        /^[[:space:]]*Download:/ {seen=1; detail=""; next}
+        seen && /^[[:space:]]+[0-9.]+[[:space:]]+ms/ {sub(/^[[:space:]]+/,""); detail=$0; seen=0}
+        END {print detail}
+    ' <<< "$filtered")"
+    upload="$(awk '/^[[:space:]]*Upload:/ {line=$0} END {sub(/^[[:space:]]*Upload:[[:space:]]*/, "", line); print line}' <<< "$filtered")"
+    upload_detail="$(awk '
+        /^[[:space:]]*Upload:/ {seen=1; detail=""; next}
+        seen && /^[[:space:]]+[0-9.]+[[:space:]]+ms/ {sub(/^[[:space:]]+/,""); detail=$0; seen=0}
+        END {print detail}
+    ' <<< "$filtered")"
     loss="$(awk '/^[[:space:]]*Packet Loss:/ {sub(/^[[:space:]]*Packet Loss:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
     url="$(awk '/^[[:space:]]*Result URL:/ {sub(/^[[:space:]]*Result URL:[[:space:]]*/, ""); print; exit}' <<< "$filtered")"
 
@@ -3019,7 +3028,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v138"
+COLLECTOR_BUILD = "v139"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3957,7 +3966,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v138"
+PUSH_BUILD="v139"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
