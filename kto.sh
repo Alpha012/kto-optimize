@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v141"
+SCRIPT_BUILD="v142"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -2876,6 +2876,15 @@ install_speedtest() {
     fi
 }
 
+speedtest_ru() {
+    header
+    need_root
+    stage "Запускаю Speedtest (RU)"
+    apt_install_with_update_if_missing wget
+    echo "running: wget -qO- bench.tlab.pw | bash" >> "$LOG_FILE"
+    bash -c 'wget -qO- bench.tlab.pw | bash'
+}
+
 ipcheck_place() {
     header
     stage "Проверяю IP.Check.Place"
@@ -3120,7 +3129,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v141"
+COLLECTOR_BUILD = "v142"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4058,7 +4067,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v141"
+PUSH_BUILD="v142"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
@@ -4802,6 +4811,8 @@ menu() {
     else
         labels+=("Speedtest")
         actions+=("speedtest")
+        labels+=("Speedtest (RU)")
+        actions+=("speedtest-ru")
         labels+=("Проверка IP (IP.Check.Place)")
         actions+=("ipcheck-place")
         labels+=("Проверка IP (Region Check)")
@@ -4851,6 +4862,7 @@ menu() {
         stats-collector) install_stats_collector ;;
         stats-collector-status) stats_collector_status ;;
         speedtest) install_speedtest ;;
+        speedtest-ru) speedtest_ru ;;
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
@@ -4881,6 +4893,7 @@ main() {
         warp) install_warp_native ;;
         status) show_status ;;
         speedtest) install_speedtest "${2:-}" ;;
+        speedtest-ru|speedtestru|bench-ru|benchru) speedtest_ru ;;
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
