@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v143"
+SCRIPT_BUILD="v144"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -3182,7 +3182,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v143"
+COLLECTOR_BUILD = "v144"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3894,6 +3894,87 @@ def handle_statsrevoke(text):
     )
 
 
+def delete_node_records(query):
+    query = str(query or "").strip()
+    needle = canonical_node_key(query)
+    if not needle:
+        return [], [], 0
+
+    deleted = []
+    removed_fall_names = []
+    removed_falls = 0
+    with LOCK:
+        aliases = {needle}
+        for node_id, node in list(NODES.items()):
+            candidates = [
+                node_id,
+                node.get("id"),
+                node.get("name"),
+                node.get("hostname"),
+            ]
+            if any(canonical_node_key(value) == needle for value in candidates):
+                deleted.append((node_id, dict(node)))
+                aliases.update(canonical_node_key(value) for value in candidates if value)
+                del NODES[node_id]
+
+        if deleted:
+            save_nodes()
+
+        falls = ensure_today_falls()
+        falls_nodes = falls.setdefault("nodes", {})
+        for name in list(falls_nodes.keys()):
+            if canonical_node_key(name) in aliases:
+                try:
+                    removed_falls += int(falls_nodes.get(name, 0) or 0)
+                except Exception:
+                    pass
+                removed_fall_names.append(name)
+                del falls_nodes[name]
+        if removed_falls:
+            falls["total"] = max(0, int(falls.get("total", 0) or 0) - removed_falls)
+        if deleted or removed_fall_names:
+            save_falls()
+
+    return deleted, removed_fall_names, removed_falls
+
+
+def handle_delete(text):
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        send_message("<b>Пример:</b> /delete Обход №8")
+        return
+
+    query = parts[1].strip()
+    deleted, removed_fall_names, removed_falls = delete_node_records(query)
+    if not deleted and not removed_fall_names:
+        send_message(
+            "<b>Не нашёл такой обход</b>\n\n"
+            f"Запрос: <code>{html.escape(query)}</code>\n"
+            "Пиши точное название, например: <code>/delete Обход №8</code>"
+        )
+        return
+
+    lines = ["<b>Обход удалён</b>", ""]
+    if deleted:
+        for node_id, node in deleted:
+            name = html.escape(str(node.get("name") or node_id))
+            ip = html.escape(str(node.get("ip") or "-"))
+            lines.append(f"<blockquote>{name}\nIP: {ip}</blockquote>")
+    else:
+        lines.append("Активной записи уже не было.")
+    if removed_fall_names:
+        lines += [
+            "",
+            f"Падений за сегодня вычистил: {removed_falls}",
+            "Топ падений: очищен по этому обходу",
+        ]
+    lines += [
+        "",
+        "<i>Если машина продолжает пушить стату, она появится снова.</i>",
+    ]
+    send_message("\n".join(lines))
+
+
 def bot_loop():
     offset = load_offset()
     try:
@@ -3932,6 +4013,8 @@ def bot_loop():
                     send_message(aggregate_message())
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statsrevoke":
                     handle_statsrevoke(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete":
+                    handle_delete(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statstest":
                     send_message("<b>Проверка алертов</b>\n\nКоллектор жив, Telegram отправка работает.")
         except Exception as exc:
@@ -4120,7 +4203,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v143"
+PUSH_BUILD="v144"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
