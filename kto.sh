@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v142"
+SCRIPT_BUILD="v143"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -1554,7 +1554,9 @@ opt_memory_guard() {
     local swappiness=10
 
     if zram_recommended; then
-        opt_zram
+        if ! opt_zram optional; then
+            warn "Продолжаю настройку памяти без ZRAM."
+        fi
     fi
     if zram_active; then
         swappiness=100
@@ -1700,19 +1702,40 @@ EOF
 
 opt_zram() {
     need_root
-    local size
+    local mode="${1:-strict}"
+    local size rc
 
     if zram_active; then
         ok "ZRAM уже активен: $(zram_swap_summary)"
         return 0
     fi
 
-    if ! command_exists zramctl; then
+    if ! command_exists zramctl || ! command_exists modprobe; then
         apt_update_quiet
-        apt_install_quiet util-linux
+        apt_install_quiet util-linux kmod
     fi
     if ! command_exists zramctl; then
-        fail "zramctl не найден"
+        if [[ "$mode" == "optional" ]]; then
+            warn "zramctl не найден, ZRAM пропущен."
+        else
+            fail "zramctl не найден"
+        fi
+        return 1
+    fi
+    if ! command_exists modprobe; then
+        if [[ "$mode" == "optional" ]]; then
+            warn "modprobe не найден, ZRAM пропущен."
+        else
+            fail "modprobe не найден"
+        fi
+        return 1
+    fi
+    if ! "${SUDO[@]}" modprobe zram >/dev/null 2>&1; then
+        if [[ "$mode" == "optional" ]]; then
+            warn "ZRAM не поддерживается ядром/провайдером, пропускаю."
+        else
+            fail "ZRAM не поддерживается ядром/провайдером"
+        fi
         return 1
     fi
 
@@ -1722,6 +1745,7 @@ opt_zram() {
     write_root_file_mode 0755 "$ZRAM_SETUP_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 SIZE_MB="\${KTO_ZRAM_SIZE_MB:-$size}"
 PREFERRED_ALGO="\${KTO_ZRAM_ALGO:-zstd}"
@@ -1730,7 +1754,7 @@ if awk '\$1 ~ /^\\/dev\\/zram/ {found=1} END{exit found ? 0 : 1}' /proc/swaps 2>
     exit 0
 fi
 
-modprobe zram
+modprobe zram num_devices=1 2>/dev/null || modprobe zram
 
 dev=""
 for algo in "\$PREFERRED_ALGO" lz4 lzo-rle lzo; do
@@ -1740,9 +1764,19 @@ for algo in "\$PREFERRED_ALGO" lz4 lzo-rle lzo; do
 done
 
 if [[ -z "\$dev" ]]; then
-    dev="\$(zramctl --find --size "\${SIZE_MB}M")"
+    dev="\$(zramctl --find --size "\${SIZE_MB}M" 2>/dev/null || true)"
 fi
 
+if [[ -z "\$dev" && -b /dev/zram0 ]]; then
+    zramctl --reset /dev/zram0 2>/dev/null || true
+    for algo in "\$PREFERRED_ALGO" lz4 lzo-rle lzo; do
+        if dev="\$(zramctl --find --size "\${SIZE_MB}M" --algorithm "\$algo" 2>/dev/null)"; then
+            break
+        fi
+    done
+fi
+
+[[ -n "\$dev" ]]
 mkswap -f "\$dev" >/dev/null
 swapon -p 100 "\$dev"
 EOF
@@ -1764,12 +1798,31 @@ WantedBy=multi-user.target
 EOF
 
     cmd "${SUDO[@]}" systemctl daemon-reload
-    must "Включение ZRAM" "${SUDO[@]}" systemctl enable --now "$ZRAM_SERVICE"
+    if "${SUDO[@]}" systemctl enable --now "$ZRAM_SERVICE" >> "$LOG_FILE" 2>&1; then
+        rc=0
+    else
+        rc=$?
+        "${SUDO[@]}" systemctl disable --now "$ZRAM_SERVICE" >> "$LOG_FILE" 2>&1 || true
+        "${SUDO[@]}" systemctl reset-failed "$ZRAM_SERVICE" >> "$LOG_FILE" 2>&1 || true
+        if [[ "$mode" == "optional" ]]; then
+            warn "ZRAM service не запустился, пропускаю."
+        else
+            fail "Включение ZRAM"
+            tail -n 25 "$LOG_FILE" >&2 || true
+        fi
+        return "$rc"
+    fi
 
     if zram_active; then
         ok "ZRAM включен: $(zram_swap_summary)"
     else
-        fail "ZRAM service запустился, но swap не активен"
+        "${SUDO[@]}" systemctl disable --now "$ZRAM_SERVICE" >> "$LOG_FILE" 2>&1 || true
+        "${SUDO[@]}" systemctl reset-failed "$ZRAM_SERVICE" >> "$LOG_FILE" 2>&1 || true
+        if [[ "$mode" == "optional" ]]; then
+            warn "ZRAM service запустился, но swap не активен; пропускаю."
+        else
+            fail "ZRAM service запустился, но swap не активен"
+        fi
         return 1
     fi
 }
@@ -3129,7 +3182,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v142"
+COLLECTOR_BUILD = "v143"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4067,7 +4120,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v142"
+PUSH_BUILD="v143"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
