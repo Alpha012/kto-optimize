@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v146"
+SCRIPT_BUILD="v147"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3379,7 +3379,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v146"
+COLLECTOR_BUILD = "v147"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3424,9 +3424,11 @@ NODES_FILE = os.path.join(STATE_DIR, "nodes.json")
 FALLS_FILE = os.path.join(STATE_DIR, "falls.json")
 OFFSET_FILE = os.path.join(STATE_DIR, "telegram_offset")
 DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
+SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
 LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
+SSH_ALLOWED_IPS = []
 
 if TZ_NAME:
     os.environ["TZ"] = TZ_NAME
@@ -3491,6 +3493,61 @@ def load_falls():
 
 def save_falls():
     atomic_write(FALLS_FILE, json.dumps(FALLS, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def valid_ipv4(value):
+    parts = str(value or "").strip().split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part.isdigit():
+            return False
+        try:
+            number = int(part)
+        except Exception:
+            return False
+        if number < 0 or number > 255:
+            return False
+    return True
+
+
+def normalize_ip(value):
+    value = str(value or "").strip()
+    if not valid_ipv4(value):
+        raise ValueError("bad IPv4")
+    return ".".join(str(int(part)) for part in value.split("."))
+
+
+def load_ssh_allowed_ips():
+    global SSH_ALLOWED_IPS
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(SSH_ALLOW_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, list):
+            SSH_ALLOWED_IPS = sorted({normalize_ip(item) for item in loaded if valid_ipv4(item)})
+    except Exception:
+        SSH_ALLOWED_IPS = []
+
+
+def save_ssh_allowed_ips():
+    atomic_write(SSH_ALLOW_FILE, json.dumps(SSH_ALLOWED_IPS, ensure_ascii=False, indent=2))
+
+
+def add_ssh_allowed_ip(ip):
+    ip = normalize_ip(ip)
+    with LOCK:
+        exists = ip in SSH_ALLOWED_IPS
+        if not exists:
+            SSH_ALLOWED_IPS.append(ip)
+            SSH_ALLOWED_IPS.sort(key=lambda value: tuple(int(part) for part in value.split(".")))
+            save_ssh_allowed_ips()
+        return ip, not exists, list(SSH_ALLOWED_IPS)
+
+
+def ssh_allowed_ips_snapshot():
+    with LOCK:
+        return list(SSH_ALLOWED_IPS)
 
 
 def today_key():
@@ -3957,7 +4014,12 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             remote_ip = self.client_address[0] if self.client_address else ""
             node = update_node(payload, remote_ip)
-            self.send_json(200, {"ok": True, "id": node["id"], "last_seen": node["last_seen"]})
+            self.send_json(200, {
+                "ok": True,
+                "id": node["id"],
+                "last_seen": node["last_seen"],
+                "ssh_allowed_ips": ssh_allowed_ips_snapshot(),
+            })
         except Exception as exc:
             self.send_json(400, {"ok": False, "error": str(exc)})
 
@@ -4172,6 +4234,31 @@ def handle_delete(text):
     send_message("\n".join(lines))
 
 
+def handle_add_ip(text):
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        send_message("<b>Пример:</b> /add_ip 1.2.3.4")
+        return
+
+    raw_ip = parts[1].split()[0].strip()
+    try:
+        ip, added, all_ips = add_ssh_allowed_ip(raw_ip)
+    except Exception:
+        send_message(
+            "<b>Не понял IP.</b>\n\n"
+            "Нужен IPv4, пример: <code>/add_ip 1.2.3.4</code>"
+        )
+        return
+
+    status = "добавлен" if added else "уже был в списке"
+    send_message(
+        f"<b>SSH IP {status}</b>\n\n"
+        f"<code>{html.escape(ip)}</code>\n\n"
+        f"Всего дополнительных IP: {len(all_ips)}\n"
+        "<i>Whitelist-машины применят правило при ближайшем push.</i>"
+    )
+
+
 def bot_loop():
     offset = load_offset()
     try:
@@ -4212,6 +4299,8 @@ def bot_loop():
                     handle_statsrevoke(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete":
                     handle_delete(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/add_ip":
+                    handle_add_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statstest":
                     send_message("<b>Проверка алертов</b>\n\nКоллектор жив, Telegram отправка работает.")
         except Exception as exc:
@@ -4225,6 +4314,7 @@ def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     load_nodes()
     load_falls()
+    load_ssh_allowed_ips()
     threading.Thread(target=offline_loop, daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
     if DAILY_REPORT_TIME:
@@ -4400,8 +4490,9 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v146"
+PUSH_BUILD="v147"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 push_error_trap() {
     local rc="$?" line="${BASH_LINENO[0]:-?}" command="${BASH_COMMAND:-unknown}"
@@ -4515,6 +4606,60 @@ cpu_load_percent() {
 
 system_uptime_seconds() {
     awk '{ printf "%d\n", $1 }' /proc/uptime 2>/dev/null || echo 0
+}
+
+validate_ipv4() {
+    local ip="$1" octet
+    local octets=()
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet >= 0 && 10#$octet <= 255 )) || return 1
+    done
+}
+
+detect_ssh_port() {
+    local port=""
+    if command -v sshd >/dev/null 2>&1; then
+        port="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)"
+    fi
+    if [[ -z "$port" && -r /etc/ssh/sshd_config ]]; then
+        port="$(awk 'tolower($1)=="port" && $1 !~ /^#/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+    fi
+    echo "${port:-22}"
+}
+
+ufw_active() {
+    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"
+}
+
+ufw_ssh_rule_exists() {
+    local rule="$1"
+    local ip="$2"
+    ufw status 2>/dev/null | awk -v rule="$rule" -v ip="$ip" '$0 ~ /ALLOW/ && $1 == rule && $3 == ip {found=1} END{exit found ? 0 : 1}'
+}
+
+apply_collector_ssh_ips() {
+    local response="$1"
+    local ssh_port rule ip applied=0
+
+    command -v jq >/dev/null 2>&1 || return 0
+    ufw_active || return 0
+
+    ssh_port="$(detect_ssh_port)"
+    rule="${ssh_port}/tcp"
+    while read -r ip; do
+        [[ -n "$ip" ]] || continue
+        validate_ipv4 "$ip" || continue
+        if ! ufw_ssh_rule_exists "$rule" "$ip"; then
+            ufw allow proto tcp from "$ip" to any port "$ssh_port" comment 'kto-ssh' >/dev/null 2>&1 || true
+            applied=$(( applied + 1 ))
+        fi
+    done < <(printf '%s' "$response" | jq -r '.ssh_allowed_ips[]? // empty' 2>/dev/null || true)
+
+    if (( applied > 0 )); then
+        echo "push ${PUSH_BUILD}: applied ssh ip rules=${applied}"
+    fi
 }
 
 read -r ram_used ram_total ram_percent < <(memory_stats)
@@ -4638,6 +4783,7 @@ fi
 rm -f "$curl_errors"
 
 if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+    apply_collector_ssh_ips "$response"
     echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}% uptime=${uptime_sec}s"
 else
     echo "push ${PUSH_BUILD}: bad response: ${response}" >&2
