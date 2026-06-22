@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v148"
+SCRIPT_BUILD="v149"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3256,15 +3256,31 @@ install_common_stack() {
     ok "Время: $(format_duration "$duration")"
 }
 
+reload_haproxy_gracefully() {
+    if "${SUDO[@]}" systemctl is-active --quiet haproxy 2>/dev/null; then
+        if "${SUDO[@]}" systemctl reload haproxy >> "$LOG_FILE" 2>&1; then
+            ok "HAProxy применён через reload"
+            return 0
+        fi
+        warn "HAProxy reload не прошёл, делаю restart."
+    fi
+
+    must "Запуск HAProxy" "${SUDO[@]}" systemctl restart haproxy
+}
+
 apply_haproxy_config() {
     local backend_ip="$1"
     local allowed_sni="$2"
+    local haproxy_threads
+
+    haproxy_threads="$(cpu_count)"
+    (( haproxy_threads > 32 )) && haproxy_threads=32
 
     stage "Настраиваю HAProxy"
     write_root_file /etc/haproxy/haproxy.cfg <<EOF
 global
     maxconn 200000
-    nbthread 32
+    nbthread ${haproxy_threads}
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
     tune.ssl.default-dh-param 2048
     tune.maxaccept 10000
@@ -3288,6 +3304,8 @@ defaults
     timeout client 2h
     timeout server 2h
     timeout tunnel 2h
+    timeout client-fin 30s
+    timeout server-fin 30s
 
     default-server inter 30s fall 8 rise 3
 
@@ -3296,7 +3314,7 @@ defaults
 # FRONTEND : 443
 # -------------------------
 frontend vless_in
-    bind *:443
+    bind *:443 backlog 65535
     stick-table type ip size 100k expire 30m store gpc0,conn_rate(10s)
     tcp-request inspect-delay 5s
     acl clienthello req.ssl_hello_type 1
@@ -3312,7 +3330,7 @@ backend vless_pool
     mode tcp
     balance leastconn
 
-    server xray1 ${backend_ip}:443 weight 10
+    server xray1 ${backend_ip}:443 check weight 10
 EOF
 
     if ! "${SUDO[@]}" haproxy -c -f /etc/haproxy/haproxy.cfg >> "$LOG_FILE" 2>&1; then
@@ -3322,7 +3340,7 @@ EOF
     fi
 
     cmd "${SUDO[@]}" systemctl enable haproxy || true
-    must "Перезапуск HAProxy" "${SUDO[@]}" systemctl restart haproxy
+    reload_haproxy_gracefully
 
     ok "HAProxy установлен: 443 -> ${backend_ip}:443"
     ok "Разрешенный SNI: ${allowed_sni}"
@@ -3383,7 +3401,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v148"
+COLLECTOR_BUILD = "v149"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4569,7 +4587,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v147"
+PUSH_BUILD="v149"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
