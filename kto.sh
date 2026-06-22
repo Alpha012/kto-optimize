@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v147"
+SCRIPT_BUILD="v148"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3265,6 +3265,7 @@ apply_haproxy_config() {
 global
     maxconn 200000
     nbthread 32
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
     tune.ssl.default-dh-param 2048
     tune.maxaccept 10000
     tune.bufsize 65536
@@ -3296,9 +3297,12 @@ defaults
 # -------------------------
 frontend vless_in
     bind *:443
+    stick-table type ip size 100k expire 30m store gpc0,conn_rate(10s)
     tcp-request inspect-delay 5s
     acl clienthello req.ssl_hello_type 1
     acl allowed_sni req.ssl_sni -i ${allowed_sni}
+    tcp-request content track-sc0 src if clienthello !allowed_sni
+    tcp-request content sc-inc-gpc0(0) if clienthello !allowed_sni
     tcp-request content accept if clienthello allowed_sni
     tcp-request content reject if clienthello !allowed_sni
     tcp-request content reject if WAIT_END
@@ -3325,12 +3329,12 @@ EOF
 }
 
 ensure_haproxy_package() {
-    if command_exists haproxy; then
+    if command_exists haproxy && command_exists socat; then
         return 0
     fi
     stage "Устанавливаю HAProxy"
     must "apt update" apt_update_quiet
-    must "Установка HAProxy" apt_install_quiet haproxy
+    must "Установка HAProxy" apt_install_quiet haproxy socat
 }
 
 harden_whitelist_haproxy_firewall() {
@@ -3379,7 +3383,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v147"
+COLLECTOR_BUILD = "v148"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3403,7 +3407,7 @@ def load_config(path):
 
 cfg = load_config(CONFIG)
 LISTEN_HOST = cfg.get("KTO_COLLECTOR_LISTEN_HOST", "0.0.0.0")
-LISTEN_PORT = int(cfg.get("KTO_COLLECTOR_LISTEN_PORT", "9788"))
+LISTEN_PORT = int(cfg.get("KTO_COLLECTOR_LISTEN_PORT", "1337"))
 SECRET = cfg.get("KTO_COLLECTOR_SECRET", "")
 BOT_TOKEN = cfg.get("KTO_COLLECTOR_BOT_TOKEN", "")
 CHAT_ID = cfg.get("KTO_COLLECTOR_CHAT_ID", "")
@@ -3419,6 +3423,14 @@ except Exception:
     EXPECTED_NODES = 10
 if EXPECTED_NODES < 1:
     EXPECTED_NODES = 10
+try:
+    SCAN_ALERT_DELTA = int(cfg.get("KTO_COLLECTOR_SCAN_ALERT_DELTA", "50") or "50")
+except Exception:
+    SCAN_ALERT_DELTA = 50
+try:
+    SCAN_ALERT_COOLDOWN = int(cfg.get("KTO_COLLECTOR_SCAN_ALERT_COOLDOWN", "600") or "600")
+except Exception:
+    SCAN_ALERT_COOLDOWN = 600
 
 NODES_FILE = os.path.join(STATE_DIR, "nodes.json")
 FALLS_FILE = os.path.join(STATE_DIR, "falls.json")
@@ -3548,6 +3560,29 @@ def add_ssh_allowed_ip(ip):
 def ssh_allowed_ips_snapshot():
     with LOCK:
         return list(SSH_ALLOWED_IPS)
+
+
+def normalize_scan_top(value):
+    result = []
+    if not isinstance(value, list):
+        return result
+    for item in value[:10]:
+        if not isinstance(item, dict):
+            continue
+        ip = str(item.get("ip") or "").strip()
+        if not valid_ipv4(ip):
+            continue
+        try:
+            count = int(item.get("count") or 0)
+        except Exception:
+            count = 0
+        try:
+            rate = int(item.get("rate") or 0)
+        except Exception:
+            rate = 0
+        if count > 0:
+            result.append({"ip": normalize_ip(ip), "count": count, "rate": rate})
+    return result
 
 
 def today_key():
@@ -3780,6 +3815,10 @@ def node_message(node, status=None):
     if metrics_ok:
         ram_line = f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}"
         cpu_line = f"Нагруженность процессора: {format_percent(node.get('cpu_percent', 0))}"
+    scan_total = int(node.get("scan_wrong_sni_total") or 0)
+    if scan_total > 0:
+        scan_sources = int(node.get("scan_wrong_sni_sources") or 0)
+        cpu_line = f"{cpu_line}\nWrong SNI: {scan_total} / {scan_sources} IP"
     lines = [f"<blockquote><b>{name}</b>\nIP: {ip}\nАптайм: {uptime_text}</blockquote>", ""]
     if error:
         lines += [
@@ -3913,11 +3952,36 @@ def alert_online(node_id, node):
     return send_message(f"<b>{name}</b>\n\nСнова онлайн")
 
 
+def alert_scan_spike(node, delta):
+    name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
+    ip = html.escape(str(node.get("ip") or "-"))
+    top = node.get("scan_wrong_sni_top") or []
+    top_lines = []
+    for item in top[:5]:
+        src = html.escape(str(item.get("ip") or "-"))
+        count = int(item.get("count") or 0)
+        rate = int(item.get("rate") or 0)
+        suffix = f", rate {rate}/10s" if rate > 0 else ""
+        top_lines.append(f"{src}: {count}{suffix}")
+    if not top_lines:
+        top_lines.append("нет топа")
+    return send_message(
+        "<b>Подозрительный wrong SNI шум</b>\n\n"
+        f"<blockquote><b>{name}</b>\nIP: {ip}</blockquote>\n"
+        f"Прирост: +{int(delta)}\n"
+        f"Всего в окне HAProxy: {int(node.get('scan_wrong_sni_total') or 0)}\n\n"
+        f"<blockquote>{chr(10).join(top_lines)}</blockquote>\n"
+        "<i>Режим: наблюдение, нормальный SNI не трогаю.</i>"
+    )
+
+
 def update_node(payload, remote_ip=""):
     node_id = str(payload.get("id") or payload.get("name") or payload.get("hostname") or "").strip()
     if not node_id:
         raise ValueError("id/name is required")
     current = now_ts()
+    scan_alert_node = None
+    scan_alert_delta = 0
     record = {
         "id": node_id,
         "name": str(payload.get("name") or node_id),
@@ -3939,6 +4003,9 @@ def update_node(payload, remote_ip=""):
         "ram_percent": int(payload.get("ram_percent") or 0),
         "cpu_percent": float(payload.get("cpu_percent") or 0),
         "metrics_ok": bool(payload.get("metrics_ok")),
+        "scan_wrong_sni_total": int(payload.get("scan_wrong_sni_total") or 0),
+        "scan_wrong_sni_sources": int(payload.get("scan_wrong_sni_sources") or 0),
+        "scan_wrong_sni_top": normalize_scan_top(payload.get("scan_wrong_sni_top")),
         "error": str(payload.get("error") or ""),
         "updated_at": int(payload.get("updated_at") or current),
         "last_seen": current,
@@ -3950,6 +4017,15 @@ def update_node(payload, remote_ip=""):
         if was_offline:
             offline_since = int(old.get("offline_since") or old.get("last_seen") or current)
             record_downtime(current - offline_since)
+        scan_alerted_at = int(old.get("scan_alerted_at") or 0)
+        record["scan_alerted_at"] = scan_alerted_at
+        if old and "scan_wrong_sni_total" in old and SCAN_ALERT_DELTA > 0:
+            old_scan_total = int(old.get("scan_wrong_sni_total") or 0)
+            scan_delta = record["scan_wrong_sni_total"] - old_scan_total
+            if scan_delta >= SCAN_ALERT_DELTA and current - scan_alerted_at >= SCAN_ALERT_COOLDOWN:
+                record["scan_alerted_at"] = current
+                scan_alert_node = dict(record)
+                scan_alert_delta = scan_delta
         canonical = node_canonical_key(record)
         removed = []
         for existing_id, existing_node in list(NODES.items()):
@@ -3963,6 +4039,9 @@ def update_node(payload, remote_ip=""):
     if was_offline:
         log(f"node online: {node_id}")
         alert_online(node_id, record)
+    if scan_alert_node:
+        log(f"scan spike: {node_id} delta={scan_alert_delta}")
+        alert_scan_spike(scan_alert_node, scan_alert_delta)
     return record
 
 
@@ -4531,6 +4610,9 @@ ram_percent=0
 cpu_percent=0
 uptime_sec=0
 metrics_ok=false
+scan_wrong_sni_total=0
+scan_wrong_sni_sources=0
+scan_wrong_sni_top='[]'
 
 int_or_zero() {
     local value="${1:-0}"
@@ -4662,6 +4744,53 @@ apply_collector_ssh_ips() {
     fi
 }
 
+read_haproxy_scan_stats() {
+    local socket="/run/haproxy/admin.sock"
+    local raw entries
+
+    scan_wrong_sni_total=0
+    scan_wrong_sni_sources=0
+    scan_wrong_sni_top='[]'
+
+    command -v socat >/dev/null 2>&1 || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    [[ -S "$socket" ]] || return 0
+
+    raw="$(printf 'show table vless_in\n' | socat -t 2 - UNIX-CONNECT:"$socket" 2>/dev/null || true)"
+    [[ -n "$raw" ]] || return 0
+
+    entries="$(awk '
+        /key=/ {
+            ip = ""
+            gpc = 0
+            rate = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^key=/) {
+                    split($i, value, "=")
+                    ip = value[2]
+                } else if ($i ~ /^gpc0=/) {
+                    split($i, value, "=")
+                    gpc = value[2] + 0
+                } else if ($i ~ /^conn_rate\([0-9]+\)=/) {
+                    split($i, value, "=")
+                    rate = value[2] + 0
+                }
+            }
+            if (ip != "" && gpc > 0) {
+                print ip, gpc, rate
+            }
+        }
+    ' <<< "$raw" || true)"
+    [[ -n "$entries" ]] || return 0
+
+    scan_wrong_sni_total="$(awk '{sum += $2} END {print sum + 0}' <<< "$entries")"
+    scan_wrong_sni_sources="$(awk 'END {print NR + 0}' <<< "$entries")"
+    scan_wrong_sni_top="$(printf '%s\n' "$entries" \
+        | sort -k2,2nr \
+        | head -n 10 \
+        | jq -R -s '[split("\n")[] | select(length > 0) | split(" ") | {ip: .[0], count: (.[1] | tonumber), rate: (.[2] | tonumber)}]' 2>/dev/null || echo '[]')"
+}
+
 read -r ram_used ram_total ram_percent < <(memory_stats)
 ram_used="$(int_or_zero "$ram_used")"
 ram_total="$(int_or_zero "$ram_total")"
@@ -4677,6 +4806,7 @@ cpu_percent="$(awk -v sample="$cpu_sample_percent" -v load_value="$cpu_load_perc
 if (( ram_total > 0 )); then
     metrics_ok=true
 fi
+read_haproxy_scan_stats
 
 if ! command -v jq >/dev/null 2>&1; then
     error="jq не установлен"
@@ -4739,6 +4869,9 @@ if ! payload="$(jq -n \
     --argjson cpu_percent "$cpu_percent" \
     --argjson uptime_sec "$uptime_sec" \
     --argjson metrics_ok "$metrics_ok" \
+    --argjson scan_wrong_sni_total "$scan_wrong_sni_total" \
+    --argjson scan_wrong_sni_sources "$scan_wrong_sni_sources" \
+    --argjson scan_wrong_sni_top "$scan_wrong_sni_top" \
     --argjson updated_at "$updated_at" \
     '{
         id: $id,
@@ -4760,6 +4893,9 @@ if ! payload="$(jq -n \
         cpu_percent: $cpu_percent,
         uptime_sec: $uptime_sec,
         metrics_ok: $metrics_ok,
+        scan_wrong_sni_total: $scan_wrong_sni_total,
+        scan_wrong_sni_sources: $scan_wrong_sni_sources,
+        scan_wrong_sni_top: $scan_wrong_sni_top,
         error: $error,
         updated_at: $updated_at
     }' 2>&1)"; then
