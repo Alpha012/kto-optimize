@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v150"
+SCRIPT_BUILD="v151"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3457,7 +3457,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v150"
+COLLECTOR_BUILD = "v151"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4044,8 +4044,7 @@ def alert_scan_spike(node, delta):
         f"<blockquote><b>{name}</b>\nIP: {ip}</blockquote>\n"
         f"Прирост: +{int(delta)}\n"
         f"Всего в окне HAProxy: {int(node.get('scan_wrong_sni_total') or 0)}\n\n"
-        f"<blockquote>{chr(10).join(top_lines)}</blockquote>\n"
-        "<i>Режим: наблюдение, нормальный SNI не трогаю.</i>"
+        f"<blockquote>{chr(10).join(top_lines)}</blockquote>"
     )
 
 
@@ -4643,7 +4642,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v150"
+PUSH_BUILD="v151"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
