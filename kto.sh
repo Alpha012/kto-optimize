@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v149"
+SCRIPT_BUILD="v150"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3268,6 +3268,32 @@ reload_haproxy_gracefully() {
     must "Запуск HAProxy" "${SUDO[@]}" systemctl restart haproxy
 }
 
+extract_haproxy_backend_ip() {
+    "${SUDO[@]}" awk '
+        $1 == "server" && $2 == "xray1" {
+            split($3, address, ":")
+            print address[1]
+            exit
+        }
+    ' /etc/haproxy/haproxy.cfg 2>/dev/null || true
+}
+
+extract_haproxy_allowed_sni() {
+    "${SUDO[@]}" awk '
+        $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "-i") {
+                    for (j = i + 1; j <= NF; j++) {
+                        printf "%s%s", (j == i + 1 ? "" : " "), $j
+                    }
+                    printf "\n"
+                    exit
+                }
+            }
+        }
+    ' /etc/haproxy/haproxy.cfg 2>/dev/null || true
+}
+
 apply_haproxy_config() {
     local backend_ip="$1"
     local allowed_sni="$2"
@@ -3384,6 +3410,36 @@ install_haproxy() {
     configure_haproxy_backend
 }
 
+update_haproxy_existing_config() {
+    header
+    require_whitelist_mode
+    need_root
+    local backend_ip allowed_sni
+
+    if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
+        fail "HAProxy config не найден. Сначала запусти обычный haproxy."
+        return 1
+    fi
+
+    backend_ip="$(extract_haproxy_backend_ip)"
+    allowed_sni="$(extract_haproxy_allowed_sni)"
+
+    if ! validate_ipv4 "$backend_ip"; then
+        fail "Не смог найти выходной IP в текущем HAProxy config."
+        return 1
+    fi
+    if [[ -z "$allowed_sni" ]]; then
+        fail "Не смог найти разрешенный SNI в текущем HAProxy config."
+        return 1
+    fi
+
+    ensure_haproxy_package
+    apply_haproxy_config "$backend_ip" "$allowed_sni"
+    harden_whitelist_haproxy_firewall
+
+    ok "HAProxy обновлён без повторного ввода"
+}
+
 write_stats_collector_script() {
     write_root_file_mode 0755 "$STATS_COLLECTOR_SCRIPT" <<'EOF'
 #!/usr/bin/env python3
@@ -3401,7 +3457,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v149"
+COLLECTOR_BUILD = "v150"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4587,7 +4643,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v149"
+PUSH_BUILD="v150"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -5458,6 +5514,8 @@ menu() {
     elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
         labels+=("HAProxy")
         actions+=("haproxy")
+        labels+=("Обновить HAProxy")
+        actions+=("haproxy-update")
         labels+=("Push статистики")
         actions+=("stats-push-menu")
     fi
@@ -5500,6 +5558,7 @@ menu() {
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
+        haproxy-update) update_haproxy_existing_config ;;
         stats-push-menu) stats_push_menu ;;
         settings) settings_menu ;;
         *) fail "Неверный выбор" ;;
@@ -5532,6 +5591,7 @@ main() {
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
+        haproxy-update|update-haproxy|haproxy-refresh) update_haproxy_existing_config ;;
         collector|collector-install|collector-update|stats-collector|stats-collector-update) install_stats_collector ;;
         collector-status|stats-collector-status) stats_collector_status ;;
         push-menu|stats-push-menu) stats_push_menu ;;
