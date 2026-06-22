@@ -5,13 +5,12 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v144"
+SCRIPT_BUILD="v145"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
 CONFIG_FILE="/etc/kto-cfg.conf"
-LEGACY_CONFIG_FILE="/etc/kto-vpn.conf"
 CONFIG_SOURCE_FILE=""
 MACHINE_MODE="${KTO_MACHINE_MODE:-}"
 NODE_PROFILE="${KTO_NODE_PROFILE:-}"
@@ -20,9 +19,9 @@ REMNA_API_TOKEN="${KTO_REMNA_API_TOKEN:-}"
 if [[ -n "${KTO_LOG_FILE:-}" ]]; then
     LOG_FILE="$KTO_LOG_FILE"
 elif [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-    LOG_FILE="/var/log/kto-vpn-tune.log"
+    LOG_FILE="/var/log/kto-tune.log"
 else
-    LOG_FILE="/tmp/kto-vpn-tune.log"
+    LOG_FILE="/tmp/kto-tune.log"
 fi
 ANTISCANNER_SCRIPT="/usr/local/bin/update-antiscanner.sh"
 ANTISCANNER_URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
@@ -31,7 +30,11 @@ ZRAM_SERVICE="kto-zram.service"
 ZRAM_PERCENT="${KTO_ZRAM_PERCENT:-50}"
 ZRAM_MAX_MB="${KTO_ZRAM_MAX_MB:-2048}"
 STORAGE_GUARD_JOURNAL_CONF="/etc/systemd/journald.conf.d/99-kto-storage.conf"
-KTO_LOGROTATE_CONF="/etc/logrotate.d/kto-vpn"
+KTO_LOGROTATE_CONF="/etc/logrotate.d/kto"
+KTO_TUNING_SYSCTL_CONF="/etc/sysctl.d/99-kto-tuning.conf"
+KTO_LIMITS_CONF="/etc/security/limits.d/99-kto-limits.conf"
+KTO_SYSTEMD_LIMITS_CONF="/etc/systemd/system.conf.d/99-kto-limits.conf"
+KTO_USER_LIMITS_CONF="/etc/systemd/user.conf.d/99-kto-limits.conf"
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
 DNS_GUARD_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-kto-dns.conf"
@@ -81,16 +84,16 @@ init_log() {
 
     if [[ "$LOG_FILE" == /tmp/* ]]; then
         mkdir -p "$log_dir" >/dev/null 2>&1 || true
-        touch "$LOG_FILE" >/dev/null 2>&1 || LOG_FILE="/tmp/kto-vpn-tune.log"
+        touch "$LOG_FILE" >/dev/null 2>&1 || LOG_FILE="/tmp/kto-tune.log"
     else
         "${SUDO[@]}" mkdir -p "$log_dir" >/dev/null 2>&1 || true
-        "${SUDO[@]}" touch "$LOG_FILE" >/dev/null 2>&1 || LOG_FILE="/tmp/kto-vpn-tune.log"
+        "${SUDO[@]}" touch "$LOG_FILE" >/dev/null 2>&1 || LOG_FILE="/tmp/kto-tune.log"
         if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
             "${SUDO[@]}" chmod 0666 "$LOG_FILE" >/dev/null 2>&1 || true
         fi
     fi
 
-    echo "===== kto VPN v${SCRIPT_VERSION} ${SCRIPT_BUILD} $(date -Is) =====" >> "$LOG_FILE" 2>/dev/null || true
+    echo "===== kto v${SCRIPT_VERSION} ${SCRIPT_BUILD} $(date -Is) =====" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 header_line() {
@@ -105,7 +108,7 @@ header_line() {
 header() {
     printf '\033c'
     echo -e "${PURPLE}==========================================${NC}"
-    header_line "kto  VPN" "${BOLD}${GREEN}"
+    header_line "kto" "${BOLD}${GREEN}"
     header_line "v${SCRIPT_VERSION}" "$DIM"
     header_line "$SCRIPT_BUILD" "$DIM"
     echo -e "${PURPLE}==========================================${NC}"
@@ -374,9 +377,6 @@ load_machine_mode() {
         fi
     fi
 
-    if ! "${SUDO[@]}" test -f "$source_file" 2>/dev/null && "${SUDO[@]}" test -f "$LEGACY_CONFIG_FILE" 2>/dev/null; then
-        source_file="$LEGACY_CONFIG_FILE"
-    fi
     CONFIG_SOURCE_FILE="$source_file"
 
     saved_mode="$("${SUDO[@]}" awk -F= '$1=="MACHINE_MODE"{gsub(/"/,"",$2); print $2; exit}' "$source_file" 2>/dev/null || true)"
@@ -458,7 +458,7 @@ cleanup_runtime_state() {
     clear_runtime_dir /opt/nginx-selfsteal
 
     cmd "${SUDO[@]}" find /opt -maxdepth 1 -type d -name 'selfsteal-backup-*' -exec rm -rf -- {} + || true
-    cmd "${SUDO[@]}" rm -f /dev/shm/nginx.sock "$LEGACY_CONFIG_FILE" || true
+    cmd "${SUDO[@]}" rm -f /dev/shm/nginx.sock || true
     cmd "${SUDO[@]}" systemctl disable --now haproxy || true
 
     if command_exists ufw; then
@@ -625,9 +625,6 @@ ensure_machine_mode() {
         select_node_profile
         need_root
         save_machine_mode
-    elif [[ "$CONFIG_SOURCE_FILE" == "$LEGACY_CONFIG_FILE" ]]; then
-        need_root
-        save_machine_mode
     fi
 }
 
@@ -788,7 +785,7 @@ ask_domain() {
             echo "$domain"
             return 0
         fi
-        fail "Некорректный домен. Пример: vpn.domain.com"
+        fail "Некорректный домен. Пример: node.domain.com"
     done
 }
 
@@ -1455,12 +1452,48 @@ truncate_large_var_logs() {
         -exec truncate -s 0 {} + || true
 }
 
+cleanup_superseded_kto_files() {
+    local path
+
+    for path in /etc/sysctl.d/99-*-tuning.conf; do
+        [[ -e "$path" ]] || continue
+        [[ "$path" == "$KTO_TUNING_SYSCTL_CONF" ]] && continue
+        if "${SUDO[@]}" grep -qs 'net.ipv4.tcp_congestion_control = bbr' "$path" &&
+            "${SUDO[@]}" grep -qs 'net.core.default_qdisc = fq' "$path"; then
+            cmd "${SUDO[@]}" rm -f "$path" || true
+        fi
+    done
+
+    for path in /etc/security/limits.d/99-*-limits.conf; do
+        [[ -e "$path" ]] || continue
+        [[ "$path" == "$KTO_LIMITS_CONF" ]] && continue
+        if "${SUDO[@]}" grep -qs 'nofile 1048576' "$path"; then
+            cmd "${SUDO[@]}" rm -f "$path" || true
+        fi
+    done
+
+    for path in /etc/systemd/system.conf.d/99-*-limits.conf /etc/systemd/user.conf.d/99-*-limits.conf; do
+        [[ -e "$path" ]] || continue
+        [[ "$path" == "$KTO_SYSTEMD_LIMITS_CONF" || "$path" == "$KTO_USER_LIMITS_CONF" ]] && continue
+        if "${SUDO[@]}" grep -qs 'DefaultLimitNOFILE=1048576' "$path"; then
+            cmd "${SUDO[@]}" rm -f "$path" || true
+        fi
+    done
+
+    for path in /etc/logrotate.d/kto-*; do
+        [[ -e "$path" ]] || continue
+        [[ "$path" == "$KTO_LOGROTATE_CONF" ]] && continue
+        cmd "${SUDO[@]}" rm -f "$path" || true
+    done
+}
+
 opt_storage_guard() {
     cmd "${SUDO[@]}" apt-get clean || true
     cmd "${SUDO[@]}" apt-get autoclean || true
     cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || true
 
     cmd "${SUDO[@]}" mkdir -p /etc/systemd/journald.conf.d /etc/logrotate.d
+    cleanup_superseded_kto_files
     write_root_file "$STORAGE_GUARD_JOURNAL_CONF" <<'EOF'
 [Journal]
 SystemMaxUse=256M
@@ -1598,9 +1631,10 @@ opt_liquorix_kernel() {
 opt_network_limits() {
     opt_dns_guard
     opt_ipv6_mode_guard
+    cleanup_superseded_kto_files
 
     cmd "${SUDO[@]}" modprobe tcp_bbr || true
-    write_root_file /etc/sysctl.d/99-vpn-tuning.conf <<'EOF'
+    write_root_file "$KTO_TUNING_SYSCTL_CONF" <<'EOF'
 fs.file-max = 2097152
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -1632,18 +1666,18 @@ vm.swappiness = 1
 EOF
     cmd "${SUDO[@]}" sysctl --system || true
 
-    write_root_file /etc/security/limits.d/99-vpn-limits.conf <<'EOF'
+    write_root_file "$KTO_LIMITS_CONF" <<'EOF'
 * soft nofile 1048576
 * hard nofile 1048576
 root soft nofile 1048576
 root hard nofile 1048576
 EOF
     cmd "${SUDO[@]}" mkdir -p /etc/systemd/system.conf.d /etc/systemd/user.conf.d
-    write_root_file /etc/systemd/system.conf.d/99-vpn-limits.conf <<'EOF'
+    write_root_file "$KTO_SYSTEMD_LIMITS_CONF" <<'EOF'
 [Manager]
 DefaultLimitNOFILE=1048576
 EOF
-    write_root_file /etc/systemd/user.conf.d/99-vpn-limits.conf <<'EOF'
+    write_root_file "$KTO_USER_LIMITS_CONF" <<'EOF'
 [Manager]
 DefaultLimitNOFILE=1048576
 EOF
@@ -2274,21 +2308,21 @@ system_check_network_limits() {
         system_check_row miss "BBR + FQ" "${cc} + ${qdisc}"
     fi
 
-    root_file_has_line /etc/sysctl.d/99-vpn-tuning.conf "net.ipv4.tcp_congestion_control = bbr" || sysctl_file_ok=0
-    root_file_has_line /etc/sysctl.d/99-vpn-tuning.conf "net.core.default_qdisc = fq" || sysctl_file_ok=0
-    root_file_has_line /etc/sysctl.d/99-vpn-tuning.conf "fs.file-max = 2097152" || sysctl_file_ok=0
-    root_file_has_line /etc/sysctl.d/99-vpn-tuning.conf "vm.swappiness = 1" || sysctl_file_ok=0
+    root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.ipv4.tcp_congestion_control = bbr" || sysctl_file_ok=0
+    root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.core.default_qdisc = fq" || sysctl_file_ok=0
+    root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "fs.file-max = 2097152" || sysctl_file_ok=0
+    root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "vm.swappiness = 1" || sysctl_file_ok=0
     if [[ "$sysctl_file_ok" == "1" ]]; then
-        system_check_row ok "sysctl file" "/etc/sysctl.d/99-vpn-tuning.conf"
+        system_check_row ok "sysctl file" "$KTO_TUNING_SYSCTL_CONF"
     else
         SYSTEM_CHECK_NEEDS_NETWORK=1
-        system_check_row miss "sysctl file" "нет или неполный /etc/sysctl.d/99-vpn-tuning.conf"
+        system_check_row miss "sysctl file" "нет или неполный $KTO_TUNING_SYSCTL_CONF"
     fi
 
-    root_file_has_line /etc/security/limits.d/99-vpn-limits.conf "* soft nofile 1048576" || limits_ok=0
-    root_file_has_line /etc/security/limits.d/99-vpn-limits.conf "* hard nofile 1048576" || limits_ok=0
-    root_file_has_line /etc/systemd/system.conf.d/99-vpn-limits.conf "DefaultLimitNOFILE=1048576" || limits_ok=0
-    root_file_has_line /etc/systemd/user.conf.d/99-vpn-limits.conf "DefaultLimitNOFILE=1048576" || limits_ok=0
+    root_file_has_line "$KTO_LIMITS_CONF" "* soft nofile 1048576" || limits_ok=0
+    root_file_has_line "$KTO_LIMITS_CONF" "* hard nofile 1048576" || limits_ok=0
+    root_file_has_line "$KTO_SYSTEMD_LIMITS_CONF" "DefaultLimitNOFILE=1048576" || limits_ok=0
+    root_file_has_line "$KTO_USER_LIMITS_CONF" "DefaultLimitNOFILE=1048576" || limits_ok=0
     if [[ "$limits_ok" == "1" ]]; then
         system_check_row ok "limits" "nofile 1048576"
     else
@@ -3182,7 +3216,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v144"
+COLLECTOR_BUILD = "v145"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4203,7 +4237,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v144"
+PUSH_BUILD="v145"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
