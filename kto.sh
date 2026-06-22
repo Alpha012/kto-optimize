@@ -5,8 +5,13 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v145"
+SCRIPT_BUILD="v146"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
+PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
+PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
+WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 83.228.242.53 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
+WHITELIST_SSH_ALLOWED_IPS="${KTO_WHITELIST_SSH_ALLOWED_IPS:-$WHITELIST_SSH_ALLOWED_IPS_DEFAULT}"
+WHITELIST_SSH_KEEP_CURRENT="${KTO_WHITELIST_SSH_KEEP_CURRENT:-1}"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
@@ -47,7 +52,8 @@ STATS_PUSH_CONFIG="/etc/kto-stats-push.conf"
 STATS_PUSH_SCRIPT="/usr/local/bin/kto-stats-push"
 STATS_PUSH_SERVICE="kto-stats-push.service"
 STATS_PUSH_TIMER="kto-stats-push.timer"
-STATS_COLLECTOR_PORT_DEFAULT="9788"
+STATS_COLLECTOR_PORT_DEFAULT="${KTO_STATS_COLLECTOR_PORT_DEFAULT:-1337}"
+STATS_COLLECTOR_URL_DEFAULT="${KTO_STATS_COLLECTOR_URL_DEFAULT:-http://${PANEL_IP}:${STATS_COLLECTOR_PORT_DEFAULT}}"
 STATS_PUSH_INTERVAL_DEFAULT="15"
 STATS_COLLECTOR_STALE_SEC_DEFAULT="60"
 STATS_COLLECTOR_TZ_DEFAULT="Europe/Moscow"
@@ -309,6 +315,88 @@ write_root_file_mode() {
 write_root_file() {
     local path="$1"
     write_root_file_mode 0644 "$path"
+}
+
+legacy_suffix() {
+    printf '\166\160\156'
+}
+
+legacy_path() {
+    local name="$1"
+    local suffix
+    suffix="$(legacy_suffix)"
+    case "$name" in
+        config) printf '/etc/kto-%s.conf\n' "$suffix" ;;
+        log-root) printf '/var/log/kto-%s-tune.log\n' "$suffix" ;;
+        log-tmp) printf '/tmp/kto-%s-tune.log\n' "$suffix" ;;
+        logrotate) printf '/etc/logrotate.d/kto-%s\n' "$suffix" ;;
+        sysctl) printf '/etc/sysctl.d/99-%s-tuning.conf\n' "$suffix" ;;
+        limits) printf '/etc/security/limits.d/99-%s-limits.conf\n' "$suffix" ;;
+        systemd-limits) printf '/etc/systemd/system.conf.d/99-%s-limits.conf\n' "$suffix" ;;
+        user-limits) printf '/etc/systemd/user.conf.d/99-%s-limits.conf\n' "$suffix" ;;
+        *) return 1 ;;
+    esac
+}
+
+migrate_superseded_file() {
+    local old_path="$1"
+    local new_path="$2"
+    local mode="${3:-0644}"
+
+    "${SUDO[@]}" test -e "$old_path" 2>/dev/null || return 1
+    if ! "${SUDO[@]}" test -e "$new_path" 2>/dev/null; then
+        cmd "${SUDO[@]}" cp -a "$old_path" "$new_path" || return 1
+        cmd "${SUDO[@]}" chmod "$mode" "$new_path" || true
+    fi
+    cmd "${SUDO[@]}" rm -f "$old_path" || true
+    return 0
+}
+
+migrate_superseded_log() {
+    local old_path="$1"
+
+    "${SUDO[@]}" test -s "$old_path" 2>/dev/null || return 1
+    if [[ "$old_path" != "$LOG_FILE" ]]; then
+        cmd "${SUDO[@]}" sh -c 'cat "$1" >> "$2"' sh "$old_path" "$LOG_FILE" || true
+    fi
+    cmd "${SUDO[@]}" rm -f "$old_path" || true
+}
+
+migrate_superseded_kto_state() {
+    local changed=0
+    local old_logrotate
+
+    migrate_superseded_file "$(legacy_path config)" "$CONFIG_FILE" 0600 && changed=1 || true
+    migrate_superseded_file "$(legacy_path sysctl)" "$KTO_TUNING_SYSCTL_CONF" 0644 && changed=1 || true
+    migrate_superseded_file "$(legacy_path limits)" "$KTO_LIMITS_CONF" 0644 && changed=1 || true
+    migrate_superseded_file "$(legacy_path systemd-limits)" "$KTO_SYSTEMD_LIMITS_CONF" 0644 && changed=1 || true
+    migrate_superseded_file "$(legacy_path user-limits)" "$KTO_USER_LIMITS_CONF" 0644 && changed=1 || true
+
+    old_logrotate="$(legacy_path logrotate)"
+    if "${SUDO[@]}" test -e "$old_logrotate" 2>/dev/null; then
+        if ! "${SUDO[@]}" test -e "$KTO_LOGROTATE_CONF" 2>/dev/null; then
+            write_root_file "$KTO_LOGROTATE_CONF" <<EOF
+$LOG_FILE {
+    size 10M
+    rotate 5
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF
+        fi
+        cmd "${SUDO[@]}" rm -f "$old_logrotate" || true
+        changed=1
+    fi
+    migrate_superseded_log "$(legacy_path log-root)" || true
+    migrate_superseded_log "$(legacy_path log-tmp)" || true
+
+    if (( changed == 1 )); then
+        cmd "${SUDO[@]}" sysctl --system || true
+        cmd "${SUDO[@]}" systemctl daemon-reload || true
+    fi
 }
 
 valid_machine_mode() {
@@ -941,6 +1029,41 @@ validate_ipv4() {
     for octet in "${octets[@]}"; do
         (( 10#$octet >= 0 && 10#$octet <= 255 )) || return 1
     done
+}
+
+current_ssh_client_ip() {
+    local ip="${SSH_CLIENT:-}"
+    ip="${ip%% *}"
+    validate_ipv4 "$ip" && echo "$ip"
+}
+
+whitelist_ssh_allowed_ips() {
+    local raw current ip
+    raw="${WHITELIST_SSH_ALLOWED_IPS//,/ }"
+    raw="${raw//;/ }"
+    for ip in $raw; do
+        validate_ipv4 "$ip" && echo "$ip"
+    done
+
+    if [[ "$WHITELIST_SSH_KEEP_CURRENT" != "0" ]]; then
+        current="$(current_ssh_client_ip || true)"
+        if [[ -n "$current" ]]; then
+            echo "$current"
+        fi
+    fi
+}
+
+apply_whitelist_ssh_rules() {
+    local ssh_port="$1"
+    local ip
+
+    cmd "${SUDO[@]}" ufw --force delete allow "${ssh_port}/tcp" || true
+    cmd "${SUDO[@]}" ufw --force delete allow ssh || true
+    cmd "${SUDO[@]}" ufw --force delete allow OpenSSH || true
+    while read -r ip; do
+        [[ -n "$ip" ]] || continue
+        cmd "${SUDO[@]}" ufw allow proto tcp from "$ip" to any port "$ssh_port" comment 'kto-ssh' || true
+    done < <(whitelist_ssh_allowed_ips | sort -u)
 }
 
 ask_ipv4() {
@@ -1706,7 +1829,11 @@ opt_firewall() {
     fi
     cmd "${SUDO[@]}" ufw default deny incoming
     cmd "${SUDO[@]}" ufw default allow outgoing
-    cmd "${SUDO[@]}" ufw allow "${ssh_port}/tcp"
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        apply_whitelist_ssh_rules "$ssh_port"
+    else
+        cmd "${SUDO[@]}" ufw allow "${ssh_port}/tcp"
+    fi
     cmd "${SUDO[@]}" ufw allow 443/tcp
     if [[ "$MACHINE_MODE" == "node" ]]; then
         cmd "${SUDO[@]}" ufw allow 443/udp
@@ -2084,6 +2211,35 @@ ufw_rule_allowed() {
         | awk -v rule="$rule" '$0 ~ /ALLOW/ && $1 == rule {found=1} END{exit found ? 0 : 1}'
 }
 
+ufw_rule_open_to_any() {
+    local rule="$1"
+    command_exists ufw || return 1
+    "${SUDO[@]}" ufw status 2>/dev/null \
+        | awk -v rule="$rule" '$0 ~ /ALLOW/ && $1 == rule && $3 ~ /^Anywhere/ {found=1} END{exit found ? 0 : 1}'
+}
+
+ufw_rule_from_allowed() {
+    local rule="$1"
+    local ip="$2"
+    command_exists ufw || return 1
+    "${SUDO[@]}" ufw status 2>/dev/null \
+        | awk -v rule="$rule" -v ip="$ip" '$0 ~ /ALLOW/ && $1 == rule && $3 == ip {found=1} END{exit found ? 0 : 1}'
+}
+
+whitelist_ssh_rules_configured() {
+    local ssh_port="$1"
+    local rule="${ssh_port}/tcp"
+    local ip
+
+    if ufw_rule_open_to_any "$rule"; then
+        return 1
+    fi
+    while read -r ip; do
+        [[ -n "$ip" ]] || continue
+        ufw_rule_from_allowed "$rule" "$ip" || return 1
+    done < <(whitelist_ssh_allowed_ips | sort -u)
+}
+
 system_check_prepare_state() {
     local issues=() dpkg_audit
 
@@ -2369,7 +2525,11 @@ system_check_firewall() {
         system_check_row miss "ufw" "не active"
     fi
 
-    ufw_rule_allowed "${ssh_port}/tcp" || missing+=("${ssh_port}/tcp")
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        whitelist_ssh_rules_configured "$ssh_port" || missing+=("ssh allowlist")
+    else
+        ufw_rule_allowed "${ssh_port}/tcp" || missing+=("${ssh_port}/tcp")
+    fi
     ufw_rule_allowed "443/tcp" || missing+=("443/tcp")
     if [[ "$MACHINE_MODE" == "node" ]]; then
         ufw_rule_allowed "443/udp" || missing+=("443/udp")
@@ -3174,9 +3334,12 @@ ensure_haproxy_package() {
 }
 
 harden_whitelist_haproxy_firewall() {
+    local ssh_port
     command_exists ufw || return 0
     ufw_active || return 0
+    ssh_port="$(detect_ssh_port)"
 
+    apply_whitelist_ssh_rules "$ssh_port"
     cmd "${SUDO[@]}" ufw allow 443/tcp || true
     cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
     cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
@@ -3216,7 +3379,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v145"
+COLLECTOR_BUILD = "v146"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4237,7 +4400,7 @@ write_stats_push_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v145"
+PUSH_BUILD="v146"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 
 push_error_trap() {
@@ -4556,7 +4719,7 @@ install_stats_push_client() {
             fail "Интерфейс ${iface} не найден. Проверь: ip -br link"
             return 1
         fi
-        collector_url="$(ask_text "URL коллектора")"
+        collector_url="$(ask_text "URL коллектора" "$STATS_COLLECTOR_URL_DEFAULT")"
         if [[ ! "$collector_url" =~ ^https?:// ]]; then
             fail "URL коллектора должен начинаться с http:// или https://"
             return 1
@@ -5045,6 +5208,7 @@ menu() {
 
 main() {
     init_log
+    migrate_superseded_kto_state
     ensure_machine_mode
 
     case "${1:-menu}" in
