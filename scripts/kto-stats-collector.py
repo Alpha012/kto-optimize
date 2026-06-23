@@ -13,7 +13,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v158"
+COLLECTOR_BUILD = "v159"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -772,6 +772,157 @@ def active_ip_limit_entries(user, ts):
     return result
 
 
+def ip_limit_snapshot(ts):
+    rows = []
+    with LOCK:
+        purge_ip_limit_state(ts)
+        users = IP_LIMIT_STATE.setdefault("users", {})
+        for user, ip_map in users.items():
+            if not isinstance(ip_map, dict):
+                continue
+            for ip, entry in ip_map.items():
+                if not isinstance(entry, dict):
+                    continue
+                last_seen = ip_limit_last_seen(entry)
+                if last_seen < ts - IP_LIMIT_WINDOW_SEC:
+                    continue
+                nodes = entry.get("nodes") if isinstance(entry.get("nodes"), dict) else {}
+                rows.append({
+                    "user": str(user),
+                    "ip": str(ip),
+                    "last_seen": last_seen,
+                    "nodes": sorted(str(node) for node in nodes.keys() if str(node).strip()),
+                })
+    rows.sort(key=lambda item: (-item["last_seen"], natural_sort_key(item["user"]), item["ip"]))
+    return rows
+
+
+def ip_limit_query_terms(query):
+    query = str(query or "").strip()
+    if not query:
+        return []
+    terms = [query]
+    try:
+        decoded = urllib.parse.unquote(query)
+        if decoded and decoded != query:
+            terms.append(decoded)
+    except Exception:
+        decoded = query
+    try:
+        parsed = urllib.parse.urlsplit(decoded)
+        if parsed.netloc:
+            terms.append(parsed.netloc)
+        for part in parsed.path.split("/"):
+            if part:
+                terms.append(part)
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=False):
+            if key:
+                terms.append(key)
+            if value:
+                terms.append(value)
+    except Exception:
+        pass
+    result = []
+    seen = set()
+    for term in terms:
+        term = str(term or "").strip()
+        key = term.casefold()
+        if term and key not in seen:
+            seen.add(key)
+            result.append(term)
+    return result
+
+
+def ip_limit_row_matches(row, query):
+    terms = ip_limit_query_terms(query)
+    if not terms:
+        return True
+
+    user = str(row.get("user") or "")
+    ip = str(row.get("ip") or "")
+    nodes = [str(node) for node in row.get("nodes") or []]
+    user_cf = user.casefold()
+    node_keys = {canonical_node_key(node) for node in nodes}
+
+    if valid_ipv4(terms[0]):
+        return ip == normalize_ip(terms[0])
+
+    for term in terms:
+        term_cf = term.casefold()
+        if term_cf == user_cf:
+            return True
+        if len(term_cf) >= 3 and len(user_cf) >= 3 and (term_cf in user_cf or user_cf in term_cf):
+            return True
+        if valid_ipv4(term) and ip == normalize_ip(term):
+            return True
+        term_node_key = canonical_node_key(term)
+        if term_node_key and term_node_key in node_keys:
+            return True
+    return False
+
+
+def ip_limit_group_rows(rows):
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["user"], []).append(row)
+    return sorted(
+        grouped.items(),
+        key=lambda item: (-len(item[1]), -max(row["last_seen"] for row in item[1]), natural_sort_key(item[0])),
+    )
+
+
+def ip_limit_user_block(user, rows, ts):
+    lines = [f"<b>{html.escape(str(user))}</b> — {len(rows)}/{IP_LIMIT_MAX_IPS} IP"]
+    for row in rows[:8]:
+        nodes = ", ".join(row.get("nodes") or []) or "-"
+        age = format_age(ts - int(row.get("last_seen") or 0))
+        lines.append(f"{html.escape(row['ip'])} — {html.escape(nodes)} — {html.escape(age)} назад")
+    if len(rows) > 8:
+        lines.append(f"... ещё {len(rows) - 8}")
+    return "<blockquote>" + "\n".join(lines) + "</blockquote>"
+
+
+def ip_limit_report(query=""):
+    query = str(query or "").strip()
+    ts = now_ts()
+    rows = [row for row in ip_limit_snapshot(ts) if ip_limit_row_matches(row, query)]
+    if not rows:
+        hint = "\n\nПримеры: <code>/ip</code>, <code>/ip Нидерланды</code>, <code>/ip 3</code>, <code>/ip 1.2.3.4</code>"
+        if query:
+            return (
+                "<b>IP лимит</b>\n"
+                f"{ALERT_SEPARATOR}\n"
+                f"{detail_line('Фильтр', query)}\n"
+                f"{detail_line('Активных записей', 0)}"
+                f"{hint}"
+            )
+        return (
+            "<b>IP лимит</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Окно', format_duration_ru(IP_LIMIT_WINDOW_SEC))}\n"
+            f"{detail_line('Лимит', f'{IP_LIMIT_MAX_IPS} IP')}\n"
+            f"{detail_line('Активных записей', 0)}"
+        )
+
+    grouped = ip_limit_group_rows(rows)
+    total_ips = len({row["ip"] for row in rows})
+    header = [
+        "<b>IP лимит</b>",
+        ALERT_SEPARATOR,
+        detail_line("Окно", format_duration_ru(IP_LIMIT_WINDOW_SEC)),
+        detail_line("Лимит", f"{IP_LIMIT_MAX_IPS} IP"),
+        detail_line("Подписок", len(grouped)),
+        detail_line("IP", total_ips),
+    ]
+    if query:
+        header.append(detail_line("Фильтр", query))
+
+    blocks = [ip_limit_user_block(user, user_rows, ts) for user, user_rows in grouped[:12]]
+    if len(grouped) > 12:
+        blocks.append(f"<i>Ещё подписок: {len(grouped) - 12}</i>")
+    return "\n".join(header + [""] + blocks)
+
+
 def alert_ip_limit_exceeded(user, entries):
     ip_lines = []
     for item in entries[:12]:
@@ -1199,6 +1350,12 @@ def handle_add_ip(text):
     )
 
 
+def handle_ip(text):
+    parts = text.split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    send_message(ip_limit_report(query))
+
+
 def handle_test_alert(text, kind):
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -1312,6 +1469,8 @@ def bot_loop():
                     handle_delete(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/add_ip":
                     handle_add_ip(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip":
+                    handle_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/down":
                     handle_test_alert(text, "down")
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/up":
