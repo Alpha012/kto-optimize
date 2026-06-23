@@ -13,7 +13,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v152"
+COLLECTOR_BUILD = "v153"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -71,6 +71,7 @@ LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
+ALERT_SEPARATOR = "➖" * 9
 
 if TZ_NAME:
     os.environ["TZ"] = TZ_NAME
@@ -572,14 +573,70 @@ def aggregate_message():
     return "\n".join(parts)
 
 
+def code_value(value):
+    value = str(value or "-")
+    return f"<code>{html.escape(value)}</code>"
+
+
+def detail_line(label, value):
+    return f"<b>{label}:</b> {code_value(value)}"
+
+
+def node_display_name(node, fallback="unknown"):
+    return str(node.get("name") or node.get("id") or node.get("hostname") or fallback)
+
+
+def node_display_ip(node):
+    return str(node.get("ip") or "-")
+
+
+def find_node(query):
+    needle = canonical_node_key(query)
+    if not needle:
+        return None
+    with LOCK:
+        for node in NODES.values():
+            candidates = [
+                node.get("id"),
+                node.get("name"),
+                node.get("hostname"),
+            ]
+            if any(canonical_node_key(value) == needle for value in candidates):
+                return dict(node)
+    return None
+
+
+def node_alert_message(kind, node_id, node, reason="-"):
+    name = node_display_name(node, node_id)
+    ip = node_display_ip(node)
+    if kind == "up":
+        lines = [
+            "❇️ #nodeConnectionRestored",
+            "Подключение к серверу восстановлено",
+            ALERT_SEPARATOR,
+            detail_line("Название", name),
+            detail_line("Адрес", ip),
+        ]
+    else:
+        updated = fmt_time(node.get("last_seen") or node.get("updated_at") or 0)
+        lines = [
+            "🚨 #nodeConnectionLost",
+            "Подключение к серверу потеряно",
+            ALERT_SEPARATOR,
+            detail_line("Название", name),
+            detail_line("Причина", reason),
+            detail_line("Последнее обновление", updated),
+            detail_line("Адрес", ip),
+        ]
+    return "\n".join(lines)
+
+
 def alert_offline(node_id, node, age):
-    name = html.escape(str(node.get("name") or node_id))
-    return send_message(f"<b>{name}</b>\n\nНе присылал стату: {format_age(age)}")
+    return send_message(node_alert_message("down", node_id, node, f"Нет push {format_age(age)}"))
 
 
 def alert_online(node_id, node):
-    name = html.escape(str(node.get("name") or node_id))
-    return send_message(f"<b>{name}</b>\n\nСнова онлайн")
+    return send_message(node_alert_message("up", node_id, node))
 
 
 def alert_scan_spike(node, delta):
@@ -967,6 +1024,77 @@ def handle_add_ip(text):
     )
 
 
+def handle_test_alert(text, kind):
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        command = "/up" if kind == "up" else "/down"
+        send_message(f"<b>Пример:</b> {command} Обход №8")
+        return
+
+    query = parts[1].strip()
+    node = find_node(query)
+    if node is None:
+        node = {"id": query, "name": query, "ip": "-", "last_seen": now_ts()}
+    if kind == "up":
+        send_message(node_alert_message("up", query, node))
+    else:
+        send_message(node_alert_message("down", query, node, "Тестовая проверка"))
+
+
+def utf16_slice(text, offset, length):
+    try:
+        raw = str(text or "").encode("utf-16-le")
+        return raw[offset * 2:(offset + length) * 2].decode("utf-16-le", errors="ignore")
+    except Exception:
+        return ""
+
+
+def collect_custom_emoji_ids(message):
+    result = []
+    seen = set()
+
+    def scan(source):
+        for text_key, entities_key in (("text", "entities"), ("caption", "caption_entities")):
+            text = str(source.get(text_key) or "")
+            entities = source.get(entities_key) or []
+            for entity in entities:
+                if entity.get("type") != "custom_emoji":
+                    continue
+                emoji_id = str(entity.get("custom_emoji_id") or "").strip()
+                if not emoji_id or emoji_id in seen:
+                    continue
+                seen.add(emoji_id)
+                fallback = utf16_slice(text, int(entity.get("offset") or 0), int(entity.get("length") or 0))
+                result.append((emoji_id, fallback or "🙂"))
+
+    scan(message)
+    reply = message.get("reply_to_message")
+    if isinstance(reply, dict):
+        scan(reply)
+    return result
+
+
+def handle_emoji(message):
+    emojis = collect_custom_emoji_ids(message)
+    if not emojis:
+        send_message(
+            "<b>Не нашёл premium emoji.</b>\n\n"
+            "Пример: <code>/emoji 🔥</code>\n"
+            "Можно ответить командой <code>/emoji</code> на сообщение с premium emoji."
+        )
+        return
+
+    lines = ["<b>Custom emoji id:</b>"]
+    for emoji_id, fallback in emojis:
+        fallback = html.escape(fallback)
+        lines += [
+            "",
+            f"<code>{html.escape(emoji_id)}</code>",
+            f"<code>&lt;tg-emoji emoji-id=\"{html.escape(emoji_id)}\"&gt;{fallback}&lt;/tg-emoji&gt;</code>",
+        ]
+    send_message("\n".join(lines))
+
+
 def bot_loop():
     offset = load_offset()
     try:
@@ -1009,6 +1137,12 @@ def bot_loop():
                     handle_delete(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/add_ip":
                     handle_add_ip(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/down":
+                    handle_test_alert(text, "down")
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/up":
+                    handle_test_alert(text, "up")
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/emoji":
+                    handle_emoji(message)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statstest":
                     send_message("<b>Проверка алертов</b>\n\nКоллектор жив, Telegram отправка работает.")
         except Exception as exc:
