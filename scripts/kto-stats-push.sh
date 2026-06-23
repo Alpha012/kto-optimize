@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v157"
+PUSH_BUILD="v158"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -33,6 +33,7 @@ KTO_IP_LIMIT_USER_REGEX="${KTO_IP_LIMIT_USER_REGEX:-}"
 KTO_IP_LIMIT_IP_REGEX="${KTO_IP_LIMIT_IP_REGEX:-}"
 KTO_IP_LIMIT_SCAN_SEC="${KTO_IP_LIMIT_SCAN_SEC:-120}"
 KTO_IP_LIMIT_TAIL_LINES="${KTO_IP_LIMIT_TAIL_LINES:-500}"
+KTO_IP_LIMIT_XRAY_LOGS="${KTO_IP_LIMIT_XRAY_LOGS:-1}"
 
 collector_url="${KTO_PUSH_COLLECTOR_URL%/}/push"
 hostname_value="$(hostname 2>/dev/null || echo unknown)"
@@ -240,8 +241,15 @@ ip_limit_enabled() {
     esac
 }
 
+ip_limit_xray_logs_enabled() {
+    case "${KTO_IP_LIMIT_XRAY_LOGS}" in
+        1|yes|true|on|enabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 ip_limit_user_from_line() {
-    local line="$1"
+    local line="$1" candidate
     local regex
 
     if [[ -n "$KTO_IP_LIMIT_USER_REGEX" && "$line" =~ $KTO_IP_LIMIT_USER_REGEX ]]; then
@@ -261,6 +269,22 @@ ip_limit_user_from_line() {
         fi
     done
 
+    if [[ "$line" =~ \[([^][]+)\] ]]; then
+        candidate="${BASH_REMATCH[1]}"
+        candidate="${candidate%% ->*}"
+        candidate="${candidate%% >>*}"
+        candidate="${candidate%% <-*}"
+        candidate="${candidate%% *}"
+        if [[ -n "$candidate" && "$candidate" != tcp:* && "$candidate" != udp:* ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+    if [[ "$line" =~ ([A-Za-z0-9._%+-]+@[A-Za-z0-9._-]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
     return 1
 }
 
@@ -271,6 +295,10 @@ ip_limit_ip_from_line() {
     if [[ -n "$KTO_IP_LIMIT_IP_REGEX" && "$line" =~ $KTO_IP_LIMIT_IP_REGEX ]]; then
         [[ -n "${BASH_REMATCH[1]-}" ]] || return 1
         printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$line" =~ from[[:space:]]+(tcp:|udp:)?(::ffff:)?([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[3]}"
         return 0
     fi
     if [[ "$line" =~ ([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
@@ -288,6 +316,21 @@ read_ip_limit_source_lines() {
 
     if [[ -n "$KTO_IP_LIMIT_DOCKER_CONTAINER" ]] && command -v docker >/dev/null 2>&1; then
         docker logs --since "${scan_sec}s" "$KTO_IP_LIMIT_DOCKER_CONTAINER" >> "$output_file" 2>/dev/null || true
+        if ip_limit_xray_logs_enabled; then
+            docker exec "$KTO_IP_LIMIT_DOCKER_CONTAINER" sh -c '
+                lines="$1"
+                case "$lines" in
+                    ""|*[!0-9]*) lines=500 ;;
+                esac
+                for path in \
+                    /var/log/supervisor/xray.out.log \
+                    /var/log/supervisor/xray.err.log \
+                    /var/log/xray/access.log \
+                    /usr/local/etc/xray/access.log; do
+                    [ -r "$path" ] && tail -n "$lines" "$path"
+                done
+            ' sh "$tail_lines" >> "$output_file" 2>/dev/null || true
+        fi
     fi
     if [[ -n "$KTO_IP_LIMIT_LOG_FILE" && -r "$KTO_IP_LIMIT_LOG_FILE" ]]; then
         tail -n "$tail_lines" "$KTO_IP_LIMIT_LOG_FILE" >> "$output_file" 2>/dev/null || true
