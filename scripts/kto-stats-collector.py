@@ -14,7 +14,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v164"
+COLLECTOR_BUILD = "v165"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -81,6 +81,13 @@ except Exception:
     IP_LIMIT_ALERT_COOLDOWN = 600
 if IP_LIMIT_ALERT_COOLDOWN < 60:
     IP_LIMIT_ALERT_COOLDOWN = 60
+IP_LIMIT_ENFORCE_ENABLED = str(cfg.get("KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED", "0")).lower() in ("1", "yes", "true", "on", "enabled")
+try:
+    IP_LIMIT_PENALTY_SEC = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC", "60") or "60")
+except Exception:
+    IP_LIMIT_PENALTY_SEC = 60
+if IP_LIMIT_PENALTY_SEC < 10:
+    IP_LIMIT_PENALTY_SEC = 10
 REMNA_API_URL = str(cfg.get("KTO_COLLECTOR_REMNA_API_URL", "") or "").strip().rstrip("/")
 REMNA_API_TOKEN = str(cfg.get("KTO_COLLECTOR_REMNA_API_TOKEN", "") or "").strip()
 try:
@@ -106,7 +113,7 @@ LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
-IP_LIMIT_STATE = {"users": {}, "alerts": {}}
+IP_LIMIT_STATE = {"users": {}, "alerts": {}, "limits": {}, "pending": {}, "penalties": {}}
 REMNA_USER_CACHE = {}
 ALERT_SEPARATOR = "➖" * 9
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
@@ -241,12 +248,18 @@ def load_ip_limit_state():
         if isinstance(loaded, dict):
             users = loaded.get("users")
             alerts = loaded.get("alerts")
+            limits = loaded.get("limits")
+            pending = loaded.get("pending")
+            penalties = loaded.get("penalties")
             IP_LIMIT_STATE = {
                 "users": users if isinstance(users, dict) else {},
                 "alerts": alerts if isinstance(alerts, dict) else {},
+                "limits": limits if isinstance(limits, dict) else {},
+                "pending": pending if isinstance(pending, dict) else {},
+                "penalties": penalties if isinstance(penalties, dict) else {},
             }
     except Exception:
-        IP_LIMIT_STATE = {"users": {}, "alerts": {}}
+        IP_LIMIT_STATE = {"users": {}, "alerts": {}, "limits": {}, "pending": {}, "penalties": {}}
 
 
 def save_ip_limit_state():
@@ -431,6 +444,17 @@ def format_duration_ru(seconds):
     return result
 
 
+def format_duration_ru_for(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} {plural_ru(seconds, 'секунду', 'секунды', 'секунд')}"
+    minutes = seconds // 60
+    rest_seconds = seconds % 60
+    if minutes < 60 and rest_seconds == 0:
+        return f"{minutes} {plural_ru(minutes, 'минуту', 'минуты', 'минут')}"
+    return format_duration_ru(seconds)
+
+
 def fmt_time(ts):
     try:
         return datetime.fromtimestamp(int(ts)).strftime("%d.%m.%Y %H:%M")
@@ -498,17 +522,20 @@ def tg_call(method, data=None, timeout=25):
     return parsed
 
 
-def send_message(text):
+def send_message(text, reply_markup=None):
     if not CHAT_ID:
         log("telegram chat id is empty")
         return False
     try:
-        result = tg_call("sendMessage", {
+        payload = {
             "chat_id": CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": "true",
-        })
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        result = tg_call("sendMessage", payload)
         msg = result.get("result", {})
         log(f"telegram sent message_id={msg.get('message_id')} chat_id={msg.get('chat', {}).get('id')}")
         return True
@@ -517,22 +544,40 @@ def send_message(text):
         return False
 
 
+def answer_callback(callback_id, text=""):
+    if not callback_id:
+        return
+    try:
+        payload = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text[:180]
+        tg_call("answerCallbackQuery", payload, timeout=10)
+    except Exception as exc:
+        log(f"telegram callback answer failed: {exc}")
+
+
 def remna_api_enabled():
     return bool(REMNA_API_URL and REMNA_API_TOKEN)
 
 
-def remna_api_call(path):
+def remna_api_call(path, method="GET", payload=None):
     if not remna_api_enabled():
         return None
     url = f"{REMNA_API_URL}{path}"
     context = ssl._create_unverified_context() if url.lower().startswith("https://") else None
+    body = None
+    headers = {
+        "Authorization": f"Bearer {REMNA_API_TOKEN}",
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
         url,
-        headers={
-            "Authorization": f"Bearer {REMNA_API_TOKEN}",
-            "Accept": "application/json",
-        },
-        method="GET",
+        data=body,
+        headers=headers,
+        method=method,
     )
     with urllib.request.urlopen(req, timeout=REMNA_API_TIMEOUT_SEC, context=context) as resp:
         body = resp.read().decode("utf-8", errors="replace")
@@ -551,22 +596,97 @@ def remna_user_path(user_id):
     return f"/api/users/by-username/{quoted}"
 
 
+def remna_lookup_paths(query):
+    value = str(query or "").strip()
+    if not value:
+        return []
+    forced_tg = False
+    if value.lower().startswith(("tg:", "telegram:")):
+        value = value.split(":", 1)[1].strip()
+        forced_tg = True
+    quoted = urllib.parse.quote(value, safe="")
+    if forced_tg and value:
+        return [f"/api/users/by-telegram-id/{quoted}"]
+    if value.isdigit():
+        by_id = f"/api/users/by-id/{quoted}"
+        by_tg = f"/api/users/by-telegram-id/{quoted}"
+        if len(value) >= 7:
+            return [by_tg, by_id]
+        return [by_id, by_tg]
+    if re.fullmatch(r"[0-9a-fA-F-]{32,36}", value):
+        return [f"/api/users/{quoted}"]
+    if "@" in value:
+        return [f"/api/users/by-email/{quoted}", f"/api/users/by-username/{quoted}"]
+    return [f"/api/users/by-username/{quoted}"]
+
+
 def remna_extract_user(payload):
-    if not isinstance(payload, dict):
-        return None
-    candidates = [payload]
-    for key in ("response", "user", "data"):
-        value = payload.get(key)
+    candidates = []
+
+    def collect(value):
         if isinstance(value, dict):
             candidates.append(value)
-            for nested_key in ("user", "data"):
-                nested = value.get(nested_key)
-                if isinstance(nested, dict):
-                    candidates.append(nested)
+            for key in ("response", "user", "data", "items", "users"):
+                collect(value.get(key))
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(payload)
     user_keys = {"username", "email", "tag", "status", "expireAt", "trafficLimitBytes", "userTraffic"}
     for candidate in candidates:
         if any(key in candidate for key in user_keys):
             return candidate
+    return None
+
+
+def remna_user_cache_put(info):
+    if not isinstance(info, dict):
+        return
+    aliases = []
+    for key in ("id", "uuid", "username", "telegramId", "email", "tag"):
+        value = str(info.get(key) or "").strip()
+        if value:
+            aliases.append(value)
+            if key == "telegramId":
+                aliases.append(f"tg:{value}")
+    ts = now_ts()
+    with LOCK:
+        for alias in aliases:
+            REMNA_USER_CACHE[alias] = {"fetched_at": ts, "data": info}
+
+
+def remna_user_lookup(query):
+    query = str(query or "").strip()
+    if not query or not remna_api_enabled():
+        return None
+    ts = now_ts()
+    with LOCK:
+        cached = REMNA_USER_CACHE.get(query)
+        if cached and ts - int(cached.get("fetched_at") or 0) < REMNA_API_CACHE_SEC:
+            return cached.get("data")
+
+    last_error = ""
+    for path in remna_lookup_paths(query):
+        try:
+            payload = remna_api_call(path)
+            data = remna_extract_user(payload)
+            if data:
+                remna_user_cache_put(data)
+                with LOCK:
+                    REMNA_USER_CACHE[query] = {"fetched_at": ts, "data": data}
+                return data
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                last_error = f"http {exc.code}"
+                log(f"remna user lookup failed query={query}: http {exc.code}")
+        except Exception as exc:
+            last_error = str(exc)
+            log(f"remna user lookup failed query={query}: {exc}")
+    if last_error:
+        return None
+    with LOCK:
+        REMNA_USER_CACHE[query] = {"fetched_at": ts, "data": None}
     return None
 
 
@@ -580,12 +700,16 @@ def remna_user_info(user_id):
         if cached and ts - int(cached.get("fetched_at") or 0) < REMNA_API_CACHE_SEC:
             return cached.get("data")
 
-    path = remna_user_path(user_id)
     data = None
-    if path:
+    for path in remna_lookup_paths(user_id) or [remna_user_path(user_id)]:
+        if not path:
+            continue
         try:
             payload = remna_api_call(path)
             data = remna_extract_user(payload)
+            if data:
+                remna_user_cache_put(data)
+                break
         except urllib.error.HTTPError as exc:
             if exc.code != 404:
                 log(f"remna user lookup failed id={user_id}: http {exc.code}")
@@ -594,6 +718,19 @@ def remna_user_info(user_id):
 
     with LOCK:
         REMNA_USER_CACHE[user_id] = {"fetched_at": ts, "data": data}
+    return data
+
+
+def remna_user_action(uuid_value, action):
+    uuid_value = str(uuid_value or "").strip()
+    action = str(action or "").strip()
+    if not uuid_value or action not in ("disable", "enable"):
+        raise ValueError("bad remna user action")
+    quoted = urllib.parse.quote(uuid_value, safe="")
+    payload = remna_api_call(f"/api/users/{quoted}/actions/{action}", method="POST", payload={})
+    data = remna_extract_user(payload)
+    if data:
+        remna_user_cache_put(data)
     return data
 
 
@@ -977,6 +1114,101 @@ def active_ip_limit_entries(user, ts):
     return result
 
 
+def remna_user_id(info, fallback=""):
+    if isinstance(info, dict):
+        value = str(info.get("id") or "").strip()
+        if value:
+            return value
+    return str(fallback or "").strip()
+
+
+def remna_user_uuid(info):
+    if not isinstance(info, dict):
+        return ""
+    return str(info.get("uuid") or "").strip()
+
+
+def ip_limit_user_keys(user, info=None):
+    keys = []
+
+    def add(value):
+        value = str(value or "").strip()
+        if value and value not in keys:
+            keys.append(value)
+
+    add(user)
+    if isinstance(info, dict):
+        for key in ("id", "uuid", "username", "telegramId", "email", "tag"):
+            value = str(info.get(key) or "").strip()
+            if value:
+                add(value)
+                if key == "telegramId":
+                    add(f"tg:{value}")
+    return keys
+
+
+def ip_limit_primary_key(user, info=None):
+    if isinstance(info, dict):
+        value = str(info.get("id") or "").strip()
+        if value:
+            return value
+    keys = ip_limit_user_keys(user, info)
+    return keys[0] if keys else str(user or "").strip()
+
+
+def ip_limit_effective_limit(user, info=None):
+    limits = IP_LIMIT_STATE.setdefault("limits", {})
+    for key in ip_limit_user_keys(user, info):
+        if key not in limits:
+            continue
+        try:
+            value = int(limits.get(key))
+        except Exception:
+            continue
+        if value <= 0:
+            return 0, "personal"
+        return value, "personal"
+    return IP_LIMIT_MAX_IPS, "global"
+
+
+def set_ip_limit_override(user, info, value):
+    key = ip_limit_primary_key(user, info)
+    if not key:
+        raise ValueError("empty user key")
+    value = int(value)
+    with LOCK:
+        limits = IP_LIMIT_STATE.setdefault("limits", {})
+        limits[key] = value
+        save_ip_limit_state()
+    return key
+
+
+def clear_ip_limit_cache(info):
+    if not isinstance(info, dict):
+        return
+    with LOCK:
+        for key in ip_limit_user_keys("", info):
+            REMNA_USER_CACHE.pop(key, None)
+
+
+def active_ip_limit_entries_for_user(user, info, ts):
+    merged = {}
+    with LOCK:
+        for key in ip_limit_user_keys(user, info):
+            for item in active_ip_limit_entries(key, ts):
+                ip = item.get("ip")
+                if not ip:
+                    continue
+                current = merged.setdefault(ip, {"ip": ip, "last_seen": 0, "nodes": set()})
+                current["last_seen"] = max(int(current["last_seen"] or 0), int(item.get("last_seen") or 0))
+                current["nodes"].update(str(node) for node in item.get("nodes") or [] if str(node).strip())
+    result = []
+    for item in merged.values():
+        result.append({"ip": item["ip"], "last_seen": item["last_seen"], "nodes": sorted(item["nodes"], key=natural_sort_key)})
+    result.sort(key=lambda row: (-row["last_seen"], row["ip"]))
+    return result
+
+
 def ip_limit_snapshot(ts):
     rows = []
     with LOCK:
@@ -1035,10 +1267,12 @@ def ip_limit_group_rows(rows):
 def ip_limit_user_block(user, rows, ts):
     info = remna_user_info(user)
     name = remna_user_name(info, user)
+    limit, _ = ip_limit_effective_limit(user, info)
+    limit_text = f"{limit} IP" if limit > 0 else "без лимита"
     title = f"<b>ID {html.escape(str(user))}</b>"
     if name:
         title += f" | {html.escape(name)}"
-    lines = [f"{title} — {len(rows)}/{IP_LIMIT_MAX_IPS} IP"]
+    lines = [f"{title} — {len(rows)}/{html.escape(limit_text)}"]
     lines.extend(remna_block_lines(user, info))
     for row in rows[:8]:
         nodes = ", ".join(row.get("nodes") or []) or "-"
@@ -1102,6 +1336,78 @@ def ip_limit_report(query=""):
     return "\n".join(header + [""] + blocks)
 
 
+def ip_limit_limit_text(limit, source):
+    if limit <= 0:
+        return "без лимита"
+    suffix = "персональный" if source == "personal" else "глобальный"
+    return f"{limit} IP ({suffix})"
+
+
+def ip_limit_user_card(query):
+    query = str(query or "").strip()
+    if not query:
+        text = (
+            "<b>IP лимит пользователя</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            "<b>Пример:</b> <code>/ip_limit 3</code>\n"
+            "<b>Telegram ID:</b> <code>/ip_limit tg:646296998</code>"
+        )
+        return text, None
+    info = remna_user_lookup(query)
+    if not isinstance(info, dict):
+        text = (
+            "<b>Не нашёл пользователя</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Запрос', query)}\n"
+            "<i>Можно Remna ID, Telegram ID через tg:, username или uuid.</i>"
+        )
+        return text, None
+    key = ip_limit_primary_key(query, info)
+    ts = now_ts()
+    entries = active_ip_limit_entries_for_user(query, info, ts)
+    limit, source = ip_limit_effective_limit(query, info)
+    active_text = f"{len(entries)}/{limit}" if limit > 0 else f"{len(entries)}/без лимита"
+    lines = [
+        "<b>IP лимит пользователя</b>",
+        ALERT_SEPARATOR,
+        detail_line("ID", remna_user_id(info, key)),
+    ]
+    telegram_id = str(info.get("telegramId") or "").strip()
+    if telegram_id:
+        lines.append(detail_line("Telegram ID", telegram_id))
+    lines.extend(remna_detail_lines(key, info, include_hwid=True))
+    lines.extend([
+        detail_line("Лимит", ip_limit_limit_text(limit, source)),
+        detail_line("Окно", format_duration_ru(IP_LIMIT_WINDOW_SEC)),
+        detail_line("Активных IP", active_text),
+    ])
+    with LOCK:
+        penalty = IP_LIMIT_STATE.setdefault("penalties", {}).get(key)
+        if isinstance(penalty, dict) and int(penalty.get("enable_at") or 0) > ts:
+            lines.append(detail_line("Отключен до", fmt_time(penalty.get("enable_at"))))
+    ip_lines = []
+    for item in entries[:12]:
+        nodes = ", ".join(item.get("nodes") or []) or "-"
+        age = format_age(ts - int(item.get("last_seen") or 0))
+        ip_lines.append(f"{html.escape(item['ip'])} — {html.escape(nodes)} — {html.escape(age)} назад")
+    if len(entries) > 12:
+        ip_lines.append(f"... ещё {len(entries) - 12}")
+    if ip_lines:
+        lines.append("<blockquote>" + "\n".join(ip_lines) + "</blockquote>")
+    else:
+        lines.append("<blockquote>Активных IP сейчас нет.</blockquote>")
+    markup = {
+        "inline_keyboard": [
+            [
+                {"text": "Убрать лимит", "callback_data": f"ipl:off:{key}"},
+                {"text": "Повысить лимит", "callback_data": f"ipl:raise:{key}"},
+            ],
+            [{"text": "Обновить", "callback_data": f"ipl:show:{key}"}],
+        ]
+    }
+    return "\n".join(lines), markup
+
+
 def alert_ip_limit_exceeded(user, entries):
     ip_lines = []
     for item in entries[:12]:
@@ -1111,6 +1417,7 @@ def alert_ip_limit_exceeded(user, entries):
         ip_lines.append(f"... ещё {len(entries) - 12}")
 
     info = remna_user_info(user)
+    limit, _ = ip_limit_effective_limit(user, info)
     lines = [
         f"{LOST_EMOJI} #ipLimitExceeded",
         "<b>IP лимит превышен</b>",
@@ -1119,23 +1426,116 @@ def alert_ip_limit_exceeded(user, entries):
     ]
     lines.extend(remna_detail_lines(user, info, include_hwid=True))
     lines.extend([
-        detail_line("Активных IP", f"{len(entries)}/{IP_LIMIT_MAX_IPS}"),
+        detail_line("Активных IP", f"{len(entries)}/{limit if limit > 0 else 'без лимита'}"),
         detail_line("Окно", format_duration_ru(IP_LIMIT_WINDOW_SEC)),
         f"<blockquote>{chr(10).join(ip_lines)}</blockquote>",
     ])
+    enforcement = enforce_ip_limit(user, entries, limit, info)
+    if enforcement:
+        lines.insert(-1, detail_line("Действие", enforcement))
     return send_message("\n".join(lines))
+
+
+def enforce_ip_limit(user, entries, limit, info=None):
+    if not IP_LIMIT_ENFORCE_ENABLED:
+        return ""
+    if limit <= 0 or len(entries) <= limit:
+        return ""
+    if not remna_api_enabled():
+        return "Remna API не настроен"
+    if not isinstance(info, dict):
+        info = remna_user_info(user)
+    if not isinstance(info, dict):
+        return "юзер не найден в Remna API"
+    uuid_value = remna_user_uuid(info)
+    if not uuid_value:
+        return "у юзера нет uuid"
+    status = str(info.get("status") or "").strip().upper()
+    if status and status != "ACTIVE":
+        return f"не отключал, статус {status}"
+    key = ip_limit_primary_key(user, info)
+    ts = now_ts()
+    enable_at = ts + IP_LIMIT_PENALTY_SEC
+    with LOCK:
+        penalties = IP_LIMIT_STATE.setdefault("penalties", {})
+        current = penalties.get(key) if isinstance(penalties.get(key), dict) else None
+        if current and int(current.get("enable_at") or 0) > ts:
+            return f"уже отключён до {fmt_time(current.get('enable_at'))}"
+    try:
+        remna_user_action(uuid_value, "disable")
+        clear_ip_limit_cache(info)
+    except Exception as exc:
+        log(f"ip limit disable failed user={user} uuid={uuid_value}: {exc}")
+        return "ошибка disable в Remna API"
+    with LOCK:
+        IP_LIMIT_STATE.setdefault("penalties", {})[key] = {
+            "uuid": uuid_value,
+            "user": key,
+            "disabled_at": ts,
+            "enable_at": enable_at,
+            "reason": "ip_limit",
+        }
+        save_ip_limit_state()
+    return f"отключен на {format_duration_ru_for(IP_LIMIT_PENALTY_SEC)}"
+
+
+def ip_limit_penalty_loop():
+    while True:
+        try:
+            time.sleep(5)
+            ts = now_ts()
+            due = []
+            with LOCK:
+                penalties = IP_LIMIT_STATE.setdefault("penalties", {})
+                for key, item in list(penalties.items()):
+                    if not isinstance(item, dict):
+                        del penalties[key]
+                        continue
+                    if int(item.get("enable_at") or 0) <= ts:
+                        due.append((key, dict(item)))
+                if len(due) != 0:
+                    save_ip_limit_state()
+            for key, item in due:
+                uuid_value = str(item.get("uuid") or "").strip()
+                if not uuid_value:
+                    with LOCK:
+                        IP_LIMIT_STATE.setdefault("penalties", {}).pop(key, None)
+                        save_ip_limit_state()
+                    continue
+                try:
+                    remna_user_action(uuid_value, "enable")
+                    with LOCK:
+                        IP_LIMIT_STATE.setdefault("penalties", {}).pop(key, None)
+                        save_ip_limit_state()
+                    log(f"ip limit penalty lifted: user={key} uuid={uuid_value}")
+                    send_message(
+                        f"{RESTORED_EMOJI} #ipLimitLifted\n"
+                        "<b>IP лимит снят</b>\n"
+                        f"{ALERT_SEPARATOR}\n"
+                        f"{detail_line('ID', key)}\n"
+                        f"{detail_line('Действие', 'доступ восстановлен')}"
+                    )
+                except Exception as exc:
+                    log(f"ip limit enable failed user={key} uuid={uuid_value}: {exc}")
+                    with LOCK:
+                        penalty = IP_LIMIT_STATE.setdefault("penalties", {}).get(key)
+                        if isinstance(penalty, dict):
+                            penalty["enable_at"] = now_ts() + 30
+                            penalty["last_error"] = str(exc)[:160]
+                            save_ip_limit_state()
+        except Exception as exc:
+            log(f"ip limit penalty loop failed: {exc}")
+            time.sleep(10)
 
 
 def process_ip_limit_events(events, fallback_node, ts):
     if not IP_LIMIT_ENABLED or not isinstance(events, list):
         return
 
-    alerts = []
+    touched = set()
     with LOCK:
         purge_ip_limit_state(ts)
         users = IP_LIMIT_STATE.setdefault("users", {})
-        alert_state = IP_LIMIT_STATE.setdefault("alerts", {})
-        touched = set()
 
         for raw in events[:500]:
             event = normalize_ip_limit_event(raw, fallback_node, ts)
@@ -1150,23 +1550,25 @@ def process_ip_limit_events(events, fallback_node, ts):
                 nodes[event["node"]] = event["seen_at"]
             else:
                 entry["nodes"] = {event["node"]: event["seen_at"]}
-
-        purge_ip_limit_state(ts)
-        for user in sorted(touched, key=natural_sort_key):
-            entries = active_ip_limit_entries(user, ts)
-            if len(entries) <= IP_LIMIT_MAX_IPS:
-                continue
-            last_alert = int(alert_state.get(user) or 0)
-            if ts - last_alert < IP_LIMIT_ALERT_COOLDOWN:
-                continue
-            alert_state[user] = ts
-            alerts.append((user, entries))
-
         if touched:
             save_ip_limit_state()
 
-    for user, entries in alerts:
-        log(f"ip limit exceeded: user={user} active_ips={len(entries)} limit={IP_LIMIT_MAX_IPS}")
+    for user in sorted(touched, key=natural_sort_key):
+        info = remna_user_info(user)
+        with LOCK:
+            purge_ip_limit_state(ts)
+            entries = active_ip_limit_entries_for_user(user, info, ts)
+            limit, _ = ip_limit_effective_limit(user, info)
+            if limit <= 0 or len(entries) <= limit:
+                continue
+            alert_state = IP_LIMIT_STATE.setdefault("alerts", {})
+            alert_key = ip_limit_primary_key(user, info)
+            last_alert = int(alert_state.get(alert_key) or 0)
+            if ts - last_alert < IP_LIMIT_ALERT_COOLDOWN:
+                continue
+            alert_state[alert_key] = ts
+            save_ip_limit_state()
+        log(f"ip limit exceeded: user={user} active_ips={len(entries)} limit={limit}")
         alert_ip_limit_exceeded(user, entries)
 
 
@@ -1540,6 +1942,111 @@ def handle_ip(text):
     send_message(ip_limit_report(query))
 
 
+def handle_ip_limit(text):
+    parts = text.split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    body, markup = ip_limit_user_card(query)
+    send_message(body, reply_markup=markup)
+
+
+def pending_key(chat_id, from_id):
+    return f"{chat_id}:{from_id}"
+
+
+def set_pending_ip_limit(chat_id, from_id, user_key):
+    with LOCK:
+        IP_LIMIT_STATE.setdefault("pending", {})[pending_key(chat_id, from_id)] = {
+            "action": "set_ip_limit",
+            "user": str(user_key),
+            "created_at": now_ts(),
+        }
+        save_ip_limit_state()
+
+
+def pop_pending_ip_limit(chat_id, from_id):
+    with LOCK:
+        pending = IP_LIMIT_STATE.setdefault("pending", {})
+        item = pending.pop(pending_key(chat_id, from_id), None)
+        if item is not None:
+            save_ip_limit_state()
+        return item if isinstance(item, dict) else None
+
+
+def peek_pending_ip_limit(chat_id, from_id):
+    with LOCK:
+        item = IP_LIMIT_STATE.setdefault("pending", {}).get(pending_key(chat_id, from_id))
+        if not isinstance(item, dict):
+            return None
+        if now_ts() - int(item.get("created_at") or 0) > 600:
+            IP_LIMIT_STATE.setdefault("pending", {}).pop(pending_key(chat_id, from_id), None)
+            save_ip_limit_state()
+            return None
+        return dict(item)
+
+
+def handle_pending_ip_limit(chat_id, from_id, text):
+    pending = peek_pending_ip_limit(chat_id, from_id)
+    if not pending or pending.get("action") != "set_ip_limit":
+        return False
+    value = str(text or "").strip()
+    if not re.fullmatch(r"\d{1,3}", value):
+        send_message("<b>Нужна цифра.</b>\n\nНапример: <code>5</code>\nОтмена: <code>/cancel</code>")
+        return True
+    limit = int(value)
+    if limit < 1 or limit > 999:
+        send_message("<b>Лимит должен быть от 1 до 999.</b>")
+        return True
+    item = pop_pending_ip_limit(chat_id, from_id)
+    user_key = str((item or {}).get("user") or pending.get("user") or "").strip()
+    info = remna_user_lookup(user_key)
+    set_ip_limit_override(user_key, info, limit)
+    body, markup = ip_limit_user_card(user_key)
+    send_message(f"<b>IP лимит обновлён</b>\n\n{body}", reply_markup=markup)
+    return True
+
+
+def handle_ip_limit_callback(callback):
+    callback_id = str(callback.get("id") or "")
+    data = str(callback.get("data") or "")
+    from_id = str((callback.get("from") or {}).get("id") or "")
+    message = callback.get("message") or {}
+    chat_id = str((message.get("chat") or {}).get("id") or CHAT_ID)
+    if chat_id != str(CHAT_ID) or from_id != ALLOWED_USER_ID:
+        answer_callback(callback_id, "нет доступа")
+        return
+    parts = data.split(":", 2)
+    if len(parts) != 3 or parts[0] != "ipl":
+        answer_callback(callback_id)
+        return
+    action, user_key = parts[1], parts[2].strip()
+    if not user_key:
+        answer_callback(callback_id, "пустой юзер")
+        return
+    info = remna_user_lookup(user_key)
+    if action == "off":
+        key = set_ip_limit_override(user_key, info, 0)
+        answer_callback(callback_id, "лимит убран")
+        body, markup = ip_limit_user_card(key)
+        send_message(f"<b>Лимит убран</b>\n\n{body}", reply_markup=markup)
+        return
+    if action == "raise":
+        set_pending_ip_limit(chat_id, from_id, user_key)
+        answer_callback(callback_id, "ответь числом")
+        send_message(
+            "<b>Новый IP лимит</b>\n\n"
+            f"{detail_line('ID', user_key)}\n"
+            "Ответь одним числом, например: <code>5</code>\n"
+            "Отмена: <code>/cancel</code>"
+        )
+        return
+    if action == "show":
+        answer_callback(callback_id, "обновляю")
+        body, markup = ip_limit_user_card(user_key)
+        send_message(body, reply_markup=markup)
+        return
+    answer_callback(callback_id)
+
+
 def handle_test_alert(text, kind):
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -1632,7 +2139,7 @@ def bot_loop():
             log(f"initial getUpdates failed: {exc}")
     while True:
         try:
-            params = {"timeout": 25, "limit": 20, "allowed_updates": json.dumps(["message"])}
+            params = {"timeout": 25, "limit": 20, "allowed_updates": json.dumps(["message", "callback_query"])}
             if offset is not None:
                 params["offset"] = offset
             updates = tg_call("getUpdates", params, timeout=35).get("result") or []
@@ -1640,11 +2147,22 @@ def bot_loop():
                 update_id = int(item.get("update_id", 0))
                 offset = update_id + 1
                 save_offset(offset)
+                callback = item.get("callback_query")
+                if isinstance(callback, dict):
+                    handle_ip_limit_callback(callback)
+                    continue
                 message = item.get("message") or {}
                 chat_id = str((message.get("chat") or {}).get("id", ""))
                 from_id = str((message.get("from") or {}).get("id", ""))
                 text = str(message.get("text") or "")
                 command = text.split()[0].split("@", 1)[0].lower() if text.split() else ""
+                if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/cancel":
+                    pop_pending_ip_limit(chat_id, from_id)
+                    send_message("<b>Отменил.</b>")
+                    continue
+                if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and not command.startswith("/"):
+                    if handle_pending_ip_limit(chat_id, from_id, text):
+                        continue
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats":
                     send_message(aggregate_message())
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statsrevoke":
@@ -1655,6 +2173,8 @@ def bot_loop():
                     handle_add_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip":
                     handle_ip(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_limit":
+                    handle_ip_limit(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/down":
                     handle_test_alert(text, "down")
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/up":
@@ -1677,6 +2197,7 @@ def main():
     load_ssh_allowed_ips()
     load_ip_limit_state()
     threading.Thread(target=offline_loop, daemon=True).start()
+    threading.Thread(target=ip_limit_penalty_loop, daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
     if DAILY_REPORT_TIME:
         threading.Thread(target=daily_report_loop, daemon=True).start()
