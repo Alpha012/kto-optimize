@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v161"
+SCRIPT_BUILD="v162"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -67,6 +67,7 @@ IP_LIMIT_WINDOW_SEC_DEFAULT="${KTO_IP_LIMIT_WINDOW_SEC_DEFAULT:-600}"
 IP_LIMIT_ALERT_COOLDOWN_DEFAULT="${KTO_IP_LIMIT_ALERT_COOLDOWN_DEFAULT:-600}"
 IP_LIMIT_SCAN_SEC_DEFAULT="${KTO_IP_LIMIT_SCAN_SEC_DEFAULT:-120}"
 IP_LIMIT_XRAY_LOGS_DEFAULT="${KTO_IP_LIMIT_XRAY_LOGS_DEFAULT:-1}"
+REMNA_API_CACHE_SEC_DEFAULT="${KTO_COLLECTOR_REMNA_API_CACHE_SEC_DEFAULT:-300}"
 SPEEDTEST_TIMEOUT="${KTO_SPEEDTEST_TIMEOUT:-240}"
 SPEEDTEST_DOWNLOAD_TIMEOUT="${KTO_SPEEDTEST_DOWNLOAD_TIMEOUT:-180}"
 APT_UPDATED=0
@@ -3518,8 +3519,10 @@ install_stats_collector() {
 
     local listen_host listen_port secret bot_token chat_id allowed_user stale_sec expected_nodes daily_report_time existing_config=0
     local ip_limit_enabled ip_limit_max_ips ip_limit_window_sec ip_limit_alert_cooldown
+    local remna_api_url remna_api_token remna_api_cache_sec
     local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_expected safe_tz safe_daily
     local safe_ip_limit_enabled safe_ip_limit_max_ips safe_ip_limit_window safe_ip_limit_cooldown
+    local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec
 
     if "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
         listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -3535,6 +3538,9 @@ install_stats_collector() {
         ip_limit_max_ips="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_IPS "$STATS_COLLECTOR_CONFIG")"
         ip_limit_window_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC "$STATS_COLLECTOR_CONFIG")"
         ip_limit_alert_cooldown="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN "$STATS_COLLECTOR_CONFIG")"
+        remna_api_url="$(config_get KTO_COLLECTOR_REMNA_API_URL "$STATS_COLLECTOR_CONFIG")"
+        remna_api_token="$(config_get KTO_COLLECTOR_REMNA_API_TOKEN "$STATS_COLLECTOR_CONFIG")"
+        remna_api_cache_sec="$(config_get KTO_COLLECTOR_REMNA_API_CACHE_SEC "$STATS_COLLECTOR_CONFIG")"
         if [[ -n "$secret" && -n "$bot_token" && -n "$chat_id" ]]; then
             existing_config=1
         else
@@ -3552,6 +3558,9 @@ install_stats_collector() {
         ip_limit_max_ips="${ip_limit_max_ips:-$IP_LIMIT_MAX_IPS_DEFAULT}"
         ip_limit_window_sec="${ip_limit_window_sec:-$IP_LIMIT_WINDOW_SEC_DEFAULT}"
         ip_limit_alert_cooldown="${ip_limit_alert_cooldown:-$IP_LIMIT_ALERT_COOLDOWN_DEFAULT}"
+        remna_api_url="${remna_api_url:-$REMNA_API_URL}"
+        remna_api_token="${remna_api_token:-$REMNA_API_TOKEN}"
+        remna_api_cache_sec="${remna_api_cache_sec:-$REMNA_API_CACHE_SEC_DEFAULT}"
     else
         listen_host="$(ask_text "IP прослушивания коллектора" "0.0.0.0")"
         listen_port="$(ask_int "Порт коллектора" "$STATS_COLLECTOR_PORT_DEFAULT" 1 65535)"
@@ -3566,6 +3575,18 @@ install_stats_collector() {
         ip_limit_max_ips="$IP_LIMIT_MAX_IPS_DEFAULT"
         ip_limit_window_sec="$IP_LIMIT_WINDOW_SEC_DEFAULT"
         ip_limit_alert_cooldown="$IP_LIMIT_ALERT_COOLDOWN_DEFAULT"
+        remna_api_url="$REMNA_API_URL"
+        remna_api_token="$REMNA_API_TOKEN"
+        remna_api_cache_sec="$REMNA_API_CACHE_SEC_DEFAULT"
+    fi
+    if [[ -n "${KTO_COLLECTOR_REMNA_API_URL:-}" ]]; then
+        remna_api_url="$KTO_COLLECTOR_REMNA_API_URL"
+    fi
+    if [[ -n "${KTO_COLLECTOR_REMNA_API_TOKEN:-}" ]]; then
+        remna_api_token="$KTO_COLLECTOR_REMNA_API_TOKEN"
+    fi
+    if [[ -n "${KTO_COLLECTOR_REMNA_API_CACHE_SEC:-}" ]]; then
+        remna_api_cache_sec="$KTO_COLLECTOR_REMNA_API_CACHE_SEC"
     fi
 
     safe_host="$(escape_config_value "$listen_host")"
@@ -3582,6 +3603,9 @@ install_stats_collector() {
     safe_ip_limit_max_ips="$(escape_config_value "$ip_limit_max_ips")"
     safe_ip_limit_window="$(escape_config_value "$ip_limit_window_sec")"
     safe_ip_limit_cooldown="$(escape_config_value "$ip_limit_alert_cooldown")"
+    safe_remna_api_url="$(escape_config_value "$remna_api_url")"
+    safe_remna_api_token="$(escape_config_value "$remna_api_token")"
+    safe_remna_api_cache_sec="$(escape_config_value "$remna_api_cache_sec")"
 
     if (( existing_config == 1 )); then
         stage "Обновляю коллектор статистики"
@@ -3606,6 +3630,9 @@ KTO_COLLECTOR_IP_LIMIT_ENABLED="$safe_ip_limit_enabled"
 KTO_COLLECTOR_IP_LIMIT_MAX_IPS="$safe_ip_limit_max_ips"
 KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC="$safe_ip_limit_window"
 KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN="$safe_ip_limit_cooldown"
+KTO_COLLECTOR_REMNA_API_URL="$safe_remna_api_url"
+KTO_COLLECTOR_REMNA_API_TOKEN="$safe_remna_api_token"
+KTO_COLLECTOR_REMNA_API_CACHE_SEC="$safe_remna_api_cache_sec"
 EOF
     write_stats_collector_script
     write_stats_collector_service
@@ -3634,16 +3661,23 @@ EOF
     else
         ok "Ежедневный отчёт: выключен"
     fi
+    if [[ -n "$remna_api_token" ]]; then
+        ok "Remnawave API enrichment: включён"
+    else
+        warn "Remnawave API enrichment: токен не задан"
+    fi
 }
 
 stats_collector_status() {
     header
     require_panel_mode
     need_root
-    local state listen_host listen_port health_host health_log rc
+    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
     listen_port="$(config_get KTO_COLLECTOR_LISTEN_PORT "$STATS_COLLECTOR_CONFIG")"
+    remna_api_url="$(config_get KTO_COLLECTOR_REMNA_API_URL "$STATS_COLLECTOR_CONFIG")"
+    remna_api_token="$(config_get KTO_COLLECTOR_REMNA_API_TOKEN "$STATS_COLLECTOR_CONFIG")"
     listen_host="${listen_host:-0.0.0.0}"
     listen_port="${listen_port:-$STATS_COLLECTOR_PORT_DEFAULT}"
     if [[ "$listen_host" == "0.0.0.0" || "$listen_host" == "::" ]]; then
@@ -3656,6 +3690,7 @@ stats_collector_status() {
     print_row "конфиг" "$STATS_COLLECTOR_CONFIG" "$([[ -s "$STATS_COLLECTOR_CONFIG" ]] && echo 1 || echo 0)"
     print_row "данные" "$STATS_COLLECTOR_STATE_DIR" "$([[ -d "$STATS_COLLECTOR_STATE_DIR" ]] && echo 1 || echo 0)"
     print_row "адрес" "${listen_host}:${listen_port}" "$([[ -n "$listen_port" ]] && echo 1 || echo 0)"
+    print_row "remna api" "${remna_api_url:-empty} / $([[ -n "$remna_api_token" ]] && echo token-set || echo no-token)" "$([[ -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
 
     if command_exists curl; then
         health_log="$(mktemp)"

@@ -13,7 +13,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v161"
+COLLECTOR_BUILD = "v162"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -80,6 +80,20 @@ except Exception:
     IP_LIMIT_ALERT_COOLDOWN = 600
 if IP_LIMIT_ALERT_COOLDOWN < 60:
     IP_LIMIT_ALERT_COOLDOWN = 60
+REMNA_API_URL = str(cfg.get("KTO_COLLECTOR_REMNA_API_URL", "") or "").strip().rstrip("/")
+REMNA_API_TOKEN = str(cfg.get("KTO_COLLECTOR_REMNA_API_TOKEN", "") or "").strip()
+try:
+    REMNA_API_CACHE_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_API_CACHE_SEC", "300") or "300")
+except Exception:
+    REMNA_API_CACHE_SEC = 300
+if REMNA_API_CACHE_SEC < 30:
+    REMNA_API_CACHE_SEC = 30
+try:
+    REMNA_API_TIMEOUT_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_API_TIMEOUT_SEC", "5") or "5")
+except Exception:
+    REMNA_API_TIMEOUT_SEC = 5
+if REMNA_API_TIMEOUT_SEC < 1:
+    REMNA_API_TIMEOUT_SEC = 1
 
 NODES_FILE = os.path.join(STATE_DIR, "nodes.json")
 FALLS_FILE = os.path.join(STATE_DIR, "falls.json")
@@ -92,6 +106,7 @@ NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
 IP_LIMIT_STATE = {"users": {}, "alerts": {}}
+REMNA_USER_CACHE = {}
 ALERT_SEPARATOR = "➖" * 9
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
 LOST_EMOJI = '<tg-emoji emoji-id="5447183459602669338">🚨</tg-emoji>'
@@ -348,6 +363,16 @@ def format_bytes(value):
     return f"{value:.1f} {units[idx]}"
 
 
+def format_bytes_limit(value):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    if value <= 0:
+        return "∞"
+    return format_bytes(value)
+
+
 def format_percent(value):
     try:
         value = float(value)
@@ -412,6 +437,22 @@ def fmt_time(ts):
         return "-"
 
 
+def parse_iso_ts(value):
+    value = str(value or "").strip()
+    if not value:
+        return 0
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return int(parsed.timestamp())
+    except Exception:
+        return 0
+
+
+def fmt_iso_time(value):
+    ts = parse_iso_ts(value)
+    return fmt_time(ts) if ts > 0 else "-"
+
+
 def natural_sort_key(value):
     text = str(value or "").casefold()
     key = []
@@ -473,6 +514,149 @@ def send_message(text):
     except Exception as exc:
         log(f"telegram send failed: {exc}")
         return False
+
+
+def remna_api_enabled():
+    return bool(REMNA_API_URL and REMNA_API_TOKEN)
+
+
+def remna_api_call(path):
+    if not remna_api_enabled():
+        return None
+    url = f"{REMNA_API_URL}{path}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {REMNA_API_TOKEN}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=REMNA_API_TIMEOUT_SEC) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    return json.loads(body)
+
+
+def remna_user_path(user_id):
+    value = str(user_id or "").strip()
+    if not value:
+        return ""
+    quoted = urllib.parse.quote(value, safe="")
+    if value.isdigit():
+        return f"/api/users/by-id/{quoted}"
+    if re.fullmatch(r"[0-9a-fA-F-]{32,36}", value):
+        return f"/api/users/{quoted}"
+    return f"/api/users/by-username/{quoted}"
+
+
+def remna_user_info(user_id):
+    user_id = str(user_id or "").strip()
+    if not user_id or not remna_api_enabled():
+        return None
+    ts = now_ts()
+    with LOCK:
+        cached = REMNA_USER_CACHE.get(user_id)
+        if cached and ts - int(cached.get("fetched_at") or 0) < REMNA_API_CACHE_SEC:
+            return cached.get("data")
+
+    path = remna_user_path(user_id)
+    data = None
+    if path:
+        try:
+            payload = remna_api_call(path)
+            response = payload.get("response") if isinstance(payload, dict) else None
+            if isinstance(response, dict):
+                data = response
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                log(f"remna user lookup failed id={user_id}: http {exc.code}")
+        except Exception as exc:
+            log(f"remna user lookup failed id={user_id}: {exc}")
+
+    with LOCK:
+        REMNA_USER_CACHE[user_id] = {"fetched_at": ts, "data": data}
+    return data
+
+
+def remna_user_name(info, fallback=""):
+    if not isinstance(info, dict):
+        return ""
+    for key in ("username", "email", "tag"):
+        value = str(info.get(key) or "").strip()
+        if value and value != str(fallback):
+            return value
+    return ""
+
+
+def remna_user_traffic(info):
+    if not isinstance(info, dict):
+        return ""
+    traffic = info.get("userTraffic") if isinstance(info.get("userTraffic"), dict) else {}
+    used = traffic.get("usedTrafficBytes") if traffic else 0
+    limit = info.get("trafficLimitBytes") or 0
+    if not used and not limit:
+        return ""
+    return f"{format_bytes(used)} / {format_bytes_limit(limit)}"
+
+
+def remna_user_online(info):
+    if not isinstance(info, dict):
+        return ""
+    traffic = info.get("userTraffic") if isinstance(info.get("userTraffic"), dict) else {}
+    online_ts = parse_iso_ts(traffic.get("onlineAt") if traffic else "")
+    if online_ts <= 0:
+        return ""
+    return f"{format_age(now_ts() - online_ts)} назад"
+
+
+def remna_user_expire(info):
+    if not isinstance(info, dict):
+        return ""
+    return fmt_iso_time(info.get("expireAt"))
+
+
+def remna_detail_lines(user_id, info, include_hwid=False):
+    lines = []
+    name = remna_user_name(info, user_id)
+    if name:
+        lines.append(detail_line("Пользователь", name))
+    status = str((info or {}).get("status") or "").strip()
+    if status:
+        lines.append(detail_line("Статус", status))
+    traffic = remna_user_traffic(info)
+    if traffic:
+        lines.append(detail_line("Трафик", traffic))
+    expire = remna_user_expire(info)
+    if expire != "-":
+        lines.append(detail_line("Истекает", expire))
+    online = remna_user_online(info)
+    if online:
+        lines.append(detail_line("Онлайн", online))
+    if include_hwid:
+        hwid = (info or {}).get("hwidDeviceLimit")
+        if hwid is not None:
+            lines.append(detail_line("HWID лимит", hwid))
+    return lines
+
+
+def remna_block_lines(user_id, info):
+    result = []
+    status = str((info or {}).get("status") or "").strip()
+    traffic = remna_user_traffic(info)
+    expire = remna_user_expire(info)
+    online = remna_user_online(info)
+    summary = []
+    if status:
+        summary.append(status)
+    if traffic:
+        summary.append(f"трафик {traffic}")
+    if expire != "-":
+        summary.append(f"до {expire}")
+    if online:
+        summary.append(f"online {online}")
+    if summary:
+        result.append(html.escape(" | ".join(summary)))
+    return result
 
 
 def node_message(node, status=None):
@@ -830,7 +1014,13 @@ def ip_limit_group_rows(rows):
 
 
 def ip_limit_user_block(user, rows, ts):
-    lines = [f"<b>ID {html.escape(str(user))}</b> — {len(rows)}/{IP_LIMIT_MAX_IPS} IP"]
+    info = remna_user_info(user)
+    name = remna_user_name(info, user)
+    title = f"<b>ID {html.escape(str(user))}</b>"
+    if name:
+        title += f" | {html.escape(name)}"
+    lines = [f"{title} — {len(rows)}/{IP_LIMIT_MAX_IPS} IP"]
+    lines.extend(remna_block_lines(user, info))
     for row in rows[:8]:
         nodes = ", ".join(row.get("nodes") or []) or "-"
         age = format_age(ts - int(row.get("last_seen") or 0))
@@ -901,15 +1091,20 @@ def alert_ip_limit_exceeded(user, entries):
     if len(entries) > 12:
         ip_lines.append(f"... ещё {len(entries) - 12}")
 
-    return send_message(
-        f"{LOST_EMOJI} #ipLimitExceeded\n"
-        "<b>IP лимит превышен</b>\n"
-        f"{ALERT_SEPARATOR}\n"
-        f"{detail_line('ID', user)}\n"
-        f"{detail_line('Активных IP', f'{len(entries)}/{IP_LIMIT_MAX_IPS}')}\n"
-        f"{detail_line('Окно', format_duration_ru(IP_LIMIT_WINDOW_SEC))}\n"
-        f"<blockquote>{chr(10).join(ip_lines)}</blockquote>"
-    )
+    info = remna_user_info(user)
+    lines = [
+        f"{LOST_EMOJI} #ipLimitExceeded",
+        "<b>IP лимит превышен</b>",
+        ALERT_SEPARATOR,
+        detail_line("ID", user),
+    ]
+    lines.extend(remna_detail_lines(user, info, include_hwid=True))
+    lines.extend([
+        detail_line("Активных IP", f"{len(entries)}/{IP_LIMIT_MAX_IPS}"),
+        detail_line("Окно", format_duration_ru(IP_LIMIT_WINDOW_SEC)),
+        f"<blockquote>{chr(10).join(ip_lines)}</blockquote>",
+    ])
+    return send_message("\n".join(lines))
 
 
 def process_ip_limit_events(events, fallback_node, ts):
