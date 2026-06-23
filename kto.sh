@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v165"
+SCRIPT_BUILD="v166"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3595,6 +3595,18 @@ install_stats_collector() {
     fi
     if [[ -n "${KTO_COLLECTOR_REMNA_API_CACHE_SEC:-}" ]]; then
         remna_api_cache_sec="$KTO_COLLECTOR_REMNA_API_CACHE_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ENABLED:-}" ]]; then
+        ip_limit_enabled="$KTO_COLLECTOR_IP_LIMIT_ENABLED"
+    fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_MAX_IPS:-}" ]]; then
+        ip_limit_max_ips="$KTO_COLLECTOR_IP_LIMIT_MAX_IPS"
+    fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC:-}" ]]; then
+        ip_limit_window_sec="$KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN:-}" ]]; then
+        ip_limit_alert_cooldown="$KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN"
     fi
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED:-}" ]]; then
         ip_limit_enforce_enabled="$KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED"
