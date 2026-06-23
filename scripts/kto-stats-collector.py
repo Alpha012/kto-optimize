@@ -13,7 +13,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v160"
+COLLECTOR_BUILD = "v161"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -884,7 +884,6 @@ def ip_limit_report(query=""):
         detail_line("Машина", query),
         detail_line("Окно", format_duration_ru(IP_LIMIT_WINDOW_SEC)),
         detail_line("Лимит", f"{IP_LIMIT_MAX_IPS} IP"),
-        detail_line("ID", len(grouped)),
         detail_line("IP", total_ips),
     ]
 
