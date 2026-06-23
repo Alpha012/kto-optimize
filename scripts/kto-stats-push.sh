@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v166"
+PUSH_BUILD="v167"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -314,13 +314,28 @@ ip_limit_ip_from_line() {
     return 1
 }
 
+ip_limit_seen_at_from_line() {
+    local line="$1"
+    local stamp
+
+    if [[ "$line" =~ ^([0-9]{4})/([0-9]{2})/([0-9]{2})[[:space:]]+([0-9]{2}):([0-9]{2}):([0-9]{2}) ]]; then
+        stamp="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+        date -d "$stamp" +%s 2>/dev/null && return 0
+    fi
+    if [[ "$line" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})[T[:space:]]([0-9]{2}):([0-9]{2}):([0-9]{2}) ]]; then
+        stamp="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+        date -d "$stamp" +%s 2>/dev/null && return 0
+    fi
+    return 1
+}
+
 read_ip_limit_source_lines() {
     local output_file="$1"
     local scan_sec="$KTO_IP_LIMIT_SCAN_SEC"
     local tail_lines="$KTO_IP_LIMIT_TAIL_LINES"
 
     if [[ -n "$KTO_IP_LIMIT_DOCKER_CONTAINER" ]] && command -v docker >/dev/null 2>&1; then
-        docker logs --since "${scan_sec}s" "$KTO_IP_LIMIT_DOCKER_CONTAINER" >> "$output_file" 2>/dev/null || true
+        docker logs --since "${scan_sec}s" "$KTO_IP_LIMIT_DOCKER_CONTAINER" 2>/dev/null | awk '{print "recent\t" $0}' >> "$output_file" || true
         if ip_limit_xray_logs_enabled; then
             docker exec "$KTO_IP_LIMIT_DOCKER_CONTAINER" sh -c '
                 lines="$1"
@@ -334,16 +349,16 @@ read_ip_limit_source_lines() {
                     /usr/local/etc/xray/access.log; do
                     [ -r "$path" ] && tail -n "$lines" "$path"
                 done
-            ' sh "$tail_lines" >> "$output_file" 2>/dev/null || true
+            ' sh "$tail_lines" 2>/dev/null | awk '{print "file\t" $0}' >> "$output_file" || true
         fi
     fi
     if [[ -n "$KTO_IP_LIMIT_LOG_FILE" && -r "$KTO_IP_LIMIT_LOG_FILE" ]]; then
-        tail -n "$tail_lines" "$KTO_IP_LIMIT_LOG_FILE" >> "$output_file" 2>/dev/null || true
+        tail -n "$tail_lines" "$KTO_IP_LIMIT_LOG_FILE" 2>/dev/null | awk '{print "file\t" $0}' >> "$output_file" || true
     fi
 }
 
 read_ip_limit_events() {
-    local lines_file events_file line user ip
+    local lines_file events_file source line user ip seen_at parsed_seen_at scan_sec cutoff
 
     ip_limit_events='[]'
     ip_limit_enabled || return 0
@@ -352,14 +367,31 @@ read_ip_limit_events() {
     lines_file="$(mktemp)"
     events_file="$(mktemp)"
     read_ip_limit_source_lines "$lines_file"
+    case "$KTO_IP_LIMIT_SCAN_SEC" in
+        ""|*[!0-9]*) scan_sec=120 ;;
+        *) scan_sec="$KTO_IP_LIMIT_SCAN_SEC" ;;
+    esac
+    cutoff=$(( updated_at - scan_sec - 5 ))
 
-    while IFS= read -r line; do
+    while IFS=$'\t' read -r source line; do
+        if [[ "$source" != "recent" && "$source" != "file" ]]; then
+            line="${source}${line:+ ${line}}"
+            source="recent"
+        fi
         [[ -n "$line" ]] || continue
         user="$(ip_limit_user_from_line "$line" || true)"
         [[ -n "$user" ]] || continue
         ip="$(ip_limit_ip_from_line "$line" || true)"
         validate_ipv4 "$ip" || continue
-        printf '%s\t%s\t%s\t%s\n' "$user" "$ip" "$KTO_PUSH_NODE_NAME" "$updated_at" >> "$events_file"
+        seen_at="$updated_at"
+        parsed_seen_at="$(ip_limit_seen_at_from_line "$line" || true)"
+        if [[ -n "$parsed_seen_at" ]]; then
+            seen_at="$parsed_seen_at"
+        elif [[ "$source" == "file" ]]; then
+            continue
+        fi
+        (( seen_at >= cutoff && seen_at <= updated_at + 300 )) || continue
+        printf '%s\t%s\t%s\t%s\n' "$user" "$ip" "$KTO_PUSH_NODE_NAME" "$seen_at" >> "$events_file"
     done < "$lines_file"
 
     if [[ -s "$events_file" ]]; then
