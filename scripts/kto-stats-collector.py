@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import ssl
+import sqlite3
 import tempfile
 import threading
 import time
@@ -14,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v170"
+COLLECTOR_BUILD = "v171"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -70,6 +71,14 @@ except Exception:
 if IP_LIMIT_MAX_IPS < 1:
     IP_LIMIT_MAX_IPS = 1
 try:
+    IP_LIMIT_MAX_EVENTS = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS", "10000") or "10000")
+except Exception:
+    IP_LIMIT_MAX_EVENTS = 10000
+if IP_LIMIT_MAX_EVENTS < 100:
+    IP_LIMIT_MAX_EVENTS = 100
+if IP_LIMIT_MAX_EVENTS > 200000:
+    IP_LIMIT_MAX_EVENTS = 200000
+try:
     IP_LIMIT_WINDOW_SEC = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC", "600") or "600")
 except Exception:
     IP_LIMIT_WINDOW_SEC = 600
@@ -109,11 +118,12 @@ OFFSET_FILE = os.path.join(STATE_DIR, "telegram_offset")
 DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
 SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
 IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
+IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
 LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
-IP_LIMIT_STATE = {"users": {}, "alerts": {}, "limits": {}, "pending": {}, "penalties": {}, "blocks": {}}
+IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
 ALERT_SEPARATOR = "➖" * 9
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
@@ -239,33 +249,229 @@ def ssh_allowed_ips_snapshot():
         return list(SSH_ALLOWED_IPS)
 
 
-def load_ip_limit_state():
-    global IP_LIMIT_STATE
-    os.makedirs(STATE_DIR, exist_ok=True)
+def ip_limit_db():
+    global IP_LIMIT_DB
+    if IP_LIMIT_DB is None:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        IP_LIMIT_DB = sqlite3.connect(IP_LIMIT_DB_FILE, check_same_thread=False)
+        IP_LIMIT_DB.row_factory = sqlite3.Row
+        IP_LIMIT_DB.execute("PRAGMA journal_mode=WAL")
+        IP_LIMIT_DB.execute("PRAGMA synchronous=NORMAL")
+        IP_LIMIT_DB.execute("PRAGMA temp_store=MEMORY")
+    return IP_LIMIT_DB
+
+
+def init_ip_limit_db():
+    db = ip_limit_db()
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS ip_limit_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ip_limit_events (
+            user TEXT NOT NULL,
+            ip TEXT NOT NULL,
+            node TEXT NOT NULL,
+            node_key TEXT NOT NULL DEFAULT '',
+            last_seen INTEGER NOT NULL,
+            PRIMARY KEY (user, ip, node)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ip_limit_events_seen
+            ON ip_limit_events(last_seen);
+        CREATE INDEX IF NOT EXISTS idx_ip_limit_events_user_seen
+            ON ip_limit_events(user, last_seen);
+        CREATE INDEX IF NOT EXISTS idx_ip_limit_events_node_seen
+            ON ip_limit_events(node_key, last_seen);
+        CREATE TABLE IF NOT EXISTS ip_limit_alerts (
+            user TEXT PRIMARY KEY,
+            last_alert INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ip_limit_limits (
+            user TEXT PRIMARY KEY,
+            limit_value INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ip_limit_pending (
+            key TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            user TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ip_limit_penalties (
+            user TEXT PRIMARY KEY,
+            uuid TEXT NOT NULL,
+            disabled_at INTEGER NOT NULL,
+            enable_at INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            last_error TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_ip_limit_penalties_enable
+            ON ip_limit_penalties(enable_at);
+        CREATE TABLE IF NOT EXISTS ip_limit_blocks (
+            node_key TEXT NOT NULL,
+            ip TEXT NOT NULL,
+            user TEXT NOT NULL,
+            node TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (node_key, ip)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ip_limit_blocks_expires
+            ON ip_limit_blocks(expires_at);
+    """)
+    try:
+        db.execute("ALTER TABLE ip_limit_events ADD COLUMN node_key TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+    rows = db.execute("SELECT user, ip, node FROM ip_limit_events WHERE node_key = ''").fetchall()
+    for row in rows:
+        db.execute(
+            "UPDATE ip_limit_events SET node_key = ? WHERE user = ? AND ip = ? AND node = ?",
+            (canonical_node_key(row["node"]), row["user"], row["ip"], row["node"]),
+        )
+    db.commit()
+
+
+def ip_limit_meta_get(key):
+    row = ip_limit_db().execute("SELECT value FROM ip_limit_meta WHERE key = ?", (str(key),)).fetchone()
+    return str(row["value"]) if row else ""
+
+
+def ip_limit_meta_set(key, value):
+    ip_limit_db().execute(
+        "INSERT INTO ip_limit_meta(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(key), str(value)),
+    )
+
+
+def load_ip_limit_legacy_json():
     try:
         with open(IP_LIMIT_FILE, "r", encoding="utf-8") as fh:
             loaded = json.load(fh)
-        if isinstance(loaded, dict):
-            users = loaded.get("users")
-            alerts = loaded.get("alerts")
-            limits = loaded.get("limits")
-            pending = loaded.get("pending")
-            penalties = loaded.get("penalties")
-            blocks = loaded.get("blocks")
-            IP_LIMIT_STATE = {
-                "users": users if isinstance(users, dict) else {},
-                "alerts": alerts if isinstance(alerts, dict) else {},
-                "limits": limits if isinstance(limits, dict) else {},
-                "pending": pending if isinstance(pending, dict) else {},
-                "penalties": penalties if isinstance(penalties, dict) else {},
-                "blocks": blocks if isinstance(blocks, dict) else {},
-            }
+        return loaded if isinstance(loaded, dict) else {}
     except Exception:
-        IP_LIMIT_STATE = {"users": {}, "alerts": {}, "limits": {}, "pending": {}, "penalties": {}, "blocks": {}}
+        return {}
+
+
+def migrate_ip_limit_json_to_db():
+    if ip_limit_meta_get("json_migrated") == "1":
+        return
+    loaded = load_ip_limit_legacy_json()
+    if not loaded:
+        ip_limit_meta_set("json_migrated", "1")
+        ip_limit_db().commit()
+        return
+    db = ip_limit_db()
+    users = loaded.get("users") if isinstance(loaded.get("users"), dict) else {}
+    for user, ip_map in users.items():
+        if not isinstance(ip_map, dict):
+            continue
+        for ip, entry in ip_map.items():
+            if not valid_ipv4(ip) or not isinstance(entry, dict):
+                continue
+            last_seen = ip_limit_last_seen(entry)
+            nodes = entry.get("nodes") if isinstance(entry.get("nodes"), dict) else {}
+            if not nodes:
+                nodes = {"-": last_seen}
+            for node, node_seen in nodes.items():
+                node = str(node or "-").strip()[:80] or "-"
+                try:
+                    seen = int(node_seen or last_seen or 0)
+                except Exception:
+                    seen = last_seen
+                db.execute(
+                    "INSERT INTO ip_limit_events(user, ip, node, node_key, last_seen) VALUES(?, ?, ?, ?, ?) "
+                    "ON CONFLICT(user, ip, node) DO UPDATE SET node_key = excluded.node_key, last_seen = max(last_seen, excluded.last_seen)",
+                    (str(user), normalize_ip(ip), node, canonical_node_key(node), max(seen, last_seen)),
+                )
+    alerts = loaded.get("alerts") if isinstance(loaded.get("alerts"), dict) else {}
+    for user, ts in alerts.items():
+        try:
+            last_alert = int(ts or 0)
+        except Exception:
+            continue
+        db.execute(
+            "INSERT INTO ip_limit_alerts(user, last_alert) VALUES(?, ?) "
+            "ON CONFLICT(user) DO UPDATE SET last_alert = excluded.last_alert",
+            (str(user), last_alert),
+        )
+    limits = loaded.get("limits") if isinstance(loaded.get("limits"), dict) else {}
+    for user, value in limits.items():
+        try:
+            limit_value = int(value)
+        except Exception:
+            continue
+        db.execute(
+            "INSERT INTO ip_limit_limits(user, limit_value) VALUES(?, ?) "
+            "ON CONFLICT(user) DO UPDATE SET limit_value = excluded.limit_value",
+            (str(user), limit_value),
+        )
+    pending = loaded.get("pending") if isinstance(loaded.get("pending"), dict) else {}
+    for key, item in pending.items():
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or "").strip()
+        user = str(item.get("user") or "").strip()
+        if not action or not user:
+            continue
+        try:
+            created_at = int(item.get("created_at") or 0)
+        except Exception:
+            created_at = 0
+        db.execute(
+            "INSERT INTO ip_limit_pending(key, action, user, created_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET action = excluded.action, user = excluded.user, created_at = excluded.created_at",
+            (str(key), action, user, created_at),
+        )
+    penalties = loaded.get("penalties") if isinstance(loaded.get("penalties"), dict) else {}
+    for user, item in penalties.items():
+        if not isinstance(item, dict):
+            continue
+        uuid = str(item.get("uuid") or "").strip()
+        if not uuid:
+            continue
+        try:
+            disabled_at = int(item.get("disabled_at") or 0)
+            enable_at = int(item.get("enable_at") or 0)
+        except Exception:
+            continue
+        db.execute(
+            "INSERT INTO ip_limit_penalties(user, uuid, disabled_at, enable_at, reason, last_error) VALUES(?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user) DO UPDATE SET uuid = excluded.uuid, disabled_at = excluded.disabled_at, enable_at = excluded.enable_at, reason = excluded.reason, last_error = excluded.last_error",
+            (str(user), uuid, disabled_at, enable_at, str(item.get("reason") or "ip_limit"), str(item.get("last_error") or "")[:160]),
+        )
+    blocks = loaded.get("blocks") if isinstance(loaded.get("blocks"), dict) else {}
+    for node_key, ip_map in blocks.items():
+        if not isinstance(ip_map, dict):
+            continue
+        node_key = str(node_key or "").strip()
+        if not node_key:
+            continue
+        for ip, item in ip_map.items():
+            if not valid_ipv4(ip) or not isinstance(item, dict):
+                continue
+            try:
+                expires_at = int(item.get("expires_at") or 0)
+            except Exception:
+                continue
+            db.execute(
+                "INSERT INTO ip_limit_blocks(node_key, ip, user, node, expires_at) VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(node_key, ip) DO UPDATE SET user = excluded.user, node = excluded.node, expires_at = max(expires_at, excluded.expires_at)",
+                (node_key, normalize_ip(ip), str(item.get("user") or ""), str(item.get("node") or node_key), expires_at),
+            )
+    ip_limit_meta_set("json_migrated", "1")
+    db.commit()
+    log("ip limit state migrated to sqlite")
+
+
+def load_ip_limit_state():
+    init_ip_limit_db()
+    migrate_ip_limit_json_to_db()
 
 
 def save_ip_limit_state():
-    atomic_write(IP_LIMIT_FILE, json.dumps(IP_LIMIT_STATE, ensure_ascii=False, indent=2, sort_keys=True))
+    if IP_LIMIT_DB is not None:
+        IP_LIMIT_DB.commit()
 
 
 def normalize_scan_top(value):
@@ -1104,38 +1310,22 @@ def ip_limit_last_seen(entry):
 
 
 def purge_ip_limit_state(ts):
-    users = IP_LIMIT_STATE.setdefault("users", {})
     cutoff = ts - IP_LIMIT_WINDOW_SEC
-    for user in list(users.keys()):
-        ip_map = users.get(user)
-        if not isinstance(ip_map, dict):
-            del users[user]
-            continue
-        for ip in list(ip_map.keys()):
-            entry = ip_map.get(ip) or {}
-            if not isinstance(entry, dict):
-                del ip_map[ip]
-                continue
-            if ip_limit_last_seen(entry) < cutoff:
-                del ip_map[ip]
-        if not ip_map:
-            del users[user]
+    ip_limit_db().execute("DELETE FROM ip_limit_events WHERE last_seen < ?", (cutoff,))
 
 
 def active_ip_limit_entries(user, ts):
     cutoff = ts - IP_LIMIT_WINDOW_SEC
-    ip_map = IP_LIMIT_STATE.setdefault("users", {}).get(user) or {}
+    rows = ip_limit_db().execute(
+        "SELECT ip, max(last_seen) AS last_seen, group_concat(node, '\n') AS nodes "
+        "FROM ip_limit_events WHERE user = ? AND last_seen >= ? "
+        "GROUP BY ip ORDER BY last_seen DESC, ip ASC",
+        (str(user), cutoff),
+    ).fetchall()
     result = []
-    for ip, entry in ip_map.items():
-        if not isinstance(entry, dict):
-            continue
-        last_seen = ip_limit_last_seen(entry)
-        if last_seen >= cutoff:
-            nodes = entry.get("nodes") if isinstance(entry, dict) else {}
-            if not isinstance(nodes, dict):
-                nodes = {}
-            result.append({"ip": ip, "last_seen": last_seen, "nodes": sorted(nodes.keys())})
-    result.sort(key=lambda item: (-item["last_seen"], item["ip"]))
+    for row in rows:
+        nodes = sorted({node for node in str(row["nodes"] or "").split("\n") if node}, key=natural_sort_key)
+        result.append({"ip": str(row["ip"]), "last_seen": int(row["last_seen"] or 0), "nodes": nodes})
     return result
 
 
@@ -1182,17 +1372,15 @@ def ip_limit_primary_key(user, info=None):
 
 
 def ip_limit_effective_limit(user, info=None):
-    limits = IP_LIMIT_STATE.setdefault("limits", {})
-    for key in ip_limit_user_keys(user, info):
-        if key not in limits:
-            continue
-        try:
-            value = int(limits.get(key))
-        except Exception:
-            continue
-        if value <= 0:
-            return 0, "personal"
-        return value, "personal"
+    with LOCK:
+        for key in ip_limit_user_keys(user, info):
+            row = ip_limit_db().execute("SELECT limit_value FROM ip_limit_limits WHERE user = ?", (str(key),)).fetchone()
+            if not row:
+                continue
+            value = int(row["limit_value"])
+            if value <= 0:
+                return 0, "personal"
+            return value, "personal"
     return IP_LIMIT_MAX_IPS, "global"
 
 
@@ -1202,8 +1390,11 @@ def set_ip_limit_override(user, info, value):
         raise ValueError("empty user key")
     value = int(value)
     with LOCK:
-        limits = IP_LIMIT_STATE.setdefault("limits", {})
-        limits[key] = value
+        ip_limit_db().execute(
+            "INSERT INTO ip_limit_limits(user, limit_value) VALUES(?, ?) "
+            "ON CONFLICT(user) DO UPDATE SET limit_value = excluded.limit_value",
+            (str(key), value),
+        )
         save_ip_limit_state()
     return key
 
@@ -1235,23 +1426,8 @@ def active_ip_limit_entries_for_user(user, info, ts):
 
 
 def purge_ip_limit_blocks(ts):
-    blocks = IP_LIMIT_STATE.setdefault("blocks", {})
-    changed = False
-    for node_key in list(blocks.keys()):
-        ip_map = blocks.get(node_key)
-        if not isinstance(ip_map, dict):
-            del blocks[node_key]
-            changed = True
-            continue
-        for ip in list(ip_map.keys()):
-            item = ip_map.get(ip)
-            if not isinstance(item, dict) or int(item.get("expires_at") or 0) <= ts:
-                del ip_map[ip]
-                changed = True
-        if not ip_map:
-            del blocks[node_key]
-            changed = True
-    return changed
+    cur = ip_limit_db().execute("DELETE FROM ip_limit_blocks WHERE expires_at <= ?", (int(ts),))
+    return cur.rowcount > 0
 
 
 def node_alias_keys(node):
@@ -1274,7 +1450,6 @@ def schedule_ip_limit_blocks(user, entries, info, expires_at):
         user_key = str(user or "").strip()
     scheduled = 0
     with LOCK:
-        blocks = IP_LIMIT_STATE.setdefault("blocks", {})
         for item in entries:
             ip = str(item.get("ip") or "").strip()
             if not valid_ipv4(ip):
@@ -1284,14 +1459,11 @@ def schedule_ip_limit_blocks(user, entries, info, expires_at):
                 node_key = canonical_node_key(node_name)
                 if not node_key:
                     continue
-                ip_map = blocks.setdefault(node_key, {})
-                current = ip_map.get(ip) if isinstance(ip_map.get(ip), dict) else {}
-                ip_map[ip] = {
-                    "ip": ip,
-                    "user": user_key,
-                    "node": node_name,
-                    "expires_at": max(int(expires_at), int(current.get("expires_at") or 0)),
-                }
+                ip_limit_db().execute(
+                    "INSERT INTO ip_limit_blocks(node_key, ip, user, node, expires_at) VALUES(?, ?, ?, ?, ?) "
+                    "ON CONFLICT(node_key, ip) DO UPDATE SET user = excluded.user, node = excluded.node, expires_at = max(expires_at, excluded.expires_at)",
+                    (node_key, normalize_ip(ip), user_key, node_name, int(expires_at)),
+                )
                 scheduled += 1
         if scheduled > 0:
             save_ip_limit_state()
@@ -1299,59 +1471,53 @@ def schedule_ip_limit_blocks(user, entries, info, expires_at):
 
 
 def ip_limit_blocks_for_node(node, ts):
-    result = []
+    aliases = list(node_alias_keys(node))
+    if not aliases:
+        return []
     with LOCK:
         changed = purge_ip_limit_blocks(ts)
-        blocks = IP_LIMIT_STATE.setdefault("blocks", {})
-        for node_key in node_alias_keys(node):
-            ip_map = blocks.get(node_key)
-            if not isinstance(ip_map, dict):
-                continue
-            for ip, item in ip_map.items():
-                if not isinstance(item, dict) or not valid_ipv4(ip):
-                    continue
-                expires_at = int(item.get("expires_at") or 0)
-                if expires_at <= ts:
-                    continue
-                result.append({
-                    "ip": ip,
-                    "user": str(item.get("user") or ""),
-                    "expires_at": expires_at,
-                })
+        placeholders = ",".join("?" for _ in aliases)
+        rows = ip_limit_db().execute(
+            f"SELECT ip, user, max(expires_at) AS expires_at FROM ip_limit_blocks "
+            f"WHERE node_key IN ({placeholders}) AND expires_at > ? GROUP BY ip, user",
+            tuple(aliases) + (int(ts),),
+        ).fetchall()
         if changed:
             save_ip_limit_state()
-    deduped = {}
-    for item in result:
-        ip = item["ip"]
-        current = deduped.get(ip)
-        if current is None or int(item["expires_at"]) > int(current["expires_at"]):
-            deduped[ip] = item
-    return sorted(deduped.values(), key=lambda item: (item["expires_at"], item["ip"]))
+    result = [{"ip": str(row["ip"]), "user": str(row["user"] or ""), "expires_at": int(row["expires_at"] or 0)} for row in rows]
+    return sorted(result, key=lambda item: (item["expires_at"], item["ip"]))
 
 
-def ip_limit_snapshot(ts):
-    rows = []
+def ip_limit_snapshot(ts, node_query=""):
+    cutoff = ts - IP_LIMIT_WINDOW_SEC
+    node_key = canonical_node_key(node_query)
     with LOCK:
         purge_ip_limit_state(ts)
-        users = IP_LIMIT_STATE.setdefault("users", {})
-        for user, ip_map in users.items():
-            if not isinstance(ip_map, dict):
-                continue
-            for ip, entry in ip_map.items():
-                if not isinstance(entry, dict):
-                    continue
-                last_seen = ip_limit_last_seen(entry)
-                if last_seen < ts - IP_LIMIT_WINDOW_SEC:
-                    continue
-                nodes = entry.get("nodes") if isinstance(entry.get("nodes"), dict) else {}
-                rows.append({
-                    "user": str(user),
-                    "ip": str(ip),
-                    "last_seen": last_seen,
-                    "nodes": sorted(str(node) for node in nodes.keys() if str(node).strip()),
-                })
-    rows.sort(key=lambda item: (-item["last_seen"], natural_sort_key(item["user"]), item["ip"]))
-    return rows
+        if node_key:
+            rows = ip_limit_db().execute(
+                "SELECT user, ip, max(last_seen) AS last_seen, group_concat(node, '\n') AS nodes "
+                "FROM ip_limit_events WHERE last_seen >= ? AND node_key = ? GROUP BY user, ip "
+                "ORDER BY last_seen DESC, user ASC, ip ASC",
+                (cutoff, node_key),
+            ).fetchall()
+        else:
+            rows = ip_limit_db().execute(
+                "SELECT user, ip, max(last_seen) AS last_seen, group_concat(node, '\n') AS nodes "
+                "FROM ip_limit_events WHERE last_seen >= ? GROUP BY user, ip "
+                "ORDER BY last_seen DESC, user ASC, ip ASC",
+                (cutoff,),
+            ).fetchall()
+    result = []
+    for row in rows:
+        nodes = sorted({node for node in str(row["nodes"] or "").split("\n") if node.strip()}, key=natural_sort_key)
+        result.append({
+            "user": str(row["user"]),
+            "ip": str(row["ip"]),
+            "last_seen": int(row["last_seen"] or 0),
+            "nodes": nodes,
+        })
+    result.sort(key=lambda item: (-item["last_seen"], natural_sort_key(item["user"]), item["ip"]))
+    return result
 
 
 def ip_limit_active_node_names(rows):
@@ -1406,9 +1572,9 @@ def ip_limit_user_block(user, rows, ts):
 def ip_limit_report(query=""):
     query = str(query or "").strip()
     ts = now_ts()
-    snapshot = ip_limit_snapshot(ts)
-    node_names = ip_limit_active_node_names(snapshot)
     if not query:
+        snapshot = ip_limit_snapshot(ts)
+        node_names = ip_limit_active_node_names(snapshot)
         lines = [
             "<b>IP лимит</b>",
             ALERT_SEPARATOR,
@@ -1424,8 +1590,9 @@ def ip_limit_report(query=""):
             lines.append("Активных IP-записей пока нет.")
         return "\n".join(lines)
 
-    rows = [row for row in snapshot if ip_limit_row_matches_node(row, query)]
+    rows = ip_limit_snapshot(ts, query)
     if not rows:
+        node_names = ip_limit_active_node_names(ip_limit_snapshot(ts))
         lines = [
             "<b>IP лимит</b>",
             ALERT_SEPARATOR,
@@ -1502,9 +1669,9 @@ def ip_limit_user_card(query):
         detail_line("Активных IP", active_text),
     ])
     with LOCK:
-        penalty = IP_LIMIT_STATE.setdefault("penalties", {}).get(key)
-        if isinstance(penalty, dict) and int(penalty.get("enable_at") or 0) > ts:
-            lines.append(detail_line("Отключен до", fmt_time(penalty.get("enable_at"))))
+        penalty = ip_limit_db().execute("SELECT enable_at FROM ip_limit_penalties WHERE user = ?", (key,)).fetchone()
+        if penalty and int(penalty["enable_at"] or 0) > ts:
+            lines.append(detail_line("Отключен до", fmt_time(penalty["enable_at"])))
     ip_lines = []
     for item in entries[:12]:
         nodes = ", ".join(item.get("nodes") or []) or "-"
@@ -1528,7 +1695,7 @@ def ip_limit_user_card(query):
     return "\n".join(lines), markup
 
 
-def alert_ip_limit_exceeded(user, entries):
+def alert_ip_limit_exceeded(user, entries, info=None):
     ip_lines = []
     for item in entries[:12]:
         nodes = ", ".join(item.get("nodes") or []) or "-"
@@ -1536,7 +1703,8 @@ def alert_ip_limit_exceeded(user, entries):
     if len(entries) > 12:
         ip_lines.append(f"... ещё {len(entries) - 12}")
 
-    info = remna_user_info(user)
+    if not isinstance(info, dict):
+        info = remna_user_info(user)
     limit, _ = ip_limit_effective_limit(user, info)
     lines = [
         f"{LOST_EMOJI} #ipLimitExceeded",
@@ -1582,12 +1750,14 @@ def enforce_ip_limit(user, entries, limit, info=None):
         return f"не отключал, статус {status}"
     key = ip_limit_primary_key(user, info)
     with LOCK:
-        penalties = IP_LIMIT_STATE.setdefault("penalties", {})
-        current = penalties.get(key) if isinstance(penalties.get(key), dict) else None
-        if current and int(current.get("enable_at") or 0) > ts:
+        current = ip_limit_db().execute(
+            "SELECT enable_at FROM ip_limit_penalties WHERE user = ?",
+            (key,),
+        ).fetchone()
+        if current and int(current["enable_at"] or 0) > ts:
             if block_text:
-                return f"{block_text} Подписка уже отключена до {fmt_time(current.get('enable_at'))}."
-            return f"уже отключён до {fmt_time(current.get('enable_at'))}"
+                return f"{block_text} Подписка уже отключена до {fmt_time(current['enable_at'])}."
+            return f"уже отключён до {fmt_time(current['enable_at'])}"
     try:
         remna_user_action(uuid_value, "disable")
         clear_ip_limit_cache(info)
@@ -1597,13 +1767,11 @@ def enforce_ip_limit(user, entries, limit, info=None):
             return f"{block_text} Remna disable не сработал."
         return "ошибка disable в Remna API"
     with LOCK:
-        IP_LIMIT_STATE.setdefault("penalties", {})[key] = {
-            "uuid": uuid_value,
-            "user": key,
-            "disabled_at": ts,
-            "enable_at": enable_at,
-            "reason": "ip_limit",
-        }
+        ip_limit_db().execute(
+            "INSERT INTO ip_limit_penalties(user, uuid, disabled_at, enable_at, reason, last_error) VALUES(?, ?, ?, ?, ?, '') "
+            "ON CONFLICT(user) DO UPDATE SET uuid = excluded.uuid, disabled_at = excluded.disabled_at, enable_at = excluded.enable_at, reason = excluded.reason, last_error = ''",
+            (key, uuid_value, ts, enable_at, "ip_limit"),
+        )
         save_ip_limit_state()
     if block_text:
         return f"Подписка отключена на {penalty_text}. Все айпи были дропнуты с ноды."
@@ -1617,26 +1785,22 @@ def ip_limit_penalty_loop():
             ts = now_ts()
             due = []
             with LOCK:
-                penalties = IP_LIMIT_STATE.setdefault("penalties", {})
-                for key, item in list(penalties.items()):
-                    if not isinstance(item, dict):
-                        del penalties[key]
-                        continue
-                    if int(item.get("enable_at") or 0) <= ts:
-                        due.append((key, dict(item)))
-                if len(due) != 0:
-                    save_ip_limit_state()
+                rows = ip_limit_db().execute(
+                    "SELECT user, uuid, disabled_at, enable_at, reason, last_error FROM ip_limit_penalties WHERE enable_at <= ?",
+                    (ts,),
+                ).fetchall()
+                due = [(str(row["user"]), dict(row)) for row in rows]
             for key, item in due:
                 uuid_value = str(item.get("uuid") or "").strip()
                 if not uuid_value:
                     with LOCK:
-                        IP_LIMIT_STATE.setdefault("penalties", {}).pop(key, None)
+                        ip_limit_db().execute("DELETE FROM ip_limit_penalties WHERE user = ?", (key,))
                         save_ip_limit_state()
                     continue
                 try:
                     remna_user_action(uuid_value, "enable")
                     with LOCK:
-                        IP_LIMIT_STATE.setdefault("penalties", {}).pop(key, None)
+                        ip_limit_db().execute("DELETE FROM ip_limit_penalties WHERE user = ?", (key,))
                         save_ip_limit_state()
                     log(f"ip limit penalty lifted: user={key} uuid={uuid_value}")
                     send_message(
@@ -1649,11 +1813,11 @@ def ip_limit_penalty_loop():
                 except Exception as exc:
                     log(f"ip limit enable failed user={key} uuid={uuid_value}: {exc}")
                     with LOCK:
-                        penalty = IP_LIMIT_STATE.setdefault("penalties", {}).get(key)
-                        if isinstance(penalty, dict):
-                            penalty["enable_at"] = now_ts() + 30
-                            penalty["last_error"] = str(exc)[:160]
-                            save_ip_limit_state()
+                        ip_limit_db().execute(
+                            "UPDATE ip_limit_penalties SET enable_at = ?, last_error = ? WHERE user = ?",
+                            (now_ts() + 30, str(exc)[:160], key),
+                        )
+                        save_ip_limit_state()
         except Exception as exc:
             log(f"ip limit penalty loop failed: {exc}")
             time.sleep(10)
@@ -1664,27 +1828,31 @@ def process_ip_limit_events(events, fallback_node, ts):
         return
 
     touched = set()
+    normalized = []
     with LOCK:
         purge_ip_limit_state(ts)
-        users = IP_LIMIT_STATE.setdefault("users", {})
-
-        for raw in events[:500]:
+        for raw in events[:IP_LIMIT_MAX_EVENTS]:
             event = normalize_ip_limit_event(raw, fallback_node, ts)
             if not event:
                 continue
             touched.add(event["user"])
-            ip_map = users.setdefault(event["user"], {})
-            entry = ip_map.setdefault(event["ip"], {"last_seen": 0, "nodes": {}})
-            entry["last_seen"] = max(int(entry.get("last_seen") or 0), event["seen_at"])
-            nodes = entry.setdefault("nodes", {})
-            if isinstance(nodes, dict):
-                nodes[event["node"]] = event["seen_at"]
-            else:
-                entry["nodes"] = {event["node"]: event["seen_at"]}
-        if touched:
+            normalized.append((event["user"], event["ip"], event["node"], canonical_node_key(event["node"]), event["seen_at"]))
+        if normalized:
+            ip_limit_db().executemany(
+                "INSERT INTO ip_limit_events(user, ip, node, node_key, last_seen) VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(user, ip, node) DO UPDATE SET node_key = excluded.node_key, last_seen = max(last_seen, excluded.last_seen)",
+                normalized,
+            )
             save_ip_limit_state()
 
     for user in sorted(touched, key=natural_sort_key):
+        info = None
+        with LOCK:
+            purge_ip_limit_state(ts)
+            entries = active_ip_limit_entries(user, ts)
+            limit, _ = ip_limit_effective_limit(user, None)
+            if limit <= 0 or len(entries) <= limit:
+                continue
         info = remna_user_info(user)
         with LOCK:
             purge_ip_limit_state(ts)
@@ -1692,15 +1860,19 @@ def process_ip_limit_events(events, fallback_node, ts):
             limit, _ = ip_limit_effective_limit(user, info)
             if limit <= 0 or len(entries) <= limit:
                 continue
-            alert_state = IP_LIMIT_STATE.setdefault("alerts", {})
             alert_key = ip_limit_primary_key(user, info)
-            last_alert = int(alert_state.get(alert_key) or 0)
+            row = ip_limit_db().execute("SELECT last_alert FROM ip_limit_alerts WHERE user = ?", (alert_key,)).fetchone()
+            last_alert = int(row["last_alert"] or 0) if row else 0
             if ts - last_alert < IP_LIMIT_ALERT_COOLDOWN:
                 continue
-            alert_state[alert_key] = ts
+            ip_limit_db().execute(
+                "INSERT INTO ip_limit_alerts(user, last_alert) VALUES(?, ?) "
+                "ON CONFLICT(user) DO UPDATE SET last_alert = excluded.last_alert",
+                (alert_key, ts),
+            )
             save_ip_limit_state()
         log(f"ip limit exceeded: user={user} active_ips={len(entries)} limit={limit}")
-        alert_ip_limit_exceeded(user, entries)
+        alert_ip_limit_exceeded(user, entries, info)
 
 
 def update_node(payload, remote_ip=""):
@@ -2087,33 +2259,37 @@ def pending_key(chat_id, from_id):
 
 def set_pending_ip_limit(chat_id, from_id, user_key):
     with LOCK:
-        IP_LIMIT_STATE.setdefault("pending", {})[pending_key(chat_id, from_id)] = {
-            "action": "set_ip_limit",
-            "user": str(user_key),
-            "created_at": now_ts(),
-        }
+        ip_limit_db().execute(
+            "INSERT INTO ip_limit_pending(key, action, user, created_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET action = excluded.action, user = excluded.user, created_at = excluded.created_at",
+            (pending_key(chat_id, from_id), "set_ip_limit", str(user_key), now_ts()),
+        )
         save_ip_limit_state()
 
 
 def pop_pending_ip_limit(chat_id, from_id):
     with LOCK:
-        pending = IP_LIMIT_STATE.setdefault("pending", {})
-        item = pending.pop(pending_key(chat_id, from_id), None)
-        if item is not None:
+        key = pending_key(chat_id, from_id)
+        row = ip_limit_db().execute("SELECT action, user, created_at FROM ip_limit_pending WHERE key = ?", (key,)).fetchone()
+        if row is not None:
+            ip_limit_db().execute("DELETE FROM ip_limit_pending WHERE key = ?", (key,))
             save_ip_limit_state()
-        return item if isinstance(item, dict) else None
+            return {"action": str(row["action"]), "user": str(row["user"]), "created_at": int(row["created_at"] or 0)}
+        return None
 
 
 def peek_pending_ip_limit(chat_id, from_id):
     with LOCK:
-        item = IP_LIMIT_STATE.setdefault("pending", {}).get(pending_key(chat_id, from_id))
-        if not isinstance(item, dict):
+        key = pending_key(chat_id, from_id)
+        row = ip_limit_db().execute("SELECT action, user, created_at FROM ip_limit_pending WHERE key = ?", (key,)).fetchone()
+        if not row:
             return None
+        item = {"action": str(row["action"]), "user": str(row["user"]), "created_at": int(row["created_at"] or 0)}
         if now_ts() - int(item.get("created_at") or 0) > 600:
-            IP_LIMIT_STATE.setdefault("pending", {}).pop(pending_key(chat_id, from_id), None)
+            ip_limit_db().execute("DELETE FROM ip_limit_pending WHERE key = ?", (key,))
             save_ip_limit_state()
             return None
-        return dict(item)
+        return item
 
 
 def handle_pending_ip_limit(chat_id, from_id, text):

@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v170"
+SCRIPT_BUILD="v171"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -63,9 +63,11 @@ STATS_ALLOWED_USER_ID_DEFAULT="646296998"
 STATS_EXPECTED_NODES_DEFAULT="10"
 IP_LIMIT_ENABLED_DEFAULT="${KTO_IP_LIMIT_ENABLED_DEFAULT:-0}"
 IP_LIMIT_MAX_IPS_DEFAULT="${KTO_IP_LIMIT_MAX_IPS_DEFAULT:-1}"
+IP_LIMIT_MAX_EVENTS_DEFAULT="${KTO_IP_LIMIT_MAX_EVENTS_DEFAULT:-5000}"
 IP_LIMIT_WINDOW_SEC_DEFAULT="${KTO_IP_LIMIT_WINDOW_SEC_DEFAULT:-600}"
 IP_LIMIT_ALERT_COOLDOWN_DEFAULT="${KTO_IP_LIMIT_ALERT_COOLDOWN_DEFAULT:-600}"
 IP_LIMIT_SCAN_SEC_DEFAULT="${KTO_IP_LIMIT_SCAN_SEC_DEFAULT:-120}"
+IP_LIMIT_TAIL_LINES_DEFAULT="${KTO_IP_LIMIT_TAIL_LINES_DEFAULT:-5000}"
 IP_LIMIT_XRAY_LOGS_DEFAULT="${KTO_IP_LIMIT_XRAY_LOGS_DEFAULT:-1}"
 IP_LIMIT_ENFORCE_ENABLED_DEFAULT="${KTO_IP_LIMIT_ENFORCE_ENABLED_DEFAULT:-0}"
 IP_LIMIT_PENALTY_SEC_DEFAULT="${KTO_IP_LIMIT_PENALTY_SEC_DEFAULT:-60}"
@@ -3520,10 +3522,10 @@ install_stats_collector() {
     need_root
 
     local listen_host listen_port secret bot_token chat_id allowed_user stale_sec expected_nodes daily_report_time existing_config=0
-    local ip_limit_enabled ip_limit_max_ips ip_limit_window_sec ip_limit_alert_cooldown ip_limit_enforce_enabled ip_limit_penalty_sec
+    local ip_limit_enabled ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_enforce_enabled ip_limit_penalty_sec
     local remna_api_url remna_api_token remna_api_cache_sec
     local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_expected safe_tz safe_daily
-    local safe_ip_limit_enabled safe_ip_limit_max_ips safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_enforce_enabled safe_ip_limit_penalty_sec
+    local safe_ip_limit_enabled safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_enforce_enabled safe_ip_limit_penalty_sec
     local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec
 
     if "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
@@ -3538,6 +3540,7 @@ install_stats_collector() {
         daily_report_time="$(config_get KTO_COLLECTOR_DAILY_REPORT_TIME "$STATS_COLLECTOR_CONFIG")"
         ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
         ip_limit_max_ips="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_IPS "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_max_events="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS "$STATS_COLLECTOR_CONFIG")"
         ip_limit_window_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC "$STATS_COLLECTOR_CONFIG")"
         ip_limit_alert_cooldown="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN "$STATS_COLLECTOR_CONFIG")"
         ip_limit_enforce_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED "$STATS_COLLECTOR_CONFIG")"
@@ -3560,6 +3563,7 @@ install_stats_collector() {
         expected_nodes="${expected_nodes:-$STATS_EXPECTED_NODES_DEFAULT}"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
         ip_limit_max_ips="${ip_limit_max_ips:-$IP_LIMIT_MAX_IPS_DEFAULT}"
+        ip_limit_max_events="${ip_limit_max_events:-$IP_LIMIT_MAX_EVENTS_DEFAULT}"
         ip_limit_window_sec="${ip_limit_window_sec:-$IP_LIMIT_WINDOW_SEC_DEFAULT}"
         ip_limit_alert_cooldown="${ip_limit_alert_cooldown:-$IP_LIMIT_ALERT_COOLDOWN_DEFAULT}"
         ip_limit_enforce_enabled="${ip_limit_enforce_enabled:-$IP_LIMIT_ENFORCE_ENABLED_DEFAULT}"
@@ -3579,6 +3583,7 @@ install_stats_collector() {
         daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
         ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
         ip_limit_max_ips="$IP_LIMIT_MAX_IPS_DEFAULT"
+        ip_limit_max_events="$IP_LIMIT_MAX_EVENTS_DEFAULT"
         ip_limit_window_sec="$IP_LIMIT_WINDOW_SEC_DEFAULT"
         ip_limit_alert_cooldown="$IP_LIMIT_ALERT_COOLDOWN_DEFAULT"
         ip_limit_enforce_enabled="$IP_LIMIT_ENFORCE_ENABLED_DEFAULT"
@@ -3601,6 +3606,9 @@ install_stats_collector() {
     fi
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_MAX_IPS:-}" ]]; then
         ip_limit_max_ips="$KTO_COLLECTOR_IP_LIMIT_MAX_IPS"
+    fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS:-}" ]]; then
+        ip_limit_max_events="$KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS"
     fi
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC:-}" ]]; then
         ip_limit_window_sec="$KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC"
@@ -3627,6 +3635,7 @@ install_stats_collector() {
     safe_daily="$(escape_config_value "$daily_report_time")"
     safe_ip_limit_enabled="$(escape_config_value "$ip_limit_enabled")"
     safe_ip_limit_max_ips="$(escape_config_value "$ip_limit_max_ips")"
+    safe_ip_limit_max_events="$(escape_config_value "$ip_limit_max_events")"
     safe_ip_limit_window="$(escape_config_value "$ip_limit_window_sec")"
     safe_ip_limit_cooldown="$(escape_config_value "$ip_limit_alert_cooldown")"
     safe_ip_limit_enforce_enabled="$(escape_config_value "$ip_limit_enforce_enabled")"
@@ -3656,6 +3665,7 @@ KTO_COLLECTOR_TZ="$safe_tz"
 KTO_COLLECTOR_DAILY_REPORT_TIME="$safe_daily"
 KTO_COLLECTOR_IP_LIMIT_ENABLED="$safe_ip_limit_enabled"
 KTO_COLLECTOR_IP_LIMIT_MAX_IPS="$safe_ip_limit_max_ips"
+KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS="$safe_ip_limit_max_events"
 KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC="$safe_ip_limit_window"
 KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN="$safe_ip_limit_cooldown"
 KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED="$safe_ip_limit_enforce_enabled"
@@ -3708,7 +3718,7 @@ stats_collector_status() {
     require_panel_mode
     need_root
     local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_test_id remna_test_log remna_code remna_probe
-    local ip_limit_enforce_enabled ip_limit_penalty_sec
+    local ip_limit_enforce_enabled ip_limit_penalty_sec ip_limit_max_events
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
     listen_port="$(config_get KTO_COLLECTOR_LISTEN_PORT "$STATS_COLLECTOR_CONFIG")"
@@ -3716,6 +3726,7 @@ stats_collector_status() {
     remna_api_token="$(config_get KTO_COLLECTOR_REMNA_API_TOKEN "$STATS_COLLECTOR_CONFIG")"
     ip_limit_enforce_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED "$STATS_COLLECTOR_CONFIG")"
     ip_limit_penalty_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC "$STATS_COLLECTOR_CONFIG")"
+    ip_limit_max_events="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS "$STATS_COLLECTOR_CONFIG")"
     listen_host="${listen_host:-0.0.0.0}"
     listen_port="${listen_port:-$STATS_COLLECTOR_PORT_DEFAULT}"
     if [[ "$listen_host" == "0.0.0.0" || "$listen_host" == "::" ]]; then
@@ -3730,6 +3741,8 @@ stats_collector_status() {
     print_row "адрес" "${listen_host}:${listen_port}" "$([[ -n "$listen_port" ]] && echo 1 || echo 0)"
     print_row "remna api" "${remna_api_url:-empty} / $([[ -n "$remna_api_token" ]] && echo token-set || echo no-token)" "$([[ -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
     print_row "ip enforce" "${ip_limit_enforce_enabled:-0} / ${ip_limit_penalty_sec:-$IP_LIMIT_PENALTY_SEC_DEFAULT}s" "$([[ "${ip_limit_enforce_enabled:-0}" == "1" ]] && echo 1 || echo 0)"
+    print_row "ip max events" "${ip_limit_max_events:-$IP_LIMIT_MAX_EVENTS_DEFAULT}"
+    print_row "ip db" "${STATS_COLLECTOR_STATE_DIR}/ip_limit.sqlite" "$("${SUDO[@]}" test -s "${STATS_COLLECTOR_STATE_DIR}/ip_limit.sqlite" 2>/dev/null && echo 1 || echo 0)"
 
     if command_exists curl; then
         health_log="$(mktemp)"
@@ -3742,16 +3755,15 @@ stats_collector_status() {
         rm -f "$health_log"
         if [[ -n "$remna_api_url" && -n "$remna_api_token" ]]; then
             remna_test_id="$("${SUDO[@]}" python3 - <<PY 2>/dev/null || true
-import json
-path = "${STATS_COLLECTOR_STATE_DIR}/ip_limit.json"
+import sqlite3
+path = "${STATS_COLLECTOR_STATE_DIR}/ip_limit.sqlite"
 try:
-    data = json.load(open(path, "r", encoding="utf-8"))
-    users = data.get("users") if isinstance(data, dict) else {}
-    if isinstance(users, dict):
-        for key in sorted(users.keys(), key=str):
-            if str(key).strip():
-                print(str(key))
-                break
+    conn = sqlite3.connect(path)
+    row = conn.execute(
+        "SELECT user FROM ip_limit_events GROUP BY user ORDER BY max(last_seen) DESC LIMIT 1"
+    ).fetchone()
+    if row and str(row[0]).strip():
+        print(str(row[0]).strip())
 except Exception:
     pass
 PY
@@ -3821,7 +3833,7 @@ PY
                 fi
                 rm -f "$remna_test_log"
             else
-                print_row "remna lookup" "нет активных ID в ip_limit.json"
+                print_row "remna lookup" "нет активных ID в ip_limit.sqlite"
             fi
         fi
     else
@@ -3867,9 +3879,9 @@ install_stats_push_client() {
     need_root
 
     local default_iface default_name node_name node_id iface collector_url secret interval existing_config=0
-    local ip_limit_enabled ip_limit_log_file ip_limit_docker_container ip_limit_user_regex ip_limit_ip_regex ip_limit_scan_sec ip_limit_tail_lines ip_limit_xray_logs
+    local ip_limit_enabled ip_limit_log_file ip_limit_docker_container ip_limit_user_regex ip_limit_ip_regex ip_limit_scan_sec ip_limit_tail_lines ip_limit_max_events ip_limit_xray_logs
     local safe_name safe_id safe_iface safe_url safe_secret safe_interval
-    local safe_ip_limit_enabled safe_ip_limit_log_file safe_ip_limit_docker safe_ip_limit_user_regex safe_ip_limit_ip_regex safe_ip_limit_scan_sec safe_ip_limit_tail_lines safe_ip_limit_xray_logs
+    local safe_ip_limit_enabled safe_ip_limit_log_file safe_ip_limit_docker safe_ip_limit_user_regex safe_ip_limit_ip_regex safe_ip_limit_scan_sec safe_ip_limit_tail_lines safe_ip_limit_max_events safe_ip_limit_xray_logs
 
     default_iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
     default_iface="${default_iface:-$(default_network_interface)}"
@@ -3890,6 +3902,7 @@ install_stats_push_client() {
         ip_limit_ip_regex="$(config_get KTO_IP_LIMIT_IP_REGEX "$STATS_PUSH_CONFIG")"
         ip_limit_scan_sec="$(config_get KTO_IP_LIMIT_SCAN_SEC "$STATS_PUSH_CONFIG")"
         ip_limit_tail_lines="$(config_get KTO_IP_LIMIT_TAIL_LINES "$STATS_PUSH_CONFIG")"
+        ip_limit_max_events="$(config_get KTO_IP_LIMIT_MAX_EVENTS "$STATS_PUSH_CONFIG")"
         ip_limit_xray_logs="$(config_get KTO_IP_LIMIT_XRAY_LOGS "$STATS_PUSH_CONFIG")"
         if [[ -n "$node_id" && -n "$node_name" && -n "$iface" && -n "$collector_url" && -n "$secret" ]]; then
             existing_config=1
@@ -3902,7 +3915,11 @@ install_stats_push_client() {
         interval="${interval:-$STATS_PUSH_INTERVAL_DEFAULT}"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
         ip_limit_scan_sec="${ip_limit_scan_sec:-$IP_LIMIT_SCAN_SEC_DEFAULT}"
-        ip_limit_tail_lines="${ip_limit_tail_lines:-500}"
+        ip_limit_tail_lines="${ip_limit_tail_lines:-$IP_LIMIT_TAIL_LINES_DEFAULT}"
+        if [[ "$ip_limit_tail_lines" == "500" ]]; then
+            ip_limit_tail_lines="$IP_LIMIT_TAIL_LINES_DEFAULT"
+        fi
+        ip_limit_max_events="${ip_limit_max_events:-$IP_LIMIT_MAX_EVENTS_DEFAULT}"
         ip_limit_xray_logs="${ip_limit_xray_logs:-$IP_LIMIT_XRAY_LOGS_DEFAULT}"
         if ! network_interface_exists "$iface"; then
             fail "Интерфейс ${iface} из конфига не найден. Проверь: ip -br link"
@@ -3933,7 +3950,8 @@ install_stats_push_client() {
         ip_limit_user_regex=""
         ip_limit_ip_regex=""
         ip_limit_scan_sec="$IP_LIMIT_SCAN_SEC_DEFAULT"
-        ip_limit_tail_lines="500"
+        ip_limit_tail_lines="$IP_LIMIT_TAIL_LINES_DEFAULT"
+        ip_limit_max_events="$IP_LIMIT_MAX_EVENTS_DEFAULT"
         ip_limit_xray_logs="$IP_LIMIT_XRAY_LOGS_DEFAULT"
     fi
 
@@ -3950,6 +3968,7 @@ install_stats_push_client() {
     safe_ip_limit_ip_regex="$(escape_config_value "$ip_limit_ip_regex")"
     safe_ip_limit_scan_sec="$(escape_config_value "$ip_limit_scan_sec")"
     safe_ip_limit_tail_lines="$(escape_config_value "$ip_limit_tail_lines")"
+    safe_ip_limit_max_events="$(escape_config_value "$ip_limit_max_events")"
     safe_ip_limit_xray_logs="$(escape_config_value "$ip_limit_xray_logs")"
 
     if (( existing_config == 1 )); then
@@ -3989,6 +4008,7 @@ KTO_IP_LIMIT_USER_REGEX="$safe_ip_limit_user_regex"
 KTO_IP_LIMIT_IP_REGEX="$safe_ip_limit_ip_regex"
 KTO_IP_LIMIT_SCAN_SEC="$safe_ip_limit_scan_sec"
 KTO_IP_LIMIT_TAIL_LINES="$safe_ip_limit_tail_lines"
+KTO_IP_LIMIT_MAX_EVENTS="$safe_ip_limit_max_events"
 KTO_IP_LIMIT_XRAY_LOGS="$safe_ip_limit_xray_logs"
 EOF
     write_stats_push_script
@@ -4059,7 +4079,7 @@ run_stats_push_debug() {
     fi
 
     local node_id node_name iface collector_url secret interval health_url debug_log rc iface_ok interval_label
-    local ip_limit_enabled ip_limit_log_file ip_limit_docker_container ip_limit_scan_sec ip_limit_xray_logs
+    local ip_limit_enabled ip_limit_log_file ip_limit_docker_container ip_limit_scan_sec ip_limit_tail_lines ip_limit_max_events ip_limit_xray_logs
     node_id="$(config_get KTO_PUSH_NODE_ID "$STATS_PUSH_CONFIG")"
     node_name="$(config_get KTO_PUSH_NODE_NAME "$STATS_PUSH_CONFIG")"
     iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
@@ -4070,6 +4090,8 @@ run_stats_push_debug() {
     ip_limit_log_file="$(config_get KTO_IP_LIMIT_LOG_FILE "$STATS_PUSH_CONFIG")"
     ip_limit_docker_container="$(config_get KTO_IP_LIMIT_DOCKER_CONTAINER "$STATS_PUSH_CONFIG")"
     ip_limit_scan_sec="$(config_get KTO_IP_LIMIT_SCAN_SEC "$STATS_PUSH_CONFIG")"
+    ip_limit_tail_lines="$(config_get KTO_IP_LIMIT_TAIL_LINES "$STATS_PUSH_CONFIG")"
+    ip_limit_max_events="$(config_get KTO_IP_LIMIT_MAX_EVENTS "$STATS_PUSH_CONFIG")"
     ip_limit_xray_logs="$(config_get KTO_IP_LIMIT_XRAY_LOGS "$STATS_PUSH_CONFIG")"
 
     if network_interface_exists "$iface"; then
@@ -4095,6 +4117,8 @@ run_stats_push_debug() {
     print_row "ip log file" "${ip_limit_log_file:-empty}"
     print_row "ip docker" "${ip_limit_docker_container:-empty}"
     print_row "ip scan" "${ip_limit_scan_sec:-$IP_LIMIT_SCAN_SEC_DEFAULT}s"
+    print_row "ip tail" "${ip_limit_tail_lines:-$IP_LIMIT_TAIL_LINES_DEFAULT}"
+    print_row "ip max events" "${ip_limit_max_events:-$IP_LIMIT_MAX_EVENTS_DEFAULT}"
     print_row "ip xray logs" "${ip_limit_xray_logs:-$IP_LIMIT_XRAY_LOGS_DEFAULT}"
 
     if [[ -z "$collector_url" || -z "$secret" ]]; then

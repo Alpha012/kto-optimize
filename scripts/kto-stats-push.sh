@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v170"
+PUSH_BUILD="v171"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -32,7 +32,8 @@ KTO_IP_LIMIT_DOCKER_CONTAINER="${KTO_IP_LIMIT_DOCKER_CONTAINER:-}"
 KTO_IP_LIMIT_USER_REGEX="${KTO_IP_LIMIT_USER_REGEX:-}"
 KTO_IP_LIMIT_IP_REGEX="${KTO_IP_LIMIT_IP_REGEX:-}"
 KTO_IP_LIMIT_SCAN_SEC="${KTO_IP_LIMIT_SCAN_SEC:-120}"
-KTO_IP_LIMIT_TAIL_LINES="${KTO_IP_LIMIT_TAIL_LINES:-500}"
+KTO_IP_LIMIT_TAIL_LINES="${KTO_IP_LIMIT_TAIL_LINES:-5000}"
+KTO_IP_LIMIT_MAX_EVENTS="${KTO_IP_LIMIT_MAX_EVENTS:-5000}"
 KTO_IP_LIMIT_XRAY_LOGS="${KTO_IP_LIMIT_XRAY_LOGS:-1}"
 KTO_IP_LIMIT_BLOCK_STATE="${KTO_IP_LIMIT_BLOCK_STATE:-/run/kto-ip-limit-blocks.tsv}"
 
@@ -472,7 +473,7 @@ read_ip_limit_source_lines() {
 }
 
 read_ip_limit_events() {
-    local lines_file events_file source line user ip seen_at parsed_seen_at scan_sec cutoff
+    local lines_file events_file dedup_file source line user ip seen_at parsed_seen_at scan_sec cutoff max_events
 
     ip_limit_events='[]'
     ip_limit_enabled || return 0
@@ -480,11 +481,19 @@ read_ip_limit_events() {
 
     lines_file="$(mktemp)"
     events_file="$(mktemp)"
+    dedup_file="$(mktemp)"
     read_ip_limit_source_lines "$lines_file"
     case "$KTO_IP_LIMIT_SCAN_SEC" in
         ""|*[!0-9]*) scan_sec=120 ;;
         *) scan_sec="$KTO_IP_LIMIT_SCAN_SEC" ;;
     esac
+    case "$KTO_IP_LIMIT_MAX_EVENTS" in
+        ""|*[!0-9]*) max_events=5000 ;;
+        *) max_events="$KTO_IP_LIMIT_MAX_EVENTS" ;;
+    esac
+    if (( max_events < 100 )); then
+        max_events=100
+    fi
     cutoff=$(( updated_at - scan_sec - 5 ))
 
     while IFS=$'\t' read -r source line; do
@@ -509,15 +518,27 @@ read_ip_limit_events() {
     done < "$lines_file"
 
     if [[ -s "$events_file" ]]; then
-        ip_limit_events="$(sort -u "$events_file" | awk 'NR <= 200' | jq -R -s '
+        awk -F '\t' 'NF >= 4 {
+            key = $1 SUBSEP $2 SUBSEP $3
+            user[key] = $1
+            ip[key] = $2
+            node[key] = $3
+            seen[key] = $4
+        }
+        END {
+            for (key in seen) {
+                print user[key] "\t" ip[key] "\t" node[key] "\t" seen[key]
+            }
+        }' "$events_file" | sort -t "$(printf '\t')" -k4,4n | tail -n "$max_events" > "$dedup_file"
+        ip_limit_events="$(jq -R -s '
             [split("\n")[] | select(length > 0) | split("\t") |
                 {user: .[0], ip: .[1], node: .[2], seen_at: (.[3] | tonumber)}
             ]
-        ' 2>/dev/null || echo '[]')"
+        ' "$dedup_file" 2>/dev/null || echo '[]')"
     fi
     ip_limit_events_count="$(printf '%s' "$ip_limit_events" | jq -r 'length' 2>/dev/null || echo 0)"
 
-    rm -f "$lines_file" "$events_file"
+    rm -f "$lines_file" "$events_file" "$dedup_file"
 }
 
 read -r ram_used ram_total ram_percent < <(memory_stats)
