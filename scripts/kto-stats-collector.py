@@ -14,7 +14,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v167"
+COLLECTOR_BUILD = "v168"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -541,6 +541,29 @@ def send_message(text, reply_markup=None):
         return True
     except Exception as exc:
         log(f"telegram send failed: {exc}")
+        return False
+
+
+def edit_message_text(chat_id, message_id, text, reply_markup=None):
+    if not chat_id or not message_id:
+        return False
+    try:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        tg_call("editMessageText", payload, timeout=15)
+        log(f"telegram edited message_id={message_id} chat_id={chat_id}")
+        return True
+    except Exception as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+        log(f"telegram edit failed: {exc}")
         return False
 
 
@@ -2011,6 +2034,7 @@ def handle_ip_limit_callback(callback):
     from_id = str((callback.get("from") or {}).get("id") or "")
     message = callback.get("message") or {}
     chat_id = str((message.get("chat") or {}).get("id") or CHAT_ID)
+    message_id = str(message.get("message_id") or "")
     if chat_id != str(CHAT_ID) or from_id != ALLOWED_USER_ID:
         answer_callback(callback_id, "нет доступа")
         return
@@ -2027,7 +2051,8 @@ def handle_ip_limit_callback(callback):
         key = set_ip_limit_override(user_key, info, 0)
         answer_callback(callback_id, "лимит убран")
         body, markup = ip_limit_user_card(key)
-        send_message(f"<b>Лимит убран</b>\n\n{body}", reply_markup=markup)
+        if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
+            send_message(body, reply_markup=markup)
         return
     if action == "raise":
         set_pending_ip_limit(chat_id, from_id, user_key)
@@ -2042,7 +2067,8 @@ def handle_ip_limit_callback(callback):
     if action == "show":
         answer_callback(callback_id, "обновляю")
         body, markup = ip_limit_user_card(user_key)
-        send_message(body, reply_markup=markup)
+        if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
+            send_message(body, reply_markup=markup)
         return
     answer_callback(callback_id)
 
