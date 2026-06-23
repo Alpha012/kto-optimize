@@ -13,7 +13,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v154"
+COLLECTOR_BUILD = "v155"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -72,6 +72,8 @@ NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
 ALERT_SEPARATOR = "➖" * 9
+RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
+LOST_EMOJI = '<tg-emoji emoji-id="5447183459602669338">🚨</tg-emoji>'
 
 if TZ_NAME:
     os.environ["TZ"] = TZ_NAME
@@ -611,7 +613,7 @@ def node_alert_message(kind, node_id, node, reason="-"):
     ip = node_display_ip(node)
     if kind == "up":
         lines = [
-            "❇️ #nodeConnectionRestored",
+            f"{RESTORED_EMOJI} #nodeConnectionRestored",
             "<b>Подключение к серверу восстановлено</b>",
             ALERT_SEPARATOR,
             detail_line("Название", name),
@@ -620,7 +622,7 @@ def node_alert_message(kind, node_id, node, reason="-"):
     else:
         updated = fmt_time(node.get("last_seen") or node.get("updated_at") or 0)
         lines = [
-            "🚨 #nodeConnectionLost",
+            f"{LOST_EMOJI} #nodeConnectionLost",
             "<b>Подключение к серверу потеряно</b>",
             ALERT_SEPARATOR,
             detail_line("Название", name),
