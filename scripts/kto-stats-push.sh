@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v155"
+PUSH_BUILD="v156"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -26,6 +26,14 @@ fi
 : "${KTO_PUSH_COLLECTOR_URL:?KTO_PUSH_COLLECTOR_URL is required}"
 : "${KTO_PUSH_SECRET:?KTO_PUSH_SECRET is required}"
 
+KTO_IP_LIMIT_ENABLED="${KTO_IP_LIMIT_ENABLED:-0}"
+KTO_IP_LIMIT_LOG_FILE="${KTO_IP_LIMIT_LOG_FILE:-}"
+KTO_IP_LIMIT_DOCKER_CONTAINER="${KTO_IP_LIMIT_DOCKER_CONTAINER:-}"
+KTO_IP_LIMIT_USER_REGEX="${KTO_IP_LIMIT_USER_REGEX:-}"
+KTO_IP_LIMIT_IP_REGEX="${KTO_IP_LIMIT_IP_REGEX:-}"
+KTO_IP_LIMIT_SCAN_SEC="${KTO_IP_LIMIT_SCAN_SEC:-120}"
+KTO_IP_LIMIT_TAIL_LINES="${KTO_IP_LIMIT_TAIL_LINES:-500}"
+
 collector_url="${KTO_PUSH_COLLECTOR_URL%/}/push"
 hostname_value="$(hostname 2>/dev/null || echo unknown)"
 updated_at="$(date +%s)"
@@ -45,6 +53,7 @@ metrics_ok=false
 scan_wrong_sni_total=0
 scan_wrong_sni_sources=0
 scan_wrong_sni_top='[]'
+ip_limit_events='[]'
 
 int_or_zero() {
     local value="${1:-0}"
@@ -223,6 +232,98 @@ read_haproxy_scan_stats() {
         | jq -R -s '[split("\n")[] | select(length > 0) | split(" ") | {ip: .[0], count: (.[1] | tonumber), rate: (.[2] | tonumber)}]' 2>/dev/null || echo '[]')"
 }
 
+ip_limit_enabled() {
+    case "${KTO_IP_LIMIT_ENABLED}" in
+        1|yes|true|on|enabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ip_limit_user_from_line() {
+    local line="$1"
+    local regex
+
+    if [[ -n "$KTO_IP_LIMIT_USER_REGEX" && "$line" =~ $KTO_IP_LIMIT_USER_REGEX ]]; then
+        [[ -n "${BASH_REMATCH[1]-}" ]] || return 1
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    for regex in \
+        'email:[[:space:]]*([^[:space:]]+)' \
+        'user:[[:space:]]*([^[:space:]]+)' \
+        'uuid:[[:space:]]*([0-9a-fA-F-]{32,36})' \
+        'client:[[:space:]]*([^[:space:]]+)'; do
+        if [[ "$line" =~ $regex ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+ip_limit_ip_from_line() {
+    local line="$1"
+    local regex
+
+    if [[ -n "$KTO_IP_LIMIT_IP_REGEX" && "$line" =~ $KTO_IP_LIMIT_IP_REGEX ]]; then
+        [[ -n "${BASH_REMATCH[1]-}" ]] || return 1
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$line" =~ ([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    return 1
+}
+
+read_ip_limit_source_lines() {
+    local output_file="$1"
+    local scan_sec="$KTO_IP_LIMIT_SCAN_SEC"
+    local tail_lines="$KTO_IP_LIMIT_TAIL_LINES"
+
+    if [[ -n "$KTO_IP_LIMIT_DOCKER_CONTAINER" ]] && command -v docker >/dev/null 2>&1; then
+        docker logs --since "${scan_sec}s" "$KTO_IP_LIMIT_DOCKER_CONTAINER" >> "$output_file" 2>/dev/null || true
+    fi
+    if [[ -n "$KTO_IP_LIMIT_LOG_FILE" && -r "$KTO_IP_LIMIT_LOG_FILE" ]]; then
+        tail -n "$tail_lines" "$KTO_IP_LIMIT_LOG_FILE" >> "$output_file" 2>/dev/null || true
+    fi
+}
+
+read_ip_limit_events() {
+    local lines_file events_file line user ip
+
+    ip_limit_events='[]'
+    ip_limit_enabled || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    lines_file="$(mktemp)"
+    events_file="$(mktemp)"
+    read_ip_limit_source_lines "$lines_file"
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        user="$(ip_limit_user_from_line "$line" || true)"
+        [[ -n "$user" ]] || continue
+        ip="$(ip_limit_ip_from_line "$line" || true)"
+        validate_ipv4 "$ip" || continue
+        printf '%s\t%s\t%s\t%s\n' "$user" "$ip" "$KTO_PUSH_NODE_NAME" "$updated_at" >> "$events_file"
+    done < "$lines_file"
+
+    if [[ -s "$events_file" ]]; then
+        ip_limit_events="$(sort -u "$events_file" | awk 'NR <= 200' | jq -R -s '
+            [split("\n")[] | select(length > 0) | split("\t") |
+                {user: .[0], ip: .[1], node: .[2], seen_at: (.[3] | tonumber)}
+            ]
+        ' 2>/dev/null || echo '[]')"
+    fi
+
+    rm -f "$lines_file" "$events_file"
+}
+
 read -r ram_used ram_total ram_percent < <(memory_stats)
 ram_used="$(int_or_zero "$ram_used")"
 ram_total="$(int_or_zero "$ram_total")"
@@ -239,6 +340,7 @@ if (( ram_total > 0 )); then
     metrics_ok=true
 fi
 read_haproxy_scan_stats
+read_ip_limit_events
 
 if ! command -v jq >/dev/null 2>&1; then
     error="jq не установлен"
@@ -304,6 +406,7 @@ if ! payload="$(jq -n \
     --argjson scan_wrong_sni_total "$scan_wrong_sni_total" \
     --argjson scan_wrong_sni_sources "$scan_wrong_sni_sources" \
     --argjson scan_wrong_sni_top "$scan_wrong_sni_top" \
+    --argjson ip_limit_events "$ip_limit_events" \
     --argjson updated_at "$updated_at" \
     '{
         id: $id,
@@ -328,6 +431,7 @@ if ! payload="$(jq -n \
         scan_wrong_sni_total: $scan_wrong_sni_total,
         scan_wrong_sni_sources: $scan_wrong_sni_sources,
         scan_wrong_sni_top: $scan_wrong_sni_top,
+        ip_limit_events: $ip_limit_events,
         error: $error,
         updated_at: $updated_at
     }' 2>&1)"; then

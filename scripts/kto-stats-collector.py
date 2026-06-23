@@ -13,7 +13,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v155"
+COLLECTOR_BUILD = "v156"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -61,16 +61,37 @@ try:
     SCAN_ALERT_COOLDOWN = int(cfg.get("KTO_COLLECTOR_SCAN_ALERT_COOLDOWN", "600") or "600")
 except Exception:
     SCAN_ALERT_COOLDOWN = 600
+IP_LIMIT_ENABLED = str(cfg.get("KTO_COLLECTOR_IP_LIMIT_ENABLED", "0")).lower() in ("1", "yes", "true", "on", "enabled")
+try:
+    IP_LIMIT_MAX_IPS = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_MAX_IPS", "1") or "1")
+except Exception:
+    IP_LIMIT_MAX_IPS = 1
+if IP_LIMIT_MAX_IPS < 1:
+    IP_LIMIT_MAX_IPS = 1
+try:
+    IP_LIMIT_WINDOW_SEC = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC", "600") or "600")
+except Exception:
+    IP_LIMIT_WINDOW_SEC = 600
+if IP_LIMIT_WINDOW_SEC < 60:
+    IP_LIMIT_WINDOW_SEC = 60
+try:
+    IP_LIMIT_ALERT_COOLDOWN = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN", "600") or "600")
+except Exception:
+    IP_LIMIT_ALERT_COOLDOWN = 600
+if IP_LIMIT_ALERT_COOLDOWN < 60:
+    IP_LIMIT_ALERT_COOLDOWN = 60
 
 NODES_FILE = os.path.join(STATE_DIR, "nodes.json")
 FALLS_FILE = os.path.join(STATE_DIR, "falls.json")
 OFFSET_FILE = os.path.join(STATE_DIR, "telegram_offset")
 DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
 SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
+IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
 LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
+IP_LIMIT_STATE = {"users": {}, "alerts": {}}
 ALERT_SEPARATOR = "➖" * 9
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
 LOST_EMOJI = '<tg-emoji emoji-id="5447183459602669338">🚨</tg-emoji>'
@@ -193,6 +214,27 @@ def add_ssh_allowed_ip(ip):
 def ssh_allowed_ips_snapshot():
     with LOCK:
         return list(SSH_ALLOWED_IPS)
+
+
+def load_ip_limit_state():
+    global IP_LIMIT_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(IP_LIMIT_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            users = loaded.get("users")
+            alerts = loaded.get("alerts")
+            IP_LIMIT_STATE = {
+                "users": users if isinstance(users, dict) else {},
+                "alerts": alerts if isinstance(alerts, dict) else {},
+            }
+    except Exception:
+        IP_LIMIT_STATE = {"users": {}, "alerts": {}}
+
+
+def save_ip_limit_state():
+    atomic_write(IP_LIMIT_FILE, json.dumps(IP_LIMIT_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def normalize_scan_top(value):
@@ -663,6 +705,136 @@ def alert_scan_spike(node, delta):
     )
 
 
+def normalize_ip_limit_user(value):
+    value = re.sub(r"\s+", " ", str(value or "").strip())
+    if not value or len(value) > 160:
+        return ""
+    return value
+
+
+def normalize_ip_limit_event(raw, fallback_node, ts):
+    if not isinstance(raw, dict):
+        return None
+    user = normalize_ip_limit_user(raw.get("user"))
+    ip = str(raw.get("ip") or "").strip()
+    if not user or not valid_ipv4(ip):
+        return None
+    node = str(raw.get("node") or fallback_node or "-").strip() or "-"
+    try:
+        seen_at = int(raw.get("seen_at") or ts)
+    except Exception:
+        seen_at = ts
+    if seen_at <= 0 or seen_at > ts + 300:
+        seen_at = ts
+    return {"user": user, "ip": normalize_ip(ip), "node": node[:80], "seen_at": seen_at}
+
+
+def ip_limit_last_seen(entry):
+    try:
+        return int((entry or {}).get("last_seen") or 0)
+    except Exception:
+        return 0
+
+
+def purge_ip_limit_state(ts):
+    users = IP_LIMIT_STATE.setdefault("users", {})
+    cutoff = ts - IP_LIMIT_WINDOW_SEC
+    for user in list(users.keys()):
+        ip_map = users.get(user)
+        if not isinstance(ip_map, dict):
+            del users[user]
+            continue
+        for ip in list(ip_map.keys()):
+            entry = ip_map.get(ip) or {}
+            if not isinstance(entry, dict):
+                del ip_map[ip]
+                continue
+            if ip_limit_last_seen(entry) < cutoff:
+                del ip_map[ip]
+        if not ip_map:
+            del users[user]
+
+
+def active_ip_limit_entries(user, ts):
+    cutoff = ts - IP_LIMIT_WINDOW_SEC
+    ip_map = IP_LIMIT_STATE.setdefault("users", {}).get(user) or {}
+    result = []
+    for ip, entry in ip_map.items():
+        if not isinstance(entry, dict):
+            continue
+        last_seen = ip_limit_last_seen(entry)
+        if last_seen >= cutoff:
+            nodes = entry.get("nodes") if isinstance(entry, dict) else {}
+            if not isinstance(nodes, dict):
+                nodes = {}
+            result.append({"ip": ip, "last_seen": last_seen, "nodes": sorted(nodes.keys())})
+    result.sort(key=lambda item: (-item["last_seen"], item["ip"]))
+    return result
+
+
+def alert_ip_limit_exceeded(user, entries):
+    ip_lines = []
+    for item in entries[:12]:
+        nodes = ", ".join(item.get("nodes") or []) or "-"
+        ip_lines.append(f"{html.escape(item['ip'])} — {html.escape(nodes)}")
+    if len(entries) > 12:
+        ip_lines.append(f"... ещё {len(entries) - 12}")
+
+    return send_message(
+        f"{LOST_EMOJI} #ipLimitExceeded\n"
+        "<b>IP лимит превышен</b>\n"
+        f"{ALERT_SEPARATOR}\n"
+        f"{detail_line('Подписка', user)}\n"
+        f"{detail_line('Активных IP', f'{len(entries)}/{IP_LIMIT_MAX_IPS}')}\n"
+        f"{detail_line('Окно', format_duration_ru(IP_LIMIT_WINDOW_SEC))}\n"
+        f"<blockquote>{chr(10).join(ip_lines)}</blockquote>"
+    )
+
+
+def process_ip_limit_events(events, fallback_node, ts):
+    if not IP_LIMIT_ENABLED or not isinstance(events, list):
+        return
+
+    alerts = []
+    with LOCK:
+        purge_ip_limit_state(ts)
+        users = IP_LIMIT_STATE.setdefault("users", {})
+        alert_state = IP_LIMIT_STATE.setdefault("alerts", {})
+        touched = set()
+
+        for raw in events[:500]:
+            event = normalize_ip_limit_event(raw, fallback_node, ts)
+            if not event:
+                continue
+            touched.add(event["user"])
+            ip_map = users.setdefault(event["user"], {})
+            entry = ip_map.setdefault(event["ip"], {"last_seen": 0, "nodes": {}})
+            entry["last_seen"] = max(int(entry.get("last_seen") or 0), event["seen_at"])
+            nodes = entry.setdefault("nodes", {})
+            if isinstance(nodes, dict):
+                nodes[event["node"]] = event["seen_at"]
+            else:
+                entry["nodes"] = {event["node"]: event["seen_at"]}
+
+        purge_ip_limit_state(ts)
+        for user in sorted(touched, key=natural_sort_key):
+            entries = active_ip_limit_entries(user, ts)
+            if len(entries) <= IP_LIMIT_MAX_IPS:
+                continue
+            last_alert = int(alert_state.get(user) or 0)
+            if ts - last_alert < IP_LIMIT_ALERT_COOLDOWN:
+                continue
+            alert_state[user] = ts
+            alerts.append((user, entries))
+
+        if touched:
+            save_ip_limit_state()
+
+    for user, entries in alerts:
+        log(f"ip limit exceeded: user={user} active_ips={len(entries)} limit={IP_LIMIT_MAX_IPS}")
+        alert_ip_limit_exceeded(user, entries)
+
+
 def update_node(payload, remote_ip=""):
     node_id = str(payload.get("id") or payload.get("name") or payload.get("hostname") or "").strip()
     if not node_id:
@@ -730,6 +902,7 @@ def update_node(payload, remote_ip=""):
     if scan_alert_node:
         log(f"scan spike: {node_id} delta={scan_alert_delta}")
         alert_scan_spike(scan_alert_node, scan_alert_delta)
+    process_ip_limit_events(payload.get("ip_limit_events"), record.get("name") or node_id, current)
     return record
 
 
@@ -1159,6 +1332,7 @@ def main():
     load_nodes()
     load_falls()
     load_ssh_allowed_ips()
+    load_ip_limit_state()
     threading.Thread(target=offline_loop, daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
     if DAILY_REPORT_TIME:

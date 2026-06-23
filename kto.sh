@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v155"
+SCRIPT_BUILD="v156"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -61,6 +61,11 @@ STATS_COLLECTOR_STALE_SEC_DEFAULT="60"
 STATS_COLLECTOR_TZ_DEFAULT="Europe/Moscow"
 STATS_ALLOWED_USER_ID_DEFAULT="646296998"
 STATS_EXPECTED_NODES_DEFAULT="10"
+IP_LIMIT_ENABLED_DEFAULT="${KTO_IP_LIMIT_ENABLED_DEFAULT:-0}"
+IP_LIMIT_MAX_IPS_DEFAULT="${KTO_IP_LIMIT_MAX_IPS_DEFAULT:-1}"
+IP_LIMIT_WINDOW_SEC_DEFAULT="${KTO_IP_LIMIT_WINDOW_SEC_DEFAULT:-600}"
+IP_LIMIT_ALERT_COOLDOWN_DEFAULT="${KTO_IP_LIMIT_ALERT_COOLDOWN_DEFAULT:-600}"
+IP_LIMIT_SCAN_SEC_DEFAULT="${KTO_IP_LIMIT_SCAN_SEC_DEFAULT:-120}"
 SPEEDTEST_TIMEOUT="${KTO_SPEEDTEST_TIMEOUT:-240}"
 SPEEDTEST_DOWNLOAD_TIMEOUT="${KTO_SPEEDTEST_DOWNLOAD_TIMEOUT:-180}"
 APT_UPDATED=0
@@ -778,6 +783,13 @@ require_reality_profile() {
 require_whitelist_mode() {
     if [[ "$MACHINE_MODE" != "whitelist" ]]; then
         fail "Этот пункт доступен только для режима whitelist."
+        exit 1
+    fi
+}
+
+require_push_mode() {
+    if [[ "$MACHINE_MODE" != "node" && "$MACHINE_MODE" != "whitelist" ]]; then
+        fail "Этот пункт доступен только для режима node или whitelist."
         exit 1
     fi
 }
@@ -3504,7 +3516,9 @@ install_stats_collector() {
     need_root
 
     local listen_host listen_port secret bot_token chat_id allowed_user stale_sec expected_nodes daily_report_time existing_config=0
+    local ip_limit_enabled ip_limit_max_ips ip_limit_window_sec ip_limit_alert_cooldown
     local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_expected safe_tz safe_daily
+    local safe_ip_limit_enabled safe_ip_limit_max_ips safe_ip_limit_window safe_ip_limit_cooldown
 
     if "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
         listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -3516,6 +3530,10 @@ install_stats_collector() {
         stale_sec="$(config_get KTO_COLLECTOR_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
         expected_nodes="$(config_get KTO_COLLECTOR_EXPECTED_NODES "$STATS_COLLECTOR_CONFIG")"
         daily_report_time="$(config_get KTO_COLLECTOR_DAILY_REPORT_TIME "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_max_ips="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_IPS "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_window_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_alert_cooldown="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN "$STATS_COLLECTOR_CONFIG")"
         if [[ -n "$secret" && -n "$bot_token" && -n "$chat_id" ]]; then
             existing_config=1
         else
@@ -3529,6 +3547,10 @@ install_stats_collector() {
         allowed_user="${allowed_user:-$STATS_ALLOWED_USER_ID_DEFAULT}"
         stale_sec="${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}"
         expected_nodes="${expected_nodes:-$STATS_EXPECTED_NODES_DEFAULT}"
+        ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
+        ip_limit_max_ips="${ip_limit_max_ips:-$IP_LIMIT_MAX_IPS_DEFAULT}"
+        ip_limit_window_sec="${ip_limit_window_sec:-$IP_LIMIT_WINDOW_SEC_DEFAULT}"
+        ip_limit_alert_cooldown="${ip_limit_alert_cooldown:-$IP_LIMIT_ALERT_COOLDOWN_DEFAULT}"
     else
         listen_host="$(ask_text "IP прослушивания коллектора" "0.0.0.0")"
         listen_port="$(ask_int "Порт коллектора" "$STATS_COLLECTOR_PORT_DEFAULT" 1 65535)"
@@ -3539,6 +3561,10 @@ install_stats_collector() {
         stale_sec="$(ask_int "Алерт offline после секунд" "$STATS_COLLECTOR_STALE_SEC_DEFAULT" 30 86400)"
         expected_nodes="$(ask_int "Ожидаемое кол-во обходов" "$STATS_EXPECTED_NODES_DEFAULT" 1 9999)"
         daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
+        ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
+        ip_limit_max_ips="$IP_LIMIT_MAX_IPS_DEFAULT"
+        ip_limit_window_sec="$IP_LIMIT_WINDOW_SEC_DEFAULT"
+        ip_limit_alert_cooldown="$IP_LIMIT_ALERT_COOLDOWN_DEFAULT"
     fi
 
     safe_host="$(escape_config_value "$listen_host")"
@@ -3551,6 +3577,10 @@ install_stats_collector() {
     safe_expected="$(escape_config_value "$expected_nodes")"
     safe_tz="$(escape_config_value "$STATS_COLLECTOR_TZ_DEFAULT")"
     safe_daily="$(escape_config_value "$daily_report_time")"
+    safe_ip_limit_enabled="$(escape_config_value "$ip_limit_enabled")"
+    safe_ip_limit_max_ips="$(escape_config_value "$ip_limit_max_ips")"
+    safe_ip_limit_window="$(escape_config_value "$ip_limit_window_sec")"
+    safe_ip_limit_cooldown="$(escape_config_value "$ip_limit_alert_cooldown")"
 
     if (( existing_config == 1 )); then
         stage "Обновляю коллектор статистики"
@@ -3571,6 +3601,10 @@ KTO_COLLECTOR_STALE_SEC="$safe_stale"
 KTO_COLLECTOR_EXPECTED_NODES="$safe_expected"
 KTO_COLLECTOR_TZ="$safe_tz"
 KTO_COLLECTOR_DAILY_REPORT_TIME="$safe_daily"
+KTO_COLLECTOR_IP_LIMIT_ENABLED="$safe_ip_limit_enabled"
+KTO_COLLECTOR_IP_LIMIT_MAX_IPS="$safe_ip_limit_max_ips"
+KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC="$safe_ip_limit_window"
+KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN="$safe_ip_limit_cooldown"
 EOF
     write_stats_collector_script
     write_stats_collector_service
@@ -3670,11 +3704,13 @@ EOF
 
 install_stats_push_client() {
     header
-    require_whitelist_mode
+    require_push_mode
     need_root
 
     local default_iface default_name node_name node_id iface collector_url secret interval existing_config=0
+    local ip_limit_enabled ip_limit_log_file ip_limit_docker_container ip_limit_user_regex ip_limit_ip_regex ip_limit_scan_sec ip_limit_tail_lines
     local safe_name safe_id safe_iface safe_url safe_secret safe_interval
+    local safe_ip_limit_enabled safe_ip_limit_log_file safe_ip_limit_docker safe_ip_limit_user_regex safe_ip_limit_ip_regex safe_ip_limit_scan_sec safe_ip_limit_tail_lines
 
     default_iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
     default_iface="${default_iface:-$(default_network_interface)}"
@@ -3688,6 +3724,13 @@ install_stats_push_client() {
         collector_url="$(config_get KTO_PUSH_COLLECTOR_URL "$STATS_PUSH_CONFIG")"
         secret="$(config_get KTO_PUSH_SECRET "$STATS_PUSH_CONFIG")"
         interval="$(config_get KTO_PUSH_INTERVAL "$STATS_PUSH_CONFIG")"
+        ip_limit_enabled="$(config_get KTO_IP_LIMIT_ENABLED "$STATS_PUSH_CONFIG")"
+        ip_limit_log_file="$(config_get KTO_IP_LIMIT_LOG_FILE "$STATS_PUSH_CONFIG")"
+        ip_limit_docker_container="$(config_get KTO_IP_LIMIT_DOCKER_CONTAINER "$STATS_PUSH_CONFIG")"
+        ip_limit_user_regex="$(config_get KTO_IP_LIMIT_USER_REGEX "$STATS_PUSH_CONFIG")"
+        ip_limit_ip_regex="$(config_get KTO_IP_LIMIT_IP_REGEX "$STATS_PUSH_CONFIG")"
+        ip_limit_scan_sec="$(config_get KTO_IP_LIMIT_SCAN_SEC "$STATS_PUSH_CONFIG")"
+        ip_limit_tail_lines="$(config_get KTO_IP_LIMIT_TAIL_LINES "$STATS_PUSH_CONFIG")"
         if [[ -n "$node_id" && -n "$node_name" && -n "$iface" && -n "$collector_url" && -n "$secret" ]]; then
             existing_config=1
         else
@@ -3697,6 +3740,9 @@ install_stats_push_client() {
 
     if (( existing_config == 1 )); then
         interval="${interval:-$STATS_PUSH_INTERVAL_DEFAULT}"
+        ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
+        ip_limit_scan_sec="${ip_limit_scan_sec:-$IP_LIMIT_SCAN_SEC_DEFAULT}"
+        ip_limit_tail_lines="${ip_limit_tail_lines:-500}"
         if ! network_interface_exists "$iface"; then
             fail "Интерфейс ${iface} из конфига не найден. Проверь: ip -br link"
             return 1
@@ -3720,6 +3766,13 @@ install_stats_push_client() {
         fi
         secret="$(ask_secret_value "Секрет коллектора")"
         interval="$(ask_int "Интервал push, сек" "$STATS_PUSH_INTERVAL_DEFAULT" 15 3600)"
+        ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
+        ip_limit_log_file=""
+        ip_limit_docker_container=""
+        ip_limit_user_regex=""
+        ip_limit_ip_regex=""
+        ip_limit_scan_sec="$IP_LIMIT_SCAN_SEC_DEFAULT"
+        ip_limit_tail_lines="500"
     fi
 
     safe_name="$(escape_config_value "$node_name")"
@@ -3728,6 +3781,13 @@ install_stats_push_client() {
     safe_url="$(escape_config_value "$collector_url")"
     safe_secret="$(escape_config_value "$secret")"
     safe_interval="$(escape_config_value "$interval")"
+    safe_ip_limit_enabled="$(escape_config_value "$ip_limit_enabled")"
+    safe_ip_limit_log_file="$(escape_config_value "$ip_limit_log_file")"
+    safe_ip_limit_docker="$(escape_config_value "$ip_limit_docker_container")"
+    safe_ip_limit_user_regex="$(escape_config_value "$ip_limit_user_regex")"
+    safe_ip_limit_ip_regex="$(escape_config_value "$ip_limit_ip_regex")"
+    safe_ip_limit_scan_sec="$(escape_config_value "$ip_limit_scan_sec")"
+    safe_ip_limit_tail_lines="$(escape_config_value "$ip_limit_tail_lines")"
 
     if (( existing_config == 1 )); then
         stage "Обновляю push статистики"
@@ -3759,6 +3819,13 @@ KTO_PUSH_IFACE="$safe_iface"
 KTO_PUSH_COLLECTOR_URL="$safe_url"
 KTO_PUSH_SECRET="$safe_secret"
 KTO_PUSH_INTERVAL="$safe_interval"
+KTO_IP_LIMIT_ENABLED="$safe_ip_limit_enabled"
+KTO_IP_LIMIT_LOG_FILE="$safe_ip_limit_log_file"
+KTO_IP_LIMIT_DOCKER_CONTAINER="$safe_ip_limit_docker"
+KTO_IP_LIMIT_USER_REGEX="$safe_ip_limit_user_regex"
+KTO_IP_LIMIT_IP_REGEX="$safe_ip_limit_ip_regex"
+KTO_IP_LIMIT_SCAN_SEC="$safe_ip_limit_scan_sec"
+KTO_IP_LIMIT_TAIL_LINES="$safe_ip_limit_tail_lines"
 EOF
     write_stats_push_script
     write_stats_push_service "$interval"
@@ -3791,7 +3858,7 @@ EOF
 
 send_stats_push_once() {
     header
-    require_whitelist_mode
+    require_push_mode
     need_root
     if ! "${SUDO[@]}" test -f "$STATS_PUSH_CONFIG" 2>/dev/null; then
         fail "Push статистики не настроен."
@@ -3808,7 +3875,7 @@ send_stats_push_once() {
 
 stats_push_status() {
     header
-    require_whitelist_mode
+    require_push_mode
     need_root
     local timer_state config_ok
     timer_state="$(service_ok "$STATS_PUSH_TIMER")"
@@ -3819,7 +3886,7 @@ stats_push_status() {
 
 run_stats_push_debug() {
     header
-    require_whitelist_mode
+    require_push_mode
     need_root
 
     if ! "${SUDO[@]}" test -s "$STATS_PUSH_CONFIG" 2>/dev/null; then
@@ -3828,12 +3895,17 @@ run_stats_push_debug() {
     fi
 
     local node_id node_name iface collector_url secret interval health_url debug_log rc iface_ok interval_label
+    local ip_limit_enabled ip_limit_log_file ip_limit_docker_container ip_limit_scan_sec
     node_id="$(config_get KTO_PUSH_NODE_ID "$STATS_PUSH_CONFIG")"
     node_name="$(config_get KTO_PUSH_NODE_NAME "$STATS_PUSH_CONFIG")"
     iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
     collector_url="$(config_get KTO_PUSH_COLLECTOR_URL "$STATS_PUSH_CONFIG")"
     secret="$(config_get KTO_PUSH_SECRET "$STATS_PUSH_CONFIG")"
     interval="$(config_get KTO_PUSH_INTERVAL "$STATS_PUSH_CONFIG")"
+    ip_limit_enabled="$(config_get KTO_IP_LIMIT_ENABLED "$STATS_PUSH_CONFIG")"
+    ip_limit_log_file="$(config_get KTO_IP_LIMIT_LOG_FILE "$STATS_PUSH_CONFIG")"
+    ip_limit_docker_container="$(config_get KTO_IP_LIMIT_DOCKER_CONTAINER "$STATS_PUSH_CONFIG")"
+    ip_limit_scan_sec="$(config_get KTO_IP_LIMIT_SCAN_SEC "$STATS_PUSH_CONFIG")"
 
     if network_interface_exists "$iface"; then
         iface_ok=1
@@ -3854,6 +3926,10 @@ run_stats_push_debug() {
     print_row "collector" "${collector_url:-empty}" "$([[ "$collector_url" =~ ^https?:// ]] && echo 1 || echo 0)"
     print_row "interval" "$interval_label" "$([[ -n "$interval" ]] && echo 1 || echo 0)"
     print_row "secret" "$([[ -n "$secret" ]] && echo set || echo empty)" "$([[ -n "$secret" ]] && echo 1 || echo 0)"
+    print_row "ip limit" "${ip_limit_enabled:-0}" "$([[ "${ip_limit_enabled:-0}" == "1" ]] && echo 1 || echo 0)"
+    print_row "ip log file" "${ip_limit_log_file:-empty}"
+    print_row "ip docker" "${ip_limit_docker_container:-empty}"
+    print_row "ip scan" "${ip_limit_scan_sec:-$IP_LIMIT_SCAN_SEC_DEFAULT}s"
 
     if [[ -z "$collector_url" || -z "$secret" ]]; then
         fail "В конфиге нет URL коллектора или секрета."
@@ -4126,6 +4202,8 @@ menu() {
         fi
         labels+=("Установка WARP Native")
         actions+=("warp")
+        labels+=("Push статистики")
+        actions+=("stats-push-menu")
     fi
 
     labels+=("Панель состояния")
