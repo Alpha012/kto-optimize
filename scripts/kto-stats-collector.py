@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import tempfile
 import threading
 import time
@@ -13,7 +14,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v163"
+COLLECTOR_BUILD = "v164"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -524,6 +525,7 @@ def remna_api_call(path):
     if not remna_api_enabled():
         return None
     url = f"{REMNA_API_URL}{path}"
+    context = ssl._create_unverified_context() if url.lower().startswith("https://") else None
     req = urllib.request.Request(
         url,
         headers={
@@ -532,7 +534,7 @@ def remna_api_call(path):
         },
         method="GET",
     )
-    with urllib.request.urlopen(req, timeout=REMNA_API_TIMEOUT_SEC) as resp:
+    with urllib.request.urlopen(req, timeout=REMNA_API_TIMEOUT_SEC, context=context) as resp:
         body = resp.read().decode("utf-8", errors="replace")
     return json.loads(body)
 
