@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v156"
+PUSH_BUILD="v157"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -54,6 +54,7 @@ scan_wrong_sni_total=0
 scan_wrong_sni_sources=0
 scan_wrong_sni_top='[]'
 ip_limit_events='[]'
+ip_limit_events_count=0
 
 int_or_zero() {
     local value="${1:-0}"
@@ -320,6 +321,7 @@ read_ip_limit_events() {
             ]
         ' 2>/dev/null || echo '[]')"
     fi
+    ip_limit_events_count="$(printf '%s' "$ip_limit_events" | jq -r 'length' 2>/dev/null || echo 0)"
 
     rm -f "$lines_file" "$events_file"
 }
@@ -455,8 +457,12 @@ fi
 rm -f "$curl_errors"
 
 if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+    ip_limit_extra=""
+    if ip_limit_enabled; then
+        ip_limit_extra=" ip_events=${ip_limit_events_count}"
+    fi
     apply_collector_ssh_ips "$response"
-    echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}% uptime=${uptime_sec}s"
+    echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}% uptime=${uptime_sec}s${ip_limit_extra}"
 else
     echo "push ${PUSH_BUILD}: bad response: ${response}" >&2
     exit 1
