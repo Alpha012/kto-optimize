@@ -13,7 +13,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v153"
+COLLECTOR_BUILD = "v154"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -574,7 +574,7 @@ def aggregate_message():
 
 
 def code_value(value):
-    value = str(value or "-")
+    value = str(value or "-").replace("№", "#")
     return f"<code>{html.escape(value)}</code>"
 
 
@@ -612,7 +612,7 @@ def node_alert_message(kind, node_id, node, reason="-"):
     if kind == "up":
         lines = [
             "❇️ #nodeConnectionRestored",
-            "Подключение к серверу восстановлено",
+            "<b>Подключение к серверу восстановлено</b>",
             ALERT_SEPARATOR,
             detail_line("Название", name),
             detail_line("Адрес", ip),
@@ -621,7 +621,7 @@ def node_alert_message(kind, node_id, node, reason="-"):
         updated = fmt_time(node.get("last_seen") or node.get("updated_at") or 0)
         lines = [
             "🚨 #nodeConnectionLost",
-            "Подключение к серверу потеряно",
+            "<b>Подключение к серверу потеряно</b>",
             ALERT_SEPARATOR,
             detail_line("Название", name),
             detail_line("Причина", reason),
