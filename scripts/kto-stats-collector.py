@@ -14,7 +14,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v169"
+COLLECTOR_BUILD = "v170"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1565,8 +1565,9 @@ def enforce_ip_limit(user, entries, limit, info=None):
         info = remna_user_info(user)
     ts = now_ts()
     enable_at = ts + IP_LIMIT_PENALTY_SEC
+    penalty_text = format_duration_ru_for(IP_LIMIT_PENALTY_SEC)
     scheduled_blocks = schedule_ip_limit_blocks(user, entries, info, enable_at)
-    block_text = f"drop {scheduled_blocks} IP на {format_duration_ru_for(IP_LIMIT_PENALTY_SEC)}" if scheduled_blocks > 0 else ""
+    block_text = f"Все айпи были дропнуты с ноды на {penalty_text}." if scheduled_blocks > 0 else ""
     if not remna_api_enabled():
         return block_text or "Remna API не настроен"
     if not isinstance(info, dict):
@@ -1577,7 +1578,7 @@ def enforce_ip_limit(user, entries, limit, info=None):
     status = str(info.get("status") or "").strip().upper()
     if status and status != "ACTIVE":
         if block_text:
-            return f"{block_text}, Remna уже {status}"
+            return f"{block_text} Подписка уже {status}."
         return f"не отключал, статус {status}"
     key = ip_limit_primary_key(user, info)
     with LOCK:
@@ -1585,7 +1586,7 @@ def enforce_ip_limit(user, entries, limit, info=None):
         current = penalties.get(key) if isinstance(penalties.get(key), dict) else None
         if current and int(current.get("enable_at") or 0) > ts:
             if block_text:
-                return f"{block_text}, Remna уже до {fmt_time(current.get('enable_at'))}"
+                return f"{block_text} Подписка уже отключена до {fmt_time(current.get('enable_at'))}."
             return f"уже отключён до {fmt_time(current.get('enable_at'))}"
     try:
         remna_user_action(uuid_value, "disable")
@@ -1593,7 +1594,7 @@ def enforce_ip_limit(user, entries, limit, info=None):
     except Exception as exc:
         log(f"ip limit disable failed user={user} uuid={uuid_value}: {exc}")
         if block_text:
-            return f"{block_text}, ошибка Remna disable"
+            return f"{block_text} Remna disable не сработал."
         return "ошибка disable в Remna API"
     with LOCK:
         IP_LIMIT_STATE.setdefault("penalties", {})[key] = {
@@ -1605,8 +1606,8 @@ def enforce_ip_limit(user, entries, limit, info=None):
         }
         save_ip_limit_state()
     if block_text:
-        return f"{block_text}, Remna disable на {format_duration_ru_for(IP_LIMIT_PENALTY_SEC)}"
-    return f"Remna disable на {format_duration_ru_for(IP_LIMIT_PENALTY_SEC)}"
+        return f"Подписка отключена на {penalty_text}. Все айпи были дропнуты с ноды."
+    return f"Подписка отключена на {penalty_text}."
 
 
 def ip_limit_penalty_loop():
