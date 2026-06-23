@@ -14,7 +14,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v168"
+COLLECTOR_BUILD = "v169"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -113,7 +113,7 @@ LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
-IP_LIMIT_STATE = {"users": {}, "alerts": {}, "limits": {}, "pending": {}, "penalties": {}}
+IP_LIMIT_STATE = {"users": {}, "alerts": {}, "limits": {}, "pending": {}, "penalties": {}, "blocks": {}}
 REMNA_USER_CACHE = {}
 ALERT_SEPARATOR = "➖" * 9
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
@@ -251,15 +251,17 @@ def load_ip_limit_state():
             limits = loaded.get("limits")
             pending = loaded.get("pending")
             penalties = loaded.get("penalties")
+            blocks = loaded.get("blocks")
             IP_LIMIT_STATE = {
                 "users": users if isinstance(users, dict) else {},
                 "alerts": alerts if isinstance(alerts, dict) else {},
                 "limits": limits if isinstance(limits, dict) else {},
                 "pending": pending if isinstance(pending, dict) else {},
                 "penalties": penalties if isinstance(penalties, dict) else {},
+                "blocks": blocks if isinstance(blocks, dict) else {},
             }
     except Exception:
-        IP_LIMIT_STATE = {"users": {}, "alerts": {}, "limits": {}, "pending": {}, "penalties": {}}
+        IP_LIMIT_STATE = {"users": {}, "alerts": {}, "limits": {}, "pending": {}, "penalties": {}, "blocks": {}}
 
 
 def save_ip_limit_state():
@@ -1232,6 +1234,101 @@ def active_ip_limit_entries_for_user(user, info, ts):
     return result
 
 
+def purge_ip_limit_blocks(ts):
+    blocks = IP_LIMIT_STATE.setdefault("blocks", {})
+    changed = False
+    for node_key in list(blocks.keys()):
+        ip_map = blocks.get(node_key)
+        if not isinstance(ip_map, dict):
+            del blocks[node_key]
+            changed = True
+            continue
+        for ip in list(ip_map.keys()):
+            item = ip_map.get(ip)
+            if not isinstance(item, dict) or int(item.get("expires_at") or 0) <= ts:
+                del ip_map[ip]
+                changed = True
+        if not ip_map:
+            del blocks[node_key]
+            changed = True
+    return changed
+
+
+def node_alias_keys(node):
+    aliases = set()
+    if isinstance(node, dict):
+        for key in ("id", "name", "hostname"):
+            alias = canonical_node_key(node.get(key))
+            if alias:
+                aliases.add(alias)
+    else:
+        alias = canonical_node_key(node)
+        if alias:
+            aliases.add(alias)
+    return aliases
+
+
+def schedule_ip_limit_blocks(user, entries, info, expires_at):
+    user_key = ip_limit_primary_key(user, info)
+    if not user_key:
+        user_key = str(user or "").strip()
+    scheduled = 0
+    with LOCK:
+        blocks = IP_LIMIT_STATE.setdefault("blocks", {})
+        for item in entries:
+            ip = str(item.get("ip") or "").strip()
+            if not valid_ipv4(ip):
+                continue
+            node_names = [str(node or "").strip() for node in item.get("nodes") or [] if str(node or "").strip()]
+            for node_name in node_names:
+                node_key = canonical_node_key(node_name)
+                if not node_key:
+                    continue
+                ip_map = blocks.setdefault(node_key, {})
+                current = ip_map.get(ip) if isinstance(ip_map.get(ip), dict) else {}
+                ip_map[ip] = {
+                    "ip": ip,
+                    "user": user_key,
+                    "node": node_name,
+                    "expires_at": max(int(expires_at), int(current.get("expires_at") or 0)),
+                }
+                scheduled += 1
+        if scheduled > 0:
+            save_ip_limit_state()
+    return scheduled
+
+
+def ip_limit_blocks_for_node(node, ts):
+    result = []
+    with LOCK:
+        changed = purge_ip_limit_blocks(ts)
+        blocks = IP_LIMIT_STATE.setdefault("blocks", {})
+        for node_key in node_alias_keys(node):
+            ip_map = blocks.get(node_key)
+            if not isinstance(ip_map, dict):
+                continue
+            for ip, item in ip_map.items():
+                if not isinstance(item, dict) or not valid_ipv4(ip):
+                    continue
+                expires_at = int(item.get("expires_at") or 0)
+                if expires_at <= ts:
+                    continue
+                result.append({
+                    "ip": ip,
+                    "user": str(item.get("user") or ""),
+                    "expires_at": expires_at,
+                })
+        if changed:
+            save_ip_limit_state()
+    deduped = {}
+    for item in result:
+        ip = item["ip"]
+        current = deduped.get(ip)
+        if current is None or int(item["expires_at"]) > int(current["expires_at"]):
+            deduped[ip] = item
+    return sorted(deduped.values(), key=lambda item: (item["expires_at"], item["ip"]))
+
+
 def ip_limit_snapshot(ts):
     rows = []
     with LOCK:
@@ -1464,31 +1561,39 @@ def enforce_ip_limit(user, entries, limit, info=None):
         return ""
     if limit <= 0 or len(entries) <= limit:
         return ""
-    if not remna_api_enabled():
-        return "Remna API не настроен"
     if not isinstance(info, dict):
         info = remna_user_info(user)
-    if not isinstance(info, dict):
-        return "юзер не найден в Remna API"
-    uuid_value = remna_user_uuid(info)
-    if not uuid_value:
-        return "у юзера нет uuid"
-    status = str(info.get("status") or "").strip().upper()
-    if status and status != "ACTIVE":
-        return f"не отключал, статус {status}"
-    key = ip_limit_primary_key(user, info)
     ts = now_ts()
     enable_at = ts + IP_LIMIT_PENALTY_SEC
+    scheduled_blocks = schedule_ip_limit_blocks(user, entries, info, enable_at)
+    block_text = f"drop {scheduled_blocks} IP на {format_duration_ru_for(IP_LIMIT_PENALTY_SEC)}" if scheduled_blocks > 0 else ""
+    if not remna_api_enabled():
+        return block_text or "Remna API не настроен"
+    if not isinstance(info, dict):
+        return block_text or "юзер не найден в Remna API"
+    uuid_value = remna_user_uuid(info)
+    if not uuid_value:
+        return block_text or "у юзера нет uuid"
+    status = str(info.get("status") or "").strip().upper()
+    if status and status != "ACTIVE":
+        if block_text:
+            return f"{block_text}, Remna уже {status}"
+        return f"не отключал, статус {status}"
+    key = ip_limit_primary_key(user, info)
     with LOCK:
         penalties = IP_LIMIT_STATE.setdefault("penalties", {})
         current = penalties.get(key) if isinstance(penalties.get(key), dict) else None
         if current and int(current.get("enable_at") or 0) > ts:
+            if block_text:
+                return f"{block_text}, Remna уже до {fmt_time(current.get('enable_at'))}"
             return f"уже отключён до {fmt_time(current.get('enable_at'))}"
     try:
         remna_user_action(uuid_value, "disable")
         clear_ip_limit_cache(info)
     except Exception as exc:
         log(f"ip limit disable failed user={user} uuid={uuid_value}: {exc}")
+        if block_text:
+            return f"{block_text}, ошибка Remna disable"
         return "ошибка disable в Remna API"
     with LOCK:
         IP_LIMIT_STATE.setdefault("penalties", {})[key] = {
@@ -1499,7 +1604,9 @@ def enforce_ip_limit(user, entries, limit, info=None):
             "reason": "ip_limit",
         }
         save_ip_limit_state()
-    return f"отключен на {format_duration_ru_for(IP_LIMIT_PENALTY_SEC)}"
+    if block_text:
+        return f"{block_text}, Remna disable на {format_duration_ru_for(IP_LIMIT_PENALTY_SEC)}"
+    return f"Remna disable на {format_duration_ru_for(IP_LIMIT_PENALTY_SEC)}"
 
 
 def ip_limit_penalty_loop():
@@ -1719,6 +1826,7 @@ class Handler(BaseHTTPRequestHandler):
                 "id": node["id"],
                 "last_seen": node["last_seen"],
                 "ssh_allowed_ips": ssh_allowed_ips_snapshot(),
+                "ip_limit_blocks": ip_limit_blocks_for_node(node, now_ts()),
             })
         except Exception as exc:
             self.send_json(400, {"ok": False, "error": str(exc)})

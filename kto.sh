@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v168"
+SCRIPT_BUILD="v169"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3957,7 +3957,7 @@ install_stats_push_client() {
     else
         stage "Устанавливаю push статистики"
     fi
-    must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat
+    must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat iptables conntrack
     if ! "${SUDO[@]}" vnstat --json -i "$iface" >/dev/null 2>&1; then
         cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
     fi

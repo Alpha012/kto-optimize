@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v168"
+PUSH_BUILD="v169"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -34,6 +34,7 @@ KTO_IP_LIMIT_IP_REGEX="${KTO_IP_LIMIT_IP_REGEX:-}"
 KTO_IP_LIMIT_SCAN_SEC="${KTO_IP_LIMIT_SCAN_SEC:-120}"
 KTO_IP_LIMIT_TAIL_LINES="${KTO_IP_LIMIT_TAIL_LINES:-500}"
 KTO_IP_LIMIT_XRAY_LOGS="${KTO_IP_LIMIT_XRAY_LOGS:-1}"
+KTO_IP_LIMIT_BLOCK_STATE="${KTO_IP_LIMIT_BLOCK_STATE:-/run/kto-ip-limit-blocks.tsv}"
 
 collector_url="${KTO_PUSH_COLLECTOR_URL%/}/push"
 hostname_value="$(hostname 2>/dev/null || echo unknown)"
@@ -184,6 +185,119 @@ apply_collector_ssh_ips() {
 
     if (( applied > 0 )); then
         echo "push ${PUSH_BUILD}: applied ssh ip rules=${applied}"
+    fi
+}
+
+ip_limit_block_chains() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    printf '%s\n' INPUT FORWARD
+    if iptables -S DOCKER-USER >/dev/null 2>&1; then
+        printf '%s\n' DOCKER-USER
+    fi
+}
+
+ip_limit_drop_exists() {
+    local chain="$1" ip="$2"
+    iptables -C "$chain" -s "$ip" -m comment --comment "kto-ip-limit" -j DROP >/dev/null 2>&1
+}
+
+ip_limit_add_drop() {
+    local chain="$1" ip="$2"
+    ip_limit_drop_exists "$chain" "$ip" && return 0
+    iptables -I "$chain" 1 -s "$ip" -m comment --comment "kto-ip-limit" -j DROP >/dev/null 2>&1 || true
+}
+
+ip_limit_del_drop() {
+    local chain="$1" ip="$2"
+    while iptables -D "$chain" -s "$ip" -m comment --comment "kto-ip-limit" -j DROP >/dev/null 2>&1; do
+        :
+    done
+}
+
+ip_limit_kill_conntrack() {
+    local ip="$1"
+    command -v conntrack >/dev/null 2>&1 || return 0
+    conntrack -D -s "$ip" >/dev/null 2>&1 || true
+    conntrack -D -d "$ip" >/dev/null 2>&1 || true
+}
+
+apply_ip_limit_blocks() {
+    local response="$1"
+    local now state_dir desired_file merged_file active_file previous_file ip expires user chain applied=0 removed=0
+
+    command -v jq >/dev/null 2>&1 || return 0
+    command -v iptables >/dev/null 2>&1 || return 0
+
+    now="$(date +%s)"
+    state_dir="$(dirname "$KTO_IP_LIMIT_BLOCK_STATE")"
+    mkdir -p "$state_dir" >/dev/null 2>&1 || true
+    desired_file="$(mktemp)"
+    merged_file="$(mktemp)"
+    active_file="$(mktemp)"
+    previous_file="$(mktemp)"
+
+    printf '%s' "$response" | jq -r --argjson now "$now" '
+        .ip_limit_blocks[]? |
+        select((.expires_at // 0 | tonumber) > $now) |
+        [.ip, (.expires_at // 0 | tostring), (.user // "")] | @tsv
+    ' 2>/dev/null > "$desired_file" || true
+
+    if [[ -r "$KTO_IP_LIMIT_BLOCK_STATE" ]]; then
+        cp "$KTO_IP_LIMIT_BLOCK_STATE" "$previous_file" 2>/dev/null || true
+        cat "$KTO_IP_LIMIT_BLOCK_STATE" >> "$merged_file" 2>/dev/null || true
+    fi
+    cat "$desired_file" >> "$merged_file" 2>/dev/null || true
+
+    awk -F '\t' -v now="$now" '
+        function valid(ip) { return ip ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/ }
+        valid($1) && ($2 + 0) > now {
+            key = $1
+            if (($2 + 0) > expires[key]) {
+                expires[key] = $2 + 0
+                user[key] = $3
+            }
+        }
+        END {
+            for (ip in expires) {
+                print ip "\t" expires[ip] "\t" user[ip]
+            }
+        }
+    ' "$merged_file" | sort -t $'\t' -k1,1 > "$active_file"
+
+    while IFS=$'\t' read -r ip expires user; do
+        [[ -n "$ip" ]] || continue
+        validate_ipv4 "$ip" || continue
+        while read -r chain; do
+            [[ -n "$chain" ]] || continue
+            if ! ip_limit_drop_exists "$chain" "$ip"; then
+                ip_limit_add_drop "$chain" "$ip"
+                applied=$(( applied + 1 ))
+            fi
+        done < <(ip_limit_block_chains)
+        ip_limit_kill_conntrack "$ip"
+    done < "$active_file"
+
+    while IFS=$'\t' read -r ip expires user; do
+        [[ -n "$ip" ]] || continue
+        validate_ipv4 "$ip" || continue
+        if ! awk -F '\t' -v ip="$ip" '$1 == ip {found=1} END {exit found ? 0 : 1}' "$active_file"; then
+            while read -r chain; do
+                [[ -n "$chain" ]] || continue
+                ip_limit_del_drop "$chain" "$ip"
+                removed=$(( removed + 1 ))
+            done < <(ip_limit_block_chains)
+        fi
+    done < "$previous_file"
+
+    if [[ -s "$active_file" ]]; then
+        cp "$active_file" "$KTO_IP_LIMIT_BLOCK_STATE" 2>/dev/null || true
+    else
+        rm -f "$KTO_IP_LIMIT_BLOCK_STATE" 2>/dev/null || true
+    fi
+    rm -f "$desired_file" "$merged_file" "$active_file" "$previous_file"
+
+    if (( applied > 0 || removed > 0 )); then
+        echo "push ${PUSH_BUILD}: ip blocks applied=${applied} removed=${removed}"
     fi
 }
 
@@ -542,6 +656,7 @@ if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
         ip_limit_extra=" ip_events=${ip_limit_events_count}"
     fi
     apply_collector_ssh_ips "$response"
+    apply_ip_limit_blocks "$response"
     echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}% uptime=${uptime_sec}s${ip_limit_extra}"
 else
     echo "push ${PUSH_BUILD}: bad response: ${response}" >&2
