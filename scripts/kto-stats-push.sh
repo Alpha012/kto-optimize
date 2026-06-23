@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v159"
+PUSH_BUILD="v160"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -259,6 +259,7 @@ ip_limit_user_from_line() {
     fi
 
     for regex in \
+        '"email"[[:space:]]*:[[:space:]]*"([^"]+)"' \
         'email:[[:space:]]*([^[:space:]]+)' \
         'user:[[:space:]]*([^[:space:]]+)' \
         'uuid:[[:space:]]*([0-9a-fA-F-]{32,36})' \
@@ -269,17 +270,21 @@ ip_limit_user_from_line() {
         fi
     done
 
-    if [[ "$line" =~ \[([^][]+)\] ]]; then
-        candidate="${BASH_REMATCH[1]}"
-        candidate="${candidate%% ->*}"
-        candidate="${candidate%% >>*}"
-        candidate="${candidate%% <-*}"
-        candidate="${candidate%% *}"
-        if [[ -n "$candidate" && "$candidate" != tcp:* && "$candidate" != udp:* ]]; then
-            printf '%s\n' "$candidate"
-            return 0
+    for regex in \
+        '\[([^][]+)[[:space:]]*->[[:space:]]*[^][]+\]' \
+        '\[([^][]+)[[:space:]]*>>[[:space:]]*[^][]+\]' \
+        '\[([^][]+)[[:space:]]*<-[[:space:]]*[^][]+\]'; do
+        if [[ "$line" =~ $regex ]]; then
+            candidate="${BASH_REMATCH[1]}"
+            candidate="${candidate#"${candidate%%[![:space:]]*}"}"
+            candidate="${candidate%"${candidate##*[![:space:]]}"}"
+            if [[ -n "$candidate" && "$candidate" != tcp:* && "$candidate" != udp:* ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
         fi
-    fi
+    done
+
     if [[ "$line" =~ ([A-Za-z0-9._%+-]+@[A-Za-z0-9._-]+) ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
         return 0
