@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v162"
+SCRIPT_BUILD="v163"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3672,7 +3672,7 @@ stats_collector_status() {
     header
     require_panel_mode
     need_root
-    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token
+    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_test_id remna_test_log remna_code remna_probe
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
     listen_port="$(config_get KTO_COLLECTOR_LISTEN_PORT "$STATS_COLLECTOR_CONFIG")"
@@ -3701,6 +3701,90 @@ stats_collector_status() {
             print_row "local health" "rc=${rc}: $(tr '\n' ' ' < "$health_log")" 0
         fi
         rm -f "$health_log"
+        if [[ -n "$remna_api_url" && -n "$remna_api_token" ]]; then
+            remna_test_id="$("${SUDO[@]}" python3 - <<PY 2>/dev/null || true
+import json
+path = "${STATS_COLLECTOR_STATE_DIR}/ip_limit.json"
+try:
+    data = json.load(open(path, "r", encoding="utf-8"))
+    users = data.get("users") if isinstance(data, dict) else {}
+    if isinstance(users, dict):
+        for key in sorted(users.keys(), key=str):
+            if str(key).strip():
+                print(str(key))
+                break
+except Exception:
+    pass
+PY
+)"
+            if [[ -n "$remna_test_id" ]]; then
+                remna_test_log="$(mktemp)"
+                remna_code="$(curl -4 -k -sS --connect-timeout 3 --max-time 8 \
+                    -H "Authorization: Bearer ${remna_api_token}" \
+                    -H "Accept: application/json" \
+                    -o "$remna_test_log" \
+                    -w '%{http_code}' \
+                    "${remna_api_url%/}/api/users/by-id/${remna_test_id}" 2>>"$remna_test_log" || true)"
+                if [[ "$remna_code" =~ ^2[0-9][0-9]$ ]]; then
+                    remna_probe="$(python3 - "$remna_test_log" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+def extract(payload):
+    if not isinstance(payload, dict):
+        return None
+    candidates = [payload]
+    for key in ("response", "user", "data"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+            for nested_key in ("user", "data"):
+                nested = value.get(nested_key)
+                if isinstance(nested, dict):
+                    candidates.append(nested)
+    user_keys = {"username", "email", "tag", "status", "expireAt", "trafficLimitBytes", "userTraffic"}
+    for candidate in candidates:
+        if any(key in candidate for key in user_keys):
+            return candidate
+    return None
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        user = extract(json.load(fh))
+except Exception:
+    user = None
+
+if not user:
+    print("no-user")
+else:
+    name = ""
+    for key in ("username", "email", "tag"):
+        value = str(user.get(key) or "").strip()
+        if value:
+            name = value
+            break
+    status = str(user.get("status") or "").strip()
+    parts = []
+    if name:
+        parts.append(f"user={name}")
+    if status:
+        parts.append(f"status={status}")
+    print(" ".join(parts) if parts else "user-found")
+PY
+)"
+                    if [[ -n "$remna_probe" && "$remna_probe" != "no-user" ]]; then
+                        print_row "remna lookup" "id=${remna_test_id} http=${remna_code} ${remna_probe}" 1
+                    else
+                        print_row "remna lookup" "id=${remna_test_id} http=${remna_code} no-user: $(head -c 120 "$remna_test_log" | tr '\n' ' ')" 0
+                    fi
+                else
+                    print_row "remna lookup" "id=${remna_test_id} http=${remna_code:-curl}: $(head -c 120 "$remna_test_log" | tr '\n' ' ')" 0
+                fi
+                rm -f "$remna_test_log"
+            else
+                print_row "remna lookup" "нет активных ID в ip_limit.json"
+            fi
+        fi
     else
         print_row "local health" "curl не установлен" 0
     fi

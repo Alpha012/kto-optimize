@@ -13,7 +13,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v162"
+COLLECTOR_BUILD = "v163"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -549,6 +549,25 @@ def remna_user_path(user_id):
     return f"/api/users/by-username/{quoted}"
 
 
+def remna_extract_user(payload):
+    if not isinstance(payload, dict):
+        return None
+    candidates = [payload]
+    for key in ("response", "user", "data"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+            for nested_key in ("user", "data"):
+                nested = value.get(nested_key)
+                if isinstance(nested, dict):
+                    candidates.append(nested)
+    user_keys = {"username", "email", "tag", "status", "expireAt", "trafficLimitBytes", "userTraffic"}
+    for candidate in candidates:
+        if any(key in candidate for key in user_keys):
+            return candidate
+    return None
+
+
 def remna_user_info(user_id):
     user_id = str(user_id or "").strip()
     if not user_id or not remna_api_enabled():
@@ -564,9 +583,7 @@ def remna_user_info(user_id):
     if path:
         try:
             payload = remna_api_call(path)
-            response = payload.get("response") if isinstance(payload, dict) else None
-            if isinstance(response, dict):
-                data = response
+            data = remna_extract_user(payload)
         except urllib.error.HTTPError as exc:
             if exc.code != 404:
                 log(f"remna user lookup failed id={user_id}: http {exc.code}")
@@ -627,7 +644,7 @@ def remna_detail_lines(user_id, info, include_hwid=False):
     if traffic:
         lines.append(detail_line("Трафик", traffic))
     expire = remna_user_expire(info)
-    if expire != "-":
+    if expire and expire != "-":
         lines.append(detail_line("Истекает", expire))
     online = remna_user_online(info)
     if online:
@@ -650,7 +667,7 @@ def remna_block_lines(user_id, info):
         summary.append(status)
     if traffic:
         summary.append(f"трафик {traffic}")
-    if expire != "-":
+    if expire and expire != "-":
         summary.append(f"до {expire}")
     if online:
         summary.append(f"online {online}")
