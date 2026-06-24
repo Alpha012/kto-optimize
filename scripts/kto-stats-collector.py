@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v172"
+COLLECTOR_BUILD = "v173"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1076,6 +1076,22 @@ def remna_user_expire(info):
     return fmt_iso_time(info.get("expireAt"))
 
 
+def remna_user_hwid_limit(info):
+    if not isinstance(info, dict):
+        return None
+    for key in ("hwidDeviceLimit", "hwidLimit", "deviceLimit", "devicesLimit"):
+        if key not in info:
+            continue
+        value = info.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return max(0, int(value))
+        except Exception:
+            continue
+    return None
+
+
 def remna_detail_lines(user_id, info, include_hwid=False):
     lines = []
     name = remna_user_name(info, user_id)
@@ -1094,7 +1110,7 @@ def remna_detail_lines(user_id, info, include_hwid=False):
     if online:
         lines.append(detail_line("Онлайн", online))
     if include_hwid:
-        hwid = (info or {}).get("hwidDeviceLimit")
+        hwid = remna_user_hwid_limit(info)
         if hwid is not None:
             lines.append(detail_line("HWID лимит", hwid))
     return lines
@@ -1660,6 +1676,11 @@ def ip_limit_effective_limit(user, info=None):
             if value <= 0:
                 return 0, "personal"
             return value, "personal"
+    hwid_limit = remna_user_hwid_limit(info)
+    if hwid_limit is not None:
+        if hwid_limit <= 0:
+            return 0, "hwid"
+        return hwid_limit, "hwid"
     return IP_LIMIT_MAX_IPS, "global"
 
 
@@ -1905,7 +1926,12 @@ def ip_limit_report(query=""):
 def ip_limit_limit_text(limit, source):
     if limit <= 0:
         return "без лимита"
-    suffix = "персональный" if source == "personal" else "глобальный"
+    suffix_map = {
+        "personal": "персональный",
+        "hwid": "HWID",
+        "global": "глобальный",
+    }
+    suffix = suffix_map.get(source, source or "глобальный")
     return f"{limit} IP ({suffix})"
 
 
@@ -2125,12 +2151,10 @@ def process_ip_limit_events(events, fallback_node, ts):
             save_ip_limit_state()
 
     for user in sorted(touched, key=natural_sort_key):
-        info = None
         with LOCK:
             purge_ip_limit_state(ts)
             entries = active_ip_limit_entries(user, ts)
-            limit, _ = ip_limit_effective_limit(user, None)
-            if limit <= 0 or len(entries) <= limit:
+            if len(entries) <= 1:
                 continue
         info = remna_user_info(user)
         with LOCK:
