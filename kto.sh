@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v171"
+SCRIPT_BUILD="v172"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3743,6 +3743,11 @@ stats_collector_status() {
     print_row "ip enforce" "${ip_limit_enforce_enabled:-0} / ${ip_limit_penalty_sec:-$IP_LIMIT_PENALTY_SEC_DEFAULT}s" "$([[ "${ip_limit_enforce_enabled:-0}" == "1" ]] && echo 1 || echo 0)"
     print_row "ip max events" "${ip_limit_max_events:-$IP_LIMIT_MAX_EVENTS_DEFAULT}"
     print_row "ip db" "${STATS_COLLECTOR_STATE_DIR}/ip_limit.sqlite" "$("${SUDO[@]}" test -s "${STATS_COLLECTOR_STATE_DIR}/ip_limit.sqlite" 2>/dev/null && echo 1 || echo 0)"
+    if "${SUDO[@]}" test -s "${STATS_COLLECTOR_STATE_DIR}/sni_allow.json" 2>/dev/null; then
+        print_row "sni allow" "${STATS_COLLECTOR_STATE_DIR}/sni_allow.json" 1
+    else
+        print_row "sni allow" "empty" 1
+    fi
 
     if command_exists curl; then
         health_log="$(mktemp)"

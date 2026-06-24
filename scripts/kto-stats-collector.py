@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v171"
+COLLECTOR_BUILD = "v172"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -117,12 +117,14 @@ FALLS_FILE = os.path.join(STATE_DIR, "falls.json")
 OFFSET_FILE = os.path.join(STATE_DIR, "telegram_offset")
 DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
 SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
+SNI_ALLOW_FILE = os.path.join(STATE_DIR, "sni_allow.json")
 IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
 IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
 LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
+SNI_STATE = {"nodes": {}, "pending": {}}
 IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
 ALERT_SEPARATOR = "➖" * 9
@@ -247,6 +249,78 @@ def add_ssh_allowed_ip(ip):
 def ssh_allowed_ips_snapshot():
     with LOCK:
         return list(SSH_ALLOWED_IPS)
+
+
+def normalize_sni(value):
+    value = str(value or "").strip().lower().rstrip(".")
+    value = value.replace("，", ",").replace(";", " ").strip()
+    if not value or len(value) > 253:
+        raise ValueError("bad sni")
+    if value.startswith("*."):
+        tail = value[2:]
+        wildcard = True
+    else:
+        tail = value
+        wildcard = False
+    labels = tail.split(".")
+    if len(labels) < 2:
+        raise ValueError("bad sni")
+    label_re = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+    for label in labels:
+        if not label_re.fullmatch(label):
+            raise ValueError("bad sni")
+    return f"*.{tail}" if wildcard else tail
+
+
+def normalize_sni_list(values):
+    result = []
+    if isinstance(values, str):
+        raw_values = re.split(r"[\s,]+", values)
+    elif isinstance(values, list):
+        raw_values = values
+    else:
+        raw_values = []
+    for value in raw_values:
+        try:
+            item = normalize_sni(value)
+        except Exception:
+            continue
+        if item not in result:
+            result.append(item)
+    return sorted(result, key=natural_sort_key)
+
+
+def load_sni_state():
+    global SNI_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(SNI_ALLOW_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        nodes = loaded.get("nodes") if isinstance(loaded, dict) else {}
+        pending = loaded.get("pending") if isinstance(loaded, dict) else {}
+        if not isinstance(nodes, dict):
+            nodes = {}
+        if not isinstance(pending, dict):
+            pending = {}
+        clean_nodes = {}
+        for key, item in nodes.items():
+            key = str(key or "").strip()
+            if not key or not isinstance(item, dict):
+                continue
+            values = normalize_sni_list(item.get("values"))
+            if values:
+                clean_nodes[key] = {
+                    "name": str(item.get("name") or key).strip()[:120],
+                    "values": values,
+                    "updated_at": int(item.get("updated_at") or 0),
+                }
+        SNI_STATE = {"nodes": clean_nodes, "pending": pending}
+    except Exception:
+        SNI_STATE = {"nodes": {}, "pending": {}}
+
+
+def save_sni_state():
+    atomic_write(SNI_ALLOW_FILE, json.dumps(SNI_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def ip_limit_db():
@@ -1223,6 +1297,211 @@ def find_node(query):
     return None
 
 
+def sni_node_aliases(node):
+    aliases = set()
+    if isinstance(node, dict):
+        for key in ("id", "name", "hostname"):
+            alias = canonical_node_key(node.get(key))
+            if alias:
+                aliases.add(alias)
+    else:
+        alias = canonical_node_key(node)
+        if alias:
+            aliases.add(alias)
+    return aliases
+
+
+def sni_override_for_node(node):
+    aliases = sni_node_aliases(node)
+    if not aliases:
+        return None
+    with LOCK:
+        nodes = SNI_STATE.setdefault("nodes", {})
+        for key in aliases:
+            item = nodes.get(key)
+            if not isinstance(item, dict):
+                continue
+            values = normalize_sni_list(item.get("values"))
+            if values:
+                return values
+    return None
+
+
+def reported_sni_for_node(node):
+    if not isinstance(node, dict):
+        return []
+    return normalize_sni_list(node.get("haproxy_allowed_sni"))
+
+
+def effective_sni_for_node(node):
+    override = sni_override_for_node(node)
+    if override is not None:
+        return override, "telegram"
+    return reported_sni_for_node(node), "node"
+
+
+def sni_list_text(values):
+    values = normalize_sni_list(values)
+    if not values:
+        return "<i>Список пуст.</i>"
+    return "<blockquote>" + "\n".join(f"<code>{html.escape(item)}</code>" for item in values) + "</blockquote>"
+
+
+def set_sni_override_for_node(node, values):
+    key = node_canonical_key(node)
+    if not key:
+        raise ValueError("empty node key")
+    values = normalize_sni_list(values)
+    if not values:
+        raise ValueError("empty sni list")
+    with LOCK:
+        SNI_STATE.setdefault("nodes", {})[key] = {
+            "name": node_display_name(node, key)[:120],
+            "values": values,
+            "updated_at": now_ts(),
+        }
+        save_sni_state()
+    return values
+
+
+def set_pending_sni(chat_id, from_id, action, node):
+    key = pending_key(chat_id, from_id)
+    node_key = node_canonical_key(node)
+    with LOCK:
+        SNI_STATE.setdefault("pending", {})[key] = {
+            "action": action,
+            "node_key": node_key,
+            "node_name": node_display_name(node, node_key),
+            "created_at": now_ts(),
+        }
+        save_sni_state()
+
+
+def pop_pending_sni(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = SNI_STATE.setdefault("pending", {}).pop(key, None)
+        if item is not None:
+            save_sni_state()
+        return item if isinstance(item, dict) else None
+
+
+def peek_pending_sni(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = SNI_STATE.setdefault("pending", {}).get(key)
+        if not isinstance(item, dict):
+            return None
+        if now_ts() - int(item.get("created_at") or 0) > 600:
+            SNI_STATE.setdefault("pending", {}).pop(key, None)
+            save_sni_state()
+            return None
+        return dict(item)
+
+
+def sni_command_intro(command, node, values, source):
+    name = node_display_name(node)
+    source_text = "Telegram override" if source == "telegram" else "последний HAProxy config"
+    action_text = "Напиши SNI ответом, и я добавлю его в allow-list." if command == "allow_sni" else "Напиши SNI ответом, и я удалю его из allow-list."
+    lines = [
+        "<b>SNI allow-list</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", name),
+        detail_line("Источник", source_text),
+        "",
+        "<b>Сейчас разрешены:</b>",
+        sni_list_text(values),
+        "",
+        action_text,
+        "Отмена: <code>/cancel</code>",
+    ]
+    return "\n".join(lines)
+
+
+def handle_sni_command(text, action, chat_id, from_id):
+    parts = text.split(maxsplit=1)
+    command = "/allow_sni" if action == "allow_sni" else "/delete_sni"
+    if len(parts) < 2 or not parts[1].strip():
+        send_message(f"<b>Пример:</b> <code>{command} Обход #8</code>")
+        return
+    query = parts[1].strip()
+    node = find_node(query)
+    if node is None:
+        send_message(
+            "<b>Не нашёл такой обход</b>\n\n"
+            f"{detail_line('Запрос', query)}\n"
+            f"Сначала проверь название через <code>/stats</code>."
+        )
+        return
+    values, source = effective_sni_for_node(node)
+    if action == "delete_sni" and not values:
+        send_message(
+            "<b>SNI allow-list пуст</b>\n\n"
+            f"{detail_line('Машина', node_display_name(node))}"
+        )
+        return
+    set_pending_sni(chat_id, from_id, action, node)
+    send_message(sni_command_intro(action, node, values, source))
+
+
+def handle_pending_sni(chat_id, from_id, text):
+    pending = peek_pending_sni(chat_id, from_id)
+    if not pending or pending.get("action") not in ("allow_sni", "delete_sni"):
+        return False
+    node = find_node(pending.get("node_key")) or find_node(pending.get("node_name"))
+    if node is None:
+        pop_pending_sni(chat_id, from_id)
+        send_message("<b>Обход больше не найден.</b>")
+        return True
+    try:
+        sni = normalize_sni(text.split()[0] if str(text or "").split() else "")
+    except Exception:
+        send_message("<b>Не понял SNI.</b>\n\nПример: <code>example.com</code> или <code>*.example.com</code>")
+        return True
+    action = pending.get("action")
+    current, _ = effective_sni_for_node(node)
+    if action == "allow_sni":
+        updated = normalize_sni_list(current + [sni])
+        added = sni not in current
+        set_sni_override_for_node(node, updated)
+        pop_pending_sni(chat_id, from_id)
+        status = "добавлен" if added else "уже был в списке"
+        send_message(
+            f"<b>SNI {status}</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n"
+            f"{detail_line('SNI', sni)}\n\n"
+            "<b>Теперь разрешены:</b>\n"
+            f"{sni_list_text(updated)}\n"
+            "<i>Машина применит список при ближайшем push.</i>"
+        )
+        return True
+    if sni not in current:
+        send_message(
+            "<b>Такого SNI нет в списке.</b>\n\n"
+            f"{detail_line('SNI', sni)}\n\n"
+            "<b>Сейчас разрешены:</b>\n"
+            f"{sni_list_text(current)}"
+        )
+        return True
+    updated = [item for item in current if item != sni]
+    if not updated:
+        send_message("<b>Последний SNI удалять нельзя.</b>\n\nТак можно случайно закрыть весь обход.")
+        return True
+    set_sni_override_for_node(node, updated)
+    pop_pending_sni(chat_id, from_id)
+    send_message(
+        "<b>SNI удалён</b>\n"
+        f"{ALERT_SEPARATOR}\n"
+        f"{detail_line('Машина', node_display_name(node))}\n"
+        f"{detail_line('SNI', sni)}\n\n"
+        "<b>Теперь разрешены:</b>\n"
+        f"{sni_list_text(updated)}\n"
+        "<i>Машина применит список при ближайшем push.</i>"
+    )
+    return True
+
+
 def node_alert_message(kind, node_id, node, reason="-"):
     name = node_display_name(node, node_id)
     ip = node_display_ip(node)
@@ -1903,6 +2182,7 @@ def update_node(payload, remote_ip=""):
         "ram_percent": int(payload.get("ram_percent") or 0),
         "cpu_percent": float(payload.get("cpu_percent") or 0),
         "metrics_ok": bool(payload.get("metrics_ok")),
+        "haproxy_allowed_sni": normalize_sni_list(payload.get("haproxy_allowed_sni")),
         "scan_wrong_sni_total": int(payload.get("scan_wrong_sni_total") or 0),
         "scan_wrong_sni_sources": int(payload.get("scan_wrong_sni_sources") or 0),
         "scan_wrong_sni_top": normalize_scan_top(payload.get("scan_wrong_sni_top")),
@@ -1989,18 +2269,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 65536:
+            if length <= 0 or length > 5242880:
                 raise ValueError("bad content length")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             remote_ip = self.client_address[0] if self.client_address else ""
             node = update_node(payload, remote_ip)
-            self.send_json(200, {
+            response = {
                 "ok": True,
                 "id": node["id"],
                 "last_seen": node["last_seen"],
                 "ssh_allowed_ips": ssh_allowed_ips_snapshot(),
                 "ip_limit_blocks": ip_limit_blocks_for_node(node, now_ts()),
-            })
+            }
+            sni_override = sni_override_for_node(node)
+            if sni_override is not None:
+                response["allowed_sni"] = sni_override
+            self.send_json(200, response)
         except Exception as exc:
             self.send_json(400, {"ok": False, "error": str(exc)})
 
@@ -2469,9 +2753,12 @@ def bot_loop():
                 command = text.split()[0].split("@", 1)[0].lower() if text.split() else ""
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/cancel":
                     pop_pending_ip_limit(chat_id, from_id)
+                    pop_pending_sni(chat_id, from_id)
                     send_message("<b>Отменил.</b>")
                     continue
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and not command.startswith("/"):
+                    if handle_pending_sni(chat_id, from_id, text):
+                        continue
                     if handle_pending_ip_limit(chat_id, from_id, text):
                         continue
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats":
@@ -2482,6 +2769,10 @@ def bot_loop():
                     handle_delete(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/add_ip":
                     handle_add_ip(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/allow_sni":
+                    handle_sni_command(text, "allow_sni", chat_id, from_id)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete_sni":
+                    handle_sni_command(text, "delete_sni", chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip":
                     handle_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_limit":
@@ -2506,6 +2797,7 @@ def main():
     load_nodes()
     load_falls()
     load_ssh_allowed_ips()
+    load_sni_state()
     load_ip_limit_state()
     threading.Thread(target=offline_loop, daemon=True).start()
     threading.Thread(target=ip_limit_penalty_loop, daemon=True).start()
