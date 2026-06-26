@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v173"
+COLLECTOR_BUILD = "v174"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -111,6 +111,26 @@ except Exception:
     REMNA_API_TIMEOUT_SEC = 5
 if REMNA_API_TIMEOUT_SEC < 1:
     REMNA_API_TIMEOUT_SEC = 1
+ASN_LOOKUP_ENABLED = str(cfg.get("KTO_COLLECTOR_ASN_LOOKUP_ENABLED", "1")).lower() in ("1", "yes", "true", "on", "enabled")
+ASN_LOOKUP_URL = str(
+    cfg.get(
+        "KTO_COLLECTOR_ASN_LOOKUP_URL",
+        "http://ip-api.com/json/{ip}?fields=status,message,as,isp,org,country,query",
+    )
+    or ""
+).strip()
+try:
+    ASN_CACHE_SEC = int(cfg.get("KTO_COLLECTOR_ASN_CACHE_SEC", "604800") or "604800")
+except Exception:
+    ASN_CACHE_SEC = 604800
+if ASN_CACHE_SEC < 3600:
+    ASN_CACHE_SEC = 3600
+try:
+    ASN_TIMEOUT_SEC = int(cfg.get("KTO_COLLECTOR_ASN_TIMEOUT_SEC", "2") or "2")
+except Exception:
+    ASN_TIMEOUT_SEC = 2
+if ASN_TIMEOUT_SEC < 1:
+    ASN_TIMEOUT_SEC = 1
 
 NODES_FILE = os.path.join(STATE_DIR, "nodes.json")
 FALLS_FILE = os.path.join(STATE_DIR, "falls.json")
@@ -390,6 +410,24 @@ def init_ip_limit_db():
         );
         CREATE INDEX IF NOT EXISTS idx_ip_limit_blocks_expires
             ON ip_limit_blocks(expires_at);
+        CREATE TABLE IF NOT EXISTS ip_limit_nodes (
+            node_key TEXT PRIMARY KEY,
+            node TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            enforce INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ip_asn_cache (
+            ip TEXT PRIMARY KEY,
+            updated_at INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT '',
+            asn TEXT NOT NULL DEFAULT '',
+            isp TEXT NOT NULL DEFAULT '',
+            org TEXT NOT NULL DEFAULT '',
+            country TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_ip_asn_cache_updated
+            ON ip_asn_cache(updated_at);
     """)
     try:
         db.execute("ALTER TABLE ip_limit_events ADD COLUMN node_key TEXT NOT NULL DEFAULT ''")
@@ -571,6 +609,125 @@ def normalize_scan_top(value):
     return result
 
 
+def normalize_scan_sni_top(value):
+    result = []
+    if not isinstance(value, list):
+        return result
+    seen = set()
+    for item in value[:20]:
+        if not isinstance(item, dict):
+            continue
+        raw_sni = str(item.get("sni") or "").strip().lower().rstrip(".")
+        if not raw_sni or raw_sni in seen or len(raw_sni) > 253:
+            continue
+        try:
+            sni = normalize_sni(raw_sni)
+        except Exception:
+            continue
+        try:
+            count = int(item.get("count") or 0)
+        except Exception:
+            count = 0
+        if count > 0:
+            seen.add(sni)
+            result.append({"sni": sni, "count": count})
+    result.sort(key=lambda item: (-int(item.get("count") or 0), natural_sort_key(item.get("sni"))))
+    return result[:10]
+
+
+def asn_info_from_row(row):
+    if not row or str(row["status"] or "") != "success":
+        return None
+    return {
+        "asn": str(row["asn"] or "").strip(),
+        "isp": str(row["isp"] or "").strip(),
+        "org": str(row["org"] or "").strip(),
+        "country": str(row["country"] or "").strip(),
+    }
+
+
+def cache_asn_info(ip, status="", asn="", isp="", org="", country=""):
+    with LOCK:
+        ip_limit_db().execute(
+            "INSERT INTO ip_asn_cache(ip, updated_at, status, asn, isp, org, country) VALUES(?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(ip) DO UPDATE SET updated_at = excluded.updated_at, status = excluded.status, "
+            "asn = excluded.asn, isp = excluded.isp, org = excluded.org, country = excluded.country",
+            (
+                normalize_ip(ip),
+                now_ts(),
+                str(status or "")[:32],
+                str(asn or "")[:160],
+                str(isp or "")[:160],
+                str(org or "")[:160],
+                str(country or "")[:80],
+            ),
+        )
+        save_ip_limit_state()
+
+
+def lookup_asn_info(ip, fetch=True):
+    if not ASN_LOOKUP_ENABLED or not ASN_LOOKUP_URL or not valid_ipv4(ip):
+        return None
+    ip = normalize_ip(ip)
+    ts = now_ts()
+    stale_row = None
+    with LOCK:
+        row = ip_limit_db().execute(
+            "SELECT updated_at, status, asn, isp, org, country FROM ip_asn_cache WHERE ip = ?",
+            (ip,),
+        ).fetchone()
+        if row:
+            if ts - int(row["updated_at"] or 0) < ASN_CACHE_SEC:
+                return asn_info_from_row(row)
+            stale_row = row
+    if not fetch:
+        return asn_info_from_row(stale_row)
+    try:
+        url = ASN_LOOKUP_URL.replace("{ip}", urllib.parse.quote(ip, safe=""))
+        req = urllib.request.Request(url, headers={"User-Agent": f"kto-stats/{COLLECTOR_BUILD}"})
+        with urllib.request.urlopen(req, timeout=ASN_TIMEOUT_SEC) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        status = str(payload.get("status") or "").strip()
+        if status == "success":
+            info = {
+                "asn": str(payload.get("as") or "").strip(),
+                "isp": str(payload.get("isp") or "").strip(),
+                "org": str(payload.get("org") or "").strip(),
+                "country": str(payload.get("country") or "").strip(),
+            }
+            cache_asn_info(ip, status="success", **info)
+            return info
+        cache_asn_info(ip, status=status or "fail")
+    except Exception as exc:
+        log(f"asn lookup failed ip={ip}: {exc}")
+    return asn_info_from_row(stale_row)
+
+
+def asn_info_text(ip, fetch=True):
+    info = lookup_asn_info(ip, fetch=fetch)
+    if not info:
+        return ""
+    parts = []
+    seen = set()
+
+    def add(value, prefix=""):
+        value = str(value or "").strip()
+        if not value:
+            return
+        text = f"{prefix}{value}" if prefix else value
+        key = text.casefold()
+        if key not in seen:
+            seen.add(key)
+            parts.append(text)
+
+    add(info.get("asn"))
+    add(info.get("isp"), "ISP: ")
+    org = str(info.get("org") or "").strip()
+    if org and org.casefold() != str(info.get("isp") or "").strip().casefold():
+        add(org, "Org: ")
+    return " | ".join(parts)[:220]
+
+
 def today_key():
     return datetime.fromtimestamp(now_ts()).strftime("%Y-%m-%d")
 
@@ -579,9 +736,18 @@ def ensure_today_falls():
     day = today_key()
     if FALLS.get("date") != day:
         FALLS.clear()
-        FALLS.update({"date": day, "total": 0, "downtime_sec": 0, "downtime_revoke_sec": 0, "nodes": {}})
+        FALLS.update({
+            "date": day,
+            "total": 0,
+            "downtime_sec": 0,
+            "downtime_revoke_sec": 0,
+            "nodes": {},
+            "downtime_nodes": {},
+        })
     elif not isinstance(FALLS.get("nodes"), dict):
         FALLS["nodes"] = {}
+    if not isinstance(FALLS.get("downtime_nodes"), dict):
+        FALLS["downtime_nodes"] = {}
     if "downtime_sec" not in FALLS:
         FALLS["downtime_sec"] = 0
     if "downtime_revoke_sec" not in FALLS:
@@ -601,12 +767,16 @@ def record_fall(node):
         log(f"save falls failed: {exc}")
 
 
-def record_downtime(seconds):
+def record_downtime(seconds, node=None):
     seconds = max(0, int(seconds or 0))
     if seconds <= 0:
         return
     falls = ensure_today_falls()
     falls["downtime_sec"] = int(falls.get("downtime_sec", 0) or 0) + seconds
+    if isinstance(node, dict):
+        name = str(node.get("name") or node.get("id") or "unknown")
+        downtime_nodes = falls.setdefault("downtime_nodes", {})
+        downtime_nodes[name] = int(downtime_nodes.get(name, 0) or 0) + seconds
     try:
         save_falls()
     except Exception as exc:
@@ -636,6 +806,7 @@ def reset_daily_falls(nodes, ts):
     falls = ensure_today_falls()
     falls["total"] = 0
     falls["nodes"] = {}
+    falls["downtime_nodes"] = {}
     falls["downtime_sec"] = 0
     falls["downtime_revoke_sec"] = active_downtime
     try:
@@ -742,6 +913,31 @@ def fmt_time(ts):
         return datetime.fromtimestamp(int(ts)).strftime("%d.%m.%Y %H:%M")
     except Exception:
         return "-"
+
+
+def day_start_ts(ts):
+    try:
+        current = datetime.fromtimestamp(int(ts))
+        return int(datetime(current.year, current.month, current.day).timestamp())
+    except Exception:
+        return int(ts) - 1
+
+
+def format_sla_percent(total_downtime, expected_total, ts):
+    elapsed = max(1, int(ts) - day_start_ts(ts))
+    budget = max(1, int(expected_total or 1)) * elapsed
+    percent = 100.0 - ((max(0, int(total_downtime or 0)) * 100.0) / budget)
+    if percent < 0:
+        percent = 0.0
+    if percent > 100:
+        percent = 100.0
+    if percent >= 99.995:
+        return "100%"
+    if percent >= 99:
+        return f"{percent:.2f}%"
+    if percent >= 95:
+        return f"{percent:.1f}%"
+    return f"{percent:.0f}%"
 
 
 def parse_iso_ts(value):
@@ -1136,6 +1332,23 @@ def remna_block_lines(user_id, info):
     return result
 
 
+def top_wrong_sni_label(node):
+    top = node.get("scan_wrong_sni_names") or []
+    if not isinstance(top, list) or not top:
+        return ""
+    item = top[0] if isinstance(top[0], dict) else {}
+    sni = str(item.get("sni") or "").strip()
+    if not sni:
+        return ""
+    try:
+        count = int(item.get("count") or 0)
+    except Exception:
+        count = 0
+    if count > 0:
+        return f"{sni} x{count}"
+    return sni
+
+
 def node_message(node, status=None):
     name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
     ip = html.escape(str(node.get("ip") or "-"))
@@ -1154,7 +1367,11 @@ def node_message(node, status=None):
     scan_total = int(node.get("scan_wrong_sni_total") or 0)
     if scan_total > 0:
         scan_sources = int(node.get("scan_wrong_sni_sources") or 0)
-        cpu_line = f"{cpu_line}\nWrong SNI: {scan_total} / {scan_sources} IP"
+        scan_line = f"Wrong SNI: {scan_total} / {scan_sources} IP"
+        top_sni = top_wrong_sni_label(node)
+        if top_sni:
+            scan_line = f"{scan_line} | {html.escape(top_sni)}"
+        cpu_line = f"{cpu_line}\n{scan_line}"
     lines = [f"<blockquote><b>{name}</b>\nIP: {ip}\nАптайм: {uptime_text}</blockquote>", ""]
     if error:
         lines += [
@@ -1181,7 +1398,27 @@ def node_message(node, status=None):
     return "\n".join(lines)
 
 
-def downtime_totals(nodes, ts):
+def node_name_keys(nodes):
+    keys = set()
+    for node in nodes:
+        for value in (node.get("name"), node.get("id"), node.get("hostname")):
+            key = canonical_node_key(value)
+            if key:
+                keys.add(key)
+    return keys
+
+
+def filter_named_counter(counter, keys):
+    if not keys:
+        return {}
+    result = {}
+    for name, value in (counter or {}).items():
+        if canonical_node_key(name) in keys:
+            result[str(name)] = value
+    return result
+
+
+def downtime_totals(nodes, ts, filtered=False):
     dead_items = []
     active_downtime = 0
     for node in nodes:
@@ -1193,9 +1430,20 @@ def downtime_totals(nodes, ts):
             active_downtime += max(0, ts - offline_since)
     with LOCK:
         falls = dict(ensure_today_falls())
-        falls_nodes = dict(falls.get("nodes") or {})
-    completed_downtime = int(falls.get("downtime_sec", 0) or 0)
-    revoked_downtime = int(falls.get("downtime_revoke_sec", 0) or 0)
+        all_falls_nodes = dict(falls.get("nodes") or {})
+        all_downtime_nodes = dict(falls.get("downtime_nodes") or {})
+    if filtered:
+        keys = node_name_keys(nodes)
+        falls_nodes = filter_named_counter(all_falls_nodes, keys)
+        downtime_nodes = filter_named_counter(all_downtime_nodes, keys)
+        falls["nodes"] = falls_nodes
+        falls["total"] = sum(int(value or 0) for value in falls_nodes.values())
+        completed_downtime = sum(int(value or 0) for value in downtime_nodes.values())
+        revoked_downtime = 0
+    else:
+        falls_nodes = all_falls_nodes
+        completed_downtime = int(falls.get("downtime_sec", 0) or 0)
+        revoked_downtime = int(falls.get("downtime_revoke_sec", 0) or 0)
     total_downtime = max(0, completed_downtime + active_downtime - revoked_downtime)
     return dead_items, falls, falls_nodes, total_downtime
 
@@ -1210,20 +1458,21 @@ def dedupe_nodes(values):
     return list(deduped.values())
 
 
-def status_summary(nodes, ts):
-    expected_total = max(EXPECTED_NODES, len(nodes), 1)
+def status_summary(nodes, ts, expected_total=None, filtered=False):
+    expected_total = max(int(expected_total or EXPECTED_NODES), len(nodes), 1)
     live_count = 0
     for node in nodes:
         last_seen = int(node.get("last_seen", 0) or 0)
         age = ts - last_seen
         if age <= STALE_SEC:
             live_count += 1
-    dead_items, falls, falls_nodes, total_downtime = downtime_totals(nodes, ts)
+    dead_items, falls, falls_nodes, total_downtime = downtime_totals(nodes, ts, filtered=filtered)
 
     lines = [
         "",
         "<blockquote>На данный момент:</blockquote>",
         f"<b>Живо: {live_count}/{expected_total}</b>",
+        f"<b>SLA за сегодня: {format_sla_percent(total_downtime, expected_total, ts)}</b>",
         "<b>Мертво:</b>",
     ]
     if dead_items:
@@ -1261,20 +1510,49 @@ def status_summary(nodes, ts):
     return "\n".join(lines)
 
 
-def aggregate_message():
+def node_is_wl(node):
+    values = [
+        node.get("name") if isinstance(node, dict) else "",
+        node.get("id") if isinstance(node, dict) else "",
+        node.get("hostname") if isinstance(node, dict) else "",
+    ]
+    for value in values:
+        text = canonical_node_key(value)
+        if text.startswith("обход") or "whitelist" in text or "haproxy" in text:
+            return True
+    return False
+
+
+def aggregate_message(scope="all"):
     with LOCK:
-        nodes = dedupe_nodes(NODES.values())
+        all_nodes = dedupe_nodes(NODES.values())
     ts = now_ts()
+    scope = str(scope or "all").strip().lower()
+    expected_total = None
+    filtered = False
+    title = "Статистика обходов"
+    if scope == "wl":
+        nodes = [node for node in all_nodes if node_is_wl(node)]
+        expected_total = max(EXPECTED_NODES, len(nodes), 1)
+        filtered = True
+    elif scope == "bl":
+        nodes = [node for node in all_nodes if not node_is_wl(node)]
+        expected_total = max(len(nodes), 1)
+        filtered = True
+        title = "Статистика других машин"
+    else:
+        nodes = all_nodes
+        expected_total = max(EXPECTED_NODES, len(nodes), 1)
     if not nodes:
-        return "<b>Статистика обходов</b>\n\nНет данных от машин."
+        return f"<b>{title}</b>\n\nНет данных от машин."
     nodes.sort(key=lambda item: natural_sort_key(item.get("name") or item.get("id") or ""))
-    parts = ["<b>Статистика обходов</b>"]
+    parts = [f"<b>{title}</b>"]
     for node in nodes:
         age = ts - int(node.get("last_seen", 0) or 0)
         status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
         parts.append("")
         parts.append(node_message(node, status))
-    parts.append(status_summary(nodes, ts))
+    parts.append(status_summary(nodes, ts, expected_total=expected_total, filtered=filtered))
     return "\n".join(parts)
 
 
@@ -1564,12 +1842,22 @@ def alert_scan_spike(node, delta):
         top_lines.append(f"{src}: {count}{suffix}")
     if not top_lines:
         top_lines.append("нет топа")
+    sni_lines = []
+    for item in (node.get("scan_wrong_sni_names") or [])[:5]:
+        sni = html.escape(str(item.get("sni") or "-"))
+        count = int(item.get("count") or 0)
+        if sni and count > 0:
+            sni_lines.append(f"{sni}: {count}")
+    sni_block = ""
+    if sni_lines:
+        sni_block = f"\n\n<b>Топ wrong SNI:</b>\n<blockquote>{chr(10).join(sni_lines)}</blockquote>"
     return send_message(
         "<b>Подозрительный wrong SNI шум</b>\n\n"
         f"<blockquote><b>{name}</b>\nIP: {ip}</blockquote>\n"
         f"Прирост: +{int(delta)}\n"
         f"Всего в окне HAProxy: {int(node.get('scan_wrong_sni_total') or 0)}\n\n"
         f"<blockquote>{chr(10).join(top_lines)}</blockquote>"
+        f"{sni_block}"
     )
 
 
@@ -1744,6 +2032,79 @@ def node_alias_keys(node):
     return aliases
 
 
+def ip_limit_node_policy(node):
+    aliases = list(node_alias_keys(node))
+    if not aliases:
+        return None
+    with LOCK:
+        placeholders = ",".join("?" for _ in aliases)
+        rows = ip_limit_db().execute(
+            f"SELECT node_key, node, enabled, enforce, updated_at FROM ip_limit_nodes WHERE node_key IN ({placeholders}) "
+            "ORDER BY updated_at DESC LIMIT 1",
+            tuple(aliases),
+        ).fetchall()
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "node_key": str(row["node_key"] or ""),
+        "node": str(row["node"] or ""),
+        "enabled": bool(int(row["enabled"] or 0)),
+        "enforce": bool(int(row["enforce"] or 0)),
+        "updated_at": int(row["updated_at"] or 0),
+    }
+
+
+def set_ip_limit_node_policy(node, enabled=True, enforce=False):
+    key = node_canonical_key(node)
+    if not key:
+        raise ValueError("empty node key")
+    name = node_display_name(node, key)
+    enabled_value = 1 if enabled else 0
+    enforce_value = 1 if enforce else 0
+    with LOCK:
+        ip_limit_db().execute(
+            "INSERT INTO ip_limit_nodes(node_key, node, enabled, enforce, updated_at) VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(node_key) DO UPDATE SET node = excluded.node, enabled = excluded.enabled, "
+            "enforce = excluded.enforce, updated_at = excluded.updated_at",
+            (key, name[:120], enabled_value, enforce_value, now_ts()),
+        )
+        save_ip_limit_state()
+    return {
+        "node_key": key,
+        "node": name,
+        "enabled": bool(enabled_value),
+        "enforce": bool(enforce_value),
+    }
+
+
+def ip_limit_processing_enabled_for_node(node_name):
+    if IP_LIMIT_ENABLED:
+        return True
+    policy = ip_limit_node_policy(node_name)
+    return bool(policy and policy.get("enabled"))
+
+
+def ip_limit_enforcement_enabled_for_entries(entries):
+    if IP_LIMIT_ENFORCE_ENABLED:
+        return True
+    aliases = set()
+    for item in entries or []:
+        for node in item.get("nodes") or []:
+            alias = canonical_node_key(node)
+            if alias:
+                aliases.add(alias)
+    if not aliases:
+        return False
+    with LOCK:
+        placeholders = ",".join("?" for _ in aliases)
+        row = ip_limit_db().execute(
+            f"SELECT 1 FROM ip_limit_nodes WHERE node_key IN ({placeholders}) AND enabled = 1 AND enforce = 1 LIMIT 1",
+            tuple(aliases),
+        ).fetchone()
+    return row is not None
+
+
 def schedule_ip_limit_blocks(user, entries, info, expires_at):
     user_key = ip_limit_primary_key(user, info)
     if not user_key:
@@ -1869,6 +2230,17 @@ def ip_limit_user_block(user, rows, ts):
     return "<blockquote>" + "\n".join(lines) + "</blockquote>"
 
 
+def ip_limit_entry_detail_line(item, ts):
+    ip = str(item.get("ip") or "-")
+    nodes = ", ".join(item.get("nodes") or []) or "-"
+    age = format_age(ts - int(item.get("last_seen") or 0))
+    parts = [html.escape(ip), html.escape(nodes), html.escape(f"{age} назад")]
+    asn = asn_info_text(ip, fetch=False)
+    if asn:
+        parts.append(html.escape(asn))
+    return " — ".join(parts)
+
+
 def ip_limit_report(query=""):
     query = str(query or "").strip()
     ts = now_ts()
@@ -1979,9 +2351,7 @@ def ip_limit_user_card(query):
             lines.append(detail_line("Отключен до", fmt_time(penalty["enable_at"])))
     ip_lines = []
     for item in entries[:12]:
-        nodes = ", ".join(item.get("nodes") or []) or "-"
-        age = format_age(ts - int(item.get("last_seen") or 0))
-        ip_lines.append(f"{html.escape(item['ip'])} — {html.escape(nodes)} — {html.escape(age)} назад")
+        ip_lines.append(ip_limit_entry_detail_line(item, ts))
     if len(entries) > 12:
         ip_lines.append(f"... ещё {len(entries) - 12}")
     if ip_lines:
@@ -2000,11 +2370,20 @@ def ip_limit_user_card(query):
     return "\n".join(lines), markup
 
 
+def ip_limit_entry_alert_line(item):
+    ip = str(item.get("ip") or "-")
+    nodes = ", ".join(item.get("nodes") or []) or "-"
+    parts = [html.escape(ip), html.escape(nodes)]
+    asn = asn_info_text(ip)
+    if asn:
+        parts.append(html.escape(asn))
+    return " — ".join(parts)
+
+
 def alert_ip_limit_exceeded(user, entries, info=None):
     ip_lines = []
     for item in entries[:12]:
-        nodes = ", ".join(item.get("nodes") or []) or "-"
-        ip_lines.append(f"{html.escape(item['ip'])} — {html.escape(nodes)}")
+        ip_lines.append(ip_limit_entry_alert_line(item))
     if len(entries) > 12:
         ip_lines.append(f"... ещё {len(entries) - 12}")
 
@@ -2023,14 +2402,22 @@ def alert_ip_limit_exceeded(user, entries, info=None):
         detail_line("Окно", format_duration_ru(IP_LIMIT_WINDOW_SEC)),
         f"<blockquote>{chr(10).join(ip_lines)}</blockquote>",
     ])
-    enforcement = enforce_ip_limit(user, entries, limit, info)
+    enforcement = enforce_ip_limit(
+        user,
+        entries,
+        limit,
+        info,
+        enforce_enabled=ip_limit_enforcement_enabled_for_entries(entries),
+    )
     if enforcement:
         lines.insert(-1, detail_line("Действие", enforcement))
     return send_message("\n".join(lines))
 
 
-def enforce_ip_limit(user, entries, limit, info=None):
-    if not IP_LIMIT_ENFORCE_ENABLED:
+def enforce_ip_limit(user, entries, limit, info=None, enforce_enabled=None):
+    if enforce_enabled is None:
+        enforce_enabled = IP_LIMIT_ENFORCE_ENABLED
+    if not enforce_enabled:
         return ""
     if limit <= 0 or len(entries) <= limit:
         return ""
@@ -2129,7 +2516,9 @@ def ip_limit_penalty_loop():
 
 
 def process_ip_limit_events(events, fallback_node, ts):
-    if not IP_LIMIT_ENABLED or not isinstance(events, list):
+    if not isinstance(events, list):
+        return
+    if not ip_limit_processing_enabled_for_node(fallback_node):
         return
 
     touched = set()
@@ -2210,6 +2599,7 @@ def update_node(payload, remote_ip=""):
         "scan_wrong_sni_total": int(payload.get("scan_wrong_sni_total") or 0),
         "scan_wrong_sni_sources": int(payload.get("scan_wrong_sni_sources") or 0),
         "scan_wrong_sni_top": normalize_scan_top(payload.get("scan_wrong_sni_top")),
+        "scan_wrong_sni_names": normalize_scan_sni_top(payload.get("scan_wrong_sni_names")),
         "error": str(payload.get("error") or ""),
         "updated_at": int(payload.get("updated_at") or current),
         "last_seen": current,
@@ -2220,7 +2610,7 @@ def update_node(payload, remote_ip=""):
         was_offline = bool(old.get("offline_alerted"))
         if was_offline:
             offline_since = int(old.get("offline_since") or old.get("last_seen") or current)
-            record_downtime(current - offline_since)
+            record_downtime(current - offline_since, record)
         scan_alerted_at = int(old.get("scan_alerted_at") or 0)
         record["scan_alerted_at"] = scan_alerted_at
         if old and "scan_wrong_sni_total" in old and SCAN_ALERT_DELTA > 0:
@@ -2305,6 +2695,9 @@ class Handler(BaseHTTPRequestHandler):
                 "ssh_allowed_ips": ssh_allowed_ips_snapshot(),
                 "ip_limit_blocks": ip_limit_blocks_for_node(node, now_ts()),
             }
+            ip_policy = ip_limit_node_policy(node)
+            if ip_policy is not None:
+                response["ip_limit_enabled"] = bool(ip_policy.get("enabled"))
             sni_override = sni_override_for_node(node)
             if sni_override is not None:
                 response["allowed_sni"] = sni_override
@@ -2561,6 +2954,39 @@ def handle_ip_limit(text):
     send_message(body, reply_markup=markup)
 
 
+def handle_ip_enable(text, force=False):
+    parts = text.split(maxsplit=1)
+    command = "/ip_enable_force" if force else "/ip_enable"
+    if len(parts) < 2 or not parts[1].strip():
+        send_message(f"<b>Пример:</b> <code>{command} Обход #8</code>")
+        return
+    query = parts[1].strip()
+    node = find_node(query)
+    if node is None:
+        send_message(
+            "<b>Не нашёл такую машину</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Запрос', query)}\n"
+            "Проверь название через <code>/stats</code>."
+        )
+        return
+    policy = set_ip_limit_node_policy(node, enabled=True, enforce=force)
+    mode = "ограничения включены" if force else "только сбор и алерты"
+    remna_state = "настроен" if remna_api_enabled() else "не настроен"
+    lines = [
+        "<b>IP лимит включён</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", policy.get("node") or query),
+        detail_line("Режим", mode),
+        detail_line("Remna API", remna_state),
+        "",
+        "<i>Машина применит флаг при ближайшем push.</i>",
+    ]
+    if force and not remna_api_enabled():
+        lines.append("<i>Без Remna API будет работать только drop IP на ноде.</i>")
+    send_message("\n".join(lines))
+
+
 def pending_key(chat_id, from_id):
     return f"{chat_id}:{from_id}"
 
@@ -2787,6 +3213,10 @@ def bot_loop():
                         continue
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats":
                     send_message(aggregate_message())
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl":
+                    send_message(aggregate_message("wl"))
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_bl":
+                    send_message(aggregate_message("bl"))
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statsrevoke":
                     handle_statsrevoke(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete":
@@ -2801,6 +3231,10 @@ def bot_loop():
                     handle_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_limit":
                     handle_ip_limit(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_enable":
+                    handle_ip_enable(text, force=False)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_enable_force":
+                    handle_ip_enable(text, force=True)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/down":
                     handle_test_alert(text, "down")
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/up":

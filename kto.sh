@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v173"
+SCRIPT_BUILD="v174"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -72,6 +72,9 @@ IP_LIMIT_XRAY_LOGS_DEFAULT="${KTO_IP_LIMIT_XRAY_LOGS_DEFAULT:-1}"
 IP_LIMIT_ENFORCE_ENABLED_DEFAULT="${KTO_IP_LIMIT_ENFORCE_ENABLED_DEFAULT:-0}"
 IP_LIMIT_PENALTY_SEC_DEFAULT="${KTO_IP_LIMIT_PENALTY_SEC_DEFAULT:-60}"
 REMNA_API_CACHE_SEC_DEFAULT="${KTO_COLLECTOR_REMNA_API_CACHE_SEC_DEFAULT:-300}"
+ASN_LOOKUP_ENABLED_DEFAULT="${KTO_COLLECTOR_ASN_LOOKUP_ENABLED_DEFAULT:-1}"
+ASN_CACHE_SEC_DEFAULT="${KTO_COLLECTOR_ASN_CACHE_SEC_DEFAULT:-604800}"
+ASN_TIMEOUT_SEC_DEFAULT="${KTO_COLLECTOR_ASN_TIMEOUT_SEC_DEFAULT:-2}"
 SPEEDTEST_TIMEOUT="${KTO_SPEEDTEST_TIMEOUT:-240}"
 SPEEDTEST_DOWNLOAD_TIMEOUT="${KTO_SPEEDTEST_DOWNLOAD_TIMEOUT:-180}"
 APT_UPDATED=0
@@ -3398,13 +3401,19 @@ frontend vless_in
     stick-table type ip size 100k expire 30m store gpc0,conn_rate(10s)
     tcp-request inspect-delay 5s
     acl clienthello req.ssl_hello_type 1
+    acl has_sni req.ssl_sni -m found
     acl allowed_sni req.ssl_sni -i ${allowed_sni}
     tcp-request content track-sc0 src if clienthello !allowed_sni
     tcp-request content sc-inc-gpc0(0) if clienthello !allowed_sni
+    tcp-request content track-sc1 req.ssl_sni,lower table wrong_sni_names if clienthello has_sni !allowed_sni
+    tcp-request content sc-inc-gpc0(1) if clienthello has_sni !allowed_sni
     tcp-request content accept if clienthello allowed_sni
     tcp-request content reject if clienthello !allowed_sni
     tcp-request content reject if WAIT_END
     default_backend vless_pool
+
+backend wrong_sni_names
+    stick-table type string len 160 size 100k expire 30m store gpc0
 
 backend vless_pool
     mode tcp
@@ -3523,10 +3532,10 @@ install_stats_collector() {
 
     local listen_host listen_port secret bot_token chat_id allowed_user stale_sec expected_nodes daily_report_time existing_config=0
     local ip_limit_enabled ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_enforce_enabled ip_limit_penalty_sec
-    local remna_api_url remna_api_token remna_api_cache_sec
+    local remna_api_url remna_api_token remna_api_cache_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
     local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_expected safe_tz safe_daily
     local safe_ip_limit_enabled safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_enforce_enabled safe_ip_limit_penalty_sec
-    local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec
+    local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
 
     if "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
         listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -3548,6 +3557,9 @@ install_stats_collector() {
         remna_api_url="$(config_get KTO_COLLECTOR_REMNA_API_URL "$STATS_COLLECTOR_CONFIG")"
         remna_api_token="$(config_get KTO_COLLECTOR_REMNA_API_TOKEN "$STATS_COLLECTOR_CONFIG")"
         remna_api_cache_sec="$(config_get KTO_COLLECTOR_REMNA_API_CACHE_SEC "$STATS_COLLECTOR_CONFIG")"
+        asn_lookup_enabled="$(config_get KTO_COLLECTOR_ASN_LOOKUP_ENABLED "$STATS_COLLECTOR_CONFIG")"
+        asn_cache_sec="$(config_get KTO_COLLECTOR_ASN_CACHE_SEC "$STATS_COLLECTOR_CONFIG")"
+        asn_timeout_sec="$(config_get KTO_COLLECTOR_ASN_TIMEOUT_SEC "$STATS_COLLECTOR_CONFIG")"
         if [[ -n "$secret" && -n "$bot_token" && -n "$chat_id" ]]; then
             existing_config=1
         else
@@ -3571,6 +3583,9 @@ install_stats_collector() {
         remna_api_url="${remna_api_url:-$REMNA_API_URL}"
         remna_api_token="${remna_api_token:-$REMNA_API_TOKEN}"
         remna_api_cache_sec="${remna_api_cache_sec:-$REMNA_API_CACHE_SEC_DEFAULT}"
+        asn_lookup_enabled="${asn_lookup_enabled:-$ASN_LOOKUP_ENABLED_DEFAULT}"
+        asn_cache_sec="${asn_cache_sec:-$ASN_CACHE_SEC_DEFAULT}"
+        asn_timeout_sec="${asn_timeout_sec:-$ASN_TIMEOUT_SEC_DEFAULT}"
     else
         listen_host="$(ask_text "IP прослушивания коллектора" "0.0.0.0")"
         listen_port="$(ask_int "Порт коллектора" "$STATS_COLLECTOR_PORT_DEFAULT" 1 65535)"
@@ -3591,6 +3606,9 @@ install_stats_collector() {
         remna_api_url="$REMNA_API_URL"
         remna_api_token="$REMNA_API_TOKEN"
         remna_api_cache_sec="$REMNA_API_CACHE_SEC_DEFAULT"
+        asn_lookup_enabled="$ASN_LOOKUP_ENABLED_DEFAULT"
+        asn_cache_sec="$ASN_CACHE_SEC_DEFAULT"
+        asn_timeout_sec="$ASN_TIMEOUT_SEC_DEFAULT"
     fi
     if [[ -n "${KTO_COLLECTOR_REMNA_API_URL:-}" ]]; then
         remna_api_url="$KTO_COLLECTOR_REMNA_API_URL"
@@ -3622,6 +3640,15 @@ install_stats_collector() {
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC:-}" ]]; then
         ip_limit_penalty_sec="$KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC"
     fi
+    if [[ -n "${KTO_COLLECTOR_ASN_LOOKUP_ENABLED:-}" ]]; then
+        asn_lookup_enabled="$KTO_COLLECTOR_ASN_LOOKUP_ENABLED"
+    fi
+    if [[ -n "${KTO_COLLECTOR_ASN_CACHE_SEC:-}" ]]; then
+        asn_cache_sec="$KTO_COLLECTOR_ASN_CACHE_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_ASN_TIMEOUT_SEC:-}" ]]; then
+        asn_timeout_sec="$KTO_COLLECTOR_ASN_TIMEOUT_SEC"
+    fi
 
     safe_host="$(escape_config_value "$listen_host")"
     safe_port="$(escape_config_value "$listen_port")"
@@ -3643,6 +3670,9 @@ install_stats_collector() {
     safe_remna_api_url="$(escape_config_value "$remna_api_url")"
     safe_remna_api_token="$(escape_config_value "$remna_api_token")"
     safe_remna_api_cache_sec="$(escape_config_value "$remna_api_cache_sec")"
+    safe_asn_lookup_enabled="$(escape_config_value "$asn_lookup_enabled")"
+    safe_asn_cache_sec="$(escape_config_value "$asn_cache_sec")"
+    safe_asn_timeout_sec="$(escape_config_value "$asn_timeout_sec")"
 
     if (( existing_config == 1 )); then
         stage "Обновляю коллектор статистики"
@@ -3673,6 +3703,9 @@ KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC="$safe_ip_limit_penalty_sec"
 KTO_COLLECTOR_REMNA_API_URL="$safe_remna_api_url"
 KTO_COLLECTOR_REMNA_API_TOKEN="$safe_remna_api_token"
 KTO_COLLECTOR_REMNA_API_CACHE_SEC="$safe_remna_api_cache_sec"
+KTO_COLLECTOR_ASN_LOOKUP_ENABLED="$safe_asn_lookup_enabled"
+KTO_COLLECTOR_ASN_CACHE_SEC="$safe_asn_cache_sec"
+KTO_COLLECTOR_ASN_TIMEOUT_SEC="$safe_asn_timeout_sec"
 EOF
     write_stats_collector_script
     write_stats_collector_service
@@ -3711,6 +3744,11 @@ EOF
     else
         warn "IP limit enforcement: выключен"
     fi
+    if [[ "${asn_lookup_enabled:-1}" == "1" ]]; then
+        ok "ASN/ISP lookup: включён"
+    else
+        warn "ASN/ISP lookup: выключен"
+    fi
 }
 
 stats_collector_status() {
@@ -3718,7 +3756,7 @@ stats_collector_status() {
     require_panel_mode
     need_root
     local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_test_id remna_test_log remna_code remna_probe
-    local ip_limit_enforce_enabled ip_limit_penalty_sec ip_limit_max_events
+    local ip_limit_enforce_enabled ip_limit_penalty_sec ip_limit_max_events asn_lookup_enabled asn_cache_sec
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
     listen_port="$(config_get KTO_COLLECTOR_LISTEN_PORT "$STATS_COLLECTOR_CONFIG")"
@@ -3727,6 +3765,8 @@ stats_collector_status() {
     ip_limit_enforce_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED "$STATS_COLLECTOR_CONFIG")"
     ip_limit_penalty_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC "$STATS_COLLECTOR_CONFIG")"
     ip_limit_max_events="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS "$STATS_COLLECTOR_CONFIG")"
+    asn_lookup_enabled="$(config_get KTO_COLLECTOR_ASN_LOOKUP_ENABLED "$STATS_COLLECTOR_CONFIG")"
+    asn_cache_sec="$(config_get KTO_COLLECTOR_ASN_CACHE_SEC "$STATS_COLLECTOR_CONFIG")"
     listen_host="${listen_host:-0.0.0.0}"
     listen_port="${listen_port:-$STATS_COLLECTOR_PORT_DEFAULT}"
     if [[ "$listen_host" == "0.0.0.0" || "$listen_host" == "::" ]]; then
@@ -3742,6 +3782,7 @@ stats_collector_status() {
     print_row "remna api" "${remna_api_url:-empty} / $([[ -n "$remna_api_token" ]] && echo token-set || echo no-token)" "$([[ -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
     print_row "ip enforce" "${ip_limit_enforce_enabled:-0} / ${ip_limit_penalty_sec:-$IP_LIMIT_PENALTY_SEC_DEFAULT}s" "$([[ "${ip_limit_enforce_enabled:-0}" == "1" ]] && echo 1 || echo 0)"
     print_row "ip max events" "${ip_limit_max_events:-$IP_LIMIT_MAX_EVENTS_DEFAULT}"
+    print_row "asn lookup" "${asn_lookup_enabled:-1} / cache ${asn_cache_sec:-$ASN_CACHE_SEC_DEFAULT}s" "$([[ "${asn_lookup_enabled:-1}" == "1" ]] && echo 1 || echo 0)"
     print_row "ip db" "${STATS_COLLECTOR_STATE_DIR}/ip_limit.sqlite" "$("${SUDO[@]}" test -s "${STATS_COLLECTOR_STATE_DIR}/ip_limit.sqlite" 2>/dev/null && echo 1 || echo 0)"
     if "${SUDO[@]}" test -s "${STATS_COLLECTOR_STATE_DIR}/sni_allow.json" 2>/dev/null; then
         print_row "sni allow" "${STATS_COLLECTOR_STATE_DIR}/sni_allow.json" 1
@@ -3919,6 +3960,10 @@ install_stats_push_client() {
     if (( existing_config == 1 )); then
         interval="${interval:-$STATS_PUSH_INTERVAL_DEFAULT}"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
+        ip_limit_log_file="${ip_limit_log_file:-}"
+        ip_limit_docker_container="${ip_limit_docker_container:-$REMNA_CONTAINER}"
+        ip_limit_user_regex="${ip_limit_user_regex:-}"
+        ip_limit_ip_regex="${ip_limit_ip_regex:-}"
         ip_limit_scan_sec="${ip_limit_scan_sec:-$IP_LIMIT_SCAN_SEC_DEFAULT}"
         ip_limit_tail_lines="${ip_limit_tail_lines:-$IP_LIMIT_TAIL_LINES_DEFAULT}"
         if [[ "$ip_limit_tail_lines" == "500" ]]; then
@@ -3951,7 +3996,7 @@ install_stats_push_client() {
         interval="$(ask_int "Интервал push, сек" "$STATS_PUSH_INTERVAL_DEFAULT" 15 3600)"
         ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
         ip_limit_log_file=""
-        ip_limit_docker_container=""
+        ip_limit_docker_container="$REMNA_CONTAINER"
         ip_limit_user_regex=""
         ip_limit_ip_regex=""
         ip_limit_scan_sec="$IP_LIMIT_SCAN_SEC_DEFAULT"
@@ -3981,7 +4026,7 @@ install_stats_push_client() {
     else
         stage "Устанавливаю push статистики"
     fi
-    must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat iptables conntrack
+    must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat iptables conntrack socat
     if ! "${SUDO[@]}" vnstat --json -i "$iface" >/dev/null 2>&1; then
         cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
     fi

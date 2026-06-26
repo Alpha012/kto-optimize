@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v173"
+PUSH_BUILD="v174"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -56,6 +56,7 @@ metrics_ok=false
 scan_wrong_sni_total=0
 scan_wrong_sni_sources=0
 scan_wrong_sni_top='[]'
+scan_wrong_sni_names='[]'
 haproxy_allowed_sni='[]'
 ip_limit_events='[]'
 ip_limit_events_count=0
@@ -410,13 +411,66 @@ apply_ip_limit_blocks() {
     fi
 }
 
+config_bool_value() {
+    case "${1:-0}" in
+        1|yes|true|on|enabled) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
+
+set_push_config_value() {
+    local key="$1" value="$2" tmp
+    [[ -n "$key" ]] || return 0
+    tmp="$(mktemp)"
+    if [[ -r "$CONFIG" ]]; then
+        awk -v key="$key" -v line="${key}=\"${value}\"" '
+            BEGIN { done = 0 }
+            $0 ~ "^" key "=" {
+                if (!done) {
+                    print line
+                    done = 1
+                }
+                next
+            }
+            { print }
+            END {
+                if (!done) print line
+            }
+        ' "$CONFIG" > "$tmp"
+    else
+        printf '%s="%s"\n' "$key" "$value" > "$tmp"
+    fi
+    if cp "$tmp" "$CONFIG" 2>/dev/null; then
+        chmod 600 "$CONFIG" 2>/dev/null || true
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+apply_collector_ip_limit_config() {
+    local response="$1" desired current
+    command -v jq >/dev/null 2>&1 || return 0
+    desired="$(printf '%s' "$response" | jq -r 'if has("ip_limit_enabled") then (if .ip_limit_enabled then "1" else "0" end) else "" end' 2>/dev/null || true)"
+    [[ "$desired" == "0" || "$desired" == "1" ]] || return 0
+    current="$(config_bool_value "$KTO_IP_LIMIT_ENABLED")"
+    [[ "$current" != "$desired" ]] || return 0
+    if set_push_config_value "KTO_IP_LIMIT_ENABLED" "$desired"; then
+        echo "push ${PUSH_BUILD}: ip limit enabled=${desired} (next run)"
+    else
+        echo "push ${PUSH_BUILD}: ip limit config write failed" >&2
+    fi
+}
+
 read_haproxy_scan_stats() {
     local socket="/run/haproxy/admin.sock"
-    local raw entries
+    local raw entries sni_raw sni_entries
 
     scan_wrong_sni_total=0
     scan_wrong_sni_sources=0
     scan_wrong_sni_top='[]'
+    scan_wrong_sni_names='[]'
 
     command -v socat >/dev/null 2>&1 || return 0
     command -v jq >/dev/null 2>&1 || return 0
@@ -455,6 +509,32 @@ read_haproxy_scan_stats() {
         | sort -k2,2nr \
         | head -n 10 \
         | jq -R -s '[split("\n")[] | select(length > 0) | split(" ") | {ip: .[0], count: (.[1] | tonumber), rate: (.[2] | tonumber)}]' 2>/dev/null || echo '[]')"
+
+    sni_raw="$(printf 'show table wrong_sni_names\n' | socat -t 2 - UNIX-CONNECT:"$socket" 2>/dev/null || true)"
+    [[ -n "$sni_raw" ]] || return 0
+    sni_entries="$(awk '
+        /key=/ {
+            sni = ""
+            gpc = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^key=/) {
+                    sub(/^key=/, "", $i)
+                    sni = $i
+                } else if ($i ~ /^gpc0=/) {
+                    split($i, value, "=")
+                    gpc = value[2] + 0
+                }
+            }
+            if (sni != "" && gpc > 0) {
+                print sni, gpc
+            }
+        }
+    ' <<< "$sni_raw" || true)"
+    [[ -n "$sni_entries" ]] || return 0
+    scan_wrong_sni_names="$(printf '%s\n' "$sni_entries" \
+        | sort -k2,2nr \
+        | head -n 10 \
+        | jq -R -s '[split("\n")[] | select(length > 0) | split(" ") | {sni: .[0], count: (.[1] | tonumber)}]' 2>/dev/null || echo '[]')"
 }
 
 ip_limit_enabled() {
@@ -732,6 +812,7 @@ if ! payload="$(jq -n \
     --argjson scan_wrong_sni_total "$scan_wrong_sni_total" \
     --argjson scan_wrong_sni_sources "$scan_wrong_sni_sources" \
     --argjson scan_wrong_sni_top "$scan_wrong_sni_top" \
+    --argjson scan_wrong_sni_names "$scan_wrong_sni_names" \
     --argjson haproxy_allowed_sni "$haproxy_allowed_sni" \
     --argjson ip_limit_events "$ip_limit_events" \
     --argjson updated_at "$updated_at" \
@@ -758,6 +839,7 @@ if ! payload="$(jq -n \
         scan_wrong_sni_total: $scan_wrong_sni_total,
         scan_wrong_sni_sources: $scan_wrong_sni_sources,
         scan_wrong_sni_top: $scan_wrong_sni_top,
+        scan_wrong_sni_names: $scan_wrong_sni_names,
         haproxy_allowed_sni: $haproxy_allowed_sni,
         ip_limit_events: $ip_limit_events,
         error: $error,
@@ -789,6 +871,7 @@ if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
     fi
     apply_collector_ssh_ips "$response"
     apply_collector_allowed_sni "$response"
+    apply_collector_ip_limit_config "$response"
     apply_ip_limit_blocks "$response"
     echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}% uptime=${uptime_sec}s${ip_limit_extra}"
 else
