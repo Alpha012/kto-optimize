@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v175"
+COLLECTOR_BUILD = "v176"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -79,9 +79,9 @@ if IP_LIMIT_MAX_EVENTS < 100:
 if IP_LIMIT_MAX_EVENTS > 200000:
     IP_LIMIT_MAX_EVENTS = 200000
 try:
-    IP_LIMIT_WINDOW_SEC = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC", "600") or "600")
+    IP_LIMIT_WINDOW_SEC = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC", "60") or "60")
 except Exception:
-    IP_LIMIT_WINDOW_SEC = 600
+    IP_LIMIT_WINDOW_SEC = 60
 if IP_LIMIT_WINDOW_SEC < 60:
     IP_LIMIT_WINDOW_SEC = 60
 try:
