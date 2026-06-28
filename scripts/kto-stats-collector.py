@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v180"
+COLLECTOR_BUILD = "v181"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -2813,7 +2813,7 @@ def remna_ip_limit_alert_rows(rows, ts):
         user = str(row.get("user") or "").strip()
         info = remna_user_info(user)
         limit, _ = ip_limit_effective_limit(user, info)
-        if limit <= 0:
+        if limit <= 0 or limit > IP_LIMIT_ALERT_THRESHOLD:
             continue
         result.append(row)
     return result
