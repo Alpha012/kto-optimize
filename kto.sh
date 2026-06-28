@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v178"
+SCRIPT_BUILD="v179"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -62,10 +62,14 @@ STATS_COLLECTOR_TZ_DEFAULT="Europe/Moscow"
 STATS_ALLOWED_USER_ID_DEFAULT="646296998"
 STATS_EXPECTED_NODES_DEFAULT="10"
 IP_LIMIT_ENABLED_DEFAULT="${KTO_IP_LIMIT_ENABLED_DEFAULT:-0}"
+IP_LIMIT_SOURCE_DEFAULT="${KTO_COLLECTOR_IP_LIMIT_SOURCE_DEFAULT:-remna}"
 IP_LIMIT_MAX_IPS_DEFAULT="${KTO_IP_LIMIT_MAX_IPS_DEFAULT:-1}"
 IP_LIMIT_MAX_EVENTS_DEFAULT="${KTO_IP_LIMIT_MAX_EVENTS_DEFAULT:-5000}"
 IP_LIMIT_WINDOW_SEC_DEFAULT="${KTO_IP_LIMIT_WINDOW_SEC_DEFAULT:-60}"
 IP_LIMIT_ALERT_COOLDOWN_DEFAULT="${KTO_IP_LIMIT_ALERT_COOLDOWN_DEFAULT:-600}"
+IP_LIMIT_COLLECTOR_SCAN_SEC_DEFAULT="${KTO_COLLECTOR_IP_LIMIT_SCAN_SEC_DEFAULT:-60}"
+IP_LIMIT_ALERT_THRESHOLD_DEFAULT="${KTO_COLLECTOR_IP_LIMIT_ALERT_THRESHOLD_DEFAULT:-20}"
+IP_LIMIT_ALERT_TOP_DEFAULT="${KTO_COLLECTOR_IP_LIMIT_ALERT_TOP_DEFAULT:-20}"
 IP_LIMIT_SCAN_SEC_DEFAULT="${KTO_IP_LIMIT_SCAN_SEC_DEFAULT:-120}"
 IP_LIMIT_TAIL_LINES_DEFAULT="${KTO_IP_LIMIT_TAIL_LINES_DEFAULT:-5000}"
 IP_LIMIT_XRAY_LOGS_DEFAULT="${KTO_IP_LIMIT_XRAY_LOGS_DEFAULT:-1}"
@@ -3531,10 +3535,10 @@ install_stats_collector() {
     need_root
 
     local listen_host listen_port secret bot_token chat_id allowed_user stale_sec expected_nodes daily_report_time existing_config=0
-    local ip_limit_enabled ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_enforce_enabled ip_limit_penalty_sec
+    local ip_limit_enabled ip_limit_source ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_penalty_sec
     local remna_api_url remna_api_token remna_api_cache_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
     local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_expected safe_tz safe_daily
-    local safe_ip_limit_enabled safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_enforce_enabled safe_ip_limit_penalty_sec
+    local safe_ip_limit_enabled safe_ip_limit_source safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_scan_sec safe_ip_limit_alert_threshold safe_ip_limit_alert_top safe_ip_limit_enforce_enabled safe_ip_limit_penalty_sec
     local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
 
     if "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
@@ -3548,10 +3552,14 @@ install_stats_collector() {
         expected_nodes="$(config_get KTO_COLLECTOR_EXPECTED_NODES "$STATS_COLLECTOR_CONFIG")"
         daily_report_time="$(config_get KTO_COLLECTOR_DAILY_REPORT_TIME "$STATS_COLLECTOR_CONFIG")"
         ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_source="$(config_get KTO_COLLECTOR_IP_LIMIT_SOURCE "$STATS_COLLECTOR_CONFIG")"
         ip_limit_max_ips="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_IPS "$STATS_COLLECTOR_CONFIG")"
         ip_limit_max_events="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS "$STATS_COLLECTOR_CONFIG")"
         ip_limit_window_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC "$STATS_COLLECTOR_CONFIG")"
         ip_limit_alert_cooldown="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_scan_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_SCAN_SEC "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_alert_threshold="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_THRESHOLD "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_alert_top="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_TOP "$STATS_COLLECTOR_CONFIG")"
         ip_limit_enforce_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED "$STATS_COLLECTOR_CONFIG")"
         ip_limit_penalty_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC "$STATS_COLLECTOR_CONFIG")"
         remna_api_url="$(config_get KTO_COLLECTOR_REMNA_API_URL "$STATS_COLLECTOR_CONFIG")"
@@ -3574,6 +3582,7 @@ install_stats_collector() {
         stale_sec="${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}"
         expected_nodes="${expected_nodes:-$STATS_EXPECTED_NODES_DEFAULT}"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
+        ip_limit_source="${ip_limit_source:-$IP_LIMIT_SOURCE_DEFAULT}"
         ip_limit_max_ips="${ip_limit_max_ips:-$IP_LIMIT_MAX_IPS_DEFAULT}"
         ip_limit_max_events="${ip_limit_max_events:-$IP_LIMIT_MAX_EVENTS_DEFAULT}"
         ip_limit_window_sec="${ip_limit_window_sec:-$IP_LIMIT_WINDOW_SEC_DEFAULT}"
@@ -3581,6 +3590,9 @@ install_stats_collector() {
             ip_limit_window_sec="$IP_LIMIT_WINDOW_SEC_DEFAULT"
         fi
         ip_limit_alert_cooldown="${ip_limit_alert_cooldown:-$IP_LIMIT_ALERT_COOLDOWN_DEFAULT}"
+        ip_limit_scan_sec="${ip_limit_scan_sec:-$IP_LIMIT_COLLECTOR_SCAN_SEC_DEFAULT}"
+        ip_limit_alert_threshold="${ip_limit_alert_threshold:-$IP_LIMIT_ALERT_THRESHOLD_DEFAULT}"
+        ip_limit_alert_top="${ip_limit_alert_top:-$IP_LIMIT_ALERT_TOP_DEFAULT}"
         ip_limit_enforce_enabled="${ip_limit_enforce_enabled:-$IP_LIMIT_ENFORCE_ENABLED_DEFAULT}"
         ip_limit_penalty_sec="${ip_limit_penalty_sec:-$IP_LIMIT_PENALTY_SEC_DEFAULT}"
         remna_api_url="${remna_api_url:-$REMNA_API_URL}"
@@ -3600,10 +3612,14 @@ install_stats_collector() {
         expected_nodes="$(ask_int "Ожидаемое кол-во обходов" "$STATS_EXPECTED_NODES_DEFAULT" 1 9999)"
         daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
         ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
+        ip_limit_source="$IP_LIMIT_SOURCE_DEFAULT"
         ip_limit_max_ips="$IP_LIMIT_MAX_IPS_DEFAULT"
         ip_limit_max_events="$IP_LIMIT_MAX_EVENTS_DEFAULT"
         ip_limit_window_sec="$IP_LIMIT_WINDOW_SEC_DEFAULT"
         ip_limit_alert_cooldown="$IP_LIMIT_ALERT_COOLDOWN_DEFAULT"
+        ip_limit_scan_sec="$IP_LIMIT_COLLECTOR_SCAN_SEC_DEFAULT"
+        ip_limit_alert_threshold="$IP_LIMIT_ALERT_THRESHOLD_DEFAULT"
+        ip_limit_alert_top="$IP_LIMIT_ALERT_TOP_DEFAULT"
         ip_limit_enforce_enabled="$IP_LIMIT_ENFORCE_ENABLED_DEFAULT"
         ip_limit_penalty_sec="$IP_LIMIT_PENALTY_SEC_DEFAULT"
         remna_api_url="$REMNA_API_URL"
@@ -3625,6 +3641,9 @@ install_stats_collector() {
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ENABLED:-}" ]]; then
         ip_limit_enabled="$KTO_COLLECTOR_IP_LIMIT_ENABLED"
     fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_SOURCE:-}" ]]; then
+        ip_limit_source="$KTO_COLLECTOR_IP_LIMIT_SOURCE"
+    fi
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_MAX_IPS:-}" ]]; then
         ip_limit_max_ips="$KTO_COLLECTOR_IP_LIMIT_MAX_IPS"
     fi
@@ -3636,6 +3655,15 @@ install_stats_collector() {
     fi
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN:-}" ]]; then
         ip_limit_alert_cooldown="$KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN"
+    fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_SCAN_SEC:-}" ]]; then
+        ip_limit_scan_sec="$KTO_COLLECTOR_IP_LIMIT_SCAN_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ALERT_THRESHOLD:-}" ]]; then
+        ip_limit_alert_threshold="$KTO_COLLECTOR_IP_LIMIT_ALERT_THRESHOLD"
+    fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ALERT_TOP:-}" ]]; then
+        ip_limit_alert_top="$KTO_COLLECTOR_IP_LIMIT_ALERT_TOP"
     fi
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED:-}" ]]; then
         ip_limit_enforce_enabled="$KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED"
@@ -3664,10 +3692,14 @@ install_stats_collector() {
     safe_tz="$(escape_config_value "$STATS_COLLECTOR_TZ_DEFAULT")"
     safe_daily="$(escape_config_value "$daily_report_time")"
     safe_ip_limit_enabled="$(escape_config_value "$ip_limit_enabled")"
+    safe_ip_limit_source="$(escape_config_value "$ip_limit_source")"
     safe_ip_limit_max_ips="$(escape_config_value "$ip_limit_max_ips")"
     safe_ip_limit_max_events="$(escape_config_value "$ip_limit_max_events")"
     safe_ip_limit_window="$(escape_config_value "$ip_limit_window_sec")"
     safe_ip_limit_cooldown="$(escape_config_value "$ip_limit_alert_cooldown")"
+    safe_ip_limit_scan_sec="$(escape_config_value "$ip_limit_scan_sec")"
+    safe_ip_limit_alert_threshold="$(escape_config_value "$ip_limit_alert_threshold")"
+    safe_ip_limit_alert_top="$(escape_config_value "$ip_limit_alert_top")"
     safe_ip_limit_enforce_enabled="$(escape_config_value "$ip_limit_enforce_enabled")"
     safe_ip_limit_penalty_sec="$(escape_config_value "$ip_limit_penalty_sec")"
     safe_remna_api_url="$(escape_config_value "$remna_api_url")"
@@ -3697,10 +3729,14 @@ KTO_COLLECTOR_EXPECTED_NODES="$safe_expected"
 KTO_COLLECTOR_TZ="$safe_tz"
 KTO_COLLECTOR_DAILY_REPORT_TIME="$safe_daily"
 KTO_COLLECTOR_IP_LIMIT_ENABLED="$safe_ip_limit_enabled"
+KTO_COLLECTOR_IP_LIMIT_SOURCE="$safe_ip_limit_source"
 KTO_COLLECTOR_IP_LIMIT_MAX_IPS="$safe_ip_limit_max_ips"
 KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS="$safe_ip_limit_max_events"
 KTO_COLLECTOR_IP_LIMIT_WINDOW_SEC="$safe_ip_limit_window"
 KTO_COLLECTOR_IP_LIMIT_ALERT_COOLDOWN="$safe_ip_limit_cooldown"
+KTO_COLLECTOR_IP_LIMIT_SCAN_SEC="$safe_ip_limit_scan_sec"
+KTO_COLLECTOR_IP_LIMIT_ALERT_THRESHOLD="$safe_ip_limit_alert_threshold"
+KTO_COLLECTOR_IP_LIMIT_ALERT_TOP="$safe_ip_limit_alert_top"
 KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED="$safe_ip_limit_enforce_enabled"
 KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC="$safe_ip_limit_penalty_sec"
 KTO_COLLECTOR_REMNA_API_URL="$safe_remna_api_url"
@@ -3742,6 +3778,7 @@ EOF
     else
         warn "Remnawave API enrichment: токен не задан"
     fi
+    ok "IP limit source: ${ip_limit_source:-$IP_LIMIT_SOURCE_DEFAULT}, enabled=${ip_limit_enabled:-0}, alert >${ip_limit_alert_threshold:-$IP_LIMIT_ALERT_THRESHOLD_DEFAULT} IP"
     if [[ "${ip_limit_enforce_enabled:-0}" == "1" ]]; then
         ok "IP limit enforcement: включён (${ip_limit_penalty_sec:-$IP_LIMIT_PENALTY_SEC_DEFAULT}s)"
     else
@@ -3759,12 +3796,17 @@ stats_collector_status() {
     require_panel_mode
     need_root
     local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_test_id remna_test_log remna_code remna_probe
-    local ip_limit_enforce_enabled ip_limit_penalty_sec ip_limit_max_events asn_lookup_enabled asn_cache_sec
+    local ip_limit_enabled ip_limit_source ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_penalty_sec ip_limit_max_events asn_lookup_enabled asn_cache_sec
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
     listen_port="$(config_get KTO_COLLECTOR_LISTEN_PORT "$STATS_COLLECTOR_CONFIG")"
     remna_api_url="$(config_get KTO_COLLECTOR_REMNA_API_URL "$STATS_COLLECTOR_CONFIG")"
     remna_api_token="$(config_get KTO_COLLECTOR_REMNA_API_TOKEN "$STATS_COLLECTOR_CONFIG")"
+    ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
+    ip_limit_source="$(config_get KTO_COLLECTOR_IP_LIMIT_SOURCE "$STATS_COLLECTOR_CONFIG")"
+    ip_limit_scan_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_SCAN_SEC "$STATS_COLLECTOR_CONFIG")"
+    ip_limit_alert_threshold="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_THRESHOLD "$STATS_COLLECTOR_CONFIG")"
+    ip_limit_alert_top="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_TOP "$STATS_COLLECTOR_CONFIG")"
     ip_limit_enforce_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED "$STATS_COLLECTOR_CONFIG")"
     ip_limit_penalty_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC "$STATS_COLLECTOR_CONFIG")"
     ip_limit_max_events="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_EVENTS "$STATS_COLLECTOR_CONFIG")"
@@ -3783,6 +3825,8 @@ stats_collector_status() {
     print_row "данные" "$STATS_COLLECTOR_STATE_DIR" "$([[ -d "$STATS_COLLECTOR_STATE_DIR" ]] && echo 1 || echo 0)"
     print_row "адрес" "${listen_host}:${listen_port}" "$([[ -n "$listen_port" ]] && echo 1 || echo 0)"
     print_row "remna api" "${remna_api_url:-empty} / $([[ -n "$remna_api_token" ]] && echo token-set || echo no-token)" "$([[ -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
+    print_row "ip source" "${ip_limit_source:-$IP_LIMIT_SOURCE_DEFAULT} / enabled ${ip_limit_enabled:-0}" 1
+    print_row "ip alert" ">${ip_limit_alert_threshold:-$IP_LIMIT_ALERT_THRESHOLD_DEFAULT} IP / top ${ip_limit_alert_top:-$IP_LIMIT_ALERT_TOP_DEFAULT} / scan ${ip_limit_scan_sec:-$IP_LIMIT_COLLECTOR_SCAN_SEC_DEFAULT}s"
     print_row "ip enforce" "${ip_limit_enforce_enabled:-0} / ${ip_limit_penalty_sec:-$IP_LIMIT_PENALTY_SEC_DEFAULT}s" "$([[ "${ip_limit_enforce_enabled:-0}" == "1" ]] && echo 1 || echo 0)"
     print_row "ip max events" "${ip_limit_max_events:-$IP_LIMIT_MAX_EVENTS_DEFAULT}"
     print_row "asn lookup" "${asn_lookup_enabled:-1} / cache ${asn_cache_sec:-$ASN_CACHE_SEC_DEFAULT}s" "$([[ "${asn_lookup_enabled:-1}" == "1" ]] && echo 1 || echo 0)"

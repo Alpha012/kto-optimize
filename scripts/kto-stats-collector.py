@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v178"
+COLLECTOR_BUILD = "v179"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -64,6 +64,9 @@ try:
 except Exception:
     SCAN_ALERT_COOLDOWN = 600
 IP_LIMIT_ENABLED = str(cfg.get("KTO_COLLECTOR_IP_LIMIT_ENABLED", "0")).lower() in ("1", "yes", "true", "on", "enabled")
+IP_LIMIT_SOURCE = str(cfg.get("KTO_COLLECTOR_IP_LIMIT_SOURCE", "remna") or "remna").strip().lower()
+if IP_LIMIT_SOURCE not in ("remna", "push", "both"):
+    IP_LIMIT_SOURCE = "remna"
 try:
     IP_LIMIT_MAX_IPS = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_MAX_IPS", "1") or "1")
 except Exception:
@@ -90,6 +93,30 @@ except Exception:
     IP_LIMIT_ALERT_COOLDOWN = 600
 if IP_LIMIT_ALERT_COOLDOWN < 60:
     IP_LIMIT_ALERT_COOLDOWN = 60
+try:
+    IP_LIMIT_SCAN_SEC = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_SCAN_SEC", "60") or "60")
+except Exception:
+    IP_LIMIT_SCAN_SEC = 60
+if IP_LIMIT_SCAN_SEC < 10:
+    IP_LIMIT_SCAN_SEC = 10
+if IP_LIMIT_SCAN_SEC > 3600:
+    IP_LIMIT_SCAN_SEC = 3600
+try:
+    IP_LIMIT_ALERT_THRESHOLD = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_ALERT_THRESHOLD", "20") or "20")
+except Exception:
+    IP_LIMIT_ALERT_THRESHOLD = 20
+if IP_LIMIT_ALERT_THRESHOLD < 1:
+    IP_LIMIT_ALERT_THRESHOLD = 1
+if IP_LIMIT_ALERT_THRESHOLD > 10000:
+    IP_LIMIT_ALERT_THRESHOLD = 10000
+try:
+    IP_LIMIT_ALERT_TOP = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_ALERT_TOP", "20") or "20")
+except Exception:
+    IP_LIMIT_ALERT_TOP = 20
+if IP_LIMIT_ALERT_TOP < 1:
+    IP_LIMIT_ALERT_TOP = 1
+if IP_LIMIT_ALERT_TOP > 100:
+    IP_LIMIT_ALERT_TOP = 100
 IP_LIMIT_ENFORCE_ENABLED = str(cfg.get("KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED", "0")).lower() in ("1", "yes", "true", "on", "enabled")
 try:
     IP_LIMIT_PENALTY_SEC = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC", "60") or "60")
@@ -2231,7 +2258,7 @@ def normalize_ip_limit_event(raw, fallback_node, ts):
         return None
     node = str(raw.get("node") or fallback_node or "-").strip() or "-"
     try:
-        seen_at = int(raw.get("seen_at") or ts)
+        seen_at = remna_epoch_sec(raw.get("seen_at", raw.get("last_seen")), ts)
     except Exception:
         seen_at = ts
     if seen_at <= 0 or seen_at > ts + 300:
@@ -2249,6 +2276,30 @@ def ip_limit_last_seen(entry):
 def purge_ip_limit_state(ts):
     cutoff = ts - IP_LIMIT_WINDOW_SEC
     ip_limit_db().execute("DELETE FROM ip_limit_events WHERE last_seen < ?", (cutoff,))
+
+
+def store_ip_limit_events(events, fallback_node="", ts=None, max_events=None):
+    if not isinstance(events, list):
+        return set()
+    if ts is None:
+        ts = now_ts()
+    if max_events is None:
+        max_events = IP_LIMIT_MAX_EVENTS
+    touched = set()
+    normalized = []
+    for raw in events[:max_events]:
+        event = normalize_ip_limit_event(raw, fallback_node, ts)
+        if not event:
+            continue
+        touched.add(event["user"])
+        normalized.append((event["user"], event["ip"], event["node"], canonical_node_key(event["node"]), event["seen_at"]))
+    if normalized:
+        ip_limit_db().executemany(
+            "INSERT INTO ip_limit_events(user, ip, node, node_key, last_seen) VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(user, ip, node) DO UPDATE SET node_key = excluded.node_key, last_seen = max(last_seen, excluded.last_seen)",
+            normalized,
+        )
+    return touched
 
 
 def active_ip_limit_entries(user, ts):
@@ -2407,6 +2458,42 @@ def ip_limit_node_policy(node):
         "enforce": bool(int(row["enforce"] or 0)),
         "updated_at": int(row["updated_at"] or 0),
     }
+
+
+def ip_limit_enabled_node_keys():
+    with LOCK:
+        rows = ip_limit_db().execute("SELECT node_key FROM ip_limit_nodes WHERE enabled = 1").fetchall()
+    return {str(row["node_key"] or "") for row in rows if str(row["node_key"] or "").strip()}
+
+
+def ip_limit_remna_monitor_enabled():
+    if IP_LIMIT_SOURCE not in ("remna", "both"):
+        return False
+    if not remna_api_enabled():
+        return False
+    if IP_LIMIT_ENABLED:
+        return True
+    return bool(ip_limit_enabled_node_keys())
+
+
+def remna_ip_limit_allowed_rows(rows, enabled_node_keys):
+    allowed = []
+    active_after = now_ts() - REMNA_TOP_IP_ACTIVE_SEC
+    for row in rows or []:
+        last_seen = remna_epoch_sec(row.get("last_seen"), 0)
+        if last_seen > 0 and last_seen < active_after:
+            continue
+        node_key = canonical_node_key(row.get("node"))
+        if not IP_LIMIT_ENABLED and enabled_node_keys and node_key not in enabled_node_keys:
+            continue
+        allowed.append({
+            "user": row.get("user"),
+            "ip": row.get("ip"),
+            "node": row.get("node"),
+            "last_seen": last_seen or now_ts(),
+            "seen_at": last_seen or now_ts(),
+        })
+    return allowed
 
 
 def set_ip_limit_node_policy(node, enabled=True, enforce=False):
@@ -2719,6 +2806,59 @@ def top_ip_report(limit=20):
     return "\n".join(lines)
 
 
+def remna_ip_limit_top_message(rows, snapshot):
+    ts = now_ts()
+    top_rows = remna_top_ip_rows(rows, active_after=ts - REMNA_TOP_IP_ACTIVE_SEC)
+    shown = top_rows[:IP_LIMIT_ALERT_TOP]
+    max_ips = len(top_rows[0].get("ips") or []) if top_rows else 0
+    lines = [
+        f"{LOST_EMOJI} #ipLimitTop",
+        "<b>Много активных IP</b>",
+        ALERT_SEPARATOR,
+        detail_line("Порог", f">{IP_LIMIT_ALERT_THRESHOLD} IP"),
+        detail_line("Максимум", f"{max_ips} IP"),
+        detail_line("Окно", format_duration_ru(REMNA_TOP_IP_ACTIVE_SEC)),
+        detail_line("Ноды", f"{snapshot.get('nodes_polled', 0)}/{snapshot.get('nodes_total', 0)}"),
+        detail_line("Показано", f"{len(shown)}/{len(top_rows)}"),
+    ]
+    problems = []
+    if int(snapshot.get("nodes_skipped") or 0) > 0:
+        problems.append(f"пропущено нод: {int(snapshot.get('nodes_skipped') or 0)}")
+    if int(snapshot.get("jobs_pending") or 0) > 0:
+        problems.append(f"не успело jobs: {int(snapshot.get('jobs_pending') or 0)}")
+    if int(snapshot.get("jobs_failed") or 0) > 0:
+        problems.append(f"упало jobs: {int(snapshot.get('jobs_failed') or 0)}")
+    if problems:
+        lines.append(detail_line("Замечания", ", ".join(problems)))
+    lines.append("")
+    if shown:
+        for index, row in enumerate(shown, 1):
+            lines.append(top_ip_user_line(index, row))
+    else:
+        lines.append("<blockquote>Активных IP сейчас не нашёл.</blockquote>")
+    errors = snapshot.get("errors") or []
+    if errors:
+        lines += ["", "<blockquote>" + "\n".join(html.escape(str(item)) for item in errors[:5]) + "</blockquote>"]
+    return "\n".join(lines)
+
+
+def maybe_alert_remna_ip_limit_top(rows, snapshot, ts):
+    top_rows = remna_top_ip_rows(rows, active_after=ts - REMNA_TOP_IP_ACTIVE_SEC)
+    if not top_rows:
+        return
+    max_ips = len(top_rows[0].get("ips") or [])
+    if max_ips <= IP_LIMIT_ALERT_THRESHOLD:
+        return
+    with LOCK:
+        last_alert = int(ip_limit_meta_get("remna_top_alert_last") or 0)
+        if ts - last_alert < IP_LIMIT_ALERT_COOLDOWN:
+            return
+        ip_limit_meta_set("remna_top_alert_last", str(ts))
+        save_ip_limit_state()
+    log(f"remna ip top alert: max_ips={max_ips} threshold={IP_LIMIT_ALERT_THRESHOLD}")
+    send_message(remna_ip_limit_top_message(rows, snapshot))
+
+
 def ip_limit_limit_text(limit, source):
     if limit <= 0:
         return "без лимита"
@@ -2942,25 +3082,15 @@ def ip_limit_penalty_loop():
 def process_ip_limit_events(events, fallback_node, ts):
     if not isinstance(events, list):
         return
+    if IP_LIMIT_SOURCE not in ("push", "both"):
+        return
     if not ip_limit_processing_enabled_for_node(fallback_node):
         return
 
-    touched = set()
-    normalized = []
     with LOCK:
         purge_ip_limit_state(ts)
-        for raw in events[:IP_LIMIT_MAX_EVENTS]:
-            event = normalize_ip_limit_event(raw, fallback_node, ts)
-            if not event:
-                continue
-            touched.add(event["user"])
-            normalized.append((event["user"], event["ip"], event["node"], canonical_node_key(event["node"]), event["seen_at"]))
-        if normalized:
-            ip_limit_db().executemany(
-                "INSERT INTO ip_limit_events(user, ip, node, node_key, last_seen) VALUES(?, ?, ?, ?, ?) "
-                "ON CONFLICT(user, ip, node) DO UPDATE SET node_key = excluded.node_key, last_seen = max(last_seen, excluded.last_seen)",
-                normalized,
-            )
+        touched = store_ip_limit_events(events, fallback_node, ts)
+        if touched:
             save_ip_limit_state()
 
     for user in sorted(touched, key=natural_sort_key):
@@ -2989,6 +3119,34 @@ def process_ip_limit_events(events, fallback_node, ts):
             save_ip_limit_state()
         log(f"ip limit exceeded: user={user} active_ips={len(entries)} limit={limit}")
         alert_ip_limit_exceeded(user, entries, info)
+
+
+def remna_ip_limit_poll_once():
+    ts = now_ts()
+    enabled_node_keys = ip_limit_enabled_node_keys()
+    if not IP_LIMIT_ENABLED and not enabled_node_keys:
+        return {"ok": True, "disabled": True}
+    snapshot = remna_fetch_active_user_ips()
+    rows = remna_ip_limit_allowed_rows(snapshot.get("rows") or [], enabled_node_keys)
+    with LOCK:
+        purge_ip_limit_state(ts)
+        store_ip_limit_events(rows, "", ts, max_events=len(rows))
+        save_ip_limit_state()
+    maybe_alert_remna_ip_limit_top(rows, snapshot, ts)
+    return {"ok": True, "rows": len(rows), "nodes": snapshot.get("nodes_polled", 0)}
+
+
+def remna_ip_limit_loop():
+    while True:
+        try:
+            if ip_limit_remna_monitor_enabled():
+                result = remna_ip_limit_poll_once()
+                if result.get("rows", 0) > 0:
+                    log(f"remna ip monitor: rows={result.get('rows')} nodes={result.get('nodes')}")
+            time.sleep(IP_LIMIT_SCAN_SEC)
+        except Exception as exc:
+            log(f"remna ip monitor failed: {exc}")
+            time.sleep(max(10, min(IP_LIMIT_SCAN_SEC, 60)))
 
 
 def update_node(payload, remote_ip=""):
@@ -3706,6 +3864,7 @@ def main():
     load_ip_limit_state()
     threading.Thread(target=offline_loop, daemon=True).start()
     threading.Thread(target=ip_limit_penalty_loop, daemon=True).start()
+    threading.Thread(target=remna_ip_limit_loop, daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
     if DAILY_REPORT_TIME:
         threading.Thread(target=daily_report_loop, daemon=True).start()
