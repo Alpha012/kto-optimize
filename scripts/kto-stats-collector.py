@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v174"
+COLLECTOR_BUILD = "v175"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1349,7 +1349,19 @@ def top_wrong_sni_label(node):
     return sni
 
 
-def node_message(node, status=None):
+def wrong_sni_html_line(node):
+    scan_total = int(node.get("scan_wrong_sni_total") or 0)
+    if scan_total <= 0:
+        return ""
+    scan_sources = int(node.get("scan_wrong_sni_sources") or 0)
+    scan_line = f"Wrong SNI: {scan_total} / {scan_sources} IP"
+    top_sni = top_wrong_sni_label(node)
+    if top_sni:
+        scan_line = f"{scan_line} | {top_sni}"
+    return html.escape(scan_line)
+
+
+def node_message(node, status=None, compact=False):
     name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
     ip = html.escape(str(node.get("ip") or "-"))
     uptime_sec = int(node.get("uptime_sec") or 0)
@@ -1364,14 +1376,27 @@ def node_message(node, status=None):
     if metrics_ok:
         ram_line = f"Забитость ОЗУ: {int(node.get('ram_percent', 0) or 0)}% | {format_bytes(node.get('ram_used', 0))} / {format_bytes(node.get('ram_total', 0))}"
         cpu_line = f"Нагруженность процессора: {format_percent(node.get('cpu_percent', 0))}"
-    scan_total = int(node.get("scan_wrong_sni_total") or 0)
-    if scan_total > 0:
-        scan_sources = int(node.get("scan_wrong_sni_sources") or 0)
-        scan_line = f"Wrong SNI: {scan_total} / {scan_sources} IP"
-        top_sni = top_wrong_sni_label(node)
-        if top_sni:
-            scan_line = f"{scan_line} | {html.escape(top_sni)}"
-        cpu_line = f"{cpu_line}\n{scan_line}"
+    wrong_sni_line = wrong_sni_html_line(node)
+    if wrong_sni_line:
+        cpu_line = f"{cpu_line}\n{wrong_sni_line}"
+    if compact:
+        lines = [f"<blockquote><b>{name}</b>\nIP: {ip}</blockquote>", ""]
+        if error:
+            lines += [
+                "<b>Сегодня: ошибка | Вчера: - | Месяц: ошибка</b>",
+                "",
+                f"Ошибка: {html.escape(error)[:800]}",
+                "",
+                footer,
+            ]
+            return "\n".join(lines)
+        lines += [
+            f"<b>Сегодня: {format_bytes(node.get('day_total', 0))} | Вчера: {format_bytes(node.get('yesterday_total', 0))} | Месяц: {format_bytes(node.get('month_total', 0))}</b>",
+        ]
+        if wrong_sni_line:
+            lines += ["", f"<b><i>{wrong_sni_line}</i></b>"]
+        lines += ["", footer]
+        return "\n".join(lines)
     lines = [f"<blockquote><b>{name}</b>\nIP: {ip}\nАптайм: {uptime_text}</blockquote>", ""]
     if error:
         lines += [
@@ -1458,6 +1483,22 @@ def dedupe_nodes(values):
     return list(deduped.values())
 
 
+def nodes_day_traffic(nodes):
+    total = 0
+    for node in nodes:
+        try:
+            value = int(node.get("day_total") or 0)
+        except Exception:
+            value = 0
+        if value <= 0:
+            try:
+                value = int(node.get("day_rx") or 0) + int(node.get("day_tx") or 0)
+            except Exception:
+                value = 0
+        total += max(0, value)
+    return total
+
+
 def status_summary(nodes, ts, expected_total=None, filtered=False):
     expected_total = max(int(expected_total or EXPECTED_NODES), len(nodes), 1)
     live_count = 0
@@ -1473,6 +1514,10 @@ def status_summary(nodes, ts, expected_total=None, filtered=False):
         "<blockquote>На данный момент:</blockquote>",
         f"<b>Живо: {live_count}/{expected_total}</b>",
         f"<b>SLA за сегодня: {format_sla_percent(total_downtime, expected_total, ts)}</b>",
+        f"<b>Объем трафика: {format_bytes(nodes_day_traffic(nodes))}</b>",
+        "",
+        f"<b>Общее кол-во падений за сегодня: {int(falls.get('total', 0) or 0)}</b>",
+        f"<b>Общее время даунтайма за сегодня: {format_duration_ru(total_downtime)}</b>",
         "<b>Мертво:</b>",
     ]
     if dead_items:
@@ -1493,20 +1538,13 @@ def status_summary(nodes, ts, expected_total=None, filtered=False):
     else:
         lines.append("нет")
 
-    total_falls = int(falls.get("total", 0) or 0)
-    lines += [
-        "",
-        f"<b>Общее кол-во падений за сегодня: {total_falls}</b>",
-        f"<b>Общее время даунтайма за сегодня: {format_duration_ru(total_downtime)}</b>",
-    ]
     if falls_nodes:
+        lines.append("")
         lines.append("<b>Топ лист машин которые падали:</b>")
         top_lines = []
         for name, count in sorted(falls_nodes.items(), key=lambda item: (-int(item[1]), natural_sort_key(item[0]))):
             top_lines.append(f"{html.escape(str(name))}: {int(count)} раз")
         lines.append(f"<blockquote>{chr(10).join(top_lines)}</blockquote>")
-    else:
-        lines.append("<b>Топ лист машин которые падали:</b> нет")
     return "\n".join(lines)
 
 
@@ -1530,11 +1568,13 @@ def aggregate_message(scope="all"):
     scope = str(scope or "all").strip().lower()
     expected_total = None
     filtered = False
+    compact = False
     title = "Статистика обходов"
-    if scope == "wl":
+    if scope in ("wl", "wl_full"):
         nodes = [node for node in all_nodes if node_is_wl(node)]
         expected_total = max(EXPECTED_NODES, len(nodes), 1)
         filtered = True
+        compact = scope == "wl"
     elif scope == "bl":
         nodes = [node for node in all_nodes if not node_is_wl(node)]
         expected_total = max(len(nodes), 1)
@@ -1551,7 +1591,7 @@ def aggregate_message(scope="all"):
         age = ts - int(node.get("last_seen", 0) or 0)
         status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
         parts.append("")
-        parts.append(node_message(node, status))
+        parts.append(node_message(node, status, compact=compact))
     parts.append(status_summary(nodes, ts, expected_total=expected_total, filtered=filtered))
     return "\n".join(parts)
 
@@ -2764,7 +2804,7 @@ def daily_report_loop():
             current = datetime.now()
             today = current.strftime("%Y-%m-%d")
             if current.strftime("%H:%M") == DAILY_REPORT_TIME and last_sent != today:
-                if send_message(aggregate_message()):
+                if send_message(aggregate_message("wl")):
                     last_sent = today
                     save_daily_date(today)
                 time.sleep(70)
@@ -3215,6 +3255,8 @@ def bot_loop():
                     send_message(aggregate_message())
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl":
                     send_message(aggregate_message("wl"))
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl_full":
+                    send_message(aggregate_message("wl_full"))
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_bl":
                     send_message(aggregate_message("bl"))
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statsrevoke":
