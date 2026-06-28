@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v179"
+COLLECTOR_BUILD = "v180"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -2806,9 +2806,20 @@ def top_ip_report(limit=20):
     return "\n".join(lines)
 
 
-def remna_ip_limit_top_message(rows, snapshot):
-    ts = now_ts()
+def remna_ip_limit_alert_rows(rows, ts):
     top_rows = remna_top_ip_rows(rows, active_after=ts - REMNA_TOP_IP_ACTIVE_SEC)
+    result = []
+    for row in top_rows:
+        user = str(row.get("user") or "").strip()
+        info = remna_user_info(user)
+        limit, _ = ip_limit_effective_limit(user, info)
+        if limit <= 0:
+            continue
+        result.append(row)
+    return result
+
+
+def remna_ip_limit_top_message(top_rows, snapshot):
     shown = top_rows[:IP_LIMIT_ALERT_TOP]
     max_ips = len(top_rows[0].get("ips") or []) if top_rows else 0
     lines = [
@@ -2843,7 +2854,7 @@ def remna_ip_limit_top_message(rows, snapshot):
 
 
 def maybe_alert_remna_ip_limit_top(rows, snapshot, ts):
-    top_rows = remna_top_ip_rows(rows, active_after=ts - REMNA_TOP_IP_ACTIVE_SEC)
+    top_rows = remna_ip_limit_alert_rows(rows, ts)
     if not top_rows:
         return
     max_ips = len(top_rows[0].get("ips") or [])
@@ -2856,7 +2867,7 @@ def maybe_alert_remna_ip_limit_top(rows, snapshot, ts):
         ip_limit_meta_set("remna_top_alert_last", str(ts))
         save_ip_limit_state()
     log(f"remna ip top alert: max_ips={max_ips} threshold={IP_LIMIT_ALERT_THRESHOLD}")
-    send_message(remna_ip_limit_top_message(rows, snapshot))
+    send_message(remna_ip_limit_top_message(top_rows, snapshot))
 
 
 def ip_limit_limit_text(limit, source):
