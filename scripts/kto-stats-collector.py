@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v177"
+COLLECTOR_BUILD = "v178"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -127,6 +127,14 @@ if REMNA_TOP_IP_POLL_SEC < 0.2:
     REMNA_TOP_IP_POLL_SEC = 0.2
 if REMNA_TOP_IP_POLL_SEC > 5:
     REMNA_TOP_IP_POLL_SEC = 5
+try:
+    REMNA_TOP_IP_ACTIVE_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_TOP_IP_ACTIVE_SEC", "60") or "60")
+except Exception:
+    REMNA_TOP_IP_ACTIVE_SEC = 60
+if REMNA_TOP_IP_ACTIVE_SEC < 10:
+    REMNA_TOP_IP_ACTIVE_SEC = 10
+if REMNA_TOP_IP_ACTIVE_SEC > 3600:
+    REMNA_TOP_IP_ACTIVE_SEC = 3600
 ASN_LOOKUP_ENABLED = str(cfg.get("KTO_COLLECTOR_ASN_LOOKUP_ENABLED", "1")).lower() in ("1", "yes", "true", "on", "enabled")
 ASN_LOOKUP_URL = str(
     cfg.get(
@@ -1032,7 +1040,7 @@ def send_message(text, reply_markup=None):
         result = tg_call("sendMessage", payload)
         msg = result.get("result", {})
         log(f"telegram sent message_id={msg.get('message_id')} chat_id={msg.get('chat', {}).get('id')}")
-        return True
+        return msg or True
     except Exception as exc:
         log(f"telegram send failed: {exc}")
         return False
@@ -1225,6 +1233,16 @@ def remna_ip_item_value(ip_item):
     return ""
 
 
+def remna_epoch_sec(value, fallback=0):
+    try:
+        numeric = int(float(value))
+    except Exception:
+        return int(fallback or 0)
+    if numeric > 10_000_000_000:
+        numeric = numeric // 1000
+    return numeric
+
+
 def remna_ip_item_last_seen(ip_item, fallback_ts):
     if not isinstance(ip_item, dict):
         return fallback_ts
@@ -1234,7 +1252,7 @@ def remna_ip_item_last_seen(ip_item, fallback_ts):
             continue
         try:
             if isinstance(value, (int, float)):
-                return int(value)
+                return remna_epoch_sec(value, fallback_ts)
             parsed = parse_iso_ts(value)
             if parsed > 0:
                 return parsed
@@ -1337,6 +1355,7 @@ def remna_fetch_active_user_ips():
 
     return {
         "rows": rows,
+        "collected_at": now_ts(),
         "nodes_total": len(nodes),
         "nodes_polled": len(jobs),
         "nodes_skipped": skipped,
@@ -1346,19 +1365,21 @@ def remna_fetch_active_user_ips():
     }
 
 
-def remna_top_ip_rows(rows):
+def remna_top_ip_rows(rows, active_after=0):
     grouped = {}
     for row in rows:
         user = str(row.get("user") or "").strip()
         ip = str(row.get("ip") or "").strip()
         if not user or not valid_ipv4(ip):
             continue
+        last_seen = remna_epoch_sec(row.get("last_seen"), 0)
+        if active_after and last_seen > 0 and last_seen < active_after:
+            continue
         entry = grouped.setdefault(user, {"user": user, "ips": {}, "last_seen": 0})
         ip_entry = entry["ips"].setdefault(ip, {"ip": ip, "nodes": set(), "last_seen": 0})
         node = str(row.get("node") or "").strip()
         if node:
             ip_entry["nodes"].add(node)
-        last_seen = int(row.get("last_seen") or 0)
         if last_seen > ip_entry["last_seen"]:
             ip_entry["last_seen"] = last_seen
         if last_seen > entry["last_seen"]:
@@ -2630,8 +2651,17 @@ def ip_limit_report(query=""):
 
 def top_ip_user_line(index, row):
     user = str(row.get("user") or "").strip()
+    info = remna_user_info(user)
+    telegram_id = "-"
+    if isinstance(info, dict):
+        telegram_id = str(info.get("telegramId") or "-").strip() or "-"
+        user = remna_user_id(info, user) or user
     count = len(row.get("ips") or [])
-    return f"{index}. <b>ID:</b> <code>{html.escape(user)}</code> — <b>IP:</b> <code>{count}</code>"
+    return (
+        f"{index}. <b>ID:</b> <code>{html.escape(user)}</code> | "
+        f"<b>IP:</b> <code>{count}</code> | "
+        f"<b>TG:</b> <code>{html.escape(telegram_id)}</code>"
+    )
 
 
 def top_ip_report(limit=20):
@@ -2658,12 +2688,14 @@ def top_ip_report(limit=20):
             f"{ALERT_SEPARATOR}\n"
             f"{detail_line('Ошибка', str(exc)[:160])}"
         )
-    rows = remna_top_ip_rows(snapshot.get("rows") or [])
+    active_after = int(snapshot.get("collected_at") or now_ts()) - REMNA_TOP_IP_ACTIVE_SEC
+    rows = remna_top_ip_rows(snapshot.get("rows") or [], active_after=active_after)
     shown = rows[:limit]
     lines = [
         "<b>Топ активных IP</b>",
         ALERT_SEPARATOR,
         detail_line("Ноды", f"{snapshot.get('nodes_polled', 0)}/{snapshot.get('nodes_total', 0)}"),
+        detail_line("Окно", format_duration_ru(REMNA_TOP_IP_ACTIVE_SEC)),
         detail_line("Показано", f"{len(shown)}/{len(rows)}"),
     ]
     problems = []
@@ -3348,7 +3380,14 @@ def handle_top_ip(text):
             send_message("<b>Пример:</b> <code>/top_ip 50</code>")
             return
         limit = int(value)
-    send_message(top_ip_report(limit))
+    message = send_message("Собираю информацию...")
+    body = top_ip_report(limit)
+    if isinstance(message, dict):
+        chat_id = str((message.get("chat") or {}).get("id") or CHAT_ID)
+        message_id = str(message.get("message_id") or "")
+        if edit_message_text(chat_id, message_id, body):
+            return
+    send_message(body)
 
 
 def handle_ip_limit(text):
