@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v176"
+COLLECTOR_BUILD = "v177"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -111,6 +111,22 @@ except Exception:
     REMNA_API_TIMEOUT_SEC = 5
 if REMNA_API_TIMEOUT_SEC < 1:
     REMNA_API_TIMEOUT_SEC = 1
+try:
+    REMNA_TOP_IP_JOB_TIMEOUT_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_TOP_IP_JOB_TIMEOUT_SEC", "25") or "25")
+except Exception:
+    REMNA_TOP_IP_JOB_TIMEOUT_SEC = 25
+if REMNA_TOP_IP_JOB_TIMEOUT_SEC < 5:
+    REMNA_TOP_IP_JOB_TIMEOUT_SEC = 5
+if REMNA_TOP_IP_JOB_TIMEOUT_SEC > 120:
+    REMNA_TOP_IP_JOB_TIMEOUT_SEC = 120
+try:
+    REMNA_TOP_IP_POLL_SEC = float(cfg.get("KTO_COLLECTOR_REMNA_TOP_IP_POLL_SEC", "0.8") or "0.8")
+except Exception:
+    REMNA_TOP_IP_POLL_SEC = 0.8
+if REMNA_TOP_IP_POLL_SEC < 0.2:
+    REMNA_TOP_IP_POLL_SEC = 0.2
+if REMNA_TOP_IP_POLL_SEC > 5:
+    REMNA_TOP_IP_POLL_SEC = 5
 ASN_LOOKUP_ENABLED = str(cfg.get("KTO_COLLECTOR_ASN_LOOKUP_ENABLED", "1")).lower() in ("1", "yes", "true", "on", "enabled")
 ASN_LOOKUP_URL = str(
     cfg.get(
@@ -1083,6 +1099,283 @@ def remna_api_call(path, method="GET", payload=None):
     with urllib.request.urlopen(req, timeout=REMNA_API_TIMEOUT_SEC, context=context) as resp:
         body = resp.read().decode("utf-8", errors="replace")
     return json.loads(body)
+
+
+def remna_dicts(value):
+    result = []
+
+    def collect(item):
+        if isinstance(item, dict):
+            result.append(item)
+            for child in item.values():
+                collect(child)
+        elif isinstance(item, list):
+            for child in item:
+                collect(child)
+
+    collect(value)
+    return result
+
+
+def remna_list_payload(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("response", "data", "items", "nodes", "users", "result"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = remna_list_payload(value)
+            if nested:
+                return nested
+    return []
+
+
+def remna_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "yes", "true", "on", "enabled")
+
+
+def remna_get_nodes():
+    payload = remna_api_call("/api/nodes")
+    items = remna_list_payload(payload)
+    nodes = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        uuid_value = str(item.get("uuid") or item.get("id") or "").strip()
+        if not uuid_value or uuid_value in seen:
+            continue
+        seen.add(uuid_value)
+        nodes.append(item)
+    return nodes
+
+
+def remna_job_id(payload):
+    for item in remna_dicts(payload):
+        for key in ("jobId", "job_id"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def remna_fetch_users_ips_state(payload):
+    for item in remna_dicts(payload):
+        if "isCompleted" in item or "is_completed" in item or "isFailed" in item or "is_failed" in item:
+            return item
+    return payload if isinstance(payload, dict) else {}
+
+
+def remna_fetch_users_ips_result(payload):
+    state = remna_fetch_users_ips_state(payload)
+    if not isinstance(state, dict):
+        return False, False, None
+    completed = remna_bool(state.get("isCompleted", state.get("is_completed")))
+    failed = remna_bool(state.get("isFailed", state.get("is_failed")))
+    result = state.get("result") if isinstance(state.get("result"), dict) else None
+    if result is None and isinstance(state.get("data"), dict):
+        result = state.get("data")
+    if result is None and "users" in state:
+        result = state
+    return completed, failed, result
+
+
+def remna_user_ip_items(user_item):
+    if not isinstance(user_item, dict):
+        return []
+    ips = user_item.get("ips")
+    if isinstance(ips, list):
+        return ips
+    ip = user_item.get("ip")
+    return [ip] if ip else []
+
+
+def remna_user_item_id(user_item):
+    if not isinstance(user_item, dict):
+        return ""
+    for key in ("userId", "user_id", "id", "uuid", "userUuid", "user_uuid", "username"):
+        value = str(user_item.get(key) or "").strip()
+        if value:
+            return value
+    user = user_item.get("user")
+    if isinstance(user, dict):
+        for key in ("id", "uuid", "username", "email", "tag"):
+            value = str(user.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def remna_ip_item_value(ip_item):
+    if isinstance(ip_item, str):
+        return ip_item
+    if not isinstance(ip_item, dict):
+        return ""
+    for key in ("ip", "clientIp", "client_ip", "address"):
+        value = str(ip_item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def remna_ip_item_last_seen(ip_item, fallback_ts):
+    if not isinstance(ip_item, dict):
+        return fallback_ts
+    for key in ("lastSeen", "last_seen", "seenAt", "seen_at", "connectedAt", "connected_at"):
+        value = ip_item.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            if isinstance(value, (int, float)):
+                return int(value)
+            parsed = parse_iso_ts(value)
+            if parsed > 0:
+                return parsed
+        except Exception:
+            continue
+    return fallback_ts
+
+
+def remna_active_user_ips_from_result(result, node, ts):
+    if not isinstance(result, dict):
+        return []
+    users = result.get("users") if isinstance(result.get("users"), list) else []
+    node_name = str(node.get("name") or result.get("nodeName") or result.get("node_name") or node.get("address") or node.get("uuid") or "-").strip()
+    rows = []
+    for user_item in users:
+        user_id = remna_user_item_id(user_item)
+        if not user_id:
+            continue
+        for ip_item in remna_user_ip_items(user_item):
+            ip = remna_ip_item_value(ip_item)
+            if ip.startswith("::ffff:"):
+                ip = ip.rsplit(":", 1)[-1]
+            if not valid_ipv4(ip):
+                continue
+            rows.append({
+                "user": user_id,
+                "ip": normalize_ip(ip),
+                "node": node_name[:80] or "-",
+                "last_seen": remna_ip_item_last_seen(ip_item, ts),
+            })
+    return rows
+
+
+def remna_fetch_active_user_ips():
+    if not remna_api_enabled():
+        raise RuntimeError("Remna API не настроен")
+    nodes = remna_get_nodes()
+    runnable = []
+    skipped = 0
+    for node in nodes:
+        if remna_bool(node.get("isDisabled")):
+            skipped += 1
+            continue
+        if "isConnected" in node and not remna_bool(node.get("isConnected")):
+            skipped += 1
+            continue
+        uuid_value = str(node.get("uuid") or node.get("id") or "").strip()
+        if not uuid_value:
+            skipped += 1
+            continue
+        runnable.append(node)
+
+    jobs = {}
+    errors = []
+    for node in runnable:
+        uuid_value = str(node.get("uuid") or node.get("id") or "").strip()
+        quoted = urllib.parse.quote(uuid_value, safe="")
+        try:
+            payload = remna_api_call(f"/api/ip-control/fetch-users-ips/{quoted}", method="POST")
+            job_id = remna_job_id(payload)
+            if job_id:
+                jobs[job_id] = node
+            else:
+                errors.append(f"{node.get('name') or uuid_value}: нет jobId")
+        except Exception as exc:
+            errors.append(f"{node.get('name') or uuid_value}: {exc}")
+
+    deadline = time.monotonic() + REMNA_TOP_IP_JOB_TIMEOUT_SEC
+    pending = dict(jobs)
+    rows = []
+    failed = 0
+    while pending and time.monotonic() < deadline:
+        completed_jobs = []
+        for job_id, node in list(pending.items()):
+            quoted_job = urllib.parse.quote(str(job_id), safe="")
+            try:
+                payload = remna_api_call(f"/api/ip-control/fetch-users-ips/result/{quoted_job}")
+                completed, is_failed, result = remna_fetch_users_ips_result(payload)
+                if is_failed:
+                    failed += 1
+                    completed_jobs.append(job_id)
+                    continue
+                if completed:
+                    rows.extend(remna_active_user_ips_from_result(result, node, now_ts()))
+                    completed_jobs.append(job_id)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    continue
+                failed += 1
+                completed_jobs.append(job_id)
+                errors.append(f"{node.get('name') or job_id}: http {exc.code}")
+            except Exception as exc:
+                failed += 1
+                completed_jobs.append(job_id)
+                errors.append(f"{node.get('name') or job_id}: {exc}")
+        for job_id in completed_jobs:
+            pending.pop(job_id, None)
+        if pending:
+            time.sleep(REMNA_TOP_IP_POLL_SEC)
+
+    return {
+        "rows": rows,
+        "nodes_total": len(nodes),
+        "nodes_polled": len(jobs),
+        "nodes_skipped": skipped,
+        "jobs_pending": len(pending),
+        "jobs_failed": failed,
+        "errors": errors[:5],
+    }
+
+
+def remna_top_ip_rows(rows):
+    grouped = {}
+    for row in rows:
+        user = str(row.get("user") or "").strip()
+        ip = str(row.get("ip") or "").strip()
+        if not user or not valid_ipv4(ip):
+            continue
+        entry = grouped.setdefault(user, {"user": user, "ips": {}, "last_seen": 0})
+        ip_entry = entry["ips"].setdefault(ip, {"ip": ip, "nodes": set(), "last_seen": 0})
+        node = str(row.get("node") or "").strip()
+        if node:
+            ip_entry["nodes"].add(node)
+        last_seen = int(row.get("last_seen") or 0)
+        if last_seen > ip_entry["last_seen"]:
+            ip_entry["last_seen"] = last_seen
+        if last_seen > entry["last_seen"]:
+            entry["last_seen"] = last_seen
+    result = []
+    for entry in grouped.values():
+        ips = []
+        for item in entry["ips"].values():
+            ips.append({
+                "ip": item["ip"],
+                "nodes": sorted(item["nodes"], key=natural_sort_key),
+                "last_seen": item["last_seen"],
+            })
+        ips.sort(key=lambda item: (-int(item.get("last_seen") or 0), item.get("ip") or ""))
+        result.append({"user": entry["user"], "ips": ips, "last_seen": entry["last_seen"]})
+    result.sort(key=lambda item: (-len(item["ips"]), -int(item.get("last_seen") or 0), natural_sort_key(item["user"])))
+    return result
 
 
 def remna_user_path(user_id):
@@ -2335,6 +2628,65 @@ def ip_limit_report(query=""):
     return "\n".join(header + [""] + blocks)
 
 
+def top_ip_user_line(index, row):
+    user = str(row.get("user") or "").strip()
+    count = len(row.get("ips") or [])
+    return f"{index}. <b>ID:</b> <code>{html.escape(user)}</code> — <b>IP:</b> <code>{count}</code>"
+
+
+def top_ip_report(limit=20):
+    if not remna_api_enabled():
+        return (
+            "<b>Топ активных IP</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            "<b>Remna API:</b> <code>не настроен</code>"
+        )
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 20
+    if limit < 1:
+        limit = 20
+    if limit > 100:
+        limit = 100
+    try:
+        snapshot = remna_fetch_active_user_ips()
+    except Exception as exc:
+        log(f"top_ip failed: {exc}")
+        return (
+            "<b>Топ активных IP</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Ошибка', str(exc)[:160])}"
+        )
+    rows = remna_top_ip_rows(snapshot.get("rows") or [])
+    shown = rows[:limit]
+    lines = [
+        "<b>Топ активных IP</b>",
+        ALERT_SEPARATOR,
+        detail_line("Ноды", f"{snapshot.get('nodes_polled', 0)}/{snapshot.get('nodes_total', 0)}"),
+        detail_line("Показано", f"{len(shown)}/{len(rows)}"),
+    ]
+    problems = []
+    if int(snapshot.get("nodes_skipped") or 0) > 0:
+        problems.append(f"пропущено нод: {int(snapshot.get('nodes_skipped') or 0)}")
+    if int(snapshot.get("jobs_pending") or 0) > 0:
+        problems.append(f"не успело jobs: {int(snapshot.get('jobs_pending') or 0)}")
+    if int(snapshot.get("jobs_failed") or 0) > 0:
+        problems.append(f"упало jobs: {int(snapshot.get('jobs_failed') or 0)}")
+    if problems:
+        lines.append(detail_line("Замечания", ", ".join(problems)))
+    if not shown:
+        lines += ["", "<blockquote>Активных IP сейчас не нашёл.</blockquote>"]
+    else:
+        lines.append("")
+        for index, row in enumerate(shown, 1):
+            lines.append(top_ip_user_line(index, row))
+    errors = snapshot.get("errors") or []
+    if errors:
+        lines += ["", "<blockquote>" + "\n".join(html.escape(str(item)) for item in errors[:5]) + "</blockquote>"]
+    return "\n".join(lines)
+
+
 def ip_limit_limit_text(limit, source):
     if limit <= 0:
         return "без лимита"
@@ -2987,6 +3339,18 @@ def handle_ip(text):
     send_message(ip_limit_report(query))
 
 
+def handle_top_ip(text):
+    parts = text.split()
+    limit = 20
+    if len(parts) > 1:
+        value = parts[1].strip()
+        if not re.fullmatch(r"\d{1,3}", value):
+            send_message("<b>Пример:</b> <code>/top_ip 50</code>")
+            return
+        limit = int(value)
+    send_message(top_ip_report(limit))
+
+
 def handle_ip_limit(text):
     parts = text.split(maxsplit=1)
     query = parts[1].strip() if len(parts) > 1 else ""
@@ -3271,6 +3635,8 @@ def bot_loop():
                     handle_sni_command(text, "delete_sni", chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip":
                     handle_ip(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/top_ip":
+                    handle_top_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_limit":
                     handle_ip_limit(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_enable":
