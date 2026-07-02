@@ -15,7 +15,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v181"
+COLLECTOR_BUILD = "v182"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -290,6 +290,33 @@ def normalize_ip(value):
     return ".".join(str(int(part)) for part in value.split("."))
 
 
+def normalize_haproxy_target(value):
+    value = re.sub(r"\s+", "", str(value or ""))
+    if not value:
+        raise ValueError("bad haproxy target")
+    if ":" in value:
+        parts = value.rsplit(":", 1)
+        if len(parts) != 2:
+            raise ValueError("bad haproxy target")
+        ip, port_text = parts
+    else:
+        ip, port_text = value, "443"
+    ip = normalize_ip(ip)
+    if not port_text.isdigit():
+        raise ValueError("bad haproxy port")
+    port = int(port_text)
+    if port < 1 or port > 65535:
+        raise ValueError("bad haproxy port")
+    return f"{ip}:{port}"
+
+
+def normalize_haproxy_target_or_empty(value):
+    try:
+        return normalize_haproxy_target(value)
+    except Exception:
+        return ""
+
+
 def load_ssh_allowed_ips():
     global SSH_ALLOWED_IPS
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -379,12 +406,17 @@ def load_sni_state():
             if not key or not isinstance(item, dict):
                 continue
             values = normalize_sni_list(item.get("values"))
-            if values:
-                clean_nodes[key] = {
+            target = normalize_haproxy_target_or_empty(item.get("target") or item.get("haproxy_target"))
+            if values or target:
+                clean_item = {
                     "name": str(item.get("name") or key).strip()[:120],
-                    "values": values,
                     "updated_at": int(item.get("updated_at") or 0),
                 }
+                if values:
+                    clean_item["values"] = values
+                if target:
+                    clean_item["target"] = target
+                clean_nodes[key] = clean_item
         SNI_STATE = {"nodes": clean_nodes, "pending": pending}
     except Exception:
         SNI_STATE = {"nodes": {}, "pending": {}}
@@ -1842,12 +1874,7 @@ def nodes_day_traffic(nodes):
 
 def status_summary(nodes, ts, expected_total=None, filtered=False):
     expected_total = max(int(expected_total or EXPECTED_NODES), len(nodes), 1)
-    live_count = 0
-    for node in nodes:
-        last_seen = int(node.get("last_seen", 0) or 0)
-        age = ts - last_seen
-        if age <= STALE_SEC:
-            live_count += 1
+    live_count = live_node_count(nodes, ts)
     dead_items, falls, falls_nodes, total_downtime = downtime_totals(nodes, ts, filtered=filtered)
 
     lines = [
@@ -1902,6 +1929,27 @@ def node_is_wl(node):
     return False
 
 
+def node_is_exact_bypass(node):
+    values = [
+        node.get("name") if isinstance(node, dict) else "",
+        node.get("id") if isinstance(node, dict) else "",
+        node.get("hostname") if isinstance(node, dict) else "",
+    ]
+    for value in values:
+        if re.fullmatch(r"обход\d+", canonical_node_key(value) or ""):
+            return True
+    return False
+
+
+def live_node_count(nodes, ts):
+    live_count = 0
+    for node in nodes:
+        last_seen = int(node.get("last_seen", 0) or 0)
+        if ts - last_seen <= STALE_SEC:
+            live_count += 1
+    return live_count
+
+
 def aggregate_message(scope="all"):
     with LOCK:
         all_nodes = dedupe_nodes(NODES.values())
@@ -1910,9 +1958,12 @@ def aggregate_message(scope="all"):
     expected_total = None
     filtered = False
     compact = False
+    other_nodes = []
     title = "Статистика обходов"
     if scope in ("wl", "wl_full"):
-        nodes = [node for node in all_nodes if node_is_wl(node)]
+        wl_nodes = [node for node in all_nodes if node_is_wl(node)]
+        nodes = [node for node in wl_nodes if node_is_exact_bypass(node)]
+        other_nodes = [node for node in wl_nodes if not node_is_exact_bypass(node)]
         expected_total = max(EXPECTED_NODES, len(nodes), 1)
         filtered = True
         compact = scope == "wl"
@@ -1924,9 +1975,10 @@ def aggregate_message(scope="all"):
     else:
         nodes = all_nodes
         expected_total = max(EXPECTED_NODES, len(nodes), 1)
-    if not nodes:
+    if not nodes and not other_nodes:
         return f"<b>{title}</b>\n\nНет данных от машин."
     nodes.sort(key=lambda item: natural_sort_key(item.get("name") or item.get("id") or ""))
+    other_nodes.sort(key=lambda item: natural_sort_key(item.get("name") or item.get("id") or ""))
     parts = [f"<b>{title}</b>"]
     for node in nodes:
         age = ts - int(node.get("last_seen", 0) or 0)
@@ -1934,6 +1986,14 @@ def aggregate_message(scope="all"):
         parts.append("")
         parts.append(node_message(node, status, compact=compact))
     parts.append(status_summary(nodes, ts, expected_total=expected_total, filtered=filtered))
+    if other_nodes:
+        parts.append("")
+        parts.append(f"<blockquote><b>Другие: {live_node_count(other_nodes, ts)}/{len(other_nodes)}</b></blockquote>")
+        for node in other_nodes:
+            age = ts - int(node.get("last_seen", 0) or 0)
+            status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
+            parts.append("")
+            parts.append(node_message(node, status, compact=compact))
     return "\n".join(parts)
 
 
@@ -2002,10 +2062,32 @@ def sni_override_for_node(node):
     return None
 
 
+def haproxy_target_override_for_node(node):
+    aliases = sni_node_aliases(node)
+    if not aliases:
+        return None
+    with LOCK:
+        nodes = SNI_STATE.setdefault("nodes", {})
+        for key in aliases:
+            item = nodes.get(key)
+            if not isinstance(item, dict):
+                continue
+            target = normalize_haproxy_target_or_empty(item.get("target") or item.get("haproxy_target"))
+            if target:
+                return target
+    return None
+
+
 def reported_sni_for_node(node):
     if not isinstance(node, dict):
         return []
     return normalize_sni_list(node.get("haproxy_allowed_sni"))
+
+
+def reported_haproxy_target_for_node(node):
+    if not isinstance(node, dict):
+        return ""
+    return normalize_haproxy_target_or_empty(node.get("haproxy_backend_target"))
 
 
 def effective_sni_for_node(node):
@@ -2013,6 +2095,13 @@ def effective_sni_for_node(node):
     if override is not None:
         return override, "telegram"
     return reported_sni_for_node(node), "node"
+
+
+def effective_haproxy_target_for_node(node):
+    override = haproxy_target_override_for_node(node)
+    if override:
+        return override, "telegram"
+    return reported_haproxy_target_for_node(node), "node"
 
 
 def sni_list_text(values):
@@ -2030,25 +2119,53 @@ def set_sni_override_for_node(node, values):
     if not values:
         raise ValueError("empty sni list")
     with LOCK:
-        SNI_STATE.setdefault("nodes", {})[key] = {
+        nodes = SNI_STATE.setdefault("nodes", {})
+        existing = nodes.get(key) if isinstance(nodes.get(key), dict) else {}
+        target = normalize_haproxy_target_or_empty(existing.get("target") or existing.get("haproxy_target"))
+        item = {
             "name": node_display_name(node, key)[:120],
             "values": values,
             "updated_at": now_ts(),
         }
+        if target:
+            item["target"] = target
+        nodes[key] = item
         save_sni_state()
     return values
 
 
-def set_pending_sni(chat_id, from_id, action, node):
+def set_haproxy_override_for_node(node, target, values):
+    key = node_canonical_key(node)
+    if not key:
+        raise ValueError("empty node key")
+    target = normalize_haproxy_target(target)
+    values = normalize_sni_list(values)
+    if not values:
+        raise ValueError("empty sni list")
+    with LOCK:
+        SNI_STATE.setdefault("nodes", {})[key] = {
+            "name": node_display_name(node, key)[:120],
+            "target": target,
+            "values": values,
+            "updated_at": now_ts(),
+        }
+        save_sni_state()
+    return target, values
+
+
+def set_pending_sni(chat_id, from_id, action, node, extra=None):
     key = pending_key(chat_id, from_id)
     node_key = node_canonical_key(node)
     with LOCK:
-        SNI_STATE.setdefault("pending", {})[key] = {
+        item = {
             "action": action,
             "node_key": node_key,
             "node_name": node_display_name(node, node_key),
             "created_at": now_ts(),
         }
+        if isinstance(extra, dict):
+            item.update(extra)
+        SNI_STATE.setdefault("pending", {})[key] = item
         save_sni_state()
 
 
@@ -2093,6 +2210,47 @@ def sni_command_intro(command, node, values, source):
     return "\n".join(lines)
 
 
+def haproxy_command_intro(node, target, target_source, values, sni_source):
+    name = node_display_name(node)
+    target_source_text = "Telegram override" if target_source == "telegram" else "последний HAProxy config"
+    sni_source_text = "Telegram override" if sni_source == "telegram" else "последний HAProxy config"
+    lines = [
+        "<b>HAProxy</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", name),
+        detail_line("Backend", target or "-"),
+        detail_line("Источник backend", target_source_text),
+        detail_line("Источник SNI", sni_source_text),
+        "",
+        "<b>Сейчас разрешены:</b>",
+        sni_list_text(values),
+        "",
+        "Напиши backend ответом: <code>1.2.3.4</code> или <code>1.2.3.4:8443</code>",
+        "Отмена: <code>/cancel</code>",
+    ]
+    return "\n".join(lines)
+
+
+def handle_haproxy_command(text, chat_id, from_id):
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        send_message("<b>Пример:</b> <code>/haproxy Обход #8</code>")
+        return
+    query = parts[1].strip()
+    node = find_node(query)
+    if node is None:
+        send_message(
+            "<b>Не нашёл такую машину</b>\n\n"
+            f"{detail_line('Запрос', query)}\n"
+            f"Сначала проверь название через <code>/stats</code>."
+        )
+        return
+    values, sni_source = effective_sni_for_node(node)
+    target, target_source = effective_haproxy_target_for_node(node)
+    set_pending_sni(chat_id, from_id, "haproxy_target", node)
+    send_message(haproxy_command_intro(node, target, target_source, values, sni_source))
+
+
 def handle_sni_command(text, action, chat_id, from_id):
     parts = text.split(maxsplit=1)
     command = "/allow_sni" if action == "allow_sni" else "/delete_sni"
@@ -2121,19 +2279,58 @@ def handle_sni_command(text, action, chat_id, from_id):
 
 def handle_pending_sni(chat_id, from_id, text):
     pending = peek_pending_sni(chat_id, from_id)
-    if not pending or pending.get("action") not in ("allow_sni", "delete_sni"):
+    if not pending or pending.get("action") not in ("allow_sni", "delete_sni", "haproxy_target", "haproxy_sni"):
         return False
     node = find_node(pending.get("node_key")) or find_node(pending.get("node_name"))
     if node is None:
         pop_pending_sni(chat_id, from_id)
         send_message("<b>Обход больше не найден.</b>")
         return True
+    action = pending.get("action")
+    if action == "haproxy_target":
+        raw_target = text.split()[0] if str(text or "").split() else ""
+        try:
+            target = normalize_haproxy_target(raw_target)
+        except Exception:
+            send_message("<b>Не понял backend.</b>\n\nПример: <code>1.2.3.4</code> или <code>1.2.3.4:8443</code>")
+            return True
+        current, _ = effective_sni_for_node(node)
+        set_pending_sni(chat_id, from_id, "haproxy_sni", node, {"target": target})
+        send_message(
+            "<b>Backend принят</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n"
+            f"{detail_line('Backend', target)}\n\n"
+            "<b>Сейчас разрешены:</b>\n"
+            f"{sni_list_text(current)}\n\n"
+            "Теперь напиши SNI для allow-list.\n"
+            "Пример: <code>example.com</code>"
+        )
+        return True
     try:
         sni = normalize_sni(text.split()[0] if str(text or "").split() else "")
     except Exception:
         send_message("<b>Не понял SNI.</b>\n\nПример: <code>example.com</code> или <code>*.example.com</code>")
         return True
-    action = pending.get("action")
+    if action == "haproxy_sni":
+        target = normalize_haproxy_target_or_empty(pending.get("target"))
+        if not target:
+            pop_pending_sni(chat_id, from_id)
+            send_message("<b>Backend потерялся.</b>\n\nЗапусти <code>/haproxy</code> заново.")
+            return True
+        target, updated = set_haproxy_override_for_node(node, target, [sni])
+        pop_pending_sni(chat_id, from_id)
+        send_message(
+            "<b>HAProxy обновление сохранено</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n"
+            f"{detail_line('Backend', target)}\n"
+            f"{detail_line('SNI', sni)}\n\n"
+            "<b>Теперь разрешены:</b>\n"
+            f"{sni_list_text(updated)}\n"
+            "<i>Машина применит HAProxy config при ближайшем push.</i>"
+        )
+        return True
     current, _ = effective_sni_for_node(node)
     if action == "allow_sni":
         updated = normalize_sni_list(current + [sni])
@@ -3189,6 +3386,7 @@ def update_node(payload, remote_ip=""):
         "cpu_percent": float(payload.get("cpu_percent") or 0),
         "metrics_ok": bool(payload.get("metrics_ok")),
         "haproxy_allowed_sni": normalize_sni_list(payload.get("haproxy_allowed_sni")),
+        "haproxy_backend_target": normalize_haproxy_target_or_empty(payload.get("haproxy_backend_target")),
         "scan_wrong_sni_total": int(payload.get("scan_wrong_sni_total") or 0),
         "scan_wrong_sni_sources": int(payload.get("scan_wrong_sni_sources") or 0),
         "scan_wrong_sni_top": normalize_scan_top(payload.get("scan_wrong_sni_top")),
@@ -3294,6 +3492,9 @@ class Handler(BaseHTTPRequestHandler):
             sni_override = sni_override_for_node(node)
             if sni_override is not None:
                 response["allowed_sni"] = sni_override
+            haproxy_target = haproxy_target_override_for_node(node)
+            if haproxy_target:
+                response["haproxy_target"] = haproxy_target
             self.send_json(200, response)
         except Exception as exc:
             self.send_json(400, {"ok": False, "error": str(exc)})
@@ -3837,6 +4038,8 @@ def bot_loop():
                     handle_delete(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/add_ip":
                     handle_add_ip(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/haproxy":
+                    handle_haproxy_command(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/allow_sni":
                     handle_sni_command(text, "allow_sni", chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete_sni":

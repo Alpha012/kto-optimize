@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v181"
+SCRIPT_BUILD="v182"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -1092,6 +1092,23 @@ validate_ipv4() {
     done
 }
 
+normalize_haproxy_target() {
+    local raw="${1:-}" ip port
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    if [[ "$raw" == *:* ]]; then
+        ip="${raw%%:*}"
+        port="${raw##*:}"
+    else
+        ip="$raw"
+        port="443"
+    fi
+    validate_ipv4 "$ip" || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    port=$((10#$port))
+    (( port >= 1 && port <= 65535 )) || return 1
+    printf '%s:%d\n' "$ip" "$port"
+}
+
 current_ssh_client_ip() {
     local ip="${SSH_CLIENT:-}"
     ip="${ip%% *}"
@@ -1138,6 +1155,20 @@ ask_ipv4() {
             return 0
         fi
         fail "Некорректный IPv4. Пример: 1.2.3.4"
+    done
+}
+
+ask_haproxy_target() {
+    local prompt="${1:-Введите выходной IP или IP:порт}"
+    local value target
+    while true; do
+        printf '%s: ' "$prompt" >&2
+        read -r value
+        if target="$(normalize_haproxy_target "$value")"; then
+            echo "$target"
+            return 0
+        fi
+        fail "Некорректный target. Пример: 1.2.3.4 или 1.2.3.4:8443"
     done
 }
 
@@ -3329,6 +3360,17 @@ reload_haproxy_gracefully() {
     must "Запуск HAProxy" "${SUDO[@]}" systemctl restart haproxy
 }
 
+extract_haproxy_backend_target() {
+    local target
+    target="$("${SUDO[@]}" awk '
+        $1 == "server" && $2 == "xray1" {
+            print $3
+            exit
+        }
+    ' /etc/haproxy/haproxy.cfg 2>/dev/null || true)"
+    normalize_haproxy_target "$target" 2>/dev/null || true
+}
+
 extract_haproxy_backend_ip() {
     "${SUDO[@]}" awk '
         $1 == "server" && $2 == "xray1" {
@@ -3356,9 +3398,14 @@ extract_haproxy_allowed_sni() {
 }
 
 apply_haproxy_config() {
-    local backend_ip="$1"
+    local backend_target="$1"
     local allowed_sni="$2"
     local haproxy_threads
+
+    backend_target="$(normalize_haproxy_target "$backend_target")" || {
+        fail "Некорректный HAProxy target. Пример: 1.2.3.4 или 1.2.3.4:8443"
+        return 1
+    }
 
     haproxy_threads="$(cpu_count)"
     (( haproxy_threads > 32 )) && haproxy_threads=32
@@ -3423,7 +3470,7 @@ backend vless_pool
     mode tcp
     balance leastconn
 
-    server xray1 ${backend_ip}:443 check weight 10
+    server xray1 ${backend_target} check weight 10
 EOF
 
     if ! "${SUDO[@]}" haproxy -c -f /etc/haproxy/haproxy.cfg >> "$LOG_FILE" 2>&1; then
@@ -3435,7 +3482,7 @@ EOF
     cmd "${SUDO[@]}" systemctl enable haproxy || true
     reload_haproxy_gracefully
 
-    ok "HAProxy установлен: 443 -> ${backend_ip}:443"
+    ok "HAProxy установлен: 443 -> ${backend_target}"
     ok "Разрешенный SNI: ${allowed_sni}"
 }
 
@@ -3464,12 +3511,12 @@ configure_haproxy_backend() {
     header
     require_whitelist_mode
     need_root
-    local backend_ip allowed_sni
-    backend_ip="$(ask_ipv4 "Введите выходной IP")"
+    local backend_target allowed_sni
+    backend_target="$(ask_haproxy_target "Введите выходной IP или IP:порт")"
     allowed_sni="$(ask_domain "Введите разрешенный SNI")"
 
     ensure_haproxy_package
-    apply_haproxy_config "$backend_ip" "$allowed_sni"
+    apply_haproxy_config "$backend_target" "$allowed_sni"
     harden_whitelist_haproxy_firewall
 }
 
@@ -3481,18 +3528,18 @@ update_haproxy_existing_config() {
     header
     require_whitelist_mode
     need_root
-    local backend_ip allowed_sni
+    local backend_target allowed_sni
 
     if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
         fail "HAProxy config не найден. Сначала запусти обычный haproxy."
         return 1
     fi
 
-    backend_ip="$(extract_haproxy_backend_ip)"
+    backend_target="$(extract_haproxy_backend_target)"
     allowed_sni="$(extract_haproxy_allowed_sni)"
 
-    if ! validate_ipv4 "$backend_ip"; then
-        fail "Не смог найти выходной IP в текущем HAProxy config."
+    if [[ -z "$backend_target" ]]; then
+        fail "Не смог найти выходной IP:порт в текущем HAProxy config."
         return 1
     fi
     if [[ -z "$allowed_sni" ]]; then
@@ -3501,7 +3548,7 @@ update_haproxy_existing_config() {
     fi
 
     ensure_haproxy_package
-    apply_haproxy_config "$backend_ip" "$allowed_sni"
+    apply_haproxy_config "$backend_target" "$allowed_sni"
     harden_whitelist_haproxy_firewall
 
     ok "HAProxy обновлён без повторного ввода"

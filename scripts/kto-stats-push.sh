@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v181"
+PUSH_BUILD="v182"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -58,6 +58,7 @@ scan_wrong_sni_sources=0
 scan_wrong_sni_top='[]'
 scan_wrong_sni_names='[]'
 haproxy_allowed_sni='[]'
+haproxy_backend_target=''
 ip_limit_events='[]'
 ip_limit_events_count=0
 
@@ -145,6 +146,23 @@ validate_ipv4() {
     for octet in "${octets[@]}"; do
         (( 10#$octet >= 0 && 10#$octet <= 255 )) || return 1
     done
+}
+
+normalize_haproxy_target() {
+    local raw="${1:-}" ip port
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    if [[ "$raw" == *:* ]]; then
+        ip="${raw%%:*}"
+        port="${raw##*:}"
+    else
+        ip="$raw"
+        port="443"
+    fi
+    validate_ipv4 "$ip" || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    port=$((10#$port))
+    (( port >= 1 && port <= 65535 )) || return 1
+    printf '%s:%d\n' "$ip" "$port"
 }
 
 detect_ssh_port() {
@@ -236,54 +254,123 @@ read_haproxy_allowed_sni() {
     done <<< "$values" | awk '!seen[$0]++' | jq -R -s '[split("\n")[] | select(length > 0)]' 2>/dev/null || echo '[]')"
 }
 
-apply_collector_allowed_sni() {
+read_haproxy_backend_target() {
+    local target
+
+    haproxy_backend_target=''
+    [[ -r /etc/haproxy/haproxy.cfg ]] || return 0
+
+    target="$(awk '
+        $1 == "server" && $2 == "xray1" {
+            print $3
+            exit
+        }
+    ' /etc/haproxy/haproxy.cfg 2>/dev/null || true)"
+    haproxy_backend_target="$(normalize_haproxy_target "$target" 2>/dev/null || true)"
+}
+
+apply_collector_haproxy_config() {
     local response="$1"
-    local desired_file tmp_cfg desired_line current_line applied=0
+    local desired_file tmp_cfg next_cfg desired_sni_line current_sni_line
+    local desired_target current_target current_target_raw applied=0 changed=0 has_sni=0 has_target=0
 
     command -v jq >/dev/null 2>&1 || return 0
     command -v haproxy >/dev/null 2>&1 || return 0
     [[ -r /etc/haproxy/haproxy.cfg && -w /etc/haproxy/haproxy.cfg ]] || return 0
-    printf '%s' "$response" | jq -e 'has("allowed_sni") and (.allowed_sni | type == "array")' >/dev/null 2>&1 || return 0
 
     desired_file="$(mktemp)"
     tmp_cfg="$(mktemp)"
-    printf '%s' "$response" | jq -r '.allowed_sni[]? // empty' 2>/dev/null | while read -r value; do
-        [[ -n "$value" ]] || continue
-        normalize_sni_value "$value" || true
-    done | awk '!seen[$0]++' > "$desired_file"
+    next_cfg="$(mktemp)"
 
-    if [[ ! -s "$desired_file" ]]; then
-        rm -f "$desired_file" "$tmp_cfg"
+    if ! cp /etc/haproxy/haproxy.cfg "$tmp_cfg" 2>/dev/null; then
+        rm -f "$desired_file" "$tmp_cfg" "$next_cfg"
         return 0
     fi
 
-    desired_line="    acl allowed_sni req.ssl_sni -i $(paste -sd ' ' "$desired_file")"
-    current_line="$(awk '
-        $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
-            print
-            exit
-        }
-    ' /etc/haproxy/haproxy.cfg 2>/dev/null || true)"
-    if [[ "$current_line" == "$desired_line" ]]; then
-        rm -f "$desired_file" "$tmp_cfg"
+    desired_target="$(printf '%s' "$response" | jq -r '.haproxy_target // empty' 2>/dev/null || true)"
+    if [[ -n "$desired_target" ]]; then
+        if desired_target="$(normalize_haproxy_target "$desired_target" 2>/dev/null)"; then
+            current_target_raw="$(awk '
+                $1 == "server" && $2 == "xray1" {
+                    print $3
+                    exit
+                }
+            ' "$tmp_cfg" 2>/dev/null || true)"
+            current_target="$(normalize_haproxy_target "$current_target_raw" 2>/dev/null || true)"
+            if [[ -n "$current_target_raw" && "$current_target" != "$desired_target" ]]; then
+                if awk -v target="$desired_target" '
+                    $1 == "server" && $2 == "xray1" && replaced == 0 {
+                        print "    server xray1 " target " check weight 10"
+                        replaced = 1
+                        next
+                    }
+                    { print }
+                    END { if (replaced == 0) exit 2 }
+                ' "$tmp_cfg" > "$next_cfg"; then
+                    mv "$next_cfg" "$tmp_cfg"
+                    changed=1
+                    has_target=1
+                else
+                    rm -f "$desired_file" "$tmp_cfg" "$next_cfg"
+                    return 0
+                fi
+            elif [[ -z "$current_target_raw" ]]; then
+                echo "push ${PUSH_BUILD}: haproxy target skipped, xray1 backend not found" >&2
+            fi
+        else
+            echo "push ${PUSH_BUILD}: haproxy target skipped, bad target from collector" >&2
+            desired_target=""
+        fi
+    fi
+
+    if printf '%s' "$response" | jq -e 'has("allowed_sni") and (.allowed_sni | type == "array")' >/dev/null 2>&1; then
+        printf '%s' "$response" | jq -r '.allowed_sni[]? // empty' 2>/dev/null | while read -r value; do
+            [[ -n "$value" ]] || continue
+            normalize_sni_value "$value" || true
+        done | awk '!seen[$0]++' > "$desired_file"
+
+        if [[ -s "$desired_file" ]]; then
+            has_sni=1
+            desired_sni_line="    acl allowed_sni req.ssl_sni -i $(paste -sd ' ' "$desired_file")"
+            current_sni_line="$(awk '
+                $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+                    print
+                    exit
+                }
+            ' "$tmp_cfg" 2>/dev/null || true)"
+            if [[ "$current_sni_line" != "$desired_sni_line" ]]; then
+                if awk -v replacement="$desired_sni_line" '
+                    $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" && replaced == 0 {
+                        print replacement
+                        replaced = 1
+                        next
+                    }
+                    { print }
+                    END { if (replaced == 0) exit 2 }
+                ' "$tmp_cfg" > "$next_cfg"; then
+                    mv "$next_cfg" "$tmp_cfg"
+                    changed=1
+                else
+                    rm -f "$desired_file" "$tmp_cfg" "$next_cfg"
+                    return 0
+                fi
+            fi
+        elif [[ -n "$desired_target" ]]; then
+            :
+        else
+            rm -f "$desired_file" "$tmp_cfg" "$next_cfg"
+            return 0
+        fi
+    fi
+
+    if (( changed == 0 )); then
+        rm -f "$desired_file" "$tmp_cfg" "$next_cfg"
         return 0
     fi
 
-    if ! awk -v replacement="$desired_line" '
-        $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" && replaced == 0 {
-            print replacement
-            replaced = 1
-            next
-        }
-        { print }
-        END { if (replaced == 0) exit 2 }
-    ' /etc/haproxy/haproxy.cfg > "$tmp_cfg"; then
-        rm -f "$desired_file" "$tmp_cfg"
-        return 0
-    fi
     if ! haproxy -c -f "$tmp_cfg" >/dev/null 2>&1; then
-        echo "push ${PUSH_BUILD}: allowed_sni skipped, haproxy config check failed" >&2
-        rm -f "$desired_file" "$tmp_cfg"
+        echo "push ${PUSH_BUILD}: haproxy config skipped, config check failed" >&2
+        rm -f "$desired_file" "$tmp_cfg" "$next_cfg"
         return 0
     fi
     if cp "$tmp_cfg" /etc/haproxy/haproxy.cfg 2>/dev/null; then
@@ -291,10 +378,16 @@ apply_collector_allowed_sni() {
             applied=1
         fi
     fi
-    rm -f "$desired_file" "$tmp_cfg"
+    rm -f "$desired_file" "$tmp_cfg" "$next_cfg"
 
     if (( applied == 1 )); then
-        echo "push ${PUSH_BUILD}: allowed_sni applied"
+        if (( has_sni == 1 && has_target == 1 )); then
+            echo "push ${PUSH_BUILD}: haproxy target+sni applied"
+        elif (( has_target == 1 )); then
+            echo "push ${PUSH_BUILD}: haproxy target applied"
+        else
+            echo "push ${PUSH_BUILD}: allowed_sni applied"
+        fi
     fi
 }
 
@@ -746,6 +839,7 @@ if (( ram_total > 0 )); then
 fi
 read_haproxy_scan_stats
 read_haproxy_allowed_sni
+read_haproxy_backend_target
 read_ip_limit_events
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -814,6 +908,7 @@ if ! payload="$(jq -n \
     --argjson scan_wrong_sni_top "$scan_wrong_sni_top" \
     --argjson scan_wrong_sni_names "$scan_wrong_sni_names" \
     --argjson haproxy_allowed_sni "$haproxy_allowed_sni" \
+    --arg haproxy_backend_target "$haproxy_backend_target" \
     --argjson ip_limit_events "$ip_limit_events" \
     --argjson updated_at "$updated_at" \
     '{
@@ -841,6 +936,7 @@ if ! payload="$(jq -n \
         scan_wrong_sni_top: $scan_wrong_sni_top,
         scan_wrong_sni_names: $scan_wrong_sni_names,
         haproxy_allowed_sni: $haproxy_allowed_sni,
+        haproxy_backend_target: $haproxy_backend_target,
         ip_limit_events: $ip_limit_events,
         error: $error,
         updated_at: $updated_at
@@ -870,7 +966,7 @@ if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
         ip_limit_extra=" ip_events=${ip_limit_events_count}"
     fi
     apply_collector_ssh_ips "$response"
-    apply_collector_allowed_sni "$response"
+    apply_collector_haproxy_config "$response"
     apply_collector_ip_limit_config "$response"
     apply_ip_limit_blocks "$response"
     echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}% uptime=${uptime_sec}s${ip_limit_extra}"
