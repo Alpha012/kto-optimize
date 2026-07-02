@@ -3,9 +3,11 @@ import html
 import json
 import os
 import re
+import shlex
 import socket
 import ssl
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -15,7 +17,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v182"
+COLLECTOR_BUILD = "v183"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -38,6 +40,7 @@ def load_config(path):
 
 
 cfg = load_config(CONFIG)
+RAW_BASE = cfg.get("KTO_RAW_BASE", "https://raw.githubusercontent.com/Alpha012/kto-optimize/main").rstrip("/")
 LISTEN_HOST = cfg.get("KTO_COLLECTOR_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(cfg.get("KTO_COLLECTOR_LISTEN_PORT", "1337"))
 SECRET = cfg.get("KTO_COLLECTOR_SECRET", "")
@@ -191,11 +194,13 @@ SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
 SNI_ALLOW_FILE = os.path.join(STATE_DIR, "sni_allow.json")
 IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
 IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
+UPDATE_STATE_FILE = os.path.join(STATE_DIR, "update_state.json")
 LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
 SNI_STATE = {"nodes": {}, "pending": {}}
+UPDATE_STATE = {"current": {}, "results": {}, "local": {}}
 IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
 ALERT_SEPARATOR = "➖" * 9
@@ -424,6 +429,158 @@ def load_sni_state():
 
 def save_sni_state():
     atomic_write(SNI_ALLOW_FILE, json.dumps(SNI_STATE, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def clean_update_result(item):
+    if not isinstance(item, dict):
+        return {}
+    job_id = str(item.get("id") or item.get("job_id") or "").strip()[:80]
+    status = str(item.get("status") or "").strip().lower()[:24]
+    if status not in ("queued", "running", "ok", "error"):
+        status = ""
+    try:
+        updated_at = int(item.get("updated_at") or 0)
+    except Exception:
+        updated_at = 0
+    return {
+        "id": job_id,
+        "status": status,
+        "build": str(item.get("build") or "").strip()[:40],
+        "message": str(item.get("message") or "").strip()[:240],
+        "updated_at": updated_at,
+    }
+
+
+def load_update_state():
+    global UPDATE_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(UPDATE_STATE_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if not isinstance(loaded, dict):
+            raise ValueError("bad update state")
+        current = loaded.get("current") if isinstance(loaded.get("current"), dict) else {}
+        current_id = str(current.get("id") or "").strip()[:80]
+        clean_current = {}
+        if current_id:
+            clean_current = {
+                "id": current_id,
+                "created_at": int(current.get("created_at") or 0),
+                "requested_by": str(current.get("requested_by") or "").strip()[:80],
+                "raw_base": str(current.get("raw_base") or RAW_BASE).strip().rstrip("/")[:300],
+            }
+        results = {}
+        raw_results = loaded.get("results") if isinstance(loaded.get("results"), dict) else {}
+        for key, item in raw_results.items():
+            key = str(key or "").strip()[:120]
+            result = clean_update_result(item)
+            if key and result.get("id") and result.get("status"):
+                result["node"] = str(item.get("node") or key).strip()[:120] if isinstance(item, dict) else key
+                results[key] = result
+        local = clean_update_result(loaded.get("local"))
+        UPDATE_STATE = {"current": clean_current, "results": results, "local": local}
+    except Exception:
+        UPDATE_STATE = {"current": {}, "results": {}, "local": {}}
+
+
+def save_update_state():
+    atomic_write(UPDATE_STATE_FILE, json.dumps(UPDATE_STATE, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def queue_update_task(requested_by):
+    ts = now_ts()
+    job = {
+        "id": f"{ts}-{os.getpid()}",
+        "created_at": ts,
+        "requested_by": str(requested_by or "").strip()[:80],
+        "raw_base": RAW_BASE,
+    }
+    with LOCK:
+        UPDATE_STATE["current"] = job
+        UPDATE_STATE["results"] = {}
+        UPDATE_STATE["local"] = {"id": job["id"], "status": "queued", "build": COLLECTOR_BUILD, "message": "", "updated_at": ts}
+        save_update_state()
+    return dict(job)
+
+
+def update_task_for_node(node):
+    node_key = node_canonical_key(node)
+    if not node_key:
+        return None
+    with LOCK:
+        current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
+        job_id = str(current.get("id") or "")
+        if not job_id:
+            return None
+        result = UPDATE_STATE.setdefault("results", {}).get(node_key)
+        if isinstance(result, dict) and result.get("id") == job_id and result.get("status") in ("ok", "error"):
+            return None
+        return {
+            "id": job_id,
+            "action": "push_update",
+            "raw_base": str(current.get("raw_base") or RAW_BASE).rstrip("/"),
+            "collector_build": COLLECTOR_BUILD,
+        }
+
+
+def process_update_result(raw, node, ts):
+    result = clean_update_result(raw)
+    if not result.get("id") or not result.get("status"):
+        return
+    node_key = node_canonical_key(node)
+    if not node_key:
+        return
+    result["node"] = node_display_name(node, node_key)[:120]
+    if not result.get("updated_at"):
+        result["updated_at"] = ts
+    with LOCK:
+        UPDATE_STATE.setdefault("results", {})[node_key] = result
+        save_update_state()
+
+
+def set_local_update_result(job_id, status, message=""):
+    with LOCK:
+        UPDATE_STATE["local"] = {
+            "id": str(job_id or "")[:80],
+            "status": str(status or "")[:24],
+            "build": COLLECTOR_BUILD,
+            "message": str(message or "")[:240],
+            "updated_at": now_ts(),
+        }
+        save_update_state()
+
+
+def local_collector_update(job):
+    job_id = str(job.get("id") or "")
+    raw_base = str(job.get("raw_base") or RAW_BASE).rstrip("/")
+    set_local_update_result(job_id, "running", "collector update started")
+    script = f"""
+set -eu
+tmp="$(mktemp)"
+cleanup() {{ rm -f "$tmp"; }}
+trap cleanup EXIT
+curl -fsSL {shlex.quote(raw_base)}/scripts/kto-stats-collector.py -o "$tmp"
+python3 -m py_compile "$tmp"
+install -m 0755 "$tmp" /usr/local/bin/kto-stats-collector
+(sleep 1; systemctl restart kto-stats-collector.service) >/dev/null 2>&1 &
+"""
+    try:
+        completed = subprocess.run(["/bin/sh", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90)
+        if completed.returncode == 0:
+            set_local_update_result(job_id, "ok", "collector updated, restart scheduled")
+            log(f"local collector update queued restart for job={job_id}")
+        else:
+            message = (completed.stderr or completed.stdout or f"rc={completed.returncode}").replace("\n", " ")[:220]
+            set_local_update_result(job_id, "error", message)
+            log(f"local collector update failed job={job_id}: {message}")
+    except Exception as exc:
+        message = str(exc).replace("\n", " ")[:220]
+        set_local_update_result(job_id, "error", message)
+        log(f"local collector update exception job={job_id}: {message}")
+
+
+def start_local_collector_update(job):
+    threading.Thread(target=local_collector_update, args=(dict(job),), daemon=True).start()
 
 
 def ip_limit_db():
@@ -3427,6 +3584,7 @@ def update_node(payload, remote_ip=""):
     if scan_alert_node:
         log(f"scan spike: {node_id} delta={scan_alert_delta}")
         alert_scan_spike(scan_alert_node, scan_alert_delta)
+    process_update_result(payload.get("update_result"), record, current)
     process_ip_limit_events(payload.get("ip_limit_events"), record.get("name") or node_id, current)
     return record
 
@@ -3495,6 +3653,9 @@ class Handler(BaseHTTPRequestHandler):
             haproxy_target = haproxy_target_override_for_node(node)
             if haproxy_target:
                 response["haproxy_target"] = haproxy_target
+            update_task = update_task_for_node(node)
+            if update_task:
+                response["update_task"] = update_task
             self.send_json(200, response)
         except Exception as exc:
             self.send_json(400, {"ok": False, "error": str(exc)})
@@ -3733,6 +3894,74 @@ def handle_add_ip(text):
         f"Всего дополнительных IP: {len(all_ips)}\n"
         "<i>Whitelist-машины применят правило при ближайшем push.</i>"
     )
+
+
+def update_status_message():
+    with LOCK:
+        current = dict(UPDATE_STATE.get("current") or {})
+        local = dict(UPDATE_STATE.get("local") or {})
+        results = dict(UPDATE_STATE.get("results") or {})
+        nodes = dedupe_nodes(NODES.values())
+    job_id = str(current.get("id") or "")
+    if not job_id:
+        return "<b>Update-задачи нет.</b>"
+    total_nodes = len(nodes)
+    ok_count = 0
+    error_count = 0
+    running_count = 0
+    for item in results.values():
+        if not isinstance(item, dict) or item.get("id") != job_id:
+            continue
+        status = item.get("status")
+        if status == "ok":
+            ok_count += 1
+        elif status == "error":
+            error_count += 1
+        elif status == "running":
+            running_count += 1
+    pending_count = max(0, total_nodes - ok_count - error_count - running_count)
+    local_status = local.get("status") if local.get("id") == job_id else "-"
+    lines = [
+        "<b>Update status</b>",
+        ALERT_SEPARATOR,
+        detail_line("Job", job_id),
+        detail_line("Collector", local_status or "-"),
+        detail_line("Ноды", f"ok {ok_count} / error {error_count} / running {running_count} / wait {pending_count}"),
+    ]
+    errors = [
+        item for item in results.values()
+        if isinstance(item, dict) and item.get("id") == job_id and item.get("status") == "error"
+    ]
+    if errors:
+        lines.append("")
+        lines.append("<b>Ошибки:</b>")
+        for item in errors[:10]:
+            node = html.escape(str(item.get("node") or "-"))
+            message = html.escape(str(item.get("message") or "-"))
+            lines.append(f"<blockquote>{node}: {message}</blockquote>")
+    return "\n".join(lines)
+
+
+def handle_update_collector(text, chat_id, from_id):
+    parts = text.split()
+    if len(parts) > 1 and parts[1].lower() in ("status", "статус"):
+        send_message(update_status_message())
+        return
+    job = queue_update_task(from_id)
+    with LOCK:
+        total_nodes = len(dedupe_nodes(NODES.values()))
+    lines = [
+        "<b>Update запущен</b>",
+        ALERT_SEPARATOR,
+        detail_line("Job", job.get("id")),
+        detail_line("Машин в очереди", total_nodes),
+        detail_line("Raw", job.get("raw_base")),
+        "",
+        "<i>Collector обновится локально. Ноды применят update при ближайшем push.</i>",
+        "<i>Статус: <code>/update_collector status</code></i>",
+    ]
+    send_message("\n".join(lines))
+    start_local_collector_update(job)
 
 
 def handle_ip(text):
@@ -4038,6 +4267,8 @@ def bot_loop():
                     handle_delete(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/add_ip":
                     handle_add_ip(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector":
+                    handle_update_collector(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/haproxy":
                     handle_haproxy_command(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/allow_sni":
@@ -4075,6 +4306,7 @@ def main():
     load_falls()
     load_ssh_allowed_ips()
     load_sni_state()
+    load_update_state()
     load_ip_limit_state()
     threading.Thread(target=offline_loop, daemon=True).start()
     threading.Thread(target=ip_limit_penalty_loop, daemon=True).start()

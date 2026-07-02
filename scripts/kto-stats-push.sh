@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v182"
+PUSH_BUILD="v183"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -36,6 +36,8 @@ KTO_IP_LIMIT_TAIL_LINES="${KTO_IP_LIMIT_TAIL_LINES:-5000}"
 KTO_IP_LIMIT_MAX_EVENTS="${KTO_IP_LIMIT_MAX_EVENTS:-5000}"
 KTO_IP_LIMIT_XRAY_LOGS="${KTO_IP_LIMIT_XRAY_LOGS:-1}"
 KTO_IP_LIMIT_BLOCK_STATE="${KTO_IP_LIMIT_BLOCK_STATE:-/run/kto-ip-limit-blocks.tsv}"
+KTO_PUSH_UPDATE_STATE="${KTO_PUSH_UPDATE_STATE:-/var/lib/kto-stats-push/update_state.json}"
+KTO_UPDATE_RAW_BASE="${KTO_UPDATE_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 
 collector_url="${KTO_PUSH_COLLECTOR_URL%/}/push"
 hostname_value="$(hostname 2>/dev/null || echo unknown)"
@@ -61,6 +63,7 @@ haproxy_allowed_sni='[]'
 haproxy_backend_target=''
 ip_limit_events='[]'
 ip_limit_events_count=0
+update_result='{}'
 
 int_or_zero() {
     local value="${1:-0}"
@@ -388,6 +391,98 @@ apply_collector_haproxy_config() {
         else
             echo "push ${PUSH_BUILD}: allowed_sni applied"
         fi
+    fi
+}
+
+write_update_result() {
+    local job_id="$1" status="$2" message="${3:-}" build="${4:-$PUSH_BUILD}" state_dir tmp
+    state_dir="$(dirname "$KTO_PUSH_UPDATE_STATE")"
+    mkdir -p "$state_dir" 2>/dev/null || true
+    message="${message//$'\n'/ }"
+    message="${message:0:240}"
+    tmp="$(mktemp)"
+    if jq -n \
+        --arg id "$job_id" \
+        --arg status "$status" \
+        --arg build "$build" \
+        --arg message "$message" \
+        --argjson updated_at "$(date +%s)" \
+        '{id: $id, status: $status, build: $build, message: $message, updated_at: $updated_at}' > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || rm -f "$tmp"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+read_update_result() {
+    update_result='{}'
+    command -v jq >/dev/null 2>&1 || return 0
+    [[ -r "$KTO_PUSH_UPDATE_STATE" ]] || return 0
+    update_result="$(jq -c '{
+        id: (.id // ""),
+        status: (.status // ""),
+        build: (.build // ""),
+        message: (.message // ""),
+        updated_at: (.updated_at // 0)
+    }' "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || echo '{}')"
+}
+
+update_task_already_finished() {
+    local job_id="$1" current_id current_status
+    command -v jq >/dev/null 2>&1 || return 1
+    [[ -r "$KTO_PUSH_UPDATE_STATE" ]] || return 1
+    current_id="$(jq -r '.id // empty' "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || true)"
+    current_status="$(jq -r '.status // empty' "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || true)"
+    [[ "$current_id" == "$job_id" && ( "$current_status" == "ok" || "$current_status" == "error" ) ]]
+}
+
+apply_collector_update_task() {
+    local response="$1"
+    local job_id action raw_base tmp err_file message new_build
+
+    command -v jq >/dev/null 2>&1 || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    command -v bash >/dev/null 2>&1 || return 0
+    printf '%s' "$response" | jq -e 'has("update_task") and (.update_task | type == "object")' >/dev/null 2>&1 || return 0
+
+    job_id="$(printf '%s' "$response" | jq -r '.update_task.id // empty' 2>/dev/null || true)"
+    action="$(printf '%s' "$response" | jq -r '.update_task.action // empty' 2>/dev/null || true)"
+    raw_base="$(printf '%s' "$response" | jq -r '.update_task.raw_base // empty' 2>/dev/null || true)"
+    [[ -n "$job_id" && "$action" == "push_update" ]] || return 0
+    if update_task_already_finished "$job_id"; then
+        return 0
+    fi
+    raw_base="${raw_base:-$KTO_UPDATE_RAW_BASE}"
+    raw_base="${raw_base%/}"
+
+    write_update_result "$job_id" "running" "push update started"
+    tmp="$(mktemp)"
+    err_file="$(mktemp)"
+    if ! curl -fsSL "${raw_base}/scripts/kto-stats-push.sh" -o "$tmp" 2>"$err_file"; then
+        message="curl failed: $(tr '\n' ' ' <"$err_file" 2>/dev/null || true)"
+        rm -f "$tmp" "$err_file"
+        write_update_result "$job_id" "error" "$message"
+        echo "push ${PUSH_BUILD}: update failed: ${message}" >&2
+        return 0
+    fi
+    rm -f "$err_file"
+
+    if ! bash -n "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        write_update_result "$job_id" "error" "downloaded push script failed bash -n"
+        echo "push ${PUSH_BUILD}: update failed: downloaded push script failed bash -n" >&2
+        return 0
+    fi
+    new_build="$(awk -F= '$1 == "PUSH_BUILD" { gsub(/"/, "", $2); print $2; exit }' "$tmp" 2>/dev/null || true)"
+    new_build="${new_build:-$PUSH_BUILD}"
+    if install -m 0755 "$tmp" /usr/local/bin/kto-stats-push 2>/dev/null; then
+        rm -f "$tmp"
+        write_update_result "$job_id" "ok" "push script updated" "$new_build"
+        echo "push ${PUSH_BUILD}: push script updated job=${job_id}"
+    else
+        rm -f "$tmp"
+        write_update_result "$job_id" "error" "install /usr/local/bin/kto-stats-push failed"
+        echo "push ${PUSH_BUILD}: update failed: install /usr/local/bin/kto-stats-push failed" >&2
     fi
 }
 
@@ -841,6 +936,7 @@ read_haproxy_scan_stats
 read_haproxy_allowed_sni
 read_haproxy_backend_target
 read_ip_limit_events
+read_update_result
 
 if ! command -v jq >/dev/null 2>&1; then
     error="jq не установлен"
@@ -910,6 +1006,7 @@ if ! payload="$(jq -n \
     --argjson haproxy_allowed_sni "$haproxy_allowed_sni" \
     --arg haproxy_backend_target "$haproxy_backend_target" \
     --argjson ip_limit_events "$ip_limit_events" \
+    --argjson update_result "$update_result" \
     --argjson updated_at "$updated_at" \
     '{
         id: $id,
@@ -938,6 +1035,7 @@ if ! payload="$(jq -n \
         haproxy_allowed_sni: $haproxy_allowed_sni,
         haproxy_backend_target: $haproxy_backend_target,
         ip_limit_events: $ip_limit_events,
+        update_result: $update_result,
         error: $error,
         updated_at: $updated_at
     }' 2>&1)"; then
@@ -969,6 +1067,7 @@ if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
     apply_collector_haproxy_config "$response"
     apply_collector_ip_limit_config "$response"
     apply_ip_limit_blocks "$response"
+    apply_collector_update_task "$response"
     echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}% uptime=${uptime_sec}s${ip_limit_extra}"
 else
     echo "push ${PUSH_BUILD}: bad response: ${response}" >&2
