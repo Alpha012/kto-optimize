@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v191"
+COLLECTOR_BUILD = "v192"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1556,6 +1556,27 @@ def edit_message_text(chat_id, message_id, text, reply_markup=None):
         return False
 
 
+def edit_rich_message_text(chat_id, message_id, rich_html, reply_markup=None):
+    if not chat_id or not message_id:
+        return False
+    try:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "rich_message": json.dumps({"html": rich_html}, ensure_ascii=False),
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        tg_call("editMessageText", payload, timeout=15)
+        log(f"telegram edited rich message_id={message_id} chat_id={chat_id}")
+        return True
+    except Exception as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+        log(f"telegram rich edit failed: {exc}")
+        return False
+
+
 def answer_callback(callback_id, text=""):
     if not callback_id:
         return
@@ -2533,6 +2554,8 @@ def wrong_sni_table_text(node):
 
 
 def node_status_text(node, ts):
+    if clean_display_text(node.get("error") or ""):
+        return "ERR"
     age = ts - int(node.get("last_seen", 0) or 0)
     if age <= STALE_SEC:
         return "OK"
@@ -2624,6 +2647,99 @@ def send_stats_wl():
     if send_rich_message(rich_html):
         return
     send_message(aggregate_message("wl"))
+
+
+def remna_table_text(node):
+    remna = node.get("remna") if isinstance(node, dict) else {}
+    if not isinstance(remna, dict):
+        return "-"
+    status = clean_display_text(remna.get("status") or "")
+    restarts = int(remna.get("restarts") or 0)
+    error_count = int(remna.get("error_count") or 0)
+    last_error = clean_display_text(remna.get("last_error") or "")
+    parts = []
+    if status and status != "running":
+        parts.append(status)
+    if restarts > 0:
+        parts.append(f"restarts {restarts}")
+    if error_count > 0:
+        parts.append(f"errors {error_count}")
+    if last_error:
+        parts.append(last_error[:80])
+    return ", ".join(parts) if parts else "-"
+
+
+def rich_bl_rows(nodes, ts):
+    rows = []
+    for node in nodes:
+        error = clean_display_text(node.get("error") or "")
+        metrics_ok = bool(node.get("metrics_ok"))
+        if error:
+            today = "ошибка"
+            yesterday = "-"
+            month = "ошибка"
+        else:
+            today = format_bytes(node.get("day_total", 0))
+            yesterday = format_bytes(node.get("yesterday_total", 0))
+            month = format_bytes(node.get("month_total", 0))
+        ram = f"{int(node.get('ram_percent', 0) or 0)}%" if metrics_ok else "-"
+        cpu = format_percent(node.get("cpu_percent", 0)) if metrics_ok else "-"
+        rows.append([
+            (node_display_name(node, "unknown").replace("№", "#"), "left"),
+            (str(node.get("ip") or "-"), "left"),
+            (today, "right"),
+            (yesterday, "right"),
+            (month, "right"),
+            (ram, "right"),
+            (cpu, "right"),
+            (remna_table_text(node), "left"),
+            (node_status_text(node, ts), "center"),
+        ])
+    return rows
+
+
+def bl_group_rich_context(group_id=None, ungrouped=False):
+    nodes = current_bl_nodes()
+    if ungrouped:
+        group_nodes = bl_ungrouped_nodes(nodes, bl_group_list())
+        group_name = "Без группы"
+        group_found = True
+    else:
+        group = bl_group_by_id(group_id)
+        if group is None:
+            return "", [], False
+        group_nodes = bl_group_nodes(group, nodes)
+        group_nodes.sort(key=bl_node_sort_key)
+        group_name = group.get("name") or "Группа"
+        group_found = True
+    return group_name, group_nodes, group_found
+
+
+def bl_group_stats_rich_message(group_id=None, ungrouped=False):
+    group_name, group_nodes, group_found = bl_group_rich_context(group_id, ungrouped=ungrouped)
+    if not group_found:
+        return "<h3>Статистика других машин</h3><p>Группа не найдена.</p>"
+    if not group_nodes:
+        return f"<h3>Статистика других машин</h3><h4>{rich_text(group_name)}</h4><p>Нет машин в группе.</p>"
+    ts = now_ts()
+    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "RAM", "CPU", "Remna", "Статус"]
+    parts = [
+        "<h3>Статистика других машин</h3>",
+        f"<h4>{rich_text(group_name)}</h4>",
+        rich_table(headers, rich_bl_rows(group_nodes, ts)),
+        rich_status_summary(group_nodes, ts, max(len(group_nodes), 1)),
+    ]
+    return "".join(part for part in parts if part)
+
+
+def edit_or_send_bl_group_stats(chat_id, message_id, group_id=None, ungrouped=False):
+    markup = bl_group_action_markup(group_id, ungrouped=ungrouped)
+    rich_html = bl_group_stats_rich_message(group_id, ungrouped=ungrouped)
+    if edit_rich_message_text(chat_id, message_id, rich_html, reply_markup=markup):
+        return
+    body = bl_group_stats_message(group_id, ungrouped=ungrouped)
+    if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
+        send_message(body, reply_markup=markup)
 
 
 def code_value(value):
@@ -5354,10 +5470,7 @@ def handle_bl_group_callback(callback):
         return True
     if data == "blg:u":
         answer_callback(callback_id, "обновляю")
-        body = bl_group_stats_message(ungrouped=True)
-        markup = bl_group_action_markup(ungrouped=True)
-        if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
-            send_message(body, reply_markup=markup)
+        edit_or_send_bl_group_stats(chat_id, message_id, ungrouped=True)
         return True
     parts = data.split(":", 2)
     if len(parts) != 3:
@@ -5373,10 +5486,7 @@ def handle_bl_group_callback(callback):
         return True
     if action == "s":
         answer_callback(callback_id, "обновляю")
-        body = bl_group_stats_message(group_id)
-        markup = bl_group_action_markup(group_id)
-        if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
-            send_message(body, reply_markup=markup)
+        edit_or_send_bl_group_stats(chat_id, message_id, group_id)
         return True
     if action == "a":
         set_pending_bl_group(chat_id, from_id, "add", group_id)
