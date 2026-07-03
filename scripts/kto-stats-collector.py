@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v186"
+COLLECTOR_BUILD = "v187"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -193,6 +193,7 @@ OFFSET_FILE = os.path.join(STATE_DIR, "telegram_offset")
 DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
 SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
 SNI_ALLOW_FILE = os.path.join(STATE_DIR, "sni_allow.json")
+NODE_NAMES_FILE = os.path.join(STATE_DIR, "node_names.json")
 IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
 IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
 UPDATE_STATE_FILE = os.path.join(STATE_DIR, "update_state.json")
@@ -201,6 +202,7 @@ NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
 SNI_STATE = {"nodes": {}, "pending": {}}
+NODE_NAME_STATE = {"nodes": {}, "pending": {}}
 UPDATE_STATE = {"current": {}, "results": {}, "local": {}}
 IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
@@ -445,6 +447,69 @@ def load_sni_state():
 
 def save_sni_state():
     atomic_write(SNI_ALLOW_FILE, json.dumps(SNI_STATE, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def normalize_node_name(value):
+    name = clean_display_text(value)
+    if not name:
+        raise ValueError("empty name")
+    if len(name) > 120:
+        raise ValueError("too long")
+    if re.search(r'["\\$`]', name):
+        raise ValueError("bad chars")
+    return name
+
+
+def load_node_name_state():
+    global NODE_NAME_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(NODE_NAMES_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        nodes = loaded.get("nodes") if isinstance(loaded, dict) else {}
+        pending = loaded.get("pending") if isinstance(loaded, dict) else {}
+        if not isinstance(nodes, dict):
+            nodes = {}
+        if not isinstance(pending, dict):
+            pending = {}
+        clean_nodes = {}
+        for key, item in nodes.items():
+            key = str(key or "").strip()
+            if not key:
+                continue
+            if isinstance(item, str):
+                raw_name = item
+                raw_aliases = [key]
+                updated_at = 0
+            elif isinstance(item, dict):
+                raw_name = item.get("name")
+                raw_aliases = item.get("aliases") if isinstance(item.get("aliases"), list) else []
+                updated_at = int(item.get("updated_at") or 0)
+            else:
+                continue
+            try:
+                name = normalize_node_name(raw_name)
+            except Exception:
+                continue
+            aliases = {canonical_node_key(key), canonical_node_key(name)}
+            for alias in raw_aliases:
+                alias = canonical_node_key(alias)
+                if alias:
+                    aliases.add(alias)
+            aliases.discard("")
+            clean_nodes[key] = {
+                "name": name,
+                "aliases": sorted(aliases, key=natural_sort_key),
+                "updated_at": updated_at,
+            }
+        clean_pending = pending if isinstance(pending, dict) else {}
+        NODE_NAME_STATE = {"nodes": clean_nodes, "pending": clean_pending}
+    except Exception:
+        NODE_NAME_STATE = {"nodes": {}, "pending": {}}
+
+
+def save_node_name_state():
+    atomic_write(NODE_NAMES_FILE, json.dumps(NODE_NAME_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def clean_update_result(item):
@@ -2346,7 +2411,47 @@ def detail_line(label, value):
     return f"<b>{label}:</b> {code_value(value)}"
 
 
+def node_base_aliases(node):
+    aliases = set()
+    if isinstance(node, dict):
+        for key in ("id", "name", "hostname"):
+            alias = canonical_node_key(node.get(key))
+            if alias:
+                aliases.add(alias)
+    else:
+        alias = canonical_node_key(node)
+        if alias:
+            aliases.add(alias)
+    return aliases
+
+
+def node_name_override_for_node(node):
+    aliases = node_base_aliases(node)
+    if not aliases:
+        return ""
+    with LOCK:
+        nodes = NODE_NAME_STATE.setdefault("nodes", {})
+        for key in aliases:
+            item = nodes.get(key)
+            if isinstance(item, dict):
+                name = clean_display_text(item.get("name") or "")
+                if name:
+                    return name
+        for item in nodes.values():
+            if not isinstance(item, dict):
+                continue
+            item_aliases = {canonical_node_key(value) for value in item.get("aliases") or []}
+            if aliases.intersection(item_aliases):
+                name = clean_display_text(item.get("name") or "")
+                if name:
+                    return name
+    return ""
+
+
 def node_display_name(node, fallback="unknown"):
+    override = node_name_override_for_node(node)
+    if override:
+        return override
     return clean_display_text(node.get("name") or node.get("id") or node.get("hostname") or fallback)
 
 
@@ -2364,24 +2469,16 @@ def find_node(query):
                 node.get("id"),
                 node.get("name"),
                 node.get("hostname"),
+                node_name_override_for_node(node),
             ]
-            if any(canonical_node_key(value) == needle for value in candidates):
+            aliases = node_alias_keys(node)
+            if canonical_node_key(needle) in aliases or any(canonical_node_key(value) == needle for value in candidates):
                 return dict(node)
     return None
 
 
 def sni_node_aliases(node):
-    aliases = set()
-    if isinstance(node, dict):
-        for key in ("id", "name", "hostname"):
-            alias = canonical_node_key(node.get(key))
-            if alias:
-                aliases.add(alias)
-    else:
-        alias = canonical_node_key(node)
-        if alias:
-            aliases.add(alias)
-    return aliases
+    return node_base_aliases(node)
 
 
 def sni_override_for_node(node):
@@ -2712,6 +2809,189 @@ def handle_pending_sni(chat_id, from_id, text):
     return True
 
 
+def set_pending_rename(chat_id, from_id, node):
+    key = pending_key(chat_id, from_id)
+    node_key = node_canonical_key(node)
+    with LOCK:
+        NODE_NAME_STATE.setdefault("pending", {})[key] = {
+            "action": "rename",
+            "node_key": node_key,
+            "node_name": node_display_name(node, node_key),
+            "created_at": now_ts(),
+        }
+        save_node_name_state()
+
+
+def pop_pending_rename(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = NODE_NAME_STATE.setdefault("pending", {}).pop(key, None)
+        if item is not None:
+            save_node_name_state()
+        return item if isinstance(item, dict) else None
+
+
+def peek_pending_rename(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = NODE_NAME_STATE.setdefault("pending", {}).get(key)
+        if not isinstance(item, dict):
+            return None
+        if now_ts() - int(item.get("created_at") or 0) > 600:
+            NODE_NAME_STATE.setdefault("pending", {}).pop(key, None)
+            save_node_name_state()
+            return None
+        return dict(item)
+
+
+def move_ip_limit_policy_on_rename(aliases, new_key, new_name):
+    if not aliases or not new_key:
+        return
+    init_ip_limit_db()
+    with LOCK:
+        placeholders = ",".join("?" for _ in aliases)
+        row = ip_limit_db().execute(
+            f"SELECT node_key, enabled, enforce, updated_at FROM ip_limit_nodes WHERE node_key IN ({placeholders}) "
+            "ORDER BY updated_at DESC LIMIT 1",
+            tuple(aliases),
+        ).fetchone()
+        if not row:
+            return
+        ip_limit_db().execute(f"DELETE FROM ip_limit_nodes WHERE node_key IN ({placeholders})", tuple(aliases))
+        ip_limit_db().execute(
+            "INSERT INTO ip_limit_nodes(node_key, node, enabled, enforce, updated_at) VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(node_key) DO UPDATE SET node = excluded.node, enabled = excluded.enabled, "
+            "enforce = excluded.enforce, updated_at = excluded.updated_at",
+            (new_key, new_name[:120], int(row["enabled"] or 0), int(row["enforce"] or 0), now_ts()),
+        )
+        save_ip_limit_state()
+
+
+def rename_fall_counters(aliases, new_name):
+    changed = False
+    falls = ensure_today_falls()
+    for field in ("nodes", "downtime_nodes"):
+        counter = falls.setdefault(field, {})
+        total = 0
+        for name in list(counter.keys()):
+            if canonical_node_key(name) in aliases and name != new_name:
+                total += int(counter.pop(name, 0) or 0)
+                changed = True
+        if total > 0:
+            counter[new_name] = int(counter.get(new_name, 0) or 0) + total
+            changed = True
+    if changed:
+        save_falls()
+
+
+def set_node_name_override(node, new_name):
+    new_name = normalize_node_name(new_name)
+    old_aliases = node_base_aliases(node)
+    old_key = node_canonical_key(node)
+    new_key = canonical_node_key(new_name)
+    if not old_key or not new_key:
+        raise ValueError("empty node key")
+    aliases = set(old_aliases)
+    aliases.add(old_key)
+    aliases.add(new_key)
+    with LOCK:
+        for key, item in list(NODE_NAME_STATE.setdefault("nodes", {}).items()):
+            item_aliases = {canonical_node_key(value) for value in (item.get("aliases") or [])} if isinstance(item, dict) else {canonical_node_key(key)}
+            if aliases.intersection(item_aliases) or key in aliases:
+                NODE_NAME_STATE["nodes"].pop(key, None)
+        NODE_NAME_STATE.setdefault("nodes", {})[old_key] = {
+            "name": new_name,
+            "aliases": sorted(aliases, key=natural_sort_key),
+            "updated_at": now_ts(),
+        }
+        save_node_name_state()
+
+        best_record = None
+        for existing_id, existing_node in list(NODES.items()):
+            existing_aliases = node_base_aliases(existing_node)
+            if existing_aliases.intersection(aliases):
+                if best_record is None or int(existing_node.get("last_seen", 0) or 0) >= int(best_record.get("last_seen", 0) or 0):
+                    best_record = dict(existing_node)
+                del NODES[existing_id]
+        if best_record is not None:
+            best_record["id"] = new_name
+            best_record["name"] = new_name
+            NODES[new_name] = best_record
+            save_nodes()
+
+        for key, item in SNI_STATE.setdefault("nodes", {}).items():
+            if isinstance(item, dict) and (canonical_node_key(key) in aliases or canonical_node_key(item.get("name")) in aliases):
+                item["name"] = new_name[:120]
+        save_sni_state()
+
+        rename_fall_counters(aliases, new_name)
+    move_ip_limit_policy_on_rename(aliases, new_key, new_name)
+    return new_name, old_key, new_key
+
+
+def handle_rename_command(text, chat_id, from_id):
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        send_message("<b>Пример:</b> <code>/rename Германия</code>")
+        return
+    query = parts[1].strip()
+    node = find_node(query)
+    if node is None:
+        send_message(
+            "<b>Не нашёл такую машину</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Запрос', query)}\n"
+            "Проверь название через <code>/stats</code>."
+        )
+        return
+    set_pending_rename(chat_id, from_id, node)
+    send_message(
+        "<b>Переименование машины</b>\n"
+        f"{ALERT_SEPARATOR}\n"
+        f"{detail_line('Сейчас', node_display_name(node))}\n\n"
+        "Ответь новым названием.\n"
+        "Отмена: <code>/cancel</code>"
+    )
+
+
+def handle_pending_rename(chat_id, from_id, text):
+    pending = peek_pending_rename(chat_id, from_id)
+    if not pending or pending.get("action") != "rename":
+        return False
+    try:
+        new_name = normalize_node_name(text)
+    except Exception:
+        send_message(
+            "<b>Не понял название.</b>\n\n"
+            "Нельзя пустое, слишком длинное, а ещё нельзя символы <code>\" \\ $ `</code>."
+        )
+        return True
+    node = find_node(pending.get("node_key")) or find_node(pending.get("node_name"))
+    if node is None:
+        pop_pending_rename(chat_id, from_id)
+        send_message("<b>Машина больше не найдена.</b>")
+        return True
+    old_aliases = node_base_aliases(node)
+    existing = find_node(new_name)
+    if existing is not None and not node_base_aliases(existing).intersection(old_aliases):
+        send_message(
+            "<b>Такое имя уже занято.</b>\n\n"
+            f"{detail_line('Название', new_name)}"
+        )
+        return True
+    old_name = node_display_name(node)
+    new_name, _, _ = set_node_name_override(node, new_name)
+    pop_pending_rename(chat_id, from_id)
+    send_message(
+        "<b>Машина переименована</b>\n"
+        f"{ALERT_SEPARATOR}\n"
+        f"{detail_line('Было', old_name)}\n"
+        f"{detail_line('Стало', new_name)}\n\n"
+        "<i>Нода перепишет имя в push-конфиге при ближайшем push.</i>"
+    )
+    return True
+
+
 def node_alert_message(kind, node_id, node, reason="-"):
     name = node_display_name(node, node_id)
     ip = node_display_ip(node)
@@ -2959,16 +3239,19 @@ def purge_ip_limit_blocks(ts):
 
 
 def node_alias_keys(node):
-    aliases = set()
-    if isinstance(node, dict):
-        for key in ("id", "name", "hostname"):
-            alias = canonical_node_key(node.get(key))
-            if alias:
-                aliases.add(alias)
-    else:
-        alias = canonical_node_key(node)
-        if alias:
-            aliases.add(alias)
+    aliases = node_base_aliases(node)
+    override = node_name_override_for_node(node)
+    alias = canonical_node_key(override)
+    if alias:
+        aliases.add(alias)
+    with LOCK:
+        nodes = NODE_NAME_STATE.setdefault("nodes", {})
+        for item in nodes.values():
+            if not isinstance(item, dict):
+                continue
+            item_aliases = {canonical_node_key(value) for value in item.get("aliases") or []}
+            if aliases.intersection(item_aliases):
+                aliases.update(alias for alias in item_aliases if alias)
     return aliases
 
 
@@ -3018,8 +3301,8 @@ def remna_ip_limit_allowed_rows(rows, enabled_node_keys):
         last_seen = remna_epoch_sec(row.get("last_seen"), 0)
         if last_seen > 0 and last_seen < active_after:
             continue
-        node_key = canonical_node_key(row.get("node"))
-        if not IP_LIMIT_ENABLED and enabled_node_keys and node_key not in enabled_node_keys:
+        node_keys = node_alias_keys(row.get("node"))
+        if not IP_LIMIT_ENABLED and enabled_node_keys and not node_keys.intersection(enabled_node_keys):
             continue
         allowed.append({
             "user": row.get("user"),
@@ -3067,9 +3350,7 @@ def ip_limit_enforcement_enabled_for_entries(entries):
     aliases = set()
     for item in entries or []:
         for node in item.get("nodes") or []:
-            alias = canonical_node_key(node)
-            if alias:
-                aliases.add(alias)
+            aliases.update(node_alias_keys(node))
     if not aliases:
         return False
     with LOCK:
@@ -3699,6 +3980,10 @@ def update_node(payload, remote_ip=""):
     raw_id = clean_display_text(payload.get("id") or "")
     node_name = clean_display_text(payload.get("name") or raw_id or payload.get("hostname") or "")
     node_id = node_name or raw_id or clean_display_text(payload.get("hostname") or "")
+    override_name = node_name_override_for_node({"id": raw_id, "name": node_name, "hostname": payload.get("hostname")})
+    if override_name:
+        node_name = override_name
+        node_id = override_name
     if not node_id:
         raise ValueError("id/name is required")
     current = now_ts()
@@ -3837,6 +4122,9 @@ class Handler(BaseHTTPRequestHandler):
             haproxy_target = haproxy_target_override_for_node(node)
             if haproxy_target:
                 response["haproxy_target"] = haproxy_target
+            node_name_override = node_name_override_for_node(node)
+            if node_name_override:
+                response["node_name"] = node_name_override
             update_task = update_task_for_node(node)
             if update_task:
                 response["update_task"] = update_task
@@ -4630,9 +4918,12 @@ def bot_loop():
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/cancel":
                     pop_pending_ip_limit(chat_id, from_id)
                     pop_pending_sni(chat_id, from_id)
+                    pop_pending_rename(chat_id, from_id)
                     send_message("<b>Отменил.</b>")
                     continue
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and not command.startswith("/"):
+                    if handle_pending_rename(chat_id, from_id, text):
+                        continue
                     if handle_pending_sni(chat_id, from_id, text):
                         continue
                     if handle_pending_ip_limit(chat_id, from_id, text):
@@ -4649,6 +4940,8 @@ def bot_loop():
                     handle_statsrevoke(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete":
                     handle_delete(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/rename":
+                    handle_rename_command(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/add_ip":
                     handle_add_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector":
@@ -4696,6 +4989,7 @@ def main():
     load_falls()
     load_ssh_allowed_ips()
     load_sni_state()
+    load_node_name_state()
     load_update_state()
     load_ip_limit_state()
     threading.Thread(target=offline_loop, daemon=True).start()

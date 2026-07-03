@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v186"
+PUSH_BUILD="v187"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -748,12 +748,22 @@ config_bool_value() {
     esac
 }
 
+config_escape_value() {
+    local value="${1:-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//\$/\\$}"
+    value="${value//\`/\\\`}"
+    printf '%s' "$value"
+}
+
 set_push_config_value() {
-    local key="$1" value="$2" tmp
+    local key="$1" value="$2" tmp escaped
     [[ -n "$key" ]] || return 0
+    escaped="$(config_escape_value "$value")"
     tmp="$(mktemp)"
     if [[ -r "$CONFIG" ]]; then
-        awk -v key="$key" -v line="${key}=\"${value}\"" '
+        awk -v key="$key" -v line="${key}=\"${escaped}\"" '
             BEGIN { done = 0 }
             $0 ~ "^" key "=" {
                 if (!done) {
@@ -768,7 +778,7 @@ set_push_config_value() {
             }
         ' "$CONFIG" > "$tmp"
     else
-        printf '%s="%s"\n' "$key" "$value" > "$tmp"
+        printf '%s="%s"\n' "$key" "$escaped" > "$tmp"
     fi
     if cp "$tmp" "$CONFIG" 2>/dev/null; then
         chmod 600 "$CONFIG" 2>/dev/null || true
@@ -777,6 +787,43 @@ set_push_config_value() {
     fi
     rm -f "$tmp"
     return 1
+}
+
+normalize_node_name_from_collector() {
+    local value="${1:-}"
+    value="${value//$'\r'/ }"
+    value="${value//$'\n'/ }"
+    value="$(printf '%s' "$value" | awk '{$1=$1; print}' 2>/dev/null || true)"
+    [[ -n "$value" && ${#value} -le 120 ]] || return 1
+    [[ "$value" != *\"* && "$value" != *\\* && "$value" != *'$'* && "$value" != *'`'* ]] || return 1
+    printf '%s\n' "$value"
+}
+
+apply_collector_node_name_config() {
+    local response="$1" desired changed=0
+    command -v jq >/dev/null 2>&1 || return 0
+    desired="$(printf '%s' "$response" | jq -r '.node_name // empty' 2>/dev/null || true)"
+    [[ -n "$desired" ]] || return 0
+    desired="$(normalize_node_name_from_collector "$desired" 2>/dev/null || true)"
+    [[ -n "$desired" ]] || return 0
+    [[ "$desired" != "$KTO_PUSH_NODE_NAME" || "$desired" != "${KTO_PUSH_NODE_ID:-}" ]] || return 0
+    if [[ "$desired" != "$KTO_PUSH_NODE_NAME" ]]; then
+        if set_push_config_value "KTO_PUSH_NODE_NAME" "$desired"; then
+            changed=1
+        else
+            echo "push ${PUSH_BUILD}: node name config write failed" >&2
+        fi
+    fi
+    if [[ "$desired" != "${KTO_PUSH_NODE_ID:-}" ]]; then
+        if set_push_config_value "KTO_PUSH_NODE_ID" "$desired"; then
+            changed=1
+        else
+            echo "push ${PUSH_BUILD}: node id config write failed" >&2
+        fi
+    fi
+    if (( changed == 1 )); then
+        echo "push ${PUSH_BUILD}: node name=${desired} (next run)"
+    fi
 }
 
 apply_collector_ip_limit_config() {
@@ -1220,6 +1267,7 @@ if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
     fi
     apply_collector_ssh_ips "$response"
     apply_collector_haproxy_config "$response"
+    apply_collector_node_name_config "$response"
     apply_collector_ip_limit_config "$response"
     apply_ip_limit_blocks "$response"
     apply_collector_update_task "$response"
