@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v187"
+COLLECTOR_BUILD = "v188"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4526,6 +4526,8 @@ def update_start_title(action, scope, retry=False):
     if retry:
         return "Update retry запущен"
     if action == "node_update":
+        if str(scope or "").lower() == "single":
+            return "Update node запущен"
         return "Update nodes запущен"
     if scope == "wl":
         return "Update WL запущен"
@@ -4587,6 +4589,35 @@ def handle_update_nodes(text, chat_id, from_id):
         send_message(body, reply_markup=markup)
         return
     start_update_job("node_update", "all", from_id, local_required=False)
+
+
+def handle_update_node(text, chat_id, from_id):
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        send_message("<b>Пример:</b> <code>/update_node Германия</code>")
+        return
+    query = parts[1].strip()
+    node = find_node(query)
+    if node is None:
+        send_message(
+            "<b>Не нашёл такую машину</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Запрос', query)}\n"
+            "Проверь название через <code>/stats</code>."
+        )
+        return
+    node_key = node_canonical_key(node)
+    node_name = node_display_name(node, node_key)
+    if not node_key:
+        send_message("<b>Не смог получить ключ машины.</b>")
+        return
+    start_update_job(
+        "node_update",
+        "single",
+        from_id,
+        local_required=False,
+        targets={node_key: node_name},
+    )
 
 
 def handle_update_callback(callback):
@@ -4950,6 +4981,8 @@ def bot_loop():
                     handle_update_collector(text, chat_id, from_id, scope="wl")
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector_bl":
                     handle_update_collector(text, chat_id, from_id, scope="bl")
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_node":
+                    handle_update_node(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_nodes":
                     handle_update_nodes(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/haproxy":
