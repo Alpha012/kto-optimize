@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v188"
+COLLECTOR_BUILD = "v189"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -590,6 +590,8 @@ def node_scope_matches(node, scope):
     scope = str(scope or "all").strip().lower()
     if scope in ("all", "*"):
         return True
+    if scope in ("panel", "collector"):
+        return False
     if scope in ("wl", "whitelist"):
         return node_is_wl(node)
     if scope in ("bl", "blacklist", "other", "others"):
@@ -4438,6 +4440,8 @@ def update_action_label(action):
 
 def update_scope_label(scope):
     scope = str(scope or "all").lower()
+    if scope in ("panel", "collector"):
+        return "панель"
     if scope == "wl":
         return "WL"
     if scope == "bl":
@@ -4471,8 +4475,11 @@ def update_status_message_from_snapshot(snapshot, title="Update status"):
     if not job_id:
         return "<b>Update-задачи нет.</b>"
     collector_status = snapshot.get("local_status") or "-"
+    node_status = f"ok {snapshot.get('ok_count', 0)} / error {snapshot.get('error_count', 0)} / running {snapshot.get('running_count', 0)} / wait {snapshot.get('wait_count', 0)}"
     if not snapshot.get("local_required", True):
         collector_status = "skip"
+    if str(snapshot.get("scope") or "").lower() in ("panel", "collector"):
+        node_status = "skip"
     lines = [
         f"<b>{title}</b>",
         ALERT_SEPARATOR,
@@ -4480,7 +4487,7 @@ def update_status_message_from_snapshot(snapshot, title="Update status"):
         detail_line("Тип", update_action_label(snapshot.get("action"))),
         detail_line("Группа", update_scope_label(snapshot.get("scope"))),
         detail_line("Collector", collector_status),
-        detail_line("Ноды", f"ok {snapshot.get('ok_count', 0)} / error {snapshot.get('error_count', 0)} / running {snapshot.get('running_count', 0)} / wait {snapshot.get('wait_count', 0)}"),
+        detail_line("Ноды", node_status),
     ]
     errors = snapshot.get("errors") if isinstance(snapshot.get("errors"), list) else []
     if errors:
@@ -4533,6 +4540,8 @@ def update_start_title(action, scope, retry=False):
         return "Update WL запущен"
     if scope == "bl":
         return "Update BL запущен"
+    if str(scope or "").lower() in ("panel", "collector"):
+        return "Update collector запущен"
     return "Update запущен"
 
 
@@ -4551,15 +4560,23 @@ def start_update_job(action, scope, requested_by, local_required=True, targets=N
         detail_line("Job", job.get("id")),
         detail_line("Тип", update_action_label(action)),
         detail_line("Группа", update_scope_label(scope)),
-        detail_line("Машин в очереди", total_nodes),
     ]
+    if str(scope or "").lower() not in ("panel", "collector"):
+        lines.append(detail_line("Машин в очереди", total_nodes))
     if action == "push_update":
         lines.append(detail_line("Raw", job.get("raw_base")))
-        lines += [
-            "",
-            "<i>Collector обновится локально. Ноды применят update при ближайшем push.</i>" if local_required else "<i>Нода применит update при ближайшем push.</i>",
-            f"<i>Статус: <code>{update_status_command(action)}</code></i>",
-        ]
+        if str(scope or "").lower() in ("panel", "collector"):
+            lines += [
+                "",
+                "<i>Обновится только collector на панели. Ноды не трогаю.</i>",
+                f"<i>Статус: <code>{update_status_command(action)}</code></i>",
+            ]
+        else:
+            lines += [
+                "",
+                "<i>Collector обновится локально. Ноды применят update при ближайшем push.</i>" if local_required else "<i>Нода применит update при ближайшем push.</i>",
+                f"<i>Статус: <code>{update_status_command(action)}</code></i>",
+            ]
     else:
         lines += [
             "",
@@ -4573,7 +4590,7 @@ def start_update_job(action, scope, requested_by, local_required=True, targets=N
     return job
 
 
-def handle_update_collector(text, chat_id, from_id, scope="all"):
+def handle_update_collector(text, chat_id, from_id, scope="panel"):
     parts = text.split()
     if len(parts) > 1 and parts[1].lower() in ("status", "статус"):
         body, markup = update_status_payload()
@@ -4977,6 +4994,8 @@ def bot_loop():
                     handle_add_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector":
                     handle_update_collector(text, chat_id, from_id)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector_full":
+                    handle_update_collector(text, chat_id, from_id, scope="all")
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector_wl":
                     handle_update_collector(text, chat_id, from_id, scope="wl")
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector_bl":
