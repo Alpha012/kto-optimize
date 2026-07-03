@@ -17,7 +17,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v184"
+COLLECTOR_BUILD = "v185"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -478,11 +478,26 @@ def load_update_state():
         current_id = str(current.get("id") or "").strip()[:80]
         clean_current = {}
         if current_id:
+            targets = {}
+            raw_targets = current.get("targets")
+            if isinstance(raw_targets, dict):
+                for key, name in raw_targets.items():
+                    key = str(key or "").strip()[:120]
+                    name = clean_display_text(name or key)[:120]
+                    if key:
+                        targets[key] = name or key
+            elif isinstance(raw_targets, list):
+                for item in raw_targets:
+                    key = str(item or "").strip()[:120]
+                    if key:
+                        targets[key] = key
             clean_current = {
                 "id": current_id,
                 "created_at": int(current.get("created_at") or 0),
                 "requested_by": str(current.get("requested_by") or "").strip()[:80],
                 "raw_base": str(current.get("raw_base") or RAW_BASE).strip().rstrip("/")[:300],
+                "targets": targets,
+                "notified_at": int(current.get("notified_at") or 0),
             }
         results = {}
         raw_results = loaded.get("results") if isinstance(loaded.get("results"), dict) else {}
@@ -502,15 +517,27 @@ def save_update_state():
     atomic_write(UPDATE_STATE_FILE, json.dumps(UPDATE_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def current_update_targets():
+    targets = {}
+    for node in dedupe_nodes(NODES.values()):
+        key = node_canonical_key(node)
+        if key:
+            targets[key] = node_display_name(node, key)[:120]
+    return targets
+
+
 def queue_update_task(requested_by):
     ts = now_ts()
-    job = {
-        "id": f"{ts}-{os.getpid()}",
-        "created_at": ts,
-        "requested_by": str(requested_by or "").strip()[:80],
-        "raw_base": RAW_BASE,
-    }
     with LOCK:
+        targets = current_update_targets()
+        job = {
+            "id": f"{ts}-{os.getpid()}",
+            "created_at": ts,
+            "requested_by": str(requested_by or "").strip()[:80],
+            "raw_base": RAW_BASE,
+            "targets": targets,
+            "notified_at": 0,
+        }
         UPDATE_STATE["current"] = job
         UPDATE_STATE["results"] = {}
         UPDATE_STATE["local"] = {"id": job["id"], "status": "queued", "build": COLLECTOR_BUILD, "message": "", "updated_at": ts}
@@ -526,6 +553,9 @@ def update_task_for_node(node):
         current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
         job_id = str(current.get("id") or "")
         if not job_id:
+            return None
+        targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
+        if targets and node_key not in targets:
             return None
         result = UPDATE_STATE.setdefault("results", {}).get(node_key)
         if isinstance(result, dict) and result.get("id") == job_id and result.get("status") in ("ok", "error"):
@@ -548,9 +578,17 @@ def process_update_result(raw, node, ts):
     result["node"] = node_display_name(node, node_key)[:120]
     if not result.get("updated_at"):
         result["updated_at"] = ts
+    should_check_done = False
     with LOCK:
+        current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
+        targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
+        if targets and node_key not in targets:
+            return
         UPDATE_STATE.setdefault("results", {})[node_key] = result
         save_update_state()
+        should_check_done = True
+    if should_check_done:
+        maybe_send_update_done_notification()
 
 
 def set_local_update_result(job_id, status, message=""):
@@ -563,6 +601,7 @@ def set_local_update_result(job_id, status, message=""):
             "updated_at": now_ts(),
         }
         save_update_state()
+    maybe_send_update_done_notification()
 
 
 def local_collector_update(job):
@@ -3943,50 +3982,95 @@ def handle_add_ip(text):
     )
 
 
-def update_status_message():
-    with LOCK:
-        current = dict(UPDATE_STATE.get("current") or {})
-        local = dict(UPDATE_STATE.get("local") or {})
-        results = dict(UPDATE_STATE.get("results") or {})
-        nodes = dedupe_nodes(NODES.values())
+def update_progress_snapshot_unlocked():
+    current = dict(UPDATE_STATE.get("current") or {})
+    local = dict(UPDATE_STATE.get("local") or {})
+    results = dict(UPDATE_STATE.get("results") or {})
+    targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
+    targets = {str(key): clean_display_text(value or key) for key, value in targets.items() if key}
     job_id = str(current.get("id") or "")
-    if not job_id:
-        return "<b>Update-задачи нет.</b>"
-    total_nodes = len(nodes)
     ok_count = 0
     error_count = 0
     running_count = 0
-    for item in results.values():
+    wait_count = 0
+    errors = []
+    for key in targets:
+        item = results.get(key)
         if not isinstance(item, dict) or item.get("id") != job_id:
+            wait_count += 1
             continue
         status = item.get("status")
         if status == "ok":
             ok_count += 1
         elif status == "error":
             error_count += 1
+            errors.append(item)
         elif status == "running":
             running_count += 1
-    pending_count = max(0, total_nodes - ok_count - error_count - running_count)
-    local_status = local.get("status") if local.get("id") == job_id else "-"
+        else:
+            wait_count += 1
+    local_status = local.get("status") if local.get("id") == job_id else "wait"
+    if local_status == "error":
+        local_error = dict(local)
+        local_error["node"] = "collector"
+        errors.insert(0, local_error)
+    done = bool(job_id) and local_status in ("ok", "error") and wait_count == 0 and running_count == 0
+    return {
+        "job_id": job_id,
+        "local_status": local_status or "wait",
+        "ok_count": ok_count,
+        "error_count": error_count,
+        "running_count": running_count,
+        "wait_count": wait_count,
+        "errors": errors,
+        "done": done,
+        "notified_at": int(current.get("notified_at") or 0),
+    }
+
+
+def update_status_message_from_snapshot(snapshot, title="Update status"):
+    job_id = str(snapshot.get("job_id") or "")
+    if not job_id:
+        return "<b>Update-задачи нет.</b>"
     lines = [
-        "<b>Update status</b>",
+        f"<b>{title}</b>",
         ALERT_SEPARATOR,
         detail_line("Job", job_id),
-        detail_line("Collector", local_status or "-"),
-        detail_line("Ноды", f"ok {ok_count} / error {error_count} / running {running_count} / wait {pending_count}"),
+        detail_line("Collector", snapshot.get("local_status") or "-"),
+        detail_line("Ноды", f"ok {snapshot.get('ok_count', 0)} / error {snapshot.get('error_count', 0)} / running {snapshot.get('running_count', 0)} / wait {snapshot.get('wait_count', 0)}"),
     ]
-    errors = [
-        item for item in results.values()
-        if isinstance(item, dict) and item.get("id") == job_id and item.get("status") == "error"
-    ]
+    errors = snapshot.get("errors") if isinstance(snapshot.get("errors"), list) else []
     if errors:
         lines.append("")
         lines.append("<b>Ошибки:</b>")
         for item in errors[:10]:
-            node = html.escape(str(item.get("node") or "-"))
-            message = html.escape(str(item.get("message") or "-"))
+            node = html.escape(clean_display_text(item.get("node") or "-"))
+            message = html.escape(clean_display_text(item.get("message") or "-"))
             lines.append(f"<blockquote>{node}: {message}</blockquote>")
     return "\n".join(lines)
+
+
+def update_status_message():
+    with LOCK:
+        snapshot = update_progress_snapshot_unlocked()
+    return update_status_message_from_snapshot(snapshot)
+
+
+def maybe_send_update_done_notification():
+    message = ""
+    with LOCK:
+        snapshot = update_progress_snapshot_unlocked()
+        current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
+        if not snapshot.get("done") or snapshot.get("notified_at"):
+            return
+        current["notified_at"] = now_ts()
+        UPDATE_STATE["current"] = current
+        save_update_state()
+        success = snapshot.get("error_count", 0) == 0 and snapshot.get("local_status") == "ok"
+        title = "Update завершён" if success else "Update завершён с ошибками"
+        message = update_status_message_from_snapshot(snapshot, title=title)
+    if message:
+        send_message(message)
 
 
 def handle_update_collector(text, chat_id, from_id):
@@ -3995,8 +4079,7 @@ def handle_update_collector(text, chat_id, from_id):
         send_message(update_status_message())
         return
     job = queue_update_task(from_id)
-    with LOCK:
-        total_nodes = len(dedupe_nodes(NODES.values()))
+    total_nodes = len(job.get("targets") if isinstance(job.get("targets"), dict) else {})
     lines = [
         "<b>Update запущен</b>",
         ALERT_SEPARATOR,
