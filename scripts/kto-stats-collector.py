@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v189"
+COLLECTOR_BUILD = "v190"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -194,6 +194,7 @@ DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
 SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
 SNI_ALLOW_FILE = os.path.join(STATE_DIR, "sni_allow.json")
 NODE_NAMES_FILE = os.path.join(STATE_DIR, "node_names.json")
+BL_GROUPS_FILE = os.path.join(STATE_DIR, "bl_groups.json")
 IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
 IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
 UPDATE_STATE_FILE = os.path.join(STATE_DIR, "update_state.json")
@@ -203,6 +204,7 @@ FALLS = {}
 SSH_ALLOWED_IPS = []
 SNI_STATE = {"nodes": {}, "pending": {}}
 NODE_NAME_STATE = {"nodes": {}, "pending": {}}
+BL_GROUP_STATE = {"groups": {}, "pending": {}}
 UPDATE_STATE = {"current": {}, "results": {}, "local": {}}
 IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
@@ -510,6 +512,77 @@ def load_node_name_state():
 
 def save_node_name_state():
     atomic_write(NODE_NAMES_FILE, json.dumps(NODE_NAME_STATE, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def normalize_bl_group_name(value):
+    return normalize_node_name(value)
+
+
+def bl_group_id_for_name(name):
+    base = canonical_node_key(name)
+    digest = hashlib.sha1(str(name or "").encode("utf-8", errors="ignore")).hexdigest()[:10]
+    if base and re.fullmatch(r"[a-z0-9_]{1,32}", base):
+        return f"{base[:32]}{digest}"[:42]
+    return f"g{digest}"
+
+
+def load_bl_group_state():
+    global BL_GROUP_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(BL_GROUPS_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        raw_groups = loaded.get("groups") if isinstance(loaded, dict) else {}
+        raw_pending = loaded.get("pending") if isinstance(loaded, dict) else {}
+        if not isinstance(raw_groups, dict):
+            raw_groups = {}
+        if not isinstance(raw_pending, dict):
+            raw_pending = {}
+        clean_groups = {}
+        seen_names = set()
+        for raw_gid, item in raw_groups.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                name = normalize_bl_group_name(item.get("name"))
+            except Exception:
+                continue
+            name_key = canonical_node_key(name)
+            if not name_key or name_key in seen_names:
+                continue
+            gid = str(raw_gid or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_:-]{1,48}", gid):
+                gid = bl_group_id_for_name(name)
+            nodes = {}
+            raw_nodes = item.get("nodes") if isinstance(item.get("nodes"), dict) else {}
+            for key, value in raw_nodes.items():
+                node_key = canonical_node_key(key)
+                if not node_key:
+                    continue
+                nodes[node_key] = clean_display_text(value or node_key)[:120] or node_key
+            try:
+                created_at = int(item.get("created_at") or 0)
+            except Exception:
+                created_at = 0
+            try:
+                updated_at = int(item.get("updated_at") or created_at)
+            except Exception:
+                updated_at = created_at
+            clean_groups[gid] = {
+                "name": name,
+                "nodes": nodes,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }
+            seen_names.add(name_key)
+        clean_pending = raw_pending if isinstance(raw_pending, dict) else {}
+        BL_GROUP_STATE = {"groups": clean_groups, "pending": clean_pending}
+    except Exception:
+        BL_GROUP_STATE = {"groups": {}, "pending": {}}
+
+
+def save_bl_group_state():
+    atomic_write(BL_GROUPS_FILE, json.dumps(BL_GROUP_STATE, ensure_ascii=False, indent=2))
 
 
 def clean_update_result(item):
@@ -2926,6 +2999,7 @@ def set_node_name_override(node, new_name):
                 item["name"] = new_name[:120]
         save_sni_state()
 
+        move_bl_group_nodes_on_rename(aliases, new_key, new_name)
         rename_fall_counters(aliases, new_name)
     move_ip_limit_policy_on_rename(aliases, new_key, new_name)
     return new_name, old_key, new_key
@@ -3255,6 +3329,327 @@ def node_alias_keys(node):
             if aliases.intersection(item_aliases):
                 aliases.update(alias for alias in item_aliases if alias)
     return aliases
+
+
+def current_bl_nodes():
+    with LOCK:
+        nodes = [dict(node) for node in dedupe_nodes(NODES.values()) if not node_is_wl(node)]
+    return nodes
+
+
+def bl_groups_snapshot():
+    with LOCK:
+        groups = BL_GROUP_STATE.setdefault("groups", {})
+        result = {}
+        for gid, group in groups.items():
+            if not isinstance(group, dict):
+                continue
+            result[str(gid)] = {
+                "id": str(gid),
+                "name": clean_display_text(group.get("name") or str(gid))[:120],
+                "nodes": dict(group.get("nodes") if isinstance(group.get("nodes"), dict) else {}),
+                "created_at": int(group.get("created_at") or 0),
+                "updated_at": int(group.get("updated_at") or 0),
+            }
+    return result
+
+
+def bl_group_list():
+    groups = list(bl_groups_snapshot().values())
+    groups.sort(key=lambda item: (int(item.get("created_at") or 0), natural_sort_key(item.get("name") or "")))
+    return groups
+
+
+def bl_group_by_id(group_id):
+    group_id = str(group_id or "").strip()
+    if not group_id:
+        return None
+    with LOCK:
+        group = BL_GROUP_STATE.setdefault("groups", {}).get(group_id)
+        if not isinstance(group, dict):
+            return None
+        return {
+            "id": group_id,
+            "name": clean_display_text(group.get("name") or group_id)[:120],
+            "nodes": dict(group.get("nodes") if isinstance(group.get("nodes"), dict) else {}),
+            "created_at": int(group.get("created_at") or 0),
+            "updated_at": int(group.get("updated_at") or 0),
+        }
+
+
+def bl_node_lookup(nodes=None):
+    lookup = {}
+    for node in (nodes if nodes is not None else current_bl_nodes()):
+        for key in node_alias_keys(node):
+            if key:
+                lookup.setdefault(key, node)
+    return lookup
+
+
+def bl_group_nodes(group, nodes=None):
+    if not isinstance(group, dict):
+        return []
+    lookup = bl_node_lookup(nodes)
+    result = []
+    seen = set()
+    for key in (group.get("nodes") or {}).keys():
+        node = lookup.get(canonical_node_key(key))
+        if not node:
+            continue
+        node_key = node_canonical_key(node)
+        if node_key in seen:
+            continue
+        seen.add(node_key)
+        result.append(node)
+    return result
+
+
+def bl_assigned_node_aliases(groups=None):
+    aliases = set()
+    for group in (groups if groups is not None else bl_group_list()):
+        raw_nodes = group.get("nodes") if isinstance(group.get("nodes"), dict) else {}
+        for key in raw_nodes.keys():
+            key = canonical_node_key(key)
+            if key:
+                aliases.add(key)
+    return aliases
+
+
+def bl_ungrouped_nodes(nodes=None, groups=None):
+    nodes = list(nodes if nodes is not None else current_bl_nodes())
+    assigned = bl_assigned_node_aliases(groups)
+    result = []
+    for node in nodes:
+        if node_alias_keys(node).isdisjoint(assigned):
+            result.append(node)
+    result.sort(key=bl_node_sort_key)
+    return result
+
+
+def bl_group_node_count(group, nodes=None):
+    group_nodes = bl_group_nodes(group, nodes)
+    ts = now_ts()
+    return live_node_count(group_nodes, ts), len(group_nodes)
+
+
+def create_bl_group(name):
+    name = normalize_bl_group_name(name)
+    name_key = canonical_node_key(name)
+    if not name_key:
+        raise ValueError("empty group name")
+    with LOCK:
+        for group in BL_GROUP_STATE.setdefault("groups", {}).values():
+            if isinstance(group, dict) and canonical_node_key(group.get("name")) == name_key:
+                raise ValueError("duplicate group name")
+        group_id = bl_group_id_for_name(name)
+        if group_id in BL_GROUP_STATE["groups"]:
+            group_id = f"g{hashlib.sha1((name + str(now_ts())).encode('utf-8', errors='ignore')).hexdigest()[:12]}"
+        ts = now_ts()
+        BL_GROUP_STATE["groups"][group_id] = {
+            "name": name,
+            "nodes": {},
+            "created_at": ts,
+            "updated_at": ts,
+        }
+        save_bl_group_state()
+    return bl_group_by_id(group_id)
+
+
+def find_bl_node_exact(query):
+    needle = canonical_node_key(query)
+    if not needle:
+        return None
+    matches = []
+    for node in current_bl_nodes():
+        candidates = node_alias_keys(node)
+        for value in (node.get("id"), node.get("name"), node.get("hostname"), node_display_name(node)):
+            key = canonical_node_key(value)
+            if key:
+                candidates.add(key)
+        if needle in candidates:
+            matches.append(node)
+    if not matches:
+        return None
+    matches.sort(key=lambda node: int(node.get("last_seen", 0) or 0), reverse=True)
+    return matches[0]
+
+
+def add_nodes_to_bl_group(group_id, nodes):
+    group_id = str(group_id or "").strip()
+    prepared = []
+    for node in nodes:
+        key = node_canonical_key(node)
+        if not key:
+            continue
+        prepared.append((key, node_display_name(node, key)[:120], node_alias_keys(node)))
+    added = []
+    already = []
+    moved = []
+    with LOCK:
+        groups = BL_GROUP_STATE.setdefault("groups", {})
+        group = groups.get(group_id)
+        if not isinstance(group, dict):
+            raise ValueError("group not found")
+        group_nodes = group.setdefault("nodes", {})
+        for key, name, aliases in prepared:
+            was_here = any(canonical_node_key(existing) in aliases for existing in group_nodes.keys())
+            was_elsewhere = False
+            for other_id, other_group in groups.items():
+                if not isinstance(other_group, dict):
+                    continue
+                other_nodes = other_group.setdefault("nodes", {})
+                for existing in list(other_nodes.keys()):
+                    if canonical_node_key(existing) in aliases and (other_id != group_id or canonical_node_key(existing) != key):
+                        other_nodes.pop(existing, None)
+                        if other_id != group_id:
+                            was_elsewhere = True
+            group_nodes[key] = name
+            if was_here:
+                already.append(name)
+            elif was_elsewhere:
+                moved.append(name)
+            else:
+                added.append(name)
+        if prepared:
+            group["updated_at"] = now_ts()
+            save_bl_group_state()
+    return {"added": added, "already": already, "moved": moved}
+
+
+def move_bl_group_nodes_on_rename(aliases, new_key, new_name):
+    aliases = {canonical_node_key(item) for item in aliases if canonical_node_key(item)}
+    new_key = canonical_node_key(new_key)
+    if not aliases or not new_key:
+        return
+    changed = False
+    with LOCK:
+        for group in BL_GROUP_STATE.setdefault("groups", {}).values():
+            if not isinstance(group, dict):
+                continue
+            nodes = group.setdefault("nodes", {})
+            found = False
+            for key in list(nodes.keys()):
+                if canonical_node_key(key) in aliases:
+                    nodes.pop(key, None)
+                    found = True
+            if found:
+                nodes[new_key] = clean_display_text(new_name or new_key)[:120] or new_key
+                group["updated_at"] = now_ts()
+                changed = True
+        if changed:
+            save_bl_group_state()
+
+
+def remove_bl_group_nodes_by_aliases(aliases):
+    aliases = {canonical_node_key(item) for item in aliases if canonical_node_key(item)}
+    if not aliases:
+        return
+    changed = False
+    with LOCK:
+        for group in BL_GROUP_STATE.setdefault("groups", {}).values():
+            if not isinstance(group, dict):
+                continue
+            nodes = group.setdefault("nodes", {})
+            for key in list(nodes.keys()):
+                if canonical_node_key(key) in aliases:
+                    nodes.pop(key, None)
+                    group["updated_at"] = now_ts()
+                    changed = True
+        if changed:
+            save_bl_group_state()
+
+
+def bl_group_selector_payload():
+    groups = bl_group_list()
+    nodes = current_bl_nodes()
+    lines = [
+        "<b>Статистика других машин</b>",
+        ALERT_SEPARATOR,
+        "Выберите группу:",
+    ]
+    rows = []
+    if not groups:
+        lines += ["", "<i>Групп пока нет.</i>"]
+    for group in groups:
+        live_count, total_count = bl_group_node_count(group, nodes)
+        label = f"{group.get('name')} ({live_count}/{total_count})"
+        rows.append([{"text": label[:60], "callback_data": f"blg:s:{group.get('id')}"}])
+    ungrouped = bl_ungrouped_nodes(nodes, groups)
+    if ungrouped:
+        rows.append([{"text": f"Без группы ({live_node_count(ungrouped, now_ts())}/{len(ungrouped)})", "callback_data": "blg:u"}])
+    rows.append([{"text": "Создать группу", "callback_data": "blg:c"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def bl_group_stats_message(group_id=None, ungrouped=False):
+    nodes = current_bl_nodes()
+    if ungrouped:
+        group_nodes = bl_ungrouped_nodes(nodes, bl_group_list())
+        group_name = "Без группы"
+    else:
+        group = bl_group_by_id(group_id)
+        if group is None:
+            return "<b>Группа не найдена.</b>"
+        group_nodes = bl_group_nodes(group, nodes)
+        group_name = group.get("name") or "Группа"
+    ts = now_ts()
+    parts = [
+        "<b>Статистика других машин</b>",
+        "",
+        f"<blockquote><b>{html.escape(clean_display_text(group_name))}:</b></blockquote>",
+    ]
+    if not group_nodes:
+        parts += ["", "Нет машин в группе."]
+        return "\n".join(parts)
+    for node in group_nodes:
+        age = ts - int(node.get("last_seen", 0) or 0)
+        status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
+        parts.append("")
+        parts.append(node_message(node, status, compact=False))
+    parts.append(status_summary(group_nodes, ts, expected_total=max(len(group_nodes), 1), filtered=True))
+    return "\n".join(parts)
+
+
+def bl_group_action_markup(group_id=None, ungrouped=False):
+    rows = []
+    if not ungrouped and group_id:
+        rows.append([{"text": "Добавить сюда машины", "callback_data": f"blg:a:{group_id}"}])
+        rows.append([{"text": "Обновить", "callback_data": f"blg:s:{group_id}"}])
+    elif ungrouped:
+        rows.append([{"text": "Обновить", "callback_data": "blg:u"}])
+    rows.append([{"text": "К списку групп", "callback_data": "blg:l"}])
+    rows.append([{"text": "Создать группу", "callback_data": "blg:c"}])
+    return {"inline_keyboard": rows}
+
+
+def aggregate_grouped_bl_summary_message():
+    groups = bl_group_list()
+    if not groups:
+        return aggregate_summary_message("bl")
+    nodes = current_bl_nodes()
+    parts = ["<b>Статистика других машин</b>"]
+    rendered = 0
+    for group in groups:
+        group_nodes = bl_group_nodes(group, nodes)
+        if not group_nodes:
+            continue
+        parts += [
+            "",
+            f"<blockquote><b>{html.escape(clean_display_text(group.get('name') or 'Группа'))}:</b></blockquote>",
+            status_summary(group_nodes, now_ts(), expected_total=max(len(group_nodes), 1), filtered=True),
+        ]
+        rendered += 1
+    ungrouped = bl_ungrouped_nodes(nodes, groups)
+    if ungrouped:
+        parts += [
+            "",
+            "<blockquote><b>Без группы:</b></blockquote>",
+            status_summary(ungrouped, now_ts(), expected_total=max(len(ungrouped), 1), filtered=True),
+        ]
+        rendered += 1
+    if not rendered:
+        return "<b>Статистика других машин</b>\n\nНет данных от машин."
+    return "\n".join(parts)
 
 
 def ip_limit_node_policy(node):
@@ -4196,7 +4591,7 @@ def daily_report_loop():
                 wl_sent = send_message(aggregate_message("wl"))
                 bl_sent = False
                 if wl_sent:
-                    bl_sent = send_message(aggregate_summary_message("bl"))
+                    bl_sent = send_message(aggregate_grouped_bl_summary_message())
                 if wl_sent and bl_sent:
                     last_sent = today
                     save_daily_date(today)
@@ -4308,6 +4703,8 @@ def delete_node_records(query):
             falls["total"] = max(0, int(falls.get("total", 0) or 0) - removed_falls)
         if deleted or removed_fall_names:
             save_falls()
+        if deleted:
+            remove_bl_group_nodes_by_aliases(aliases)
 
     return deleted, removed_fall_names, removed_falls
 
@@ -4637,6 +5034,208 @@ def handle_update_node(text, chat_id, from_id):
     )
 
 
+def handle_stats_bl(text=None):
+    body, markup = bl_group_selector_payload()
+    send_message(body, reply_markup=markup)
+
+
+def set_pending_bl_group(chat_id, from_id, action, group_id=""):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        BL_GROUP_STATE.setdefault("pending", {})[key] = {
+            "action": str(action or "").strip(),
+            "group_id": str(group_id or "").strip(),
+            "created_at": now_ts(),
+        }
+        save_bl_group_state()
+
+
+def pop_pending_bl_group(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = BL_GROUP_STATE.setdefault("pending", {}).pop(key, None)
+        if item is not None:
+            save_bl_group_state()
+        return item if isinstance(item, dict) else None
+
+
+def peek_pending_bl_group(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = BL_GROUP_STATE.setdefault("pending", {}).get(key)
+        if not isinstance(item, dict):
+            return None
+        if now_ts() - int(item.get("created_at") or 0) > 600:
+            BL_GROUP_STATE.setdefault("pending", {}).pop(key, None)
+            save_bl_group_state()
+            return None
+        return dict(item)
+
+
+def bl_group_add_prompt(group):
+    name = clean_display_text((group or {}).get("name") or "Группа")
+    current_nodes = bl_group_nodes(group)
+    lines = [
+        "<b>Добавление машин в группу</b>",
+        ALERT_SEPARATOR,
+        detail_line("Группа", name),
+        "",
+    ]
+    if current_nodes:
+        lines += [
+            "<b>Сейчас в группе:</b>",
+            "<blockquote>" + "\n".join(html.escape(node_display_name(node)) for node in current_nodes) + "</blockquote>",
+            "",
+        ]
+    lines += [
+        "Напиши список машин, каждая с новой строки.",
+        "Пример:",
+        "<code>Латвия\nГермания</code>",
+        "Отмена: <code>/cancel</code>",
+    ]
+    return "\n".join(lines)
+
+
+def handle_pending_bl_group(chat_id, from_id, text):
+    pending = peek_pending_bl_group(chat_id, from_id)
+    if not pending:
+        return False
+    action = str(pending.get("action") or "")
+    if action == "create":
+        try:
+            group = create_bl_group(text)
+        except ValueError as exc:
+            if "duplicate" in str(exc):
+                send_message("<b>Такая группа уже есть.</b>\n\nНапиши другое название или <code>/cancel</code>.")
+            else:
+                send_message("<b>Не понял название группы.</b>\n\nНапример: <code>kto VPN</code>\nОтмена: <code>/cancel</code>")
+            return True
+        pop_pending_bl_group(chat_id, from_id)
+        body = (
+            "<b>Группа создана</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Название', group.get('name'))}\n\n"
+            "Теперь можно добавить сюда машины."
+        )
+        send_message(body, reply_markup=bl_group_action_markup(group.get("id")))
+        return True
+    if action == "add":
+        group_id = str(pending.get("group_id") or "").strip()
+        group = bl_group_by_id(group_id)
+        if group is None:
+            pop_pending_bl_group(chat_id, from_id)
+            send_message("<b>Группа больше не найдена.</b>")
+            return True
+        raw_lines = [line.strip() for line in str(text or "").splitlines()]
+        raw_lines = [line for line in raw_lines if line]
+        if not raw_lines:
+            send_message("<b>Список пуст.</b>\n\nНапиши названия машин строками.\nОтмена: <code>/cancel</code>")
+            return True
+        found = []
+        missing = []
+        seen = set()
+        for line in raw_lines:
+            node = find_bl_node_exact(line)
+            if node is None:
+                missing.append(line)
+                continue
+            node_key = node_canonical_key(node)
+            if node_key in seen:
+                continue
+            seen.add(node_key)
+            found.append(node)
+        if not found:
+            send_message(
+                "<b>Не нашёл ни одной машины exact-match.</b>\n\n"
+                "Пиши название ровно как в <code>/stats_bl</code>.\n"
+                f"<blockquote>{html.escape(chr(10).join(missing[:20]))}</blockquote>\n"
+                "Отмена: <code>/cancel</code>"
+            )
+            return True
+        result = add_nodes_to_bl_group(group_id, found)
+        pop_pending_bl_group(chat_id, from_id)
+        group = bl_group_by_id(group_id)
+        lines = [
+            "<b>Группа обновлена</b>",
+            ALERT_SEPARATOR,
+            detail_line("Группа", (group or {}).get("name") or group_id),
+        ]
+        if result.get("added"):
+            lines += ["", "<b>Добавлено:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in result["added"]) + "</blockquote>"]
+        if result.get("moved"):
+            lines += ["", "<b>Перенесено из других групп:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in result["moved"]) + "</blockquote>"]
+        if result.get("already"):
+            lines += ["", "<b>Уже были тут:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in result["already"]) + "</blockquote>"]
+        if missing:
+            lines += ["", "<b>Не нашёл:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in missing[:20]) + "</blockquote>"]
+        send_message("\n".join(lines), reply_markup=bl_group_action_markup(group_id))
+        return True
+    return False
+
+
+def handle_bl_group_callback(callback):
+    callback_id = str(callback.get("id") or "")
+    data = str(callback.get("data") or "")
+    from_id = str((callback.get("from") or {}).get("id") or "")
+    message = callback.get("message") or {}
+    chat_id = str((message.get("chat") or {}).get("id") or CHAT_ID)
+    message_id = str(message.get("message_id") or "")
+    if not data.startswith("blg:"):
+        return False
+    if chat_id != str(CHAT_ID) or from_id != ALLOWED_USER_ID:
+        answer_callback(callback_id, "нет доступа")
+        return True
+    if data == "blg:c":
+        set_pending_bl_group(chat_id, from_id, "create")
+        answer_callback(callback_id, "напиши название")
+        send_message(
+            "<b>Новая группа обычных машин</b>\n\n"
+            "Ответь названием группы.\n"
+            "Пример: <code>kto VPN</code>\n"
+            "Отмена: <code>/cancel</code>"
+        )
+        return True
+    if data == "blg:l":
+        answer_callback(callback_id, "список групп")
+        body, markup = bl_group_selector_payload()
+        if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
+            send_message(body, reply_markup=markup)
+        return True
+    if data == "blg:u":
+        answer_callback(callback_id, "обновляю")
+        body = bl_group_stats_message(ungrouped=True)
+        markup = bl_group_action_markup(ungrouped=True)
+        if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
+            send_message(body, reply_markup=markup)
+        return True
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        answer_callback(callback_id)
+        return True
+    action, group_id = parts[1], parts[2].strip()
+    group = bl_group_by_id(group_id)
+    if group is None:
+        answer_callback(callback_id, "группа не найдена")
+        body, markup = bl_group_selector_payload()
+        if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
+            send_message(body, reply_markup=markup)
+        return True
+    if action == "s":
+        answer_callback(callback_id, "обновляю")
+        body = bl_group_stats_message(group_id)
+        markup = bl_group_action_markup(group_id)
+        if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
+            send_message(body, reply_markup=markup)
+        return True
+    if action == "a":
+        set_pending_bl_group(chat_id, from_id, "add", group_id)
+        answer_callback(callback_id, "жду список")
+        send_message(bl_group_add_prompt(group))
+        return True
+    answer_callback(callback_id)
+    return True
+
+
 def handle_update_callback(callback):
     callback_id = str(callback.get("id") or "")
     data = str(callback.get("data") or "")
@@ -4956,6 +5555,8 @@ def bot_loop():
                 if isinstance(callback, dict):
                     if handle_update_callback(callback):
                         continue
+                    if handle_bl_group_callback(callback):
+                        continue
                     handle_ip_limit_callback(callback)
                     continue
                 message = item.get("message") or {}
@@ -4967,9 +5568,12 @@ def bot_loop():
                     pop_pending_ip_limit(chat_id, from_id)
                     pop_pending_sni(chat_id, from_id)
                     pop_pending_rename(chat_id, from_id)
+                    pop_pending_bl_group(chat_id, from_id)
                     send_message("<b>Отменил.</b>")
                     continue
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and not command.startswith("/"):
+                    if handle_pending_bl_group(chat_id, from_id, text):
+                        continue
                     if handle_pending_rename(chat_id, from_id, text):
                         continue
                     if handle_pending_sni(chat_id, from_id, text):
@@ -4983,7 +5587,7 @@ def bot_loop():
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl_full":
                     send_message(aggregate_message("wl_full"))
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_bl":
-                    send_message(aggregate_message("bl"))
+                    handle_stats_bl(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statsrevoke":
                     handle_statsrevoke(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete":
@@ -5042,6 +5646,7 @@ def main():
     load_ssh_allowed_ips()
     load_sni_state()
     load_node_name_state()
+    load_bl_group_state()
     load_update_state()
     load_ip_limit_state()
     threading.Thread(target=offline_loop, daemon=True).start()
