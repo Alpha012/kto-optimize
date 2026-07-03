@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v193"
+SCRIPT_BUILD="v194"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -4137,7 +4137,7 @@ install_stats_push_client() {
             fail "URL коллектора должен начинаться с http:// или https://"
             return 1
         fi
-        secret="$(ask_secret_value "Секрет коллектора" "$secret")"
+        secret="$(ask_secret_value "Секрет коллектора" "${secret:-}")"
         interval="$(ask_int "Интервал push, сек" "${interval:-$STATS_PUSH_INTERVAL_DEFAULT}" 15 3600)"
         ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
         ip_limit_log_file=""
