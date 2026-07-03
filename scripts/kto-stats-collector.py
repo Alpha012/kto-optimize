@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v190"
+COLLECTOR_BUILD = "v191"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1513,6 +1513,26 @@ def send_message(text, reply_markup=None):
         return False
 
 
+def send_rich_message(rich_html, reply_markup=None):
+    if not CHAT_ID:
+        log("telegram chat id is empty")
+        return False
+    try:
+        payload = {
+            "chat_id": CHAT_ID,
+            "rich_message": json.dumps({"html": rich_html}, ensure_ascii=False),
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        result = tg_call("sendRichMessage", payload)
+        msg = result.get("result", {})
+        log(f"telegram sent rich message_id={msg.get('message_id')} chat_id={msg.get('chat', {}).get('id')}")
+        return msg or True
+    except Exception as exc:
+        log(f"telegram rich send failed: {exc}")
+        return False
+
+
 def edit_message_text(chat_id, message_id, text, reply_markup=None):
     if not chat_id or not message_id:
         return False
@@ -2473,6 +2493,137 @@ def aggregate_summary_message(scope="bl"):
     if not nodes:
         return f"<b>{title}</b>\n\nНет данных от машин."
     return f"<b>{title}</b>\n{status_summary(nodes, ts, expected_total=expected_total, filtered=True)}"
+
+
+def rich_text(value):
+    return html.escape(clean_display_text(value if value is not None else "-"))
+
+
+def rich_cell(value, header=False, align="left"):
+    tag = "th" if header else "td"
+    attrs = ""
+    if align in ("left", "center", "right"):
+        attrs = f' align="{align}"'
+    return f"<{tag}{attrs}>{rich_text(value)}</{tag}>"
+
+
+def rich_table(headers, rows, caption=""):
+    if not rows:
+        return ""
+    parts = ["<table bordered striped>"]
+    if caption:
+        parts.append(f"<caption>{rich_text(caption)}</caption>")
+    parts.append("<tr>" + "".join(rich_cell(header, header=True, align="center") for header in headers) + "</tr>")
+    for row in rows:
+        parts.append("<tr>" + "".join(rich_cell(value, align=align) for value, align in row) + "</tr>")
+    parts.append("</table>")
+    return "".join(parts)
+
+
+def wrong_sni_table_text(node):
+    total = int(node.get("scan_wrong_sni_total") or 0)
+    if total <= 0:
+        return "-"
+    sources = int(node.get("scan_wrong_sni_sources") or 0)
+    text = f"{total}/{sources} IP"
+    top = top_wrong_sni_label(node)
+    if top:
+        text = f"{text} | {top}"
+    return text
+
+
+def node_status_text(node, ts):
+    age = ts - int(node.get("last_seen", 0) or 0)
+    if age <= STALE_SEC:
+        return "OK"
+    return f"OFF {format_age(age)}"
+
+
+def rich_wl_rows(nodes, ts):
+    rows = []
+    for node in nodes:
+        error = clean_display_text(node.get("error") or "")
+        if error:
+            today = "ошибка"
+            yesterday = "-"
+            month = "ошибка"
+            sni = "-"
+        else:
+            today = format_bytes(node.get("day_total", 0))
+            yesterday = format_bytes(node.get("yesterday_total", 0))
+            month = format_bytes(node.get("month_total", 0))
+            sni = wrong_sni_table_text(node)
+        rows.append([
+            (node_display_name(node, "unknown").replace("№", "#"), "left"),
+            (str(node.get("ip") or "-"), "left"),
+            (today, "right"),
+            (yesterday, "right"),
+            (month, "right"),
+            (sni, "left"),
+            (node_status_text(node, ts), "center"),
+        ])
+    return rows
+
+
+def rich_status_summary(nodes, ts, expected_total):
+    expected_total = max(int(expected_total or EXPECTED_NODES), len(nodes), 1)
+    live_count = live_node_count(nodes, ts)
+    dead_items, falls, falls_nodes, total_downtime = downtime_totals(nodes, ts, filtered=True)
+    parts = [
+        "<h4>На данный момент</h4>",
+        f"<p><b>Живо:</b> {rich_text(f'{live_count}/{expected_total}')}</p>",
+        f"<p><b>SLA за сегодня:</b> {rich_text(format_sla_percent(total_downtime, expected_total, ts))}</p>",
+        f"<p><b>Объем трафика:</b> {rich_text(format_bytes(nodes_day_traffic(nodes)))}</p>",
+        f"<p><b>Общее кол-во падений за сегодня:</b> {rich_text(int(falls.get('total', 0) or 0))}</p>",
+        f"<p><b>Общее время даунтайма за сегодня:</b> {rich_text(format_duration_ru(total_downtime))}</p>",
+    ]
+    if dead_items:
+        dead_lines = []
+        dead_items.sort(key=lambda item: natural_sort_key(item[0].get("name") or item[0].get("id") or ""))
+        for node, age in dead_items:
+            name = node_display_name(node, "unknown")
+            ip = str(node.get("ip") or "-")
+            dead_lines.append(f"{name} ({ip}) - {format_duration_ru(age)}")
+        parts.append("<blockquote>" + "<br/>".join(rich_text(line) for line in dead_lines) + "</blockquote>")
+    else:
+        parts.append("<p><b>Мертво:</b> нет</p>")
+    if falls_nodes:
+        top_lines = []
+        for name, count in sorted(falls_nodes.items(), key=lambda item: (-int(item[1]), natural_sort_key(item[0]))):
+            top_lines.append(f"{clean_display_text(name)}: {int(count)} раз")
+        parts.append("<details><summary>Топ падений</summary>" + "<br/>".join(rich_text(line) for line in top_lines) + "</details>")
+    return "".join(parts)
+
+
+def aggregate_wl_rich_message():
+    with LOCK:
+        all_nodes = dedupe_nodes(NODES.values())
+    ts = now_ts()
+    wl_nodes = [node for node in all_nodes if node_is_wl(node)]
+    nodes = [node for node in wl_nodes if node_is_exact_bypass(node)]
+    other_nodes = [node for node in wl_nodes if not node_is_exact_bypass(node)]
+    expected_total = max(EXPECTED_NODES, len(nodes), 1)
+    if not nodes and not other_nodes:
+        return "<h3>Статистика обходов</h3><p>Нет данных от машин.</p>"
+    nodes.sort(key=node_natural_sort_key)
+    other_nodes.sort(key=node_natural_sort_key)
+    headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "SNI", "Статус"]
+    parts = [
+        "<h3>Статистика обходов</h3>",
+        rich_table(headers, rich_wl_rows(nodes, ts)),
+        rich_status_summary(nodes, ts, expected_total),
+    ]
+    if other_nodes:
+        other_caption = f"Другие: {live_node_count(other_nodes, ts)}/{len(other_nodes)}"
+        parts.append(rich_table(headers, rich_wl_rows(other_nodes, ts), caption=other_caption))
+    return "".join(part for part in parts if part)
+
+
+def send_stats_wl():
+    rich_html = aggregate_wl_rich_message()
+    if send_rich_message(rich_html):
+        return
+    send_message(aggregate_message("wl"))
 
 
 def code_value(value):
@@ -5583,7 +5734,7 @@ def bot_loop():
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats":
                     send_message(aggregate_message())
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl":
-                    send_message(aggregate_message("wl"))
+                    send_stats_wl()
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl_full":
                     send_message(aggregate_message("wl_full"))
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_bl":
