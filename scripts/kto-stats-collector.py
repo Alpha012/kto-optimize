@@ -17,7 +17,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v183"
+COLLECTOR_BUILD = "v184"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -206,6 +206,21 @@ REMNA_USER_CACHE = {}
 ALERT_SEPARATOR = "➖" * 9
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
 LOST_EMOJI = '<tg-emoji emoji-id="5447183459602669338">🚨</tg-emoji>'
+BL_NODE_ORDER = [
+    "финляндия",
+    "германия",
+    "нидерланды",
+    "латвия",
+    "латвияhysteria",
+    "эстония",
+    "швейцария",
+    "сингапур",
+    "япония",
+    "сшамайами",
+    "россиясанктпетербург",
+    "россияновосибирск",
+]
+BL_NODE_ORDER_INDEX = {name: index for index, name in enumerate(BL_NODE_ORDER)}
 
 if TZ_NAME:
     os.environ["TZ"] = TZ_NAME
@@ -1196,8 +1211,18 @@ def fmt_iso_time(value):
     return fmt_time(ts) if ts > 0 else "-"
 
 
+def clean_display_text(value):
+    text = str(value or "")
+    text = text.replace("\ufeff", "").replace("\ufffd", "")
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("Санкрт-Петербург", "Санкт-Петербург")
+    text = text.replace("санкрт-петербург", "санкт-петербург")
+    return text
+
+
 def natural_sort_key(value):
-    text = str(value or "").casefold()
+    text = clean_display_text(value).casefold()
     key = []
     for part in re.split(r"(\d+)", text):
         if not part:
@@ -1210,7 +1235,7 @@ def natural_sort_key(value):
 
 
 def canonical_node_key(value):
-    text = re.sub(r"[^\w]+", "", str(value or "").casefold(), flags=re.UNICODE)
+    text = re.sub(r"[^\w]+", "", clean_display_text(value).casefold(), flags=re.UNICODE)
     parts = []
     for part in re.split(r"(\d+)", text):
         if not part:
@@ -1892,7 +1917,7 @@ def wrong_sni_html_line(node):
 
 
 def node_message(node, status=None, compact=False):
-    name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
+    name = html.escape(clean_display_text(node.get("name") or node.get("id") or "unknown"))
     ip = html.escape(str(node.get("ip") or "-"))
     uptime_sec = int(node.get("uptime_sec") or 0)
     uptime_text = format_duration_ru(uptime_sec) if uptime_sec > 0 else "-"
@@ -2048,7 +2073,7 @@ def status_summary(nodes, ts, expected_total=None, filtered=False):
     if dead_items:
         dead_items.sort(key=lambda item: natural_sort_key(item[0].get("name") or item[0].get("id") or ""))
         for node, age in dead_items:
-            name = html.escape(str(node.get("name") or node.get("id") or "unknown"))
+            name = html.escape(clean_display_text(node.get("name") or node.get("id") or "unknown"))
             ip = html.escape(str(node.get("ip") or "-"))
             uptime_sec = int(node.get("uptime_sec") or 0)
             uptime_text = format_duration_ru(uptime_sec) if uptime_sec > 0 else "-"
@@ -2068,7 +2093,7 @@ def status_summary(nodes, ts, expected_total=None, filtered=False):
         lines.append("<b>Топ лист машин которые падали:</b>")
         top_lines = []
         for name, count in sorted(falls_nodes.items(), key=lambda item: (-int(item[1]), natural_sort_key(item[0]))):
-            top_lines.append(f"{html.escape(str(name))}: {int(count)} раз")
+            top_lines.append(f"{html.escape(clean_display_text(name))}: {int(count)} раз")
         lines.append(f"<blockquote>{chr(10).join(top_lines)}</blockquote>")
     return "\n".join(lines)
 
@@ -2107,6 +2132,25 @@ def live_node_count(nodes, ts):
     return live_count
 
 
+def node_sort_text(node):
+    if not isinstance(node, dict):
+        return ""
+    return clean_display_text(node.get("name") or node.get("id") or node.get("hostname") or "")
+
+
+def node_natural_sort_key(node):
+    return natural_sort_key(node_sort_text(node))
+
+
+def bl_node_sort_key(node):
+    text = node_sort_text(node)
+    canonical = canonical_node_key(text)
+    order = BL_NODE_ORDER_INDEX.get(canonical)
+    if order is None:
+        order = len(BL_NODE_ORDER_INDEX) + 1
+    return (order, natural_sort_key(text))
+
+
 def aggregate_message(scope="all"):
     with LOCK:
         all_nodes = dedupe_nodes(NODES.values())
@@ -2134,8 +2178,11 @@ def aggregate_message(scope="all"):
         expected_total = max(EXPECTED_NODES, len(nodes), 1)
     if not nodes and not other_nodes:
         return f"<b>{title}</b>\n\nНет данных от машин."
-    nodes.sort(key=lambda item: natural_sort_key(item.get("name") or item.get("id") or ""))
-    other_nodes.sort(key=lambda item: natural_sort_key(item.get("name") or item.get("id") or ""))
+    if scope == "bl":
+        nodes.sort(key=bl_node_sort_key)
+    else:
+        nodes.sort(key=node_natural_sort_key)
+    other_nodes.sort(key=node_natural_sort_key)
     parts = [f"<b>{title}</b>"]
     for node in nodes:
         age = ts - int(node.get("last_seen", 0) or 0)
@@ -2157,7 +2204,7 @@ def aggregate_message(scope="all"):
 def code_value(value):
     if value is None or value == "":
         value = "-"
-    value = str(value).replace("№", "#")
+    value = clean_display_text(value).replace("№", "#")
     return f"<code>{html.escape(value)}</code>"
 
 
@@ -2166,7 +2213,7 @@ def detail_line(label, value):
 
 
 def node_display_name(node, fallback="unknown"):
-    return str(node.get("name") or node.get("id") or node.get("hostname") or fallback)
+    return clean_display_text(node.get("name") or node.get("id") or node.get("hostname") or fallback)
 
 
 def node_display_ip(node):
@@ -3837,23 +3884,23 @@ def delete_node_records(query):
 def handle_delete(text):
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        send_message("<b>Пример:</b> /delete Обход №8")
+        send_message("<b>Пример:</b> /delete Россия, Санкт-Петербург")
         return
 
     query = parts[1].strip()
     deleted, removed_fall_names, removed_falls = delete_node_records(query)
     if not deleted and not removed_fall_names:
         send_message(
-            "<b>Не нашёл такой обход</b>\n\n"
-            f"Запрос: <code>{html.escape(query)}</code>\n"
-            "Пиши точное название, например: <code>/delete Обход №8</code>"
+            "<b>Не нашёл такую машину</b>\n\n"
+            f"Запрос: <code>{html.escape(clean_display_text(query))}</code>\n"
+            "Пиши точное название, например: <code>/delete Россия, Санкт-Петербург</code>"
         )
         return
 
-    lines = ["<b>Обход удалён</b>", ""]
+    lines = ["<b>Машина удалена</b>", ""]
     if deleted:
         for node_id, node in deleted:
-            name = html.escape(str(node.get("name") or node_id))
+            name = html.escape(clean_display_text(node.get("name") or node_id))
             ip = html.escape(str(node.get("ip") or "-"))
             lines.append(f"<blockquote>{name}\nIP: {ip}</blockquote>")
     else:
@@ -3862,7 +3909,7 @@ def handle_delete(text):
         lines += [
             "",
             f"Падений за сегодня вычистил: {removed_falls}",
-            "Топ падений: очищен по этому обходу",
+            "Топ падений: очищен по этой машине",
         ]
     lines += [
         "",
