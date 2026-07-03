@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v195"
+COLLECTOR_BUILD = "v196"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -2709,7 +2709,6 @@ def bl_group_rich_context(group_id=None, ungrouped=False):
         if group is None:
             return "", [], False
         group_nodes = bl_group_nodes(group, nodes)
-        group_nodes.sort(key=bl_node_sort_key)
         group_name = group.get("name") or "Группа"
         group_found = True
     return group_name, group_nodes, group_found
@@ -3671,6 +3670,75 @@ def bl_group_nodes(group, nodes=None):
     return result
 
 
+def bl_node_in_group(node, group):
+    if not isinstance(node, dict) or not isinstance(group, dict):
+        return False
+    aliases = node_alias_keys(node)
+    if not aliases:
+        return False
+    raw_nodes = group.get("nodes") if isinstance(group.get("nodes"), dict) else {}
+    for key in raw_nodes.keys():
+        if canonical_node_key(key) in aliases:
+            return True
+    return False
+
+
+def reorder_bl_group_nodes(group_id, ordered_nodes):
+    group_id = str(group_id or "").strip()
+    prepared = []
+    for node in ordered_nodes:
+        if not isinstance(node, dict):
+            continue
+        key = node_canonical_key(node)
+        if not key:
+            continue
+        prepared.append((key, node_display_name(node, key)[:120], node_alias_keys(node)))
+    if not prepared:
+        return {"ordered": [], "appended": []}
+    ordered = []
+    appended = []
+    with LOCK:
+        groups = BL_GROUP_STATE.setdefault("groups", {})
+        group = groups.get(group_id)
+        if not isinstance(group, dict):
+            raise ValueError("group not found")
+        group_nodes = group.setdefault("nodes", {})
+        if not isinstance(group_nodes, dict):
+            group_nodes = {}
+            group["nodes"] = group_nodes
+        old_items = list(group_nodes.items())
+        new_nodes = {}
+        used = set()
+        for key, name, aliases in prepared:
+            matched_key = None
+            for existing_key in group_nodes.keys():
+                existing_canon = canonical_node_key(existing_key)
+                if existing_canon and existing_canon in aliases:
+                    matched_key = existing_key
+                    break
+            if matched_key is None:
+                continue
+            canonical_key = canonical_node_key(matched_key) or canonical_node_key(key)
+            if not canonical_key or canonical_key in used:
+                continue
+            display = clean_display_text(group_nodes.get(matched_key) or name or canonical_key)[:120] or canonical_key
+            new_nodes[canonical_key] = display
+            used.add(canonical_key)
+            ordered.append(display)
+        for existing_key, existing_name in old_items:
+            canonical_key = canonical_node_key(existing_key)
+            if not canonical_key or canonical_key in used:
+                continue
+            display = clean_display_text(existing_name or canonical_key)[:120] or canonical_key
+            new_nodes[canonical_key] = display
+            appended.append(display)
+        if ordered:
+            group["nodes"] = new_nodes
+            group["updated_at"] = now_ts()
+            save_bl_group_state()
+    return {"ordered": ordered, "appended": appended}
+
+
 def bl_assigned_node_aliases(groups=None):
     aliases = set()
     for group in (groups if groups is not None else bl_group_list()):
@@ -3881,6 +3949,7 @@ def bl_group_action_markup(group_id=None, ungrouped=False):
     rows = []
     if not ungrouped and group_id:
         rows.append([{"text": "Добавить сюда машины", "callback_data": f"blg:a:{group_id}"}])
+        rows.append([{"text": "Редактировать вид списка", "callback_data": f"blg:o:{group_id}"}])
         rows.append([{"text": "Обновить", "callback_data": f"blg:s:{group_id}"}])
     elif ungrouped:
         rows.append([{"text": "Обновить", "callback_data": "blg:u"}])
@@ -5363,6 +5432,29 @@ def bl_group_add_prompt(group):
     return "\n".join(lines)
 
 
+def bl_group_order_prompt(group):
+    name = clean_display_text((group or {}).get("name") or "Группа")
+    current_nodes = bl_group_nodes(group)
+    lines = [
+        "<b>Редактирование вида списка</b>",
+        ALERT_SEPARATOR,
+        detail_line("Группа", name),
+        "",
+    ]
+    if current_nodes:
+        lines += [
+            "<b>Текущий порядок:</b>",
+            "<blockquote>" + "\n".join(html.escape(node_display_name(node)) for node in current_nodes) + "</blockquote>",
+            "",
+        ]
+    lines += [
+        "Ответь списком машин в нужном порядке, каждая с новой строки.",
+        "Неуказанные машины останутся внизу в старом порядке.",
+        "Отмена: <code>/cancel</code>",
+    ]
+    return "\n".join(lines)
+
+
 def handle_pending_bl_group(chat_id, from_id, text):
     pending = peek_pending_bl_group(chat_id, from_id)
     if not pending:
@@ -5437,6 +5529,66 @@ def handle_pending_bl_group(chat_id, from_id, text):
             lines += ["", "<b>Не нашёл:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in missing[:20]) + "</blockquote>"]
         send_message("\n".join(lines), reply_markup=bl_group_action_markup(group_id))
         return True
+    if action == "order":
+        group_id = str(pending.get("group_id") or "").strip()
+        group = bl_group_by_id(group_id)
+        if group is None:
+            pop_pending_bl_group(chat_id, from_id)
+            send_message("<b>Группа больше не найдена.</b>")
+            return True
+        raw_lines = [line.strip() for line in str(text or "").splitlines()]
+        raw_lines = [line for line in raw_lines if line]
+        if not raw_lines:
+            send_message("<b>Список пуст.</b>\n\nНапиши названия машин строками.\nОтмена: <code>/cancel</code>")
+            return True
+        found = []
+        missing = []
+        outside = []
+        seen = set()
+        for line in raw_lines:
+            node = find_bl_node_exact(line)
+            if node is None:
+                missing.append(line)
+                continue
+            node_key = node_canonical_key(node)
+            if node_key in seen:
+                continue
+            seen.add(node_key)
+            if not bl_node_in_group(node, group):
+                outside.append(line)
+                continue
+            found.append(node)
+        if not found:
+            lines = [
+                "<b>Не нашёл машин из этой группы.</b>",
+                "",
+                "Пиши названия ровно как в текущем списке группы.",
+                "Отмена: <code>/cancel</code>",
+            ]
+            if missing:
+                lines += ["", "<b>Не нашёл:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in missing[:20]) + "</blockquote>"]
+            if outside:
+                lines += ["", "<b>Не в этой группе:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in outside[:20]) + "</blockquote>"]
+            send_message("\n".join(lines))
+            return True
+        result = reorder_bl_group_nodes(group_id, found)
+        pop_pending_bl_group(chat_id, from_id)
+        group = bl_group_by_id(group_id)
+        lines = [
+            "<b>Порядок списка обновлён</b>",
+            ALERT_SEPARATOR,
+            detail_line("Группа", (group or {}).get("name") or group_id),
+        ]
+        if result.get("ordered"):
+            lines += ["", "<b>Новый верх списка:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in result["ordered"]) + "</blockquote>"]
+        if result.get("appended"):
+            lines += ["", "<b>Остались внизу:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in result["appended"]) + "</blockquote>"]
+        if missing:
+            lines += ["", "<b>Не нашёл:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in missing[:20]) + "</blockquote>"]
+        if outside:
+            lines += ["", "<b>Не в этой группе:</b>", "<blockquote>" + "\n".join(html.escape(item) for item in outside[:20]) + "</blockquote>"]
+        send_message("\n".join(lines), reply_markup=bl_group_action_markup(group_id))
+        return True
     return False
 
 
@@ -5492,6 +5644,11 @@ def handle_bl_group_callback(callback):
         set_pending_bl_group(chat_id, from_id, "add", group_id)
         answer_callback(callback_id, "жду список")
         send_message(bl_group_add_prompt(group))
+        return True
+    if action == "o":
+        set_pending_bl_group(chat_id, from_id, "order", group_id)
+        answer_callback(callback_id, "жду порядок")
+        send_message(bl_group_order_prompt(group))
         return True
     answer_callback(callback_id)
     return True
