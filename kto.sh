@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v194"
+SCRIPT_BUILD="v195"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -145,11 +145,20 @@ ok() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*" >&2; }
 fail() { echo -e "${RED}[ОШИБКА]${NC} $*" >&2; }
 
+enable_utf8_tty() {
+    if [[ -t 0 ]]; then
+        stty iutf8 2>/dev/null || true
+    fi
+}
+
 ensure_utf8_locale() {
     local charmap candidate candidate_charmap
     charmap="$(locale charmap 2>/dev/null || true)"
     case "$charmap" in
-        UTF-8|UTF8|utf-8|utf8) return 0 ;;
+        UTF-8|UTF8|utf-8|utf8)
+            enable_utf8_tty
+            return 0
+            ;;
     esac
 
     for candidate in C.UTF-8 C.utf8 en_US.UTF-8 ru_RU.UTF-8; do
@@ -158,6 +167,7 @@ ensure_utf8_locale() {
             UTF-8|UTF8|utf-8|utf8)
                 export LANG="$candidate"
                 export LC_ALL="$candidate"
+                enable_utf8_tty
                 return 0
                 ;;
         esac
@@ -519,11 +529,22 @@ escape_config_value() {
     local value="$1"
     value="${value//\\/\\\\}"
     value="${value//\"/\\\"}"
-    echo "$value"
+    printf '%s\n' "$value"
 }
 
 text_has_replacement_char() {
     [[ "$1" == *$'\357\277\275'* ]]
+}
+
+text_is_valid_utf8() {
+    if ! command -v iconv >/dev/null 2>&1; then
+        return 0
+    fi
+    printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1
+}
+
+text_has_bad_utf8() {
+    text_has_replacement_char "$1" || ! text_is_valid_utf8 "$1"
 }
 
 load_machine_mode() {
@@ -977,7 +998,7 @@ ask_text() {
         value="${value%$'\r'}"
         value="${value:-$default}"
         if [[ -n "$value" ]]; then
-            echo "$value"
+            printf '%s\n' "$value"
             return 0
         fi
         fail "Значение не может быть пустым"
@@ -995,7 +1016,7 @@ ask_optional_text() {
     fi
     read -r value
     value="${value%$'\r'}"
-    echo "${value:-$default}"
+    printf '%s\n' "${value:-$default}"
 }
 
 ask_int() {
@@ -4063,7 +4084,7 @@ install_stats_push_client() {
     default_iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
     default_iface="${default_iface:-$(default_network_interface)}"
     default_name="$(config_get KTO_PUSH_NODE_NAME "$STATS_PUSH_CONFIG")"
-    if text_has_replacement_char "$default_name"; then
+    if text_has_bad_utf8 "$default_name"; then
         warn "В старом push-конфиге имя машины уже с битой кодировкой, попрошу ввести его заново."
         default_name=""
     fi
@@ -4085,7 +4106,7 @@ install_stats_push_client() {
         ip_limit_tail_lines="$(config_get KTO_IP_LIMIT_TAIL_LINES "$STATS_PUSH_CONFIG")"
         ip_limit_max_events="$(config_get KTO_IP_LIMIT_MAX_EVENTS "$STATS_PUSH_CONFIG")"
         ip_limit_xray_logs="$(config_get KTO_IP_LIMIT_XRAY_LOGS "$STATS_PUSH_CONFIG")"
-        if text_has_replacement_char "$node_name" || text_has_replacement_char "$node_id"; then
+        if text_has_bad_utf8 "$node_name" || text_has_bad_utf8 "$node_id"; then
             warn "В push-конфиге имя машины сохранено с битой кодировкой, пройду настройку заново."
             node_name=""
             node_id=""
@@ -4122,8 +4143,8 @@ install_stats_push_client() {
         fi
     else
         node_name="$(ask_text "Название машины" "$default_name")"
-        if text_has_replacement_char "$node_name"; then
-            fail "Название машины прочиталось с битой кодировкой. Проверь locale/терминал и повтори установку."
+        if text_has_bad_utf8 "$node_name"; then
+            fail "Название машины прочиталось невалидным UTF-8. Включил stty iutf8, повтори ввод без исправления кириллицы backspace."
             return 1
         fi
         node_id="$node_name"
