@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import html
+import hashlib
 import json
 import os
 import re
@@ -17,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v185"
+COLLECTOR_BUILD = "v186"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -496,6 +497,9 @@ def load_update_state():
                 "created_at": int(current.get("created_at") or 0),
                 "requested_by": str(current.get("requested_by") or "").strip()[:80],
                 "raw_base": str(current.get("raw_base") or RAW_BASE).strip().rstrip("/")[:300],
+                "action": str(current.get("action") or "push_update").strip()[:40],
+                "scope": str(current.get("scope") or "all").strip()[:40],
+                "local_required": bool(current.get("local_required", True)),
                 "targets": targets,
                 "notified_at": int(current.get("notified_at") or 0),
             }
@@ -517,30 +521,53 @@ def save_update_state():
     atomic_write(UPDATE_STATE_FILE, json.dumps(UPDATE_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
-def current_update_targets():
+def node_scope_matches(node, scope):
+    scope = str(scope or "all").strip().lower()
+    if scope in ("all", "*"):
+        return True
+    if scope in ("wl", "whitelist"):
+        return node_is_wl(node)
+    if scope in ("bl", "blacklist", "other", "others"):
+        return not node_is_wl(node)
+    return True
+
+
+def current_update_targets(scope="all"):
     targets = {}
     for node in dedupe_nodes(NODES.values()):
+        if not node_scope_matches(node, scope):
+            continue
         key = node_canonical_key(node)
         if key:
             targets[key] = node_display_name(node, key)[:120]
     return targets
 
 
-def queue_update_task(requested_by):
+def queue_update_task(requested_by, action="push_update", scope="all", targets=None, local_required=True):
     ts = now_ts()
+    action = str(action or "push_update").strip()
+    if action not in ("push_update", "node_update"):
+        action = "push_update"
+    scope = str(scope or "all").strip().lower()
     with LOCK:
-        targets = current_update_targets()
+        selected_targets = targets if isinstance(targets, dict) else current_update_targets(scope)
         job = {
             "id": f"{ts}-{os.getpid()}",
             "created_at": ts,
             "requested_by": str(requested_by or "").strip()[:80],
             "raw_base": RAW_BASE,
-            "targets": targets,
+            "action": action,
+            "scope": scope,
+            "local_required": bool(local_required),
+            "targets": selected_targets,
             "notified_at": 0,
         }
         UPDATE_STATE["current"] = job
         UPDATE_STATE["results"] = {}
-        UPDATE_STATE["local"] = {"id": job["id"], "status": "queued", "build": COLLECTOR_BUILD, "message": "", "updated_at": ts}
+        if local_required:
+            UPDATE_STATE["local"] = {"id": job["id"], "status": "queued", "build": COLLECTOR_BUILD, "message": "", "updated_at": ts}
+        else:
+            UPDATE_STATE["local"] = {"id": job["id"], "status": "ok", "build": COLLECTOR_BUILD, "message": "collector skipped", "updated_at": ts}
         save_update_state()
     return dict(job)
 
@@ -562,7 +589,7 @@ def update_task_for_node(node):
             return None
         return {
             "id": job_id,
-            "action": "push_update",
+            "action": str(current.get("action") or "push_update"),
             "raw_base": str(current.get("raw_base") or RAW_BASE).rstrip("/"),
             "collector_build": COLLECTOR_BUILD,
         }
@@ -927,6 +954,26 @@ def normalize_scan_sni_top(value):
             result.append({"sni": sni, "count": count})
     result.sort(key=lambda item: (-int(item.get("count") or 0), natural_sort_key(item.get("sni"))))
     return result[:10]
+
+
+def normalize_remna_info(item):
+    if not isinstance(item, dict):
+        return {}
+    try:
+        restarts = int(item.get("restarts") or 0)
+    except Exception:
+        restarts = 0
+    try:
+        error_count = int(item.get("error_count") or 0)
+    except Exception:
+        error_count = 0
+    return {
+        "status": clean_display_text(item.get("status") or "")[:80],
+        "restarts": max(0, restarts),
+        "error_count": max(0, error_count),
+        "last_error": clean_display_text(item.get("last_error") or "")[:500],
+        "compose_dir": clean_display_text(item.get("compose_dir") or "")[:240],
+    }
 
 
 def asn_info_from_row(row):
@@ -1955,6 +2002,29 @@ def wrong_sni_html_line(node):
     return html.escape(scan_line)
 
 
+def remna_html_line(node):
+    remna = node.get("remna") if isinstance(node, dict) else {}
+    if not isinstance(remna, dict):
+        return ""
+    status = clean_display_text(remna.get("status") or "")
+    restarts = int(remna.get("restarts") or 0)
+    error_count = int(remna.get("error_count") or 0)
+    last_error = clean_display_text(remna.get("last_error") or "")
+    parts = []
+    if status and status != "running":
+        parts.append(f"status {status}")
+    if restarts > 0:
+        parts.append(f"restarts {restarts}")
+    if error_count > 0:
+        parts.append(f"errors {error_count}")
+    if not parts:
+        return ""
+    line = "Remna: " + ", ".join(parts)
+    if last_error:
+        line = f"{line} | {last_error[:180]}"
+    return html.escape(line)
+
+
 def node_message(node, status=None, compact=False):
     name = html.escape(clean_display_text(node.get("name") or node.get("id") or "unknown"))
     ip = html.escape(str(node.get("ip") or "-"))
@@ -1973,6 +2043,9 @@ def node_message(node, status=None, compact=False):
     wrong_sni_line = wrong_sni_html_line(node)
     if wrong_sni_line:
         cpu_line = f"{cpu_line}\n{wrong_sni_line}"
+    remna_line = remna_html_line(node)
+    if remna_line:
+        cpu_line = f"{cpu_line}\n{remna_line}"
     if compact:
         lines = [f"<blockquote><b>{name}</b>\nIP: {ip}</blockquote>", ""]
         if error:
@@ -1989,6 +2062,8 @@ def node_message(node, status=None, compact=False):
         ]
         if wrong_sni_line:
             lines += ["", f"<b><i>{wrong_sni_line}</i></b>"]
+        if remna_line:
+            lines += ["", f"<b><i>{remna_line}</i></b>"]
         lines += ["", footer]
         return "\n".join(lines)
     lines = [f"<blockquote><b>{name}</b>\nIP: {ip}\nАптайм: {uptime_text}</blockquote>", ""]
@@ -2238,6 +2313,26 @@ def aggregate_message(scope="all"):
             parts.append("")
             parts.append(node_message(node, status, compact=compact))
     return "\n".join(parts)
+
+
+def aggregate_summary_message(scope="bl"):
+    with LOCK:
+        all_nodes = dedupe_nodes(NODES.values())
+    ts = now_ts()
+    scope = str(scope or "bl").strip().lower()
+    if scope == "bl":
+        nodes = [node for node in all_nodes if not node_is_wl(node)]
+        title = "Статистика других машин"
+    elif scope == "wl":
+        nodes = [node for node in all_nodes if node_is_wl(node)]
+        title = "Статистика обходов"
+    else:
+        nodes = all_nodes
+        title = "Статистика машин"
+    expected_total = max(len(nodes), 1)
+    if not nodes:
+        return f"<b>{title}</b>\n\nНет данных от машин."
+    return f"<b>{title}</b>\n{status_summary(nodes, ts, expected_total=expected_total, filtered=True)}"
 
 
 def code_value(value):
@@ -3601,7 +3696,9 @@ def remna_ip_limit_loop():
 
 
 def update_node(payload, remote_ip=""):
-    node_id = str(payload.get("id") or payload.get("name") or payload.get("hostname") or "").strip()
+    raw_id = clean_display_text(payload.get("id") or "")
+    node_name = clean_display_text(payload.get("name") or raw_id or payload.get("hostname") or "")
+    node_id = node_name or raw_id or clean_display_text(payload.get("hostname") or "")
     if not node_id:
         raise ValueError("id/name is required")
     current = now_ts()
@@ -3609,7 +3706,7 @@ def update_node(payload, remote_ip=""):
     scan_alert_delta = 0
     record = {
         "id": node_id,
-        "name": str(payload.get("name") or node_id),
+        "name": node_name or node_id,
         "ip": str(remote_ip or payload.get("ip") or ""),
         "uptime_sec": int(payload.get("uptime_sec") or 0),
         "iface": str(payload.get("iface") or ""),
@@ -3634,6 +3731,7 @@ def update_node(payload, remote_ip=""):
         "scan_wrong_sni_sources": int(payload.get("scan_wrong_sni_sources") or 0),
         "scan_wrong_sni_top": normalize_scan_top(payload.get("scan_wrong_sni_top")),
         "scan_wrong_sni_names": normalize_scan_sni_top(payload.get("scan_wrong_sni_names")),
+        "remna": normalize_remna_info(payload.get("remna")),
         "error": str(payload.get("error") or ""),
         "updated_at": int(payload.get("updated_at") or current),
         "last_seen": current,
@@ -3805,7 +3903,11 @@ def daily_report_loop():
             current = datetime.now()
             today = current.strftime("%Y-%m-%d")
             if current.strftime("%H:%M") == DAILY_REPORT_TIME and last_sent != today:
-                if send_message(aggregate_message("wl")):
+                wl_sent = send_message(aggregate_message("wl"))
+                bl_sent = False
+                if wl_sent:
+                    bl_sent = send_message(aggregate_summary_message("bl"))
+                if wl_sent and bl_sent:
                     last_sent = today
                     save_daily_date(today)
                 time.sleep(70)
@@ -3989,6 +4091,9 @@ def update_progress_snapshot_unlocked():
     targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
     targets = {str(key): clean_display_text(value or key) for key, value in targets.items() if key}
     job_id = str(current.get("id") or "")
+    action = str(current.get("action") or "push_update")
+    scope = str(current.get("scope") or "all")
+    local_required = bool(current.get("local_required", True))
     ok_count = 0
     error_count = 0
     running_count = 0
@@ -3999,6 +4104,9 @@ def update_progress_snapshot_unlocked():
         if not isinstance(item, dict) or item.get("id") != job_id:
             wait_count += 1
             continue
+        item = dict(item)
+        item["key"] = key
+        item["node"] = clean_display_text(item.get("node") or targets.get(key) or key)
         status = item.get("status")
         if status == "ok":
             ok_count += 1
@@ -4010,6 +4118,8 @@ def update_progress_snapshot_unlocked():
         else:
             wait_count += 1
     local_status = local.get("status") if local.get("id") == job_id else "wait"
+    if not local_required and local_status == "wait":
+        local_status = "ok"
     if local_status == "error":
         local_error = dict(local)
         local_error["node"] = "collector"
@@ -4017,6 +4127,9 @@ def update_progress_snapshot_unlocked():
     done = bool(job_id) and local_status in ("ok", "error") and wait_count == 0 and running_count == 0
     return {
         "job_id": job_id,
+        "action": action,
+        "scope": scope,
+        "local_required": local_required,
         "local_status": local_status or "wait",
         "ok_count": ok_count,
         "error_count": error_count,
@@ -4028,15 +4141,57 @@ def update_progress_snapshot_unlocked():
     }
 
 
+def update_action_label(action):
+    action = str(action or "push_update")
+    if action == "node_update":
+        return "remnanode compose"
+    return "push script"
+
+
+def update_scope_label(scope):
+    scope = str(scope or "all").lower()
+    if scope == "wl":
+        return "WL"
+    if scope == "bl":
+        return "BL"
+    if scope == "single":
+        return "1 машина"
+    return "все"
+
+
+def update_retry_token(node_key):
+    return hashlib.sha1(str(node_key or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def update_retry_markup(snapshot):
+    errors = snapshot.get("errors") if isinstance(snapshot.get("errors"), list) else []
+    rows = []
+    action = str(snapshot.get("action") or "push_update")
+    for item in errors:
+        key = str(item.get("key") or "")
+        if not key:
+            continue
+        name = clean_display_text(item.get("node") or key)[:40]
+        rows.append([{"text": name or key, "callback_data": f"upd:r:{action}:{update_retry_token(key)}"}])
+        if len(rows) >= 10:
+            break
+    return {"inline_keyboard": rows} if rows else None
+
+
 def update_status_message_from_snapshot(snapshot, title="Update status"):
     job_id = str(snapshot.get("job_id") or "")
     if not job_id:
         return "<b>Update-задачи нет.</b>"
+    collector_status = snapshot.get("local_status") or "-"
+    if not snapshot.get("local_required", True):
+        collector_status = "skip"
     lines = [
         f"<b>{title}</b>",
         ALERT_SEPARATOR,
         detail_line("Job", job_id),
-        detail_line("Collector", snapshot.get("local_status") or "-"),
+        detail_line("Тип", update_action_label(snapshot.get("action"))),
+        detail_line("Группа", update_scope_label(snapshot.get("scope"))),
+        detail_line("Collector", collector_status),
         detail_line("Ноды", f"ok {snapshot.get('ok_count', 0)} / error {snapshot.get('error_count', 0)} / running {snapshot.get('running_count', 0)} / wait {snapshot.get('wait_count', 0)}"),
     ]
     errors = snapshot.get("errors") if isinstance(snapshot.get("errors"), list) else []
@@ -4050,10 +4205,15 @@ def update_status_message_from_snapshot(snapshot, title="Update status"):
     return "\n".join(lines)
 
 
-def update_status_message():
+def update_status_payload():
     with LOCK:
         snapshot = update_progress_snapshot_unlocked()
-    return update_status_message_from_snapshot(snapshot)
+    return update_status_message_from_snapshot(snapshot), update_retry_markup(snapshot)
+
+
+def update_status_message():
+    body, _ = update_status_payload()
+    return body
 
 
 def maybe_send_update_done_notification():
@@ -4069,29 +4229,121 @@ def maybe_send_update_done_notification():
         success = snapshot.get("error_count", 0) == 0 and snapshot.get("local_status") == "ok"
         title = "Update завершён" if success else "Update завершён с ошибками"
         message = update_status_message_from_snapshot(snapshot, title=title)
+        markup = update_retry_markup(snapshot)
     if message:
-        send_message(message)
+        send_message(message, reply_markup=markup)
 
 
-def handle_update_collector(text, chat_id, from_id):
-    parts = text.split()
-    if len(parts) > 1 and parts[1].lower() in ("status", "статус"):
-        send_message(update_status_message())
-        return
-    job = queue_update_task(from_id)
+def update_start_title(action, scope, retry=False):
+    if retry:
+        return "Update retry запущен"
+    if action == "node_update":
+        return "Update nodes запущен"
+    if scope == "wl":
+        return "Update WL запущен"
+    if scope == "bl":
+        return "Update BL запущен"
+    return "Update запущен"
+
+
+def update_status_command(action):
+    if action == "node_update":
+        return "/update_nodes status"
+    return "/update_collector status"
+
+
+def start_update_job(action, scope, requested_by, local_required=True, targets=None, retry=False):
+    job = queue_update_task(requested_by, action=action, scope=scope, targets=targets, local_required=local_required)
     total_nodes = len(job.get("targets") if isinstance(job.get("targets"), dict) else {})
     lines = [
-        "<b>Update запущен</b>",
+        f"<b>{update_start_title(action, scope, retry=retry)}</b>",
         ALERT_SEPARATOR,
         detail_line("Job", job.get("id")),
+        detail_line("Тип", update_action_label(action)),
+        detail_line("Группа", update_scope_label(scope)),
         detail_line("Машин в очереди", total_nodes),
-        detail_line("Raw", job.get("raw_base")),
-        "",
-        "<i>Collector обновится локально. Ноды применят update при ближайшем push.</i>",
-        "<i>Статус: <code>/update_collector status</code></i>",
     ]
+    if action == "push_update":
+        lines.append(detail_line("Raw", job.get("raw_base")))
+        lines += [
+            "",
+            "<i>Collector обновится локально. Ноды применят update при ближайшем push.</i>" if local_required else "<i>Нода применит update при ближайшем push.</i>",
+            f"<i>Статус: <code>{update_status_command(action)}</code></i>",
+        ]
+    else:
+        lines += [
+            "",
+            "<i>Ноды выполнят docker compose pull/down/up при ближайшем push.</i>",
+            f"<i>Статус: <code>{update_status_command(action)}</code></i>",
+        ]
     send_message("\n".join(lines))
-    start_local_collector_update(job)
+    if action == "push_update" and local_required:
+        start_local_collector_update(job)
+    maybe_send_update_done_notification()
+    return job
+
+
+def handle_update_collector(text, chat_id, from_id, scope="all"):
+    parts = text.split()
+    if len(parts) > 1 and parts[1].lower() in ("status", "статус"):
+        body, markup = update_status_payload()
+        send_message(body, reply_markup=markup)
+        return
+    start_update_job("push_update", scope, from_id, local_required=True)
+
+
+def handle_update_nodes(text, chat_id, from_id):
+    parts = text.split()
+    if len(parts) > 1 and parts[1].lower() in ("status", "статус"):
+        body, markup = update_status_payload()
+        send_message(body, reply_markup=markup)
+        return
+    start_update_job("node_update", "all", from_id, local_required=False)
+
+
+def handle_update_callback(callback):
+    callback_id = str(callback.get("id") or "")
+    data = str(callback.get("data") or "")
+    from_id = str((callback.get("from") or {}).get("id") or "")
+    message = callback.get("message") or {}
+    chat_id = str((message.get("chat") or {}).get("id") or CHAT_ID)
+    if not data.startswith("upd:"):
+        return False
+    if chat_id != str(CHAT_ID) or from_id != ALLOWED_USER_ID:
+        answer_callback(callback_id, "нет доступа")
+        return True
+    parts = data.split(":", 3)
+    if len(parts) != 4 or parts[1] != "r":
+        answer_callback(callback_id)
+        return True
+    action = parts[2].strip()
+    token = parts[3].strip()
+    with LOCK:
+        current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
+        if action != str(current.get("action") or "push_update"):
+            answer_callback(callback_id, "задача уже другая")
+            return True
+        targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
+        selected_key = ""
+        selected_name = ""
+        for key, name in targets.items():
+            if update_retry_token(key) == token:
+                selected_key = str(key)
+                selected_name = clean_display_text(name or key)
+                break
+    if not selected_key:
+        answer_callback(callback_id, "машина не найдена")
+        return True
+    answer_callback(callback_id, "запустил retry")
+    start_update_job(
+        action,
+        "single",
+        from_id,
+        local_required=False,
+        targets={selected_key: selected_name or selected_key},
+        retry=True,
+    )
+    return True
 
 
 def handle_ip(text):
@@ -4366,6 +4618,8 @@ def bot_loop():
                 save_offset(offset)
                 callback = item.get("callback_query")
                 if isinstance(callback, dict):
+                    if handle_update_callback(callback):
+                        continue
                     handle_ip_limit_callback(callback)
                     continue
                 message = item.get("message") or {}
@@ -4399,6 +4653,12 @@ def bot_loop():
                     handle_add_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector":
                     handle_update_collector(text, chat_id, from_id)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector_wl":
+                    handle_update_collector(text, chat_id, from_id, scope="wl")
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_collector_bl":
+                    handle_update_collector(text, chat_id, from_id, scope="bl")
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_nodes":
+                    handle_update_nodes(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/haproxy":
                     handle_haproxy_command(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/allow_sni":

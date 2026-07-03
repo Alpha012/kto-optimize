@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v185"
+PUSH_BUILD="v186"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -36,6 +36,9 @@ KTO_IP_LIMIT_TAIL_LINES="${KTO_IP_LIMIT_TAIL_LINES:-5000}"
 KTO_IP_LIMIT_MAX_EVENTS="${KTO_IP_LIMIT_MAX_EVENTS:-5000}"
 KTO_IP_LIMIT_XRAY_LOGS="${KTO_IP_LIMIT_XRAY_LOGS:-1}"
 KTO_IP_LIMIT_BLOCK_STATE="${KTO_IP_LIMIT_BLOCK_STATE:-/run/kto-ip-limit-blocks.tsv}"
+KTO_REMNA_LOG_ENABLED="${KTO_REMNA_LOG_ENABLED:-1}"
+KTO_REMNA_DOCKER_CONTAINER="${KTO_REMNA_DOCKER_CONTAINER:-${KTO_IP_LIMIT_DOCKER_CONTAINER:-remnanode}}"
+KTO_REMNA_LOG_SCAN_SEC="${KTO_REMNA_LOG_SCAN_SEC:-300}"
 KTO_PUSH_UPDATE_STATE="${KTO_PUSH_UPDATE_STATE:-/var/lib/kto-stats-push/update_state.json}"
 KTO_UPDATE_RAW_BASE="${KTO_UPDATE_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 
@@ -64,6 +67,11 @@ haproxy_backend_target=''
 ip_limit_events='[]'
 ip_limit_events_count=0
 update_result='{}'
+remna_status=''
+remna_restarts=0
+remna_error_count=0
+remna_last_error=''
+remna_compose_dir=''
 
 int_or_zero() {
     local value="${1:-0}"
@@ -272,6 +280,95 @@ read_haproxy_backend_target() {
     haproxy_backend_target="$(normalize_haproxy_target "$target" 2>/dev/null || true)"
 }
 
+config_enabled_value() {
+    case "${1:-}" in
+        1|yes|true|on|enabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+remna_container_name() {
+    if [[ -n "${KTO_REMNA_DOCKER_CONTAINER:-}" ]]; then
+        printf '%s\n' "$KTO_REMNA_DOCKER_CONTAINER"
+    elif [[ -n "${KTO_IP_LIMIT_DOCKER_CONTAINER:-}" ]]; then
+        printf '%s\n' "$KTO_IP_LIMIT_DOCKER_CONTAINER"
+    else
+        printf '%s\n' remnanode
+    fi
+}
+
+dir_has_compose_file() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 1
+    [[ -f "$dir/docker-compose.yml" || -f "$dir/docker-compose.yaml" || -f "$dir/compose.yml" || -f "$dir/compose.yaml" ]]
+}
+
+detect_remna_compose_dir() {
+    local container="$1" label_dir inspect_file candidate
+
+    if [[ -n "$container" ]] && command -v docker >/dev/null 2>&1; then
+        label_dir="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$container" 2>/dev/null || true)"
+        if dir_has_compose_file "$label_dir"; then
+            printf '%s\n' "$label_dir"
+            return 0
+        fi
+        inspect_file="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$container" 2>/dev/null || true)"
+        if [[ -n "$inspect_file" ]]; then
+            candidate="$(dirname "${inspect_file%%,*}" 2>/dev/null || true)"
+            if dir_has_compose_file "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        fi
+    fi
+
+    for candidate in /opt/remnawave /opt/remnanode; do
+        if dir_has_compose_file "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+read_remna_diagnostics() {
+    local container logs scan_sec
+
+    remna_status=''
+    remna_restarts=0
+    remna_error_count=0
+    remna_last_error=''
+    remna_compose_dir=''
+
+    config_enabled_value "$KTO_REMNA_LOG_ENABLED" || return 0
+    command -v docker >/dev/null 2>&1 || return 0
+
+    container="$(remna_container_name)"
+    [[ -n "$container" ]] || return 0
+    if docker inspect "$container" >/dev/null 2>&1; then
+        remna_status="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)"
+        remna_restarts="$(docker inspect -f '{{.RestartCount}}' "$container" 2>/dev/null || echo 0)"
+        remna_restarts="$(int_or_zero "$remna_restarts")"
+    fi
+    remna_compose_dir="$(detect_remna_compose_dir "$container" 2>/dev/null || true)"
+    if [[ -z "$remna_status" && -n "$remna_compose_dir" ]]; then
+        remna_status='not found'
+    fi
+    [[ -n "$remna_status" || -n "$remna_compose_dir" ]] || return 0
+
+    case "$KTO_REMNA_LOG_SCAN_SEC" in
+        ""|*[!0-9]*) scan_sec=300 ;;
+        *) scan_sec="$KTO_REMNA_LOG_SCAN_SEC" ;;
+    esac
+    logs="$(docker logs --since "${scan_sec}s" "$container" 2>&1 \
+        | grep -Eai 'error|failed|panic|fatal|exception|traceback|timeout|refused|denied|invalid|warn' \
+        | tail -n 20 || true)"
+    if [[ -n "$logs" ]]; then
+        remna_error_count="$(printf '%s\n' "$logs" | awk 'NF {count++} END {print count + 0}')"
+        remna_last_error="$(printf '%s\n' "$logs" | tail -n 1 | tr -d '\r' | cut -c1-500)"
+    fi
+}
+
 apply_collector_haproxy_config() {
     local response="$1"
     local desired_file tmp_cfg next_cfg desired_sni_line current_sni_line
@@ -441,17 +538,24 @@ apply_collector_update_task() {
     local job_id action raw_base tmp err_file message new_build
 
     command -v jq >/dev/null 2>&1 || return 0
-    command -v curl >/dev/null 2>&1 || return 0
-    command -v bash >/dev/null 2>&1 || return 0
     printf '%s' "$response" | jq -e 'has("update_task") and (.update_task | type == "object")' >/dev/null 2>&1 || return 0
 
     job_id="$(printf '%s' "$response" | jq -r '.update_task.id // empty' 2>/dev/null || true)"
     action="$(printf '%s' "$response" | jq -r '.update_task.action // empty' 2>/dev/null || true)"
     raw_base="$(printf '%s' "$response" | jq -r '.update_task.raw_base // empty' 2>/dev/null || true)"
-    [[ -n "$job_id" && "$action" == "push_update" ]] || return 0
+    [[ -n "$job_id" ]] || return 0
     if update_task_already_finished "$job_id"; then
         return 0
     fi
+
+    if [[ "$action" == "node_update" ]]; then
+        apply_node_update_task "$job_id"
+        return 0
+    fi
+
+    [[ "$action" == "push_update" ]] || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    command -v bash >/dev/null 2>&1 || return 0
     raw_base="${raw_base:-$KTO_UPDATE_RAW_BASE}"
     raw_base="${raw_base%/}"
 
@@ -483,6 +587,44 @@ apply_collector_update_task() {
         rm -f "$tmp"
         write_update_result "$job_id" "error" "install /usr/local/bin/kto-stats-push failed"
         echo "push ${PUSH_BUILD}: update failed: install /usr/local/bin/kto-stats-push failed" >&2
+    fi
+}
+
+apply_node_update_task() {
+    local job_id="$1" container compose_dir err_file message
+
+    command -v docker >/dev/null 2>&1 || {
+        write_update_result "$job_id" "error" "docker not found"
+        return 0
+    }
+    if ! docker compose version >/dev/null 2>&1; then
+        write_update_result "$job_id" "error" "docker compose not found"
+        return 0
+    fi
+
+    container="$(remna_container_name)"
+    compose_dir="$(detect_remna_compose_dir "$container" 2>/dev/null || true)"
+    if [[ -z "$compose_dir" ]]; then
+        write_update_result "$job_id" "error" "compose dir not found"
+        return 0
+    fi
+
+    write_update_result "$job_id" "running" "node update started"
+    err_file="$(mktemp)"
+    if (
+        cd "$compose_dir" &&
+        docker compose pull &&
+        docker compose down &&
+        docker compose up -d
+    ) >"$err_file" 2>&1; then
+        rm -f "$err_file"
+        write_update_result "$job_id" "ok" "node updated"
+        echo "push ${PUSH_BUILD}: node updated dir=${compose_dir}"
+    else
+        message="$(tail -n 20 "$err_file" 2>/dev/null | tr '\n' ' ' | cut -c1-220)"
+        rm -f "$err_file"
+        write_update_result "$job_id" "error" "${message:-node update failed}"
+        echo "push ${PUSH_BUILD}: node update failed: ${message:-unknown}" >&2
     fi
 }
 
@@ -935,6 +1077,7 @@ fi
 read_haproxy_scan_stats
 read_haproxy_allowed_sni
 read_haproxy_backend_target
+read_remna_diagnostics
 read_ip_limit_events
 read_update_result
 
@@ -1005,6 +1148,11 @@ if ! payload="$(jq -n \
     --argjson scan_wrong_sni_names "$scan_wrong_sni_names" \
     --argjson haproxy_allowed_sni "$haproxy_allowed_sni" \
     --arg haproxy_backend_target "$haproxy_backend_target" \
+    --arg remna_status "$remna_status" \
+    --argjson remna_restarts "$remna_restarts" \
+    --argjson remna_error_count "$remna_error_count" \
+    --arg remna_last_error "$remna_last_error" \
+    --arg remna_compose_dir "$remna_compose_dir" \
     --argjson ip_limit_events "$ip_limit_events" \
     --argjson update_result "$update_result" \
     --argjson updated_at "$updated_at" \
@@ -1034,6 +1182,13 @@ if ! payload="$(jq -n \
         scan_wrong_sni_names: $scan_wrong_sni_names,
         haproxy_allowed_sni: $haproxy_allowed_sni,
         haproxy_backend_target: $haproxy_backend_target,
+        remna: {
+            status: $remna_status,
+            restarts: $remna_restarts,
+            error_count: $remna_error_count,
+            last_error: $remna_last_error,
+            compose_dir: $remna_compose_dir
+        },
         ip_limit_events: $ip_limit_events,
         update_result: $update_result,
         error: $error,

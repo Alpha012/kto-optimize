@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v185"
+SCRIPT_BUILD="v186"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -4053,6 +4053,7 @@ install_stats_push_client() {
 
     if (( existing_config == 1 )); then
         interval="${interval:-$STATS_PUSH_INTERVAL_DEFAULT}"
+        node_id="$node_name"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
         ip_limit_log_file="${ip_limit_log_file:-}"
         ip_limit_docker_container="${ip_limit_docker_container:-$REMNA_CONTAINER}"
@@ -4075,7 +4076,7 @@ install_stats_push_client() {
         fi
     else
         node_name="$(ask_text "Название машины" "$default_name")"
-        node_id="$(ask_text "ID машины" "$node_name")"
+        node_id="$node_name"
         iface="$(ask_text "Интерфейс" "${default_iface:-eth0}")"
         if ! network_interface_exists "$iface"; then
             fail "Интерфейс ${iface} не найден. Проверь: ip -br link"
