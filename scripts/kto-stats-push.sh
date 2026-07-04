@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v201"
+PUSH_BUILD="v202"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -42,6 +42,10 @@ KTO_REMNA_DOCKER_CONTAINER="${KTO_REMNA_DOCKER_CONTAINER:-${KTO_IP_LIMIT_DOCKER_
 KTO_REMNA_LOG_SCAN_SEC="${KTO_REMNA_LOG_SCAN_SEC:-300}"
 KTO_PUSH_UPDATE_STATE="${KTO_PUSH_UPDATE_STATE:-/var/lib/kto-stats-push/update_state.json}"
 KTO_UPDATE_RAW_BASE="${KTO_UPDATE_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
+KTO_TUNING_SYSCTL_CONF="${KTO_TUNING_SYSCTL_CONF:-/etc/sysctl.d/99-kto-tuning.conf}"
+KTO_LIMITS_CONF="${KTO_LIMITS_CONF:-/etc/security/limits.d/99-kto-limits.conf}"
+KTO_SYSTEMD_LIMITS_CONF="${KTO_SYSTEMD_LIMITS_CONF:-/etc/systemd/system.conf.d/99-kto-limits.conf}"
+KTO_USER_LIMITS_CONF="${KTO_USER_LIMITS_CONF:-/etc/systemd/user.conf.d/99-kto-limits.conf}"
 
 collector_url="${KTO_PUSH_COLLECTOR_URL%/}/push"
 hostname_value="$(hostname 2>/dev/null || echo unknown)"
@@ -493,19 +497,24 @@ apply_collector_haproxy_config() {
 }
 
 write_update_result() {
-    local job_id="$1" status="$2" message="${3:-}" build="${4:-$PUSH_BUILD}" state_dir tmp
+    local job_id="$1" status="$2" message="${3:-}" build="${4:-$PUSH_BUILD}" details="${5:-{}}" state_dir tmp
     state_dir="$(dirname "$KTO_PUSH_UPDATE_STATE")"
     mkdir -p "$state_dir" 2>/dev/null || true
     message="${message//$'\n'/ }"
     message="${message:0:240}"
+    if ! printf '%s' "$details" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        details='{}'
+    fi
     tmp="$(mktemp)"
     if jq -n \
         --arg id "$job_id" \
         --arg status "$status" \
         --arg build "$build" \
         --arg message "$message" \
+        --argjson details "$details" \
         --argjson updated_at "$(date +%s)" \
-        '{id: $id, status: $status, build: $build, message: $message, updated_at: $updated_at}' > "$tmp" 2>/dev/null; then
+        '{id: $id, status: $status, build: $build, message: $message, updated_at: $updated_at}
+        + (if ($details | length) > 0 then {details: $details} else {} end)' > "$tmp" 2>/dev/null; then
         mv "$tmp" "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || rm -f "$tmp"
     else
         rm -f "$tmp"
@@ -521,7 +530,8 @@ read_update_result() {
         status: (.status // ""),
         build: (.build // ""),
         message: (.message // ""),
-        updated_at: (.updated_at // 0)
+        updated_at: (.updated_at // 0),
+        details: (.details // {})
     }' "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || echo '{}')"
 }
 
@@ -608,6 +618,272 @@ update_task_already_finished() {
     [[ "$current_id" == "$job_id" && ( "$current_status" == "ok" || "$current_status" == "error" ) ]]
 }
 
+opt_field() {
+    local value="${1:-}"
+    value="${value//$'\t'/ }"
+    value="${value//$'\r'/ }"
+    value="${value//$'\n'/ }"
+    printf '%s' "$value"
+}
+
+append_optimize_row() {
+    local file="$1" id="$2" name="$3" status="$4" current="$5" desired="$6"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$(opt_field "$id")" \
+        "$(opt_field "$name")" \
+        "$(opt_field "$status")" \
+        "$(opt_field "$current")" \
+        "$(opt_field "$desired")" >> "$file"
+}
+
+opt_root_file_has_line() {
+    local file="$1" line="$2"
+    [[ -r "$file" ]] && grep -Fqx -- "$line" "$file" 2>/dev/null
+}
+
+opt_service_active() {
+    local service="$1"
+    command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$service" >/dev/null 2>&1
+}
+
+opt_hostname_hosts_configured() {
+    local host short
+    [[ -r /etc/hosts ]] || return 1
+    host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
+    short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+    [[ -n "$host$short" ]] || return 1
+    awk -v host="$host" -v short="$short" '
+        $1 ~ /^#/ { next }
+        {
+            for (i = 2; i <= NF; i++) {
+                if (($i == host && host != "") || ($i == short && short != "")) {
+                    found = 1
+                }
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' /etc/hosts
+}
+
+optimize_check_json() {
+    local rows_file cc qdisc sysctl_file_ok limits_ok missing=() service_current host_value
+    rows_file="$(mktemp)"
+
+    host_value="$(hostname 2>/dev/null || echo "-")"
+    if opt_hostname_hosts_configured; then
+        append_optimize_row "$rows_file" "hostname" "hostname" "ok" "$host_value" "/etc/hosts entry"
+    else
+        append_optimize_row "$rows_file" "hostname" "hostname" "miss" "$host_value" "/etc/hosts entry"
+    fi
+
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
+    qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
+    if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
+        append_optimize_row "$rows_file" "bbr_fq" "BBR + FQ" "ok" "${cc} + ${qdisc}" "bbr + fq"
+    else
+        append_optimize_row "$rows_file" "bbr_fq" "BBR + FQ" "miss" "${cc} + ${qdisc}" "bbr + fq"
+    fi
+
+    sysctl_file_ok=1
+    opt_root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.ipv4.tcp_congestion_control = bbr" || sysctl_file_ok=0
+    opt_root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.core.default_qdisc = fq" || sysctl_file_ok=0
+    opt_root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "fs.file-max = 2097152" || sysctl_file_ok=0
+    opt_root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "vm.swappiness = 1" || sysctl_file_ok=0
+    if [[ "$sysctl_file_ok" == "1" ]]; then
+        append_optimize_row "$rows_file" "sysctl_file" "sysctl file" "ok" "$KTO_TUNING_SYSCTL_CONF" "kto tuning profile"
+    else
+        append_optimize_row "$rows_file" "sysctl_file" "sysctl file" "miss" "нет или неполный" "$KTO_TUNING_SYSCTL_CONF"
+    fi
+
+    limits_ok=1
+    opt_root_file_has_line "$KTO_LIMITS_CONF" "* soft nofile 1048576" || limits_ok=0
+    opt_root_file_has_line "$KTO_LIMITS_CONF" "* hard nofile 1048576" || limits_ok=0
+    opt_root_file_has_line "$KTO_SYSTEMD_LIMITS_CONF" "DefaultLimitNOFILE=1048576" || limits_ok=0
+    opt_root_file_has_line "$KTO_USER_LIMITS_CONF" "DefaultLimitNOFILE=1048576" || limits_ok=0
+    if [[ "$limits_ok" == "1" ]]; then
+        append_optimize_row "$rows_file" "limits" "limits" "ok" "nofile 1048576" "nofile 1048576"
+    else
+        append_optimize_row "$rows_file" "limits" "limits" "miss" "нет или неполный" "nofile/systemd limits"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        missing=()
+        opt_service_active chrony || missing+=("chrony")
+        opt_root_file_has_line /etc/default/cpufrequtils 'GOVERNOR="performance"' || missing+=("performance")
+        if (( ${#missing[@]} == 0 )); then
+            append_optimize_row "$rows_file" "node_services" "node services" "ok" "chrony, performance" "chrony, performance"
+        else
+            service_current="$(IFS=', '; echo "${missing[*]}")"
+            append_optimize_row "$rows_file" "node_services" "node services" "miss" "нет: ${service_current}" "chrony, performance"
+        fi
+    else
+        append_optimize_row "$rows_file" "node_services" "node services" "skip" "systemctl нет" "chrony, performance"
+    fi
+
+    jq -R -s -c '
+        split("\n")
+        | map(select(length > 0) | split("\t") | {
+            id: (.[0] // ""),
+            name: (.[1] // ""),
+            status: (.[2] // "miss"),
+            current: (.[3] // "-"),
+            desired: (.[4] // "-")
+        })
+    ' "$rows_file" 2>/dev/null || echo '[]'
+    rm -f "$rows_file"
+}
+
+optimize_missing_count() {
+    printf '%s' "${1:-[]}" | jq '[.[] | select(.status == "miss")] | length' 2>/dev/null || echo 0
+}
+
+optimize_details_json() {
+    local mode="$1" before="$2" after="$3"
+    jq -n -c \
+        --arg mode "$mode" \
+        --argjson before "$before" \
+        --argjson after "$after" \
+        '($before | map(select(.status == "miss"))) as $missing_before |
+        ($after | map(select(.status == "miss"))) as $missing_after |
+        {
+            kind: "optimize",
+            mode: $mode,
+            before: $before,
+            after: $after,
+            missing_before: ($missing_before | map(.name)),
+            fixed_count: (($missing_before | length) - ($missing_after | length)),
+            remaining_count: ($missing_after | length)
+        }' 2>/dev/null || echo '{}'
+}
+
+optimize_ensure_hostname_hosts() {
+    local host short tmp
+    opt_hostname_hosts_configured && return 0
+    host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
+    short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+    [[ -n "$host$short" ]] || return 0
+    tmp="$(mktemp)"
+    if [[ -r /etc/hosts ]]; then
+        cat /etc/hosts > "$tmp" 2>/dev/null || true
+    fi
+    printf '127.0.1.1 %s %s\n' "${host:-$short}" "${short:-$host}" >> "$tmp"
+    install -m 0644 "$tmp" /etc/hosts 2>/dev/null || true
+    rm -f "$tmp"
+}
+
+optimize_apply_system() {
+    local tmp
+    [[ "${EUID:-$(id -u)}" == "0" ]] || return 1
+
+    optimize_ensure_hostname_hosts
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    mkdir -p /etc/sysctl.d /etc/security/limits.d /etc/systemd/system.conf.d /etc/systemd/user.conf.d 2>/dev/null || true
+
+    tmp="$(mktemp)"
+    cat >"$tmp" <<'EOF'
+fs.file-max = 2097152
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65536
+net.ipv4.tcp_max_syn_backlog = 262144
+net.ipv4.tcp_max_tw_buckets = 1440000
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+net.core.rmem_default = 1048576
+net.core.rmem_max = 67108864
+net.core.wmem_default = 1048576
+net.core.wmem_max = 67108864
+net.core.optmem_max = 1048576
+net.ipv4.tcp_rmem = 4096 1048576 33554432
+net.ipv4.tcp_wmem = 4096 1048576 33554432
+vm.swappiness = 1
+EOF
+    install -m 0644 "$tmp" "$KTO_TUNING_SYSCTL_CONF" 2>/dev/null || true
+    rm -f "$tmp"
+    sysctl --system >/dev/null 2>&1 || true
+
+    tmp="$(mktemp)"
+    cat >"$tmp" <<'EOF'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF
+    install -m 0644 "$tmp" "$KTO_LIMITS_CONF" 2>/dev/null || true
+    rm -f "$tmp"
+
+    tmp="$(mktemp)"
+    cat >"$tmp" <<'EOF'
+[Manager]
+DefaultLimitNOFILE=1048576
+EOF
+    install -m 0644 "$tmp" "$KTO_SYSTEMD_LIMITS_CONF" 2>/dev/null || true
+    install -m 0644 "$tmp" "$KTO_USER_LIMITS_CONF" 2>/dev/null || true
+    rm -f "$tmp"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y chrony cpufrequtils >/dev/null 2>&1 || true
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now chrony >/dev/null 2>&1 || true
+        tmp="$(mktemp)"
+        printf '%s\n' 'GOVERNOR="performance"' > "$tmp"
+        install -m 0644 "$tmp" /etc/default/cpufrequtils 2>/dev/null || true
+        rm -f "$tmp"
+        systemctl restart cpufrequtils >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+apply_optimize_task() {
+    local job_id="$1" mode="$2" before after before_missing remaining details status message
+    mode="${mode:-status}"
+    write_update_result "$job_id" "running" "optimize ${mode} started"
+
+    before="$(optimize_check_json)"
+    before_missing="$(optimize_missing_count "$before")"
+    if [[ "$mode" == "apply" && "$before_missing" =~ ^[0-9]+$ && "$before_missing" -gt 0 ]]; then
+        optimize_apply_system || true
+    fi
+    after="$(optimize_check_json)"
+    remaining="$(optimize_missing_count "$after")"
+    details="$(optimize_details_json "$mode" "$before" "$after")"
+
+    status="ok"
+    if [[ "$mode" == "apply" ]]; then
+        if [[ "$remaining" =~ ^[0-9]+$ && "$remaining" -gt 0 ]]; then
+            status="error"
+            message="optimize applied, remaining=${remaining}"
+        elif [[ "$before_missing" =~ ^[0-9]+$ && "$before_missing" -gt 0 ]]; then
+            message="optimize applied, fixed=${before_missing}"
+        else
+            message="already optimized"
+        fi
+    else
+        if [[ "$remaining" =~ ^[0-9]+$ && "$remaining" -gt 0 ]]; then
+            message="missing=${remaining}"
+        else
+            message="all ok"
+        fi
+    fi
+
+    write_update_result "$job_id" "$status" "$message" "$PUSH_BUILD" "$details"
+    echo "push ${PUSH_BUILD}: optimize ${mode} status=${status} before=${before_missing} remaining=${remaining}"
+}
+
 apply_collector_update_task() {
     local response="$1"
     local job_id action raw_base tmp err_file message new_build
@@ -625,6 +901,16 @@ apply_collector_update_task() {
 
     if [[ "$action" == "node_update" ]]; then
         apply_node_update_task "$job_id"
+        return 0
+    fi
+
+    if [[ "$action" == "optimize" ]]; then
+        apply_optimize_task "$job_id" "apply"
+        return 0
+    fi
+
+    if [[ "$action" == "optimize_status" ]]; then
+        apply_optimize_task "$job_id" "status"
         return 0
     fi
 

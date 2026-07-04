@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v201"
+COLLECTOR_BUILD = "v202"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -688,12 +688,77 @@ def clean_update_result(item):
         updated_at = int(item.get("updated_at") or 0)
     except Exception:
         updated_at = 0
-    return {
+    result = {
         "id": job_id,
         "status": status,
         "build": str(item.get("build") or "").strip()[:40],
         "message": str(item.get("message") or "").strip()[:240],
         "updated_at": updated_at,
+    }
+    details = clean_update_details(item.get("details"))
+    if details:
+        result["details"] = details
+    return result
+
+
+def clean_optimize_rows(value):
+    if not isinstance(value, list):
+        return []
+    rows = []
+    for item in value[:30]:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").strip().lower()[:12]
+        if status not in ("ok", "miss", "skip", "error"):
+            status = "miss"
+        rows.append({
+            "id": str(item.get("id") or "").strip()[:80],
+            "name": clean_display_text(item.get("name") or item.get("id") or "-")[:80],
+            "status": status,
+            "current": clean_display_text(item.get("current") or "-")[:160],
+            "desired": clean_display_text(item.get("desired") or "-")[:160],
+        })
+    return rows
+
+
+def clean_update_details(value):
+    if not isinstance(value, dict):
+        return {}
+    kind = str(value.get("kind") or "").strip().lower()[:40]
+    if kind != "optimize":
+        return {}
+    mode = str(value.get("mode") or "").strip().lower()[:24]
+    if mode not in ("apply", "status"):
+        mode = "status"
+    before = clean_optimize_rows(value.get("before"))
+    after = clean_optimize_rows(value.get("after"))
+    missing_before = []
+    raw_missing = value.get("missing_before")
+    if isinstance(raw_missing, list):
+        for item in raw_missing[:20]:
+            name = clean_display_text(item)[:80]
+            if name:
+                missing_before.append(name)
+    if not missing_before:
+        missing_before = [row["name"] for row in before if row.get("status") == "miss"][:20]
+    remaining_default = sum(1 for row in after if row.get("status") == "miss")
+    fixed_default = max(0, len(missing_before) - remaining_default)
+    try:
+        fixed_count = int(value.get("fixed_count")) if value.get("fixed_count") not in (None, "") else fixed_default
+    except Exception:
+        fixed_count = fixed_default
+    try:
+        remaining_count = int(value.get("remaining_count")) if value.get("remaining_count") not in (None, "") else remaining_default
+    except Exception:
+        remaining_count = remaining_default
+    return {
+        "kind": "optimize",
+        "mode": mode,
+        "before": before,
+        "after": after,
+        "missing_before": missing_before,
+        "fixed_count": fixed_count,
+        "remaining_count": remaining_count,
     }
 
 
@@ -778,7 +843,7 @@ def current_update_targets(scope="all"):
 def queue_update_task(requested_by, action="push_update", scope="all", targets=None, local_required=True):
     ts = now_ts()
     action = str(action or "push_update").strip()
-    if action not in ("push_update", "node_update"):
+    if action not in ("push_update", "node_update", "optimize", "optimize_status"):
         action = "push_update"
     scope = str(scope or "all").strip().lower()
     with LOCK:
@@ -5599,6 +5664,10 @@ def update_action_label(action):
     action = str(action or "push_update")
     if action == "node_update":
         return "remnanode compose"
+    if action == "optimize":
+        return "system optimize"
+    if action == "optimize_status":
+        return "system optimize check"
     return "push script"
 
 
@@ -5675,8 +5744,101 @@ def update_status_message():
     return body
 
 
+def optimize_status_label(status):
+    status = str(status or "").lower()
+    if status == "ok":
+        return "OK"
+    if status == "skip":
+        return "SKIP"
+    if status == "error":
+        return "ERROR"
+    return "НЕТ"
+
+
+def optimize_result_payload(result, title="Optimize status"):
+    result = result if isinstance(result, dict) else {}
+    details = result.get("details") if isinstance(result.get("details"), dict) else {}
+    mode = str(details.get("mode") or "status")
+    rows = details.get("after") if isinstance(details.get("after"), list) else []
+    if not rows:
+        rows = details.get("before") if isinstance(details.get("before"), list) else []
+    missing_before = details.get("missing_before") if isinstance(details.get("missing_before"), list) else []
+    missing_before = [clean_display_text(item) for item in missing_before if clean_display_text(item)]
+    node_name = clean_display_text(result.get("node") or "-")
+    message = clean_display_text(result.get("message") or "")
+    status = str(result.get("status") or "-")
+    rich_lines = [
+        f"<b>{html.escape(title)}</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", node_name),
+        detail_line("Режим", "fix" if mode == "apply" else "check"),
+        detail_line("Статус", status),
+    ]
+    if result.get("build"):
+        rich_lines.append(detail_line("Build", result.get("build")))
+    if mode == "apply":
+        rich_lines.append(detail_line("Исправлено", details.get("fixed_count", 0)))
+        rich_lines.append(detail_line("Осталось", details.get("remaining_count", 0)))
+        if missing_before:
+            rich_lines += [
+                "",
+                "<b>Не было до фикса:</b>",
+                "<blockquote>" + "\n".join(html.escape(item) for item in missing_before[:20]) + "</blockquote>",
+            ]
+        else:
+            rich_lines.append(detail_line("До фикса", "всё уже было OK"))
+    if message:
+        rich_lines.append(detail_line("Сообщение", message))
+
+    table_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        table_rows.append([
+            (row.get("name") or "-", "left"),
+            (optimize_status_label(row.get("status")), "center"),
+            (row.get("current") or "-", "left"),
+            (row.get("desired") or "-", "left"),
+        ])
+    table_html = rich_table(["Проверка", "Статус", "Сейчас", "Нужно"], table_rows)
+    rich_html = "\n".join(rich_lines)
+    if table_html:
+        rich_html += "\n" + table_html
+
+    text_lines = list(rich_lines)
+    if rows:
+        text_lines += ["", "<b>Проверки:</b>"]
+        for row in rows[:30]:
+            if not isinstance(row, dict):
+                continue
+            text_lines.append(
+                "<blockquote>"
+                f"{html.escape(clean_display_text(row.get('name') or '-'))}: "
+                f"{html.escape(optimize_status_label(row.get('status')))} | "
+                f"{html.escape(clean_display_text(row.get('current') or '-'))} -> "
+                f"{html.escape(clean_display_text(row.get('desired') or '-'))}"
+                "</blockquote>"
+            )
+    return rich_html, "\n".join(text_lines)
+
+
+def optimize_done_payload_unlocked(snapshot, title):
+    current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
+    results = UPDATE_STATE.get("results") if isinstance(UPDATE_STATE.get("results"), dict) else {}
+    targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
+    job_id = str(snapshot.get("job_id") or "")
+    for key, node_name in targets.items():
+        item = results.get(key)
+        if isinstance(item, dict) and item.get("id") == job_id:
+            result = dict(item)
+            result["node"] = clean_display_text(result.get("node") or node_name or key)
+            return optimize_result_payload(result, title=title)
+    return "", update_status_message_from_snapshot(snapshot, title=title)
+
+
 def maybe_send_update_done_notification():
     message = ""
+    rich_message = ""
     with LOCK:
         snapshot = update_progress_snapshot_unlocked()
         current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
@@ -5687,9 +5849,15 @@ def maybe_send_update_done_notification():
         save_update_state()
         success = snapshot.get("error_count", 0) == 0 and snapshot.get("local_status") == "ok"
         title = "Update завершён" if success else "Update завершён с ошибками"
-        message = update_status_message_from_snapshot(snapshot, title=title)
+        if str(snapshot.get("action") or "") in ("optimize", "optimize_status"):
+            title = "Optimize завершён" if success else "Optimize завершён с ошибками"
+            rich_message, message = optimize_done_payload_unlocked(snapshot, title)
+        else:
+            message = update_status_message_from_snapshot(snapshot, title=title)
         markup = update_retry_markup(snapshot)
     if message:
+        if rich_message and send_rich_message(rich_message, reply_markup=markup):
+            return
         send_message(message, reply_markup=markup)
 
 
@@ -5700,6 +5868,10 @@ def update_start_title(action, scope, retry=False):
         if str(scope or "").lower() == "single":
             return "Update node запущен"
         return "Update nodes запущен"
+    if action == "optimize":
+        return "Optimize запущен"
+    if action == "optimize_status":
+        return "Optimize status запущен"
     if scope == "wl":
         return "Update WL запущен"
     if scope == "bl":
@@ -5741,10 +5913,22 @@ def start_update_job(action, scope, requested_by, local_required=True, targets=N
                 "<i>Collector обновится локально. Ноды применят update при ближайшем push.</i>" if local_required else "<i>Нода применит update при ближайшем push.</i>",
                 f"<i>Статус: <code>{update_status_command(action)}</code></i>",
             ]
-    else:
+    elif action == "node_update":
         lines += [
             "",
             "<i>Ноды выполнят docker compose pull/down/up при ближайшем push.</i>",
+            f"<i>Статус: <code>{update_status_command(action)}</code></i>",
+        ]
+    elif action == "optimize":
+        lines += [
+            "",
+            "<i>Машина сначала проверит оптимизацию, потом применит недостающее при ближайшем push.</i>",
+            f"<i>Статус: <code>{update_status_command(action)}</code></i>",
+        ]
+    elif action == "optimize_status":
+        lines += [
+            "",
+            "<i>Машина только проверит оптимизацию при ближайшем push, без правок.</i>",
             f"<i>Статус: <code>{update_status_command(action)}</code></i>",
         ]
     send_message("\n".join(lines))
@@ -5794,6 +5978,36 @@ def handle_update_node(text, chat_id, from_id):
         return
     start_update_job(
         "node_update",
+        "single",
+        from_id,
+        local_required=False,
+        targets={node_key: node_name},
+    )
+
+
+def handle_optimize_command(text, chat_id, from_id, action):
+    parts = text.split(maxsplit=1)
+    command_name = "/optimize" if action == "optimize" else "/optimize_status"
+    if len(parts) < 2 or not parts[1].strip():
+        send_message(f"<b>Пример:</b> <code>{command_name} Германия</code>")
+        return
+    query = parts[1].strip()
+    node = find_node(query)
+    if node is None:
+        send_message(
+            "<b>Не нашёл такую машину</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Запрос', query)}\n"
+            "Проверь название через <code>/stats</code>."
+        )
+        return
+    node_key = node_canonical_key(node)
+    node_name = node_display_name(node, node_key)
+    if not node_key:
+        send_message("<b>Не смог получить ключ машины.</b>")
+        return
+    start_update_job(
+        action,
         "single",
         from_id,
         local_required=False,
@@ -6457,6 +6671,10 @@ def bot_loop():
                     handle_update_node(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_nodes":
                     handle_update_nodes(text, chat_id, from_id)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/optimize":
+                    handle_optimize_command(text, chat_id, from_id, "optimize")
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/optimize_status":
+                    handle_optimize_command(text, chat_id, from_id, "optimize_status")
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/haproxy":
                     handle_haproxy_command(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/allow_sni":
