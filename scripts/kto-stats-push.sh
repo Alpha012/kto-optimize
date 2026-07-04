@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v206"
+PUSH_BUILD="v207"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -965,6 +965,36 @@ status_panel_fail_count() {
     printf '%s' "${1:-[]}" | jq '[.[] | select(.status == "fail")] | length' 2>/dev/null || echo 0
 }
 
+status_panel_table_text_json() {
+    local rows="${1:-[]}" section name value status
+    {
+        printf '%s %s %s %s\n' \
+            "$(optimize_fit_cell 'Section' 12)" \
+            "$(optimize_fit_cell 'Check' 18)" \
+            "$(optimize_fit_cell 'Status' 6)" \
+            "Value"
+        printf '%s %s %s %s\n' \
+            "------------" \
+            "------------------" \
+            "------" \
+            "------------------------"
+        printf '%s' "$rows" | jq -r '.[] | [.section, .name, .value, .status] | @tsv' 2>/dev/null |
+            while IFS=$'\t' read -r section name value status; do
+                case "$status" in
+                    ok) status="OK" ;;
+                    fail) status="FAIL" ;;
+                    warn) status="WARN" ;;
+                    *) status="-" ;;
+                esac
+                printf '%s %s %s %s\n' \
+                    "$(optimize_fit_cell "$section" 12)" \
+                    "$(optimize_fit_cell "$name" 18)" \
+                    "$(optimize_fit_cell "$status" 6)" \
+                    "$(opt_field "$value")"
+            done
+    } | sed '/^[[:space:]]*$/d'
+}
+
 optimize_details_json() {
     local mode="$1" before="$2" after="$3"
     jq -n -c \
@@ -1013,6 +1043,48 @@ optimize_status_panel_details_json() {
             status_rows: $rows,
             status_fail_count: ($rows | map(select(.status == "fail")) | length)
         }' 2>/dev/null || echo '{}'
+}
+
+write_status_panel_result() {
+    local job_id="$1" mode="$2" rows="$3" fails="$4" message="$5" details_text tmp state_dir
+    details_text="$(status_panel_table_text_json "$rows")"
+    state_dir="$(dirname "$KTO_PUSH_UPDATE_STATE")"
+    mkdir -p "$state_dir" 2>/dev/null || true
+    message="${message//$'\n'/ }"
+    message="${message:0:240}"
+    details_text="${details_text:0:4000}"
+    tmp="$(mktemp)"
+    if jq -n \
+        --arg id "$job_id" \
+        --arg status "ok" \
+        --arg build "$PUSH_BUILD" \
+        --arg message "$message" \
+        --arg mode "$mode" \
+        --arg details_text "$details_text" \
+        --argjson rows "${rows:-[]}" \
+        --argjson fails "$(int_or_zero "$fails")" \
+        --argjson updated_at "$(date +%s)" \
+        '{
+            id: $id,
+            status: $status,
+            build: $build,
+            message: $message,
+            updated_at: $updated_at,
+            details_text: $details_text,
+            status_rows: $rows,
+            details: {
+                kind: "optimize",
+                mode: $mode,
+                source: "kto_status_panel",
+                status_rows: $rows,
+                status_fail_count: $fails
+            }
+        }' > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    write_update_result "$job_id" "ok" "$message" "$PUSH_BUILD" "{}" "$details_text"
 }
 
 optimize_ensure_hostname_hosts() {
@@ -1115,9 +1187,8 @@ apply_optimize_task() {
     if [[ "$mode" == "status" ]]; then
         panel_rows="$(status_panel_rows_json)"
         panel_fails="$(status_panel_fail_count "$panel_rows")"
-        details="$(optimize_status_panel_details_json "$mode" "$panel_rows")"
         message="status panel, fail=${panel_fails}"
-        write_update_result "$job_id" "ok" "$message" "$PUSH_BUILD" "$details"
+        write_status_panel_result "$job_id" "$mode" "$panel_rows" "$panel_fails" "$message"
         echo "push ${PUSH_BUILD}: optimize ${mode} status=ok panel_fails=${panel_fails}"
         return 0
     fi

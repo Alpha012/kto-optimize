@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v206"
+COLLECTOR_BUILD = "v207"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -699,6 +699,24 @@ def clean_update_result(item):
     if details_text:
         result["details_text"] = details_text[:4000]
     details = clean_update_details(item.get("details"))
+    top_status_rows = clean_status_panel_rows(item.get("status_rows"))
+    if top_status_rows:
+        if not details:
+            details = {
+                "kind": "optimize",
+                "mode": "status",
+                "source": "kto_status_panel",
+                "before": [],
+                "after": [],
+                "status_rows": top_status_rows,
+                "status_fail_count": sum(1 for row in top_status_rows if row.get("status") == "fail"),
+                "missing_before": [],
+                "fixed_count": 0,
+                "remaining_count": 0,
+            }
+        else:
+            details["status_rows"] = top_status_rows
+            details["status_fail_count"] = sum(1 for row in top_status_rows if row.get("status") == "fail")
     if details:
         result["details"] = details
     return result
@@ -5993,10 +6011,7 @@ def optimize_result_payload(result, title="Optimize status"):
     if table_html:
         rich_html += "\n" + table_html
     elif not rows:
-        rich_html += (
-            "\n\n<b>Проверки:</b>\n"
-            "<blockquote>Нода вернула итог без деталей. Обнови push на этой машине до v204 и повтори команду.</blockquote>"
-        )
+        rich_html = ""
 
     text_lines = list(rich_lines)
     if rows:
@@ -6007,7 +6022,7 @@ def optimize_result_payload(result, title="Optimize status"):
         text_lines += [
             "",
             "<b>Проверки:</b>",
-            "<blockquote>Нода вернула итог без деталей. Обнови push на этой машине до v204 и повтори команду.</blockquote>",
+            "<blockquote>Нода вернула итог без строк панели состояния. Обнови push на этой машине до v207 и повтори команду.</blockquote>",
         ]
     return rich_html, "\n".join(text_lines)
 
