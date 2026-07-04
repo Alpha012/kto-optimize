@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v203"
+COLLECTOR_BUILD = "v204"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -695,6 +695,9 @@ def clean_update_result(item):
         "message": str(item.get("message") or "").strip()[:240],
         "updated_at": updated_at,
     }
+    details_text = str(item.get("details_text") or "").strip()
+    if details_text:
+        result["details_text"] = details_text[:4000]
     details = clean_update_details(item.get("details"))
     if details:
         result["details"] = details
@@ -5800,6 +5803,7 @@ def optimize_result_payload(result, title="Optimize status"):
     missing_before = [clean_display_text(item) for item in missing_before if clean_display_text(item)]
     node_name = clean_display_text(result.get("node") or "-")
     message = clean_display_text(result.get("message") or "")
+    details_text = str(result.get("details_text") or "").strip()
     status = str(result.get("status") or "-")
     rich_lines = [
         f"<b>{html.escape(title)}</b>",
@@ -5841,17 +5845,19 @@ def optimize_result_payload(result, title="Optimize status"):
     elif not rows:
         rich_html += (
             "\n\n<b>Проверки:</b>\n"
-            "<blockquote>Нода вернула итог без деталей. Обнови push на этой машине до v203 и повтори команду.</blockquote>"
+            "<blockquote>Нода вернула итог без деталей. Обнови push на этой машине до v204 и повтори команду.</blockquote>"
         )
 
     text_lines = list(rich_lines)
     if rows:
         text_lines += ["", "<b>Проверки:</b>", f"<pre>{html.escape(optimize_text_table(rows))}</pre>"]
+    elif details_text:
+        text_lines += ["", "<b>Проверки:</b>", f"<pre>{html.escape(details_text)}</pre>"]
     else:
         text_lines += [
             "",
             "<b>Проверки:</b>",
-            "<blockquote>Нода вернула итог без деталей. Обнови push на этой машине до v203 и повтори команду.</blockquote>",
+            "<blockquote>Нода вернула итог без деталей. Обнови push на этой машине до v204 и повтори команду.</blockquote>",
         ]
     return rich_html, "\n".join(text_lines)
 

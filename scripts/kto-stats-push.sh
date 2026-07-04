@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v203"
+PUSH_BUILD="v204"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -497,11 +497,12 @@ apply_collector_haproxy_config() {
 }
 
 write_update_result() {
-    local job_id="$1" status="$2" message="${3:-}" build="${4:-$PUSH_BUILD}" details="${5:-{}}" state_dir tmp
+    local job_id="$1" status="$2" message="${3:-}" build="${4:-$PUSH_BUILD}" details="${5:-{}}" details_text="${6:-}" state_dir tmp
     state_dir="$(dirname "$KTO_PUSH_UPDATE_STATE")"
     mkdir -p "$state_dir" 2>/dev/null || true
     message="${message//$'\n'/ }"
     message="${message:0:240}"
+    details_text="${details_text:0:4000}"
     if ! printf '%s' "$details" | jq -e 'type == "object"' >/dev/null 2>&1; then
         details='{}'
     fi
@@ -511,10 +512,12 @@ write_update_result() {
         --arg status "$status" \
         --arg build "$build" \
         --arg message "$message" \
+        --arg details_text "$details_text" \
         --argjson details "$details" \
         --argjson updated_at "$(date +%s)" \
         '{id: $id, status: $status, build: $build, message: $message, updated_at: $updated_at}
-        + (if ($details | length) > 0 then {details: $details} else {} end)' > "$tmp" 2>/dev/null; then
+        + (if ($details | length) > 0 then {details: $details} else {} end)
+        + (if ($details_text | length) > 0 then {details_text: $details_text} else {} end)' > "$tmp" 2>/dev/null; then
         mv "$tmp" "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || rm -f "$tmp"
     else
         rm -f "$tmp"
@@ -531,6 +534,7 @@ read_update_result() {
         build: (.build // ""),
         message: (.message // ""),
         updated_at: (.updated_at // 0),
+        details_text: (.details_text // ""),
         details: (.details // {})
     }' "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || echo '{}')"
 }
@@ -737,6 +741,49 @@ optimize_missing_count() {
     printf '%s' "${1:-[]}" | jq '[.[] | select(.status == "miss")] | length' 2>/dev/null || echo 0
 }
 
+optimize_status_label() {
+    case "${1:-}" in
+        ok) printf 'OK' ;;
+        skip) printf 'SKIP' ;;
+        error) printf 'ERROR' ;;
+        *) printf 'NO' ;;
+    esac
+}
+
+optimize_fit_cell() {
+    local value="${1:-}" width="$2"
+    value="$(opt_field "$value")"
+    if (( ${#value} > width )); then
+        value="${value:0:width-1}~"
+    fi
+    printf "%-${width}s" "$value"
+}
+
+optimize_table_text_json() {
+    local rows="${1:-[]}" line name status current desired
+    {
+        printf '%s %s %s %s\n' \
+            "$(optimize_fit_cell 'Check' 18)" \
+            "$(optimize_fit_cell 'Status' 6)" \
+            "$(optimize_fit_cell 'Current' 24)" \
+            "Desired"
+        printf '%s %s %s %s\n' \
+            "------------------" \
+            "------" \
+            "------------------------" \
+            "------------------------"
+        printf '%s' "$rows" | jq -r '.[] | [.name, .status, .current, .desired] | @tsv' 2>/dev/null |
+            while IFS=$'\t' read -r name status current desired; do
+                status="$(optimize_status_label "$status")"
+                printf '%s %s %s %s\n' \
+                    "$(optimize_fit_cell "$name" 18)" \
+                    "$(optimize_fit_cell "$status" 6)" \
+                    "$(optimize_fit_cell "$current" 24)" \
+                    "$(opt_field "$desired")"
+            done
+    } | sed '/^[[:space:]]*$/d'
+}
+
 optimize_details_json() {
     local mode="$1" before="$2" after="$3"
     jq -n -c \
@@ -866,7 +913,7 @@ EOF
 }
 
 apply_optimize_task() {
-    local job_id="$1" mode="$2" before after before_missing remaining details status message
+    local job_id="$1" mode="$2" before after before_missing remaining details details_text status message
     mode="${mode:-status}"
     write_update_result "$job_id" "running" "optimize ${mode} started"
 
@@ -881,6 +928,7 @@ apply_optimize_task() {
     if ! printf '%s' "$details" | jq -e '.kind == "optimize" and (.after | type == "array") and (.after | length > 0)' >/dev/null 2>&1; then
         details="$(optimize_details_fallback_json "$mode" "$before" "$after")"
     fi
+    details_text="$(optimize_table_text_json "$after")"
 
     status="ok"
     if [[ "$mode" == "apply" ]]; then
@@ -900,7 +948,7 @@ apply_optimize_task() {
         fi
     fi
 
-    write_update_result "$job_id" "$status" "$message" "$PUSH_BUILD" "$details"
+    write_update_result "$job_id" "$status" "$message" "$PUSH_BUILD" "$details" "$details_text"
     echo "push ${PUSH_BUILD}: optimize ${mode} status=${status} before=${before_missing} remaining=${remaining}"
 }
 
