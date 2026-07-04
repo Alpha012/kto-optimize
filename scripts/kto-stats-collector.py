@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v207"
+COLLECTOR_BUILD = "v208"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -264,7 +264,7 @@ SNI_STATE = {"nodes": {}, "pending": {}}
 NODE_NAME_STATE = {"nodes": {}, "pending": {}}
 BL_GROUP_STATE = {"groups": {}, "pending": {}}
 REMNA_NODE_STATE = {"nodes": {}}
-UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}}
+UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
 IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
 ALERT_SEPARATOR = "➖" * 9
@@ -838,6 +838,28 @@ def clean_update_retry_tokens(value):
     return {compound: item for _, compound, item in items[:300]}
 
 
+def clean_update_pending(value):
+    if not isinstance(value, dict):
+        return {}
+    current = now_ts()
+    clean = {}
+    for key, item in value.items():
+        if not isinstance(item, dict):
+            continue
+        key = str(key or "").strip()[:160]
+        action = str(item.get("action") or "").strip()[:40]
+        try:
+            created_at = int(item.get("created_at") or 0)
+        except Exception:
+            created_at = 0
+        if not key or action != "update_node_list":
+            continue
+        if created_at and current - created_at > 1800:
+            continue
+        clean[key] = {"action": action, "created_at": created_at or current}
+    return clean
+
+
 def load_update_state():
     global UPDATE_STATE
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -887,9 +909,10 @@ def load_update_state():
                 results[key] = result
         local = clean_update_result(loaded.get("local"))
         retry_tokens = clean_update_retry_tokens(loaded.get("retry_tokens"))
-        UPDATE_STATE = {"current": clean_current, "results": results, "local": local, "retry_tokens": retry_tokens}
+        pending = clean_update_pending(loaded.get("pending"))
+        UPDATE_STATE = {"current": clean_current, "results": results, "local": local, "retry_tokens": retry_tokens, "pending": pending}
     except Exception:
-        UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}}
+        UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
 
 
 def save_update_state():
@@ -5701,10 +5724,19 @@ def update_progress_snapshot_unlocked():
     running_count = 0
     wait_count = 0
     errors = []
+    ok_items = []
+    running_items = []
+    wait_items = []
     for key in targets:
         item = results.get(key)
         if not isinstance(item, dict) or item.get("id") != job_id:
             wait_count += 1
+            wait_items.append({
+                "key": key,
+                "node": targets.get(key) or key,
+                "status": "wait",
+                "message": "ждёт ближайший push",
+            })
             continue
         item = dict(item)
         item["key"] = key
@@ -5712,13 +5744,16 @@ def update_progress_snapshot_unlocked():
         status = item.get("status")
         if status == "ok":
             ok_count += 1
+            ok_items.append(item)
         elif status == "error":
             error_count += 1
             errors.append(item)
         elif status == "running":
             running_count += 1
+            running_items.append(item)
         else:
             wait_count += 1
+            wait_items.append(item)
     local_status = local.get("status") if local.get("id") == job_id else "wait"
     if not local_required and local_status == "wait":
         local_status = "ok"
@@ -5737,6 +5772,9 @@ def update_progress_snapshot_unlocked():
         "error_count": error_count,
         "running_count": running_count,
         "wait_count": wait_count,
+        "ok_items": ok_items,
+        "running_items": running_items,
+        "wait_items": wait_items,
         "errors": errors,
         "done": done,
         "notified_at": int(current.get("notified_at") or 0),
@@ -5764,6 +5802,8 @@ def update_scope_label(scope):
         return "BL"
     if scope == "single":
         return "1 машина"
+    if scope == "list":
+        return "список"
     return "все"
 
 
@@ -5871,6 +5911,105 @@ def update_status_message_from_snapshot(snapshot, title="Update status"):
     return "\n".join(lines)
 
 
+def friendly_update_message(message, status=""):
+    text = clean_display_text(message)
+    lower = text.lower()
+    if lower in ("ok", "skip"):
+        return "готово"
+    if lower == "wait":
+        return "ждёт"
+    if lower == "running":
+        return "выполняется"
+    if lower == "error":
+        return "ошибка"
+    if lower == "node update started":
+        return "docker compose pull/down/up"
+    if lower == "node updated":
+        return "готово"
+    if lower == "push update started":
+        return "скачивает и ставит push-скрипт"
+    if lower == "push script updated":
+        return "push-скрипт обновлён"
+    if lower == "collector update started":
+        return "collector обновляется"
+    if lower == "collector skipped":
+        return "collector не трогаем"
+    if lower == "docker not found":
+        return "docker не найден"
+    if lower == "docker compose not found":
+        return "docker compose не найден"
+    if lower == "compose dir not found":
+        return "папка compose не найдена"
+    if lower.startswith("curl failed"):
+        return "не смог скачать скрипт"
+    if lower.startswith("install /usr/local/bin/kto-stats-push failed"):
+        return "не смог поставить push-скрипт"
+    if text:
+        return text
+    if status == "wait":
+        return "ждёт ближайший push"
+    if status == "running":
+        return "выполняется"
+    if status == "ok":
+        return "готово"
+    if status == "error":
+        return "ошибка"
+    return "-"
+
+
+def friendly_update_item_lines(items, empty_text="нет", max_items=60):
+    items = items if isinstance(items, list) else []
+    if not items:
+        return f"<blockquote>{html.escape(empty_text)}</blockquote>"
+    lines = []
+    for item in items[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        node = clean_display_text(item.get("node") or item.get("key") or "-")
+        status = str(item.get("status") or "")
+        stage = friendly_update_message(item.get("message") or "", status=status)
+        lines.append(f"{html.escape(node)} — {html.escape(stage)}")
+    if len(items) > max_items:
+        lines.append(f"... ещё {len(items) - max_items}")
+    return "<blockquote>" + "\n".join(lines or [html.escape(empty_text)]) + "</blockquote>"
+
+
+def friendly_update_status_message(snapshot):
+    job_id = str(snapshot.get("job_id") or "")
+    if not job_id:
+        return "<b>Update-задачи нет.</b>"
+    action = snapshot.get("action")
+    local_status = snapshot.get("local_status") or "-"
+    summary = (
+        f"готово {int(snapshot.get('ok_count') or 0)} / "
+        f"ошибки {int(snapshot.get('error_count') or 0)} / "
+        f"на апдейте {int(snapshot.get('running_count') or 0)} / "
+        f"ждут {int(snapshot.get('wait_count') or 0)}"
+    )
+    lines = [
+        "<b>Статус апдейта нод</b>",
+        ALERT_SEPARATOR,
+        detail_line("Job", job_id),
+        detail_line("Тип", update_action_label(action)),
+        detail_line("Группа", update_scope_label(snapshot.get("scope"))),
+        detail_line("Итог", summary),
+    ]
+    if snapshot.get("local_required", True):
+        lines.append(detail_line("Collector", friendly_update_message(local_status, status=local_status)))
+    lines += [
+        "",
+        "<b>На апдейте:</b>",
+        friendly_update_item_lines(snapshot.get("running_items"), empty_text="нет"),
+        "<b>Ждут push:</b>",
+        friendly_update_item_lines(snapshot.get("wait_items"), empty_text="нет"),
+        "<b>Выполнено:</b>",
+        friendly_update_item_lines(snapshot.get("ok_items"), empty_text="нет"),
+        "<b>Не выполнено:</b>",
+        friendly_update_item_lines(snapshot.get("errors"), empty_text="нет"),
+    ]
+    return "\n".join(lines)
+
+
 def update_status_payload():
     with LOCK:
         snapshot = update_progress_snapshot_unlocked()
@@ -5970,6 +6109,21 @@ def optimize_result_payload(result, title="Optimize status"):
         rich_lines.append(detail_line("Сообщение", message))
 
     if status_rows:
+        ok_count = sum(1 for row in status_rows if isinstance(row, dict) and row.get("status") == "ok")
+        fail_count = sum(1 for row in status_rows if isinstance(row, dict) and row.get("status") == "fail")
+        warn_count = sum(1 for row in status_rows if isinstance(row, dict) and row.get("status") == "warn")
+        info_count = sum(1 for row in status_rows if isinstance(row, dict) and row.get("status") == "info")
+        panel_title = "Панель состояния" if mode == "status" else "Панель состояния после оптимизации"
+        build = clean_display_text(result.get("build") or "-")
+        rich_lines = [
+            f"<h3>{rich_text(panel_title)}</h3>",
+            f"<p><b>Машина:</b> {rich_text(node_name)}</p>",
+            f"<p><b>OK:</b> {rich_text(str(ok_count))} · <b>FAIL:</b> {rich_text(str(fail_count))} · <b>INFO:</b> {rich_text(str(info_count))}"
+            + (f" · <b>WARN:</b> {rich_text(str(warn_count))}" if warn_count else "")
+            + f" · <b>Build:</b> {rich_text(build)}</p>",
+        ]
+        if fail_count:
+            rich_lines.append(f"<p><b>Требует внимания:</b> {rich_text(str(fail_count))}</p>")
         table_rows = []
         for row in status_rows:
             if not isinstance(row, dict):
@@ -5982,7 +6136,15 @@ def optimize_result_payload(result, title="Optimize status"):
             ])
         rich_html = "\n".join(rich_lines)
         rich_html += "\n" + rich_table(["Раздел", "Проверка", "Значение", "Статус"], table_rows)
-        text_lines = list(rich_lines)
+        text_lines = [
+            f"<b>{html.escape(panel_title)}</b>",
+            ALERT_SEPARATOR,
+            detail_line("Машина", node_name),
+            detail_line("OK / FAIL / INFO", f"{ok_count} / {fail_count} / {info_count}"),
+            detail_line("Build", build),
+        ]
+        if fail_count:
+            text_lines.append(detail_line("Требует внимания", fail_count))
         text_rows = []
         for row in status_rows:
             if not isinstance(row, dict):
@@ -6079,6 +6241,8 @@ def update_start_title(action, scope, retry=False):
     if retry:
         return "Update retry запущен"
     if action == "node_update":
+        if str(scope or "").lower() == "list":
+            return "Update node list запущен"
         if str(scope or "").lower() == "single":
             return "Update node запущен"
         return "Update nodes запущен"
@@ -6097,7 +6261,7 @@ def update_start_title(action, scope, retry=False):
 
 def update_status_command(action):
     if action == "node_update":
-        return "/update_nodes status"
+        return "/update_node_status"
     return "/update_collector status"
 
 
@@ -6170,6 +6334,12 @@ def handle_update_nodes(text, chat_id, from_id):
     start_update_job("node_update", "all", from_id, local_required=False)
 
 
+def handle_update_node_status(text, chat_id, from_id):
+    with LOCK:
+        snapshot = update_progress_snapshot_unlocked()
+    send_message(friendly_update_status_message(snapshot), reply_markup=update_retry_markup(snapshot))
+
+
 def handle_update_node(text, chat_id, from_id):
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -6196,6 +6366,127 @@ def handle_update_node(text, chat_id, from_id):
         from_id,
         local_required=False,
         targets={node_key: node_name},
+    )
+
+
+def set_pending_update_node_list(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        UPDATE_STATE.setdefault("pending", {})[key] = {
+            "action": "update_node_list",
+            "created_at": now_ts(),
+        }
+        save_update_state()
+
+
+def pop_pending_update_node_list(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = UPDATE_STATE.setdefault("pending", {}).pop(key, None)
+        if item is not None:
+            save_update_state()
+        return item if isinstance(item, dict) else None
+
+
+def peek_pending_update_node_list(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = UPDATE_STATE.setdefault("pending", {}).get(key)
+        if not isinstance(item, dict) or item.get("action") != "update_node_list":
+            return None
+        if now_ts() - int(item.get("created_at") or 0) > 1800:
+            UPDATE_STATE.setdefault("pending", {}).pop(key, None)
+            save_update_state()
+            return None
+        return dict(item)
+
+
+def normalize_update_node_query(line):
+    text = clean_display_text(line)
+    text = re.sub(r"^\s*(?:[-*]+|\d+[.)])\s*", "", text)
+    return text.strip()
+
+
+def resolve_update_node_list(text):
+    targets = {}
+    found = []
+    missing = []
+    seen_queries = set()
+    for raw_line in str(text or "").splitlines():
+        query = normalize_update_node_query(raw_line)
+        if not query:
+            continue
+        query_key = canonical_node_key(query)
+        if not query_key or query_key in seen_queries:
+            continue
+        seen_queries.add(query_key)
+        node = find_node(query)
+        if node is None:
+            missing.append(query)
+            continue
+        node_key = node_canonical_key(node)
+        node_name = node_display_name(node, node_key)
+        if node_key and node_key not in targets:
+            targets[node_key] = node_name
+            found.append(node_name)
+    return targets, found, missing
+
+
+def handle_update_node_list_text(chat_id, from_id, text):
+    targets, found, missing = resolve_update_node_list(text)
+    if not targets and not missing:
+        send_message(
+            "<b>Список пустой.</b>\n"
+            "Напиши названия нод построчно, например:\n"
+            "<blockquote>Германия\nШвейцария\nОбход #3</blockquote>"
+        )
+        return True
+    if missing:
+        lines = [
+            "<b>Не нашёл часть нод</b>",
+            ALERT_SEPARATOR,
+            "<i>Апдейт не запускал, чтобы не обновить неполный список.</i>",
+            "",
+            "<b>Не найдены:</b>",
+            "<blockquote>" + "\n".join(html.escape(item) for item in missing[:40]) + "</blockquote>",
+        ]
+        if found:
+            lines += [
+                "<b>Нашёл:</b>",
+                "<blockquote>" + "\n".join(html.escape(item) for item in found[:40]) + "</blockquote>",
+            ]
+        send_message("\n".join(lines))
+        return True
+    pop_pending_update_node_list(chat_id, from_id)
+    start_update_job(
+        "node_update",
+        "list",
+        from_id,
+        local_required=False,
+        targets=targets,
+    )
+    return True
+
+
+def handle_pending_update_node_list(chat_id, from_id, text):
+    pending = peek_pending_update_node_list(chat_id, from_id)
+    if not pending:
+        return False
+    return handle_update_node_list_text(chat_id, from_id, text)
+
+
+def handle_update_node_list(text, chat_id, from_id):
+    parts = text.split(maxsplit=1)
+    set_pending_update_node_list(chat_id, from_id)
+    if len(parts) > 1 and parts[1].strip():
+        handle_update_node_list_text(chat_id, from_id, parts[1])
+        return
+    send_message(
+        "<b>Напишите список нод</b>\n"
+        f"{ALERT_SEPARATOR}\n"
+        "Каждая нода с новой строки. Апдейт стартанёт только если нашёл все названия.\n\n"
+        "<blockquote>Германия\nШвейцария\nОбход #3</blockquote>\n"
+        "<i>Отмена: <code>/cancel</code></i>"
     )
 
 
@@ -6888,9 +7179,12 @@ def bot_loop():
                     pop_pending_sni(chat_id, from_id)
                     pop_pending_rename(chat_id, from_id)
                     pop_pending_bl_group(chat_id, from_id)
+                    pop_pending_update_node_list(chat_id, from_id)
                     send_message("<b>Отменил.</b>")
                     continue
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and not command.startswith("/"):
+                    if handle_pending_update_node_list(chat_id, from_id, text):
+                        continue
                     if handle_pending_bl_group(chat_id, from_id, text):
                         continue
                     if handle_pending_rename(chat_id, from_id, text):
@@ -6925,6 +7219,10 @@ def bot_loop():
                     handle_update_collector(text, chat_id, from_id, scope="bl")
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_node":
                     handle_update_node(text, chat_id, from_id)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_node_list":
+                    handle_update_node_list(text, chat_id, from_id)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_node_status":
+                    handle_update_node_status(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_nodes":
                     handle_update_nodes(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/optimize":
