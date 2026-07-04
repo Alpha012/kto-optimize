@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v199"
+COLLECTOR_BUILD = "v200"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1874,19 +1874,19 @@ def remna_node_alert_message(kind, info):
         address = clean_display_text(info.get("address") or "-")
     if kind == "enabled":
         lines = [
-            f"{RESTORED_EMOJI} #remnaNodeEnabled",
-            "<b>Нода включена в Remna</b>",
+            f"{RESTORED_EMOJI} #remnawaveNodeEnabled",
+            "<b>Нода включена в Remnawave</b>",
             ALERT_SEPARATOR,
             detail_line("Название", name),
             detail_line("Адрес", address),
         ]
     else:
         lines = [
-            f"{LOST_EMOJI} #remnaNodeDisabled",
-            "<b>Нода отключена в Remna</b>",
+            f"{LOST_EMOJI} #remnawaveNodeDisabled",
+            "<b>Нода отключена в Remnawave</b>",
             ALERT_SEPARATOR,
             detail_line("Название", name),
-            detail_line("Причина", "Отключена в панели Remna"),
+            detail_line("Причина", "Отключена в панели Remnawave"),
             detail_line("Адрес", address),
         ]
     return "\n".join(lines)
@@ -2019,7 +2019,7 @@ def remna_active_user_ips_from_result(result, node, ts):
 
 def remna_fetch_active_user_ips():
     if not remna_api_enabled():
-        raise RuntimeError("Remna API не настроен")
+        raise RuntimeError("Remnawave API не настроен")
     nodes = remna_get_nodes()
     runnable = []
     skipped = 0
@@ -2423,7 +2423,7 @@ def remna_html_line(node):
         parts.append(f"errors {error_count}")
     if not parts:
         return ""
-    line = "Remna: " + ", ".join(parts)
+    line = "Remnawave: " + ", ".join(parts)
     if last_error:
         line = f"{line} | {last_error[:180]}"
     return html.escape(line)
@@ -2975,7 +2975,7 @@ def bl_group_stats_rich_message(group_id=None, ungrouped=False):
     if not group_nodes:
         return f"<h3>Статистика других машин</h3><h4>{rich_text(group_name)}</h4><p>Нет машин в группе.</p>"
     ts = now_ts()
-    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "RAM", "CPU", "Remna", "Статус"]
+    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "RAM", "CPU", "Remnawave", "Статус"]
     parts = [
         "<h3>Статистика других машин</h3>",
         f"<h4>{rich_text(group_name)}</h4>",
@@ -4559,7 +4559,7 @@ def top_ip_report(limit=20):
         return (
             "<b>Топ активных IP</b>\n"
             f"{ALERT_SEPARATOR}\n"
-            "<b>Remna API:</b> <code>не настроен</code>"
+            "<b>Remnawave API:</b> <code>не настроен</code>"
         )
     try:
         limit = int(limit)
@@ -4701,7 +4701,7 @@ def ip_limit_user_card(query):
             "<b>Не нашёл пользователя</b>\n"
             f"{ALERT_SEPARATOR}\n"
             f"{detail_line('Запрос', query)}\n"
-            "<i>Можно Remna ID, Telegram ID через tg:, username или uuid.</i>"
+            "<i>Можно Remnawave ID, Telegram ID через tg:, username или uuid.</i>"
         )
         return text, None
     key = ip_limit_primary_key(query, info)
@@ -4807,9 +4807,9 @@ def enforce_ip_limit(user, entries, limit, info=None, enforce_enabled=None):
     scheduled_blocks = schedule_ip_limit_blocks(user, entries, info, enable_at)
     block_text = f"Все айпи были дропнуты с ноды на {penalty_text}." if scheduled_blocks > 0 else ""
     if not remna_api_enabled():
-        return block_text or "Remna API не настроен"
+        return block_text or "Remnawave API не настроен"
     if not isinstance(info, dict):
-        return block_text or "юзер не найден в Remna API"
+        return block_text or "юзер не найден в Remnawave API"
     uuid_value = remna_user_uuid(info)
     if not uuid_value:
         return block_text or "у юзера нет uuid"
@@ -4834,8 +4834,8 @@ def enforce_ip_limit(user, entries, limit, info=None, enforce_enabled=None):
     except Exception as exc:
         log(f"ip limit disable failed user={user} uuid={uuid_value}: {exc}")
         if block_text:
-            return f"{block_text} Remna disable не сработал."
-        return "ошибка disable в Remna API"
+            return f"{block_text} Remnawave disable не сработал."
+        return "ошибка disable в Remnawave API"
     with LOCK:
         ip_limit_db().execute(
             "INSERT INTO ip_limit_penalties(user, uuid, disabled_at, enable_at, reason, last_error) VALUES(?, ?, ?, ?, ?, '') "
@@ -6090,12 +6090,12 @@ def handle_ip_enable(text, force=False):
         ALERT_SEPARATOR,
         detail_line("Машина", policy.get("node") or query),
         detail_line("Режим", mode),
-        detail_line("Remna API", remna_state),
+        detail_line("Remnawave API", remna_state),
         "",
         "<i>Машина применит флаг при ближайшем push.</i>",
     ]
     if force and not remna_api_enabled():
-        lines.append("<i>Без Remna API будет работать только drop IP на ноде.</i>")
+        lines.append("<i>Без Remnawave API будет работать только drop IP на ноде.</i>")
     send_message("\n".join(lines))
 
 
