@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v205"
+COLLECTOR_BUILD = "v206"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -724,6 +724,25 @@ def clean_optimize_rows(value):
     return rows
 
 
+def clean_status_panel_rows(value):
+    if not isinstance(value, list):
+        return []
+    rows = []
+    for item in value[:80]:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "info").strip().lower()[:12]
+        if status not in ("ok", "fail", "info", "warn"):
+            status = "info"
+        rows.append({
+            "section": clean_display_text(item.get("section") or "-")[:80],
+            "name": clean_display_text(item.get("name") or "-")[:80],
+            "value": clean_display_text(item.get("value") or "-")[:200],
+            "status": status,
+        })
+    return rows
+
+
 def clean_update_details(value):
     if not isinstance(value, dict):
         return {}
@@ -735,6 +754,7 @@ def clean_update_details(value):
         mode = "status"
     before = clean_optimize_rows(value.get("before"))
     after = clean_optimize_rows(value.get("after"))
+    status_rows = clean_status_panel_rows(value.get("status_rows"))
     missing_before = []
     raw_missing = value.get("missing_before")
     if isinstance(raw_missing, list):
@@ -757,8 +777,11 @@ def clean_update_details(value):
     return {
         "kind": "optimize",
         "mode": mode,
+        "source": clean_display_text(value.get("source") or "")[:80],
         "before": before,
         "after": after,
+        "status_rows": status_rows,
+        "status_fail_count": sum(1 for row in status_rows if row.get("status") == "fail"),
         "missing_before": missing_before,
         "fixed_count": fixed_count,
         "remaining_count": remaining_count,
@@ -5852,6 +5875,17 @@ def optimize_status_label(status):
     return "НЕТ"
 
 
+def status_panel_label(status):
+    status = str(status or "info").lower()
+    if status == "ok":
+        return "OK"
+    if status == "fail":
+        return "FAIL"
+    if status == "warn":
+        return "WARN"
+    return "-"
+
+
 def fit_cell(value, width):
     text = clean_display_text(value)
     if len(text) <= width:
@@ -5884,6 +5918,7 @@ def optimize_result_payload(result, title="Optimize status"):
     result = result if isinstance(result, dict) else {}
     details = result.get("details") if isinstance(result.get("details"), dict) else {}
     mode = str(details.get("mode") or "status")
+    status_rows = details.get("status_rows") if isinstance(details.get("status_rows"), list) else []
     rows = details.get("after") if isinstance(details.get("after"), list) else []
     if not rows:
         rows = details.get("before") if isinstance(details.get("before"), list) else []
@@ -5915,6 +5950,33 @@ def optimize_result_payload(result, title="Optimize status"):
             rich_lines.append(detail_line("До фикса", "всё уже было OK"))
     if message:
         rich_lines.append(detail_line("Сообщение", message))
+
+    if status_rows:
+        table_rows = []
+        for row in status_rows:
+            if not isinstance(row, dict):
+                continue
+            table_rows.append([
+                (row.get("section") or "-", "left"),
+                (row.get("name") or "-", "left"),
+                (row.get("value") or "-", "left"),
+                (status_panel_label(row.get("status")), "center"),
+            ])
+        rich_html = "\n".join(rich_lines)
+        rich_html += "\n" + rich_table(["Раздел", "Проверка", "Значение", "Статус"], table_rows)
+        text_lines = list(rich_lines)
+        text_rows = []
+        for row in status_rows:
+            if not isinstance(row, dict):
+                continue
+            text_rows.append({
+                "name": f"{row.get('section') or '-'} / {row.get('name') or '-'}",
+                "status": "ok" if row.get("status") == "ok" else "miss" if row.get("status") == "fail" else "skip",
+                "current": row.get("value") or "-",
+                "desired": status_panel_label(row.get("status")),
+            })
+        text_lines += ["", "<b>Панель состояния:</b>", f"<pre>{html.escape(optimize_text_table(text_rows))}</pre>"]
+        return rich_html, "\n".join(text_lines)
 
     table_rows = []
     for row in rows:
@@ -5984,7 +6046,6 @@ def maybe_send_update_done_notification():
         if str(snapshot.get("action") or "") in ("optimize", "optimize_status"):
             title = "Optimize завершён" if success else "Optimize завершён с ошибками"
             rich_message, message = optimize_done_payload_unlocked(snapshot, title)
-            rich_message = ""
         else:
             message = update_status_message_from_snapshot(snapshot, title=title)
         markup = update_retry_markup(snapshot)

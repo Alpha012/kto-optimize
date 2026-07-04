@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v205"
+PUSH_BUILD="v206"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -784,6 +784,187 @@ optimize_table_text_json() {
     } | sed '/^[[:space:]]*$/d'
 }
 
+status_bool() {
+    if [[ "${1:-0}" == "1" || "${1:-}" == "active" || "${1:-}" == "running" ]]; then
+        printf 'ok'
+    else
+        printf 'fail'
+    fi
+}
+
+status_field() {
+    opt_field "$1"
+}
+
+append_status_panel_row() {
+    local file="$1" section="$2" name="$3" value="$4" status="${5:-info}"
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(status_field "$section")" \
+        "$(status_field "$name")" \
+        "$(status_field "$value")" \
+        "$(status_field "$status")" >> "$file"
+}
+
+kto_cfg_get() {
+    local key="$1" file="${2:-/etc/kto-cfg.conf}"
+    [[ -r "$file" ]] || return 0
+    awk -v key="$key" -F= '
+        $1 == key {
+            value = $0
+            sub(/^[^=]*=/, "", value)
+            gsub(/^"/, "", value)
+            gsub(/"$/, "", value)
+            print value
+            exit
+        }
+    ' "$file" 2>/dev/null || true
+}
+
+bytes_to_human() {
+    local bytes="${1:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    awk -v bytes="$bytes" 'BEGIN {
+        split("B KB MB GB TB", units, " ")
+        value = bytes + 0
+        unit = 1
+        while (value >= 1024 && unit < 5) {
+            value /= 1024
+            unit++
+        }
+        if (unit == 1) {
+            printf "%d %s", value, units[unit]
+        } else {
+            printf "%.1f %s", value, units[unit]
+        }
+    }'
+}
+
+swap_total_bytes() {
+    awk '$1 == "SwapTotal:" { print int($2 * 1024); found=1 } END { if (!found) print 0 }' /proc/meminfo 2>/dev/null || echo 0
+}
+
+zram_swap_active() {
+    awk 'NR > 1 && $1 ~ /zram/ { found=1 } END { exit found ? 0 : 1 }' /proc/swaps 2>/dev/null
+}
+
+zram_swap_summary() {
+    awk 'NR > 1 && $1 ~ /zram/ { size += $3; used += $4; found=1 } END {
+        if (found) {
+            printf "%.1f MB / %.1f MB", used / 1024, size / 1024
+        }
+    }' /proc/swaps 2>/dev/null || true
+}
+
+service_active_status() {
+    local service="$1"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$service" >/dev/null 2>&1; then
+        printf 'ok'
+    else
+        printf 'fail'
+    fi
+}
+
+ufw_allowed_ports_panel() {
+    command -v ufw >/dev/null 2>&1 || { printf '-'; return 0; }
+    ufw status 2>/dev/null |
+        awk '$0 ~ /ALLOW/ && $1 !~ /\[/ { print $1 }' |
+        sed 's#/tcp##; s#/udp##' |
+        awk '!seen[$0]++' |
+        paste -sd ', ' - 2>/dev/null |
+        awk 'NF {print; found=1} END {if (!found) print "-"}'
+}
+
+antiscanner_rules_count_panel() {
+    command -v ufw >/dev/null 2>&1 || { printf '0'; return 0; }
+    ufw status 2>/dev/null | grep -c 'AntiScanner-Block' 2>/dev/null || echo 0
+}
+
+status_panel_rows_json() {
+    local rows_file section cc qdisc mode profile ram_used_b ram_total_b ram_percent available_b swap_b zram_summary kernel cpus
+    local docker_status container node_status antiscanner_count
+    rows_file="$(mktemp)"
+
+    mode="$(kto_cfg_get MACHINE_MODE)"
+    mode="${mode:-node}"
+    profile="$(kto_cfg_get NODE_PROFILE)"
+    profile="${profile:-reality}"
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
+    qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
+
+    section="СЕТЬ"
+    append_status_panel_row "$rows_file" "$section" "mode" "$mode" "info"
+    if [[ "$mode" == "node" ]]; then
+        append_status_panel_row "$rows_file" "$section" "profile" "$profile" "info"
+    fi
+    append_status_panel_row "$rows_file" "$section" "BBR + FQ" "${cc} + ${qdisc}" "$([[ "$cc" == "bbr" && "$qdisc" == "fq" ]] && echo ok || echo fail)"
+    append_status_panel_row "$rows_file" "$section" "ports" "$(ufw_allowed_ports_panel)" "info"
+
+    read -r ram_used_b ram_total_b ram_percent < <(memory_stats)
+    ram_used_b="$(int_or_zero "$ram_used_b")"
+    ram_total_b="$(int_or_zero "$ram_total_b")"
+    available_b=$(( ram_total_b > ram_used_b ? ram_total_b - ram_used_b : 0 ))
+    swap_b="$(swap_total_bytes)"
+    swap_b="$(int_or_zero "$swap_b")"
+    section="ПАМЯТЬ"
+    append_status_panel_row "$rows_file" "$section" "RAM" "$(bytes_to_human "$available_b") / $(bytes_to_human "$ram_total_b")" "info"
+    if zram_swap_active; then
+        zram_summary="$(zram_swap_summary)"
+        append_status_panel_row "$rows_file" "$section" "zram" "${zram_summary:-active}" "ok"
+    elif (( swap_b > 0 )); then
+        append_status_panel_row "$rows_file" "$section" "swap" "$(bytes_to_human "$swap_b")" "ok"
+    else
+        append_status_panel_row "$rows_file" "$section" "swap/zram" "none" "fail"
+    fi
+
+    section="СЛУЖБЫ"
+    append_status_panel_row "$rows_file" "$section" "ufw" "firewall" "$(service_active_status ufw)"
+    antiscanner_count="$(antiscanner_rules_count_panel)"
+    append_status_panel_row "$rows_file" "$section" "antiscanner" "${antiscanner_count} rules" "$([[ "$antiscanner_count" =~ ^[1-9][0-9]*$ ]] && echo ok || echo fail)"
+    if command -v haproxy >/dev/null 2>&1; then
+        append_status_panel_row "$rows_file" "$section" "haproxy" "proxy" "$(service_active_status haproxy)"
+    fi
+    append_status_panel_row "$rows_file" "$section" "fail2ban" "ssh guard" "$(service_active_status fail2ban)"
+    append_status_panel_row "$rows_file" "$section" "chrony" "time sync" "$(service_active_status chrony)"
+    cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    cpus="$(int_or_zero "$cpus")"
+    if (( cpus > 1 )); then
+        append_status_panel_row "$rows_file" "$section" "irqbalance" "irq" "$(service_active_status irqbalance)"
+    else
+        append_status_panel_row "$rows_file" "$section" "irqbalance" "single CPU, skip" "info"
+    fi
+
+    section="REMNAWAVE"
+    if command -v docker >/dev/null 2>&1; then
+        docker_status="$(service_active_status docker)"
+        append_status_panel_row "$rows_file" "$section" "docker" "engine" "$docker_status"
+        container="$(remna_container_name)"
+        node_status="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || echo "not found")"
+        append_status_panel_row "$rows_file" "$section" "remnanode" "$node_status" "$([[ "$node_status" == "running" ]] && echo ok || echo fail)"
+    else
+        append_status_panel_row "$rows_file" "$section" "docker" "not installed" "fail"
+        append_status_panel_row "$rows_file" "$section" "remnanode" "not found" "fail"
+    fi
+
+    section="ЯДРО"
+    kernel="$(uname -r 2>/dev/null || echo "-")"
+    append_status_panel_row "$rows_file" "$section" "kernel" "$kernel" "$([[ "$kernel" == *liquorix* ]] && echo ok || echo fail)"
+
+    jq -R -s -c '
+        split("\n")
+        | map(select(length > 0) | split("\t") | {
+            section: (.[0] // ""),
+            name: (.[1] // ""),
+            value: (.[2] // "-"),
+            status: (.[3] // "info")
+        })
+    ' "$rows_file" 2>/dev/null || echo '[]'
+    rm -f "$rows_file"
+}
+
+status_panel_fail_count() {
+    printf '%s' "${1:-[]}" | jq '[.[] | select(.status == "fail")] | length' 2>/dev/null || echo 0
+}
+
 optimize_details_json() {
     local mode="$1" before="$2" after="$3"
     jq -n -c \
@@ -817,6 +998,20 @@ optimize_details_fallback_json() {
             missing_before: ($before | map(select(.status == "miss")) | map(.name)),
             fixed_count: 0,
             remaining_count: ($after | map(select(.status == "miss")) | length)
+        }' 2>/dev/null || echo '{}'
+}
+
+optimize_status_panel_details_json() {
+    local mode="$1" rows="$2"
+    jq -n -c \
+        --arg mode "$mode" \
+        --argjson rows "${rows:-[]}" \
+        '{
+            kind: "optimize",
+            mode: $mode,
+            source: "kto_status_panel",
+            status_rows: $rows,
+            status_fail_count: ($rows | map(select(.status == "fail")) | length)
         }' 2>/dev/null || echo '{}'
 }
 
@@ -913,9 +1108,19 @@ EOF
 }
 
 apply_optimize_task() {
-    local job_id="$1" mode="$2" before after before_missing remaining details details_text status message
+    local job_id="$1" mode="$2" before after before_missing remaining details details_text status message panel_rows panel_fails
     mode="${mode:-status}"
     write_update_result "$job_id" "running" "optimize ${mode} started"
+
+    if [[ "$mode" == "status" ]]; then
+        panel_rows="$(status_panel_rows_json)"
+        panel_fails="$(status_panel_fail_count "$panel_rows")"
+        details="$(optimize_status_panel_details_json "$mode" "$panel_rows")"
+        message="status panel, fail=${panel_fails}"
+        write_update_result "$job_id" "ok" "$message" "$PUSH_BUILD" "$details"
+        echo "push ${PUSH_BUILD}: optimize ${mode} status=ok panel_fails=${panel_fails}"
+        return 0
+    fi
 
     before="$(optimize_check_json)"
     before_missing="$(optimize_missing_count "$before")"
@@ -929,6 +1134,10 @@ apply_optimize_task() {
         details="$(optimize_details_fallback_json "$mode" "$before" "$after")"
     fi
     details_text="$(optimize_table_text_json "$after")"
+    panel_rows="$(status_panel_rows_json)"
+    if printf '%s' "$panel_rows" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        details="$(jq -n -c --argjson details "$details" --argjson rows "$panel_rows" '$details + {source: "kto_status_panel", status_rows: $rows, status_fail_count: ($rows | map(select(.status == "fail")) | length)}' 2>/dev/null || printf '%s' "$details")"
+    fi
 
     status="ok"
     if [[ "$mode" == "apply" ]]; then
