@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v196"
+COLLECTOR_BUILD = "v197"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -51,6 +51,15 @@ ALLOWED_USER_ID = str(cfg.get("KTO_COLLECTOR_ALLOWED_USER_ID", "646296998"))
 STATE_DIR = cfg.get("KTO_COLLECTOR_STATE_DIR", "/var/lib/kto-stats-collector")
 STALE_SEC = int(cfg.get("KTO_COLLECTOR_STALE_SEC", "60"))
 CHECK_INTERVAL = int(cfg.get("KTO_COLLECTOR_CHECK_INTERVAL", "30"))
+try:
+    BL_STALE_SEC = int(cfg.get("KTO_COLLECTOR_BL_STALE_SEC", "15") or "15")
+except Exception:
+    BL_STALE_SEC = 15
+if BL_STALE_SEC < 5:
+    BL_STALE_SEC = 5
+OFFLINE_LOOP_SEC = CHECK_INTERVAL
+if BL_STALE_SEC < CHECK_INTERVAL:
+    OFFLINE_LOOP_SEC = max(1, min(5, BL_STALE_SEC, CHECK_INTERVAL))
 TZ_NAME = cfg.get("KTO_COLLECTOR_TZ", "Europe/Moscow")
 DAILY_REPORT_TIME = cfg.get("KTO_COLLECTOR_DAILY_REPORT_TIME", "").strip()
 try:
@@ -142,6 +151,15 @@ except Exception:
     REMNA_API_TIMEOUT_SEC = 5
 if REMNA_API_TIMEOUT_SEC < 1:
     REMNA_API_TIMEOUT_SEC = 1
+REMNA_NODE_ALERT_ENABLED = str(cfg.get("KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED", "1")).lower() in ("1", "yes", "true", "on", "enabled")
+try:
+    REMNA_NODE_POLL_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_NODE_POLL_SEC", "15") or "15")
+except Exception:
+    REMNA_NODE_POLL_SEC = 15
+if REMNA_NODE_POLL_SEC < 5:
+    REMNA_NODE_POLL_SEC = 5
+if REMNA_NODE_POLL_SEC > 300:
+    REMNA_NODE_POLL_SEC = 300
 try:
     REMNA_TOP_IP_JOB_TIMEOUT_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_TOP_IP_JOB_TIMEOUT_SEC", "25") or "25")
 except Exception:
@@ -195,6 +213,7 @@ SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
 SNI_ALLOW_FILE = os.path.join(STATE_DIR, "sni_allow.json")
 NODE_NAMES_FILE = os.path.join(STATE_DIR, "node_names.json")
 BL_GROUPS_FILE = os.path.join(STATE_DIR, "bl_groups.json")
+REMNA_NODES_FILE = os.path.join(STATE_DIR, "remna_nodes.json")
 IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
 IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
 UPDATE_STATE_FILE = os.path.join(STATE_DIR, "update_state.json")
@@ -205,6 +224,7 @@ SSH_ALLOWED_IPS = []
 SNI_STATE = {"nodes": {}, "pending": {}}
 NODE_NAME_STATE = {"nodes": {}, "pending": {}}
 BL_GROUP_STATE = {"groups": {}, "pending": {}}
+REMNA_NODE_STATE = {"nodes": {}}
 UPDATE_STATE = {"current": {}, "results": {}, "local": {}}
 IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
@@ -583,6 +603,39 @@ def load_bl_group_state():
 
 def save_bl_group_state():
     atomic_write(BL_GROUPS_FILE, json.dumps(BL_GROUP_STATE, ensure_ascii=False, indent=2))
+
+
+def load_remna_node_state():
+    global REMNA_NODE_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(REMNA_NODES_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        raw_nodes = loaded.get("nodes") if isinstance(loaded, dict) else {}
+        if not isinstance(raw_nodes, dict):
+            raw_nodes = {}
+        clean_nodes = {}
+        for key, item in raw_nodes.items():
+            if not isinstance(item, dict):
+                continue
+            node_key = str(key or "").strip()[:120]
+            if not node_key:
+                continue
+            clean_nodes[node_key] = {
+                "name": clean_display_text(item.get("name") or node_key)[:120],
+                "address": clean_display_text(item.get("address") or "")[:160],
+                "disabled": bool(item.get("disabled")),
+                "connected": bool(item.get("connected")),
+                "seen_at": int(item.get("seen_at") or 0),
+                "alerted_at": int(item.get("alerted_at") or 0),
+            }
+        REMNA_NODE_STATE = {"nodes": clean_nodes}
+    except Exception:
+        REMNA_NODE_STATE = {"nodes": {}}
+
+
+def save_remna_node_state():
+    atomic_write(REMNA_NODES_FILE, json.dumps(REMNA_NODE_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def clean_update_result(item):
@@ -1281,7 +1334,7 @@ def reset_daily_falls(nodes, ts):
     for node in nodes:
         last_seen = int(node.get("last_seen", 0) or 0)
         age = ts - last_seen
-        if age > STALE_SEC:
+        if age > node_stale_sec(node):
             offline_since = int(node.get("offline_since") or last_seen or ts)
             active_downtime += max(0, ts - offline_since)
     falls = ensure_today_falls()
@@ -1671,6 +1724,137 @@ def remna_get_nodes():
         seen.add(uuid_value)
         nodes.append(item)
     return nodes
+
+
+def remna_node_value(item, keys):
+    if not isinstance(item, dict):
+        return ""
+    for key in keys:
+        value = item.get(key)
+        if value is None or value == "":
+            continue
+        value = clean_display_text(value)
+        if value:
+            return value
+    return ""
+
+
+def remna_node_key(item):
+    return remna_node_value(item, ("uuid", "id", "nodeUuid", "node_uuid"))
+
+
+def remna_node_name(item):
+    return remna_node_value(item, ("name", "remark", "tag", "nodeName", "node_name"))
+
+
+def remna_node_address(item):
+    value = remna_node_value(item, ("address", "ip", "host", "hostname", "domain", "nodeAddress", "node_address"))
+    if "://" in value:
+        try:
+            parsed = urllib.parse.urlparse(value)
+            value = parsed.hostname or value
+        except Exception:
+            pass
+    return value.strip("[]")
+
+
+def remna_node_is_disabled(item):
+    if not isinstance(item, dict):
+        return False
+    for key in ("isDisabled", "is_disabled", "disabled"):
+        if key in item:
+            return remna_bool(item.get(key))
+    status = str(item.get("status") or item.get("state") or "").strip().lower()
+    return status in ("disabled", "disable", "inactive", "off")
+
+
+def remna_node_is_connected(item):
+    if not isinstance(item, dict):
+        return False
+    for key in ("isConnected", "is_connected", "connected"):
+        if key in item:
+            return remna_bool(item.get(key))
+    return not remna_node_is_disabled(item)
+
+
+def normalize_remna_node(item, ts=None):
+    ts = int(ts or now_ts())
+    node_key = remna_node_key(item)
+    name = remna_node_name(item)
+    address = remna_node_address(item)
+    if not node_key:
+        seed = name or address
+        if not seed:
+            return {}
+        node_key = canonical_node_key(seed)
+    if not name:
+        name = address or node_key
+    return {
+        "key": str(node_key or "")[:120],
+        "name": clean_display_text(name or node_key)[:120],
+        "address": clean_display_text(address or "")[:160],
+        "disabled": remna_node_is_disabled(item),
+        "connected": remna_node_is_connected(item),
+        "seen_at": ts,
+    }
+
+
+def remna_local_node(info):
+    if not isinstance(info, dict):
+        return None
+    keys = {
+        canonical_node_key(info.get("name")),
+        canonical_node_key(info.get("address")),
+        canonical_node_key(info.get("key")),
+    }
+    keys.discard("")
+    if not keys:
+        return None
+    with LOCK:
+        for node in NODES.values():
+            if not isinstance(node, dict):
+                continue
+            aliases = node_alias_keys(node)
+            aliases.add(canonical_node_key(node.get("ip")))
+            aliases.add(canonical_node_key(node.get("hostname")))
+            aliases.add(canonical_node_key(node.get("id")))
+            aliases.discard("")
+            if keys.intersection(aliases):
+                return dict(node)
+    return None
+
+
+def remna_node_alert_message(kind, info):
+    info = info if isinstance(info, dict) else {}
+    local = remna_local_node(info)
+    if local:
+        name = node_display_name(local, info.get("name") or info.get("key") or "unknown")
+        address = node_display_ip(local)
+    else:
+        name = clean_display_text(info.get("name") or info.get("key") or "unknown")
+        address = clean_display_text(info.get("address") or "-")
+    if kind == "enabled":
+        lines = [
+            f"{RESTORED_EMOJI} #remnaNodeEnabled",
+            "<b>Нода включена в Remna</b>",
+            ALERT_SEPARATOR,
+            detail_line("Название", name),
+            detail_line("Адрес", address),
+        ]
+    else:
+        lines = [
+            f"{LOST_EMOJI} #remnaNodeDisabled",
+            "<b>Нода отключена в Remna</b>",
+            ALERT_SEPARATOR,
+            detail_line("Название", name),
+            detail_line("Причина", "Отключена в панели Remna"),
+            detail_line("Адрес", address),
+        ]
+    return "\n".join(lines)
+
+
+def alert_remna_node(kind, info):
+    return send_message(remna_node_alert_message(kind, info))
 
 
 def remna_job_id(payload):
@@ -2299,7 +2483,7 @@ def downtime_totals(nodes, ts, filtered=False):
     for node in nodes:
         last_seen = int(node.get("last_seen", 0) or 0)
         age = ts - last_seen
-        if age > STALE_SEC:
+        if age > node_stale_sec(node):
             dead_items.append((node, age))
             offline_since = int(node.get("offline_since") or last_seen or ts)
             active_downtime += max(0, ts - offline_since)
@@ -2406,6 +2590,13 @@ def node_is_wl(node):
     return False
 
 
+def node_stale_sec(node):
+    try:
+        return STALE_SEC if node_is_wl(node) else BL_STALE_SEC
+    except Exception:
+        return STALE_SEC
+
+
 def node_is_exact_bypass(node):
     values = [
         node.get("name") if isinstance(node, dict) else "",
@@ -2422,7 +2613,7 @@ def live_node_count(nodes, ts):
     live_count = 0
     for node in nodes:
         last_seen = int(node.get("last_seen", 0) or 0)
-        if ts - last_seen <= STALE_SEC:
+        if ts - last_seen <= node_stale_sec(node):
             live_count += 1
     return live_count
 
@@ -2481,7 +2672,7 @@ def aggregate_message(scope="all"):
     parts = [f"<b>{title}</b>"]
     for node in nodes:
         age = ts - int(node.get("last_seen", 0) or 0)
-        status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
+        status = "OK" if age <= node_stale_sec(node) else f"OFFLINE {format_age(age)}"
         parts.append("")
         parts.append(node_message(node, status, compact=compact))
     parts.append(status_summary(nodes, ts, expected_total=expected_total, filtered=filtered))
@@ -2490,7 +2681,7 @@ def aggregate_message(scope="all"):
         parts.append(f"<blockquote><b>Другие: {live_node_count(other_nodes, ts)}/{len(other_nodes)}</b></blockquote>")
         for node in other_nodes:
             age = ts - int(node.get("last_seen", 0) or 0)
-            status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
+            status = "OK" if age <= node_stale_sec(node) else f"OFFLINE {format_age(age)}"
             parts.append("")
             parts.append(node_message(node, status, compact=compact))
     return "\n".join(parts)
@@ -2557,7 +2748,7 @@ def node_status_text(node, ts):
     if clean_display_text(node.get("error") or ""):
         return "ERR"
     age = ts - int(node.get("last_seen", 0) or 0)
-    if age <= STALE_SEC:
+    if age <= node_stale_sec(node):
         return "OK"
     return f"OFF {format_age(age)}"
 
@@ -3938,7 +4129,7 @@ def bl_group_stats_message(group_id=None, ungrouped=False):
         return "\n".join(parts)
     for node in group_nodes:
         age = ts - int(node.get("last_seen", 0) or 0)
-        status = "OK" if age <= STALE_SEC else f"OFFLINE {format_age(age)}"
+        status = "OK" if age <= node_stale_sec(node) else f"OFFLINE {format_age(age)}"
         parts.append("")
         parts.append(node_message(node, status, compact=False))
     parts.append(status_summary(group_nodes, ts, expected_total=max(len(group_nodes), 1), filtered=True))
@@ -4709,6 +4900,56 @@ def remna_ip_limit_loop():
             time.sleep(max(10, min(IP_LIMIT_SCAN_SEC, 60)))
 
 
+def remna_node_monitor_enabled():
+    return bool(REMNA_NODE_ALERT_ENABLED and remna_api_enabled())
+
+
+def remna_node_poll_once():
+    ts = now_ts()
+    raw_nodes = remna_get_nodes()
+    current = {}
+    alerts = []
+    with LOCK:
+        state_nodes = REMNA_NODE_STATE.setdefault("nodes", {})
+        for raw in raw_nodes:
+            info = normalize_remna_node(raw, ts)
+            node_key = str(info.get("key") or "").strip()
+            if not node_key:
+                continue
+            old = state_nodes.get(node_key)
+            if isinstance(old, dict):
+                old_disabled = bool(old.get("disabled"))
+                if old_disabled != bool(info.get("disabled")):
+                    kind = "disabled" if info.get("disabled") else "enabled"
+                    info["alerted_at"] = ts
+                    alerts.append((kind, dict(info)))
+                else:
+                    info["alerted_at"] = int(old.get("alerted_at") or 0)
+            else:
+                info["alerted_at"] = 0
+            state_nodes[node_key] = info
+            current[node_key] = True
+        for node_key in list(state_nodes.keys()):
+            if node_key not in current:
+                state_nodes.pop(node_key, None)
+        save_remna_node_state()
+    for kind, info in alerts:
+        log(f"remna node {kind}: {info.get('name') or info.get('key')}")
+        alert_remna_node(kind, info)
+    return {"nodes": len(current), "alerts": len(alerts)}
+
+
+def remna_node_loop():
+    while True:
+        try:
+            if remna_node_monitor_enabled():
+                remna_node_poll_once()
+            time.sleep(REMNA_NODE_POLL_SEC)
+        except Exception as exc:
+            log(f"remna node monitor failed: {exc}")
+            time.sleep(max(10, min(REMNA_NODE_POLL_SEC, 60)))
+
+
 def update_node(payload, remote_ip=""):
     raw_id = clean_display_text(payload.get("id") or "")
     node_name = clean_display_text(payload.get("name") or raw_id or payload.get("hostname") or "")
@@ -4869,14 +5110,14 @@ class Handler(BaseHTTPRequestHandler):
 def offline_loop():
     while True:
         try:
-            time.sleep(CHECK_INTERVAL)
+            time.sleep(OFFLINE_LOOP_SEC)
             current = now_ts()
             changed = False
             alerts = []
             with LOCK:
                 for node_id, node in NODES.items():
                     age = current - int(node.get("last_seen", 0) or 0)
-                    if age > STALE_SEC and not node.get("offline_alerted"):
+                    if age > node_stale_sec(node) and not node.get("offline_alerted"):
                         node["offline_alerted"] = True
                         node["offline_since"] = current
                         record_fall(node)
@@ -4885,7 +5126,7 @@ def offline_loop():
                 if changed:
                     save_nodes()
             for node_id, node, age in alerts:
-                log(f"node offline: {node_id} age={age}s")
+                log(f"node offline: {node_id} age={age}s stale={node_stale_sec(node)}s")
                 alert_offline(node_id, node, age)
         except Exception as exc:
             log(f"offline loop failed: {exc}")
@@ -6065,10 +6306,12 @@ def main():
     load_sni_state()
     load_node_name_state()
     load_bl_group_state()
+    load_remna_node_state()
     load_update_state()
     load_ip_limit_state()
     threading.Thread(target=offline_loop, daemon=True).start()
     threading.Thread(target=ip_limit_penalty_loop, daemon=True).start()
+    threading.Thread(target=remna_node_loop, daemon=True).start()
     threading.Thread(target=remna_ip_limit_loop, daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
     if DAILY_REPORT_TIME:
