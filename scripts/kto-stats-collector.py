@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v198"
+COLLECTOR_BUILD = "v199"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -65,6 +65,20 @@ if BL_OFFLINE_CONFIRM_SEC < 0:
     BL_OFFLINE_CONFIRM_SEC = 0
 if BL_OFFLINE_CONFIRM_SEC > 60:
     BL_OFFLINE_CONFIRM_SEC = 60
+try:
+    BL_STALE_FALLBACK_SEC = int(cfg.get("KTO_COLLECTOR_BL_STALE_FALLBACK_SEC", "45") or "45")
+except Exception:
+    BL_STALE_FALLBACK_SEC = 45
+if BL_STALE_FALLBACK_SEC < BL_STALE_SEC:
+    BL_STALE_FALLBACK_SEC = BL_STALE_SEC
+try:
+    BL_PUSH_INTERVAL_SEC = int(cfg.get("KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC", "5") or "5")
+except Exception:
+    BL_PUSH_INTERVAL_SEC = 5
+if BL_PUSH_INTERVAL_SEC < 5:
+    BL_PUSH_INTERVAL_SEC = 5
+if BL_PUSH_INTERVAL_SEC > 3600:
+    BL_PUSH_INTERVAL_SEC = 3600
 OFFLINE_LOOP_SEC = CHECK_INTERVAL
 if BL_STALE_SEC < CHECK_INTERVAL:
     OFFLINE_LOOP_SEC = max(1, min(5, BL_STALE_SEC, CHECK_INTERVAL))
@@ -1307,6 +1321,23 @@ def record_fall(node):
         save_falls()
     except Exception as exc:
         log(f"save falls failed: {exc}")
+
+
+def revoke_fall(node):
+    falls = ensure_today_falls()
+    name = str(node.get("name") or node.get("id") or "unknown")
+    falls["total"] = max(0, int(falls.get("total", 0) or 0) - 1)
+    nodes = falls.setdefault("nodes", {})
+    if name in nodes:
+        value = max(0, int(nodes.get(name, 0) or 0) - 1)
+        if value > 0:
+            nodes[name] = value
+        else:
+            nodes.pop(name, None)
+    try:
+        save_falls()
+    except Exception as exc:
+        log(f"save falls revoke failed: {exc}")
 
 
 def record_downtime(seconds, node=None):
@@ -2600,7 +2631,15 @@ def node_is_wl(node):
 
 def node_stale_sec(node):
     try:
-        return STALE_SEC if node_is_wl(node) else BL_STALE_SEC
+        if node_is_wl(node):
+            return STALE_SEC
+        try:
+            push_interval = int((node or {}).get("push_interval_sec") or 0)
+        except Exception:
+            push_interval = 0
+        if push_interval <= 0:
+            return max(BL_STALE_SEC, BL_STALE_FALLBACK_SEC)
+        return max(BL_STALE_SEC, push_interval * 3)
     except Exception:
         return STALE_SEC
 
@@ -2608,6 +2647,15 @@ def node_stale_sec(node):
 def node_offline_confirm_sec(node):
     try:
         return 0 if node_is_wl(node) else BL_OFFLINE_CONFIRM_SEC
+    except Exception:
+        return 0
+
+
+def desired_push_interval_sec(node):
+    try:
+        if node_is_wl(node):
+            return 0
+        return BL_PUSH_INTERVAL_SEC
     except Exception:
         return 0
 
@@ -4978,6 +5026,10 @@ def update_node(payload, remote_ip=""):
     current = now_ts()
     scan_alert_node = None
     scan_alert_delta = 0
+    try:
+        push_interval_sec = int(payload.get("push_interval_sec") or 0)
+    except Exception:
+        push_interval_sec = 0
     record = {
         "id": node_id,
         "name": node_name or node_id,
@@ -4999,6 +5051,7 @@ def update_node(payload, remote_ip=""):
         "ram_percent": int(payload.get("ram_percent") or 0),
         "cpu_percent": float(payload.get("cpu_percent") or 0),
         "metrics_ok": bool(payload.get("metrics_ok")),
+        "push_interval_sec": max(0, min(3600, push_interval_sec)),
         "haproxy_allowed_sni": normalize_sni_list(payload.get("haproxy_allowed_sni")),
         "haproxy_backend_target": normalize_haproxy_target_or_empty(payload.get("haproxy_backend_target")),
         "scan_wrong_sni_total": int(payload.get("scan_wrong_sni_total") or 0),
@@ -5114,6 +5167,9 @@ class Handler(BaseHTTPRequestHandler):
             node_name_override = node_name_override_for_node(node)
             if node_name_override:
                 response["node_name"] = node_name_override
+            desired_interval = desired_push_interval_sec(node)
+            if desired_interval > 0:
+                response["push_interval_sec"] = desired_interval
             update_task = update_task_for_node(node)
             if update_task:
                 response["update_task"] = update_task
@@ -5135,6 +5191,12 @@ def offline_loop():
                     stale_sec = node_stale_sec(node)
                     if age <= stale_sec:
                         if node.pop("offline_pending_since", None) is not None:
+                            changed = True
+                        if node.get("offline_alerted") and not node_is_wl(node):
+                            node["offline_alerted"] = False
+                            node.pop("offline_confirmed", None)
+                            node.pop("offline_since", None)
+                            revoke_fall(node)
                             changed = True
                         continue
                     if node.get("offline_alerted"):

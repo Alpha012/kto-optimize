@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v198"
+PUSH_BUILD="v199"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -36,6 +36,7 @@ KTO_IP_LIMIT_TAIL_LINES="${KTO_IP_LIMIT_TAIL_LINES:-5000}"
 KTO_IP_LIMIT_MAX_EVENTS="${KTO_IP_LIMIT_MAX_EVENTS:-5000}"
 KTO_IP_LIMIT_XRAY_LOGS="${KTO_IP_LIMIT_XRAY_LOGS:-1}"
 KTO_IP_LIMIT_BLOCK_STATE="${KTO_IP_LIMIT_BLOCK_STATE:-/run/kto-ip-limit-blocks.tsv}"
+KTO_PUSH_INTERVAL="${KTO_PUSH_INTERVAL:-15}"
 KTO_REMNA_LOG_ENABLED="${KTO_REMNA_LOG_ENABLED:-1}"
 KTO_REMNA_DOCKER_CONTAINER="${KTO_REMNA_DOCKER_CONTAINER:-${KTO_IP_LIMIT_DOCKER_CONTAINER:-remnanode}}"
 KTO_REMNA_LOG_SCAN_SEC="${KTO_REMNA_LOG_SCAN_SEC:-300}"
@@ -522,6 +523,80 @@ read_update_result() {
         message: (.message // ""),
         updated_at: (.updated_at // 0)
     }' "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || echo '{}')"
+}
+
+set_push_config_value() {
+    local key="$1" value="$2" tmp
+    [[ -n "$key" && -w "$CONFIG" ]] || return 1
+    tmp="$(mktemp)" || return 1
+    if awk -v key="$key" -v value="$value" '
+        BEGIN { done = 0 }
+        $0 ~ "^" key "=" {
+            print key "=\"" value "\""
+            done = 1
+            next
+        }
+        { print }
+        END {
+            if (!done) {
+                print key "=\"" value "\""
+            }
+        }
+    ' "$CONFIG" >"$tmp"; then
+        install -m 0600 "$tmp" "$CONFIG"
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+write_push_timer_interval() {
+    local interval="$1" tmp
+    [[ "$interval" =~ ^[0-9]+$ ]] || return 1
+    tmp="$(mktemp)" || return 1
+    cat >"$tmp" <<EOF
+[Unit]
+Description=kto stats push timer
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=${interval}s
+AccuracySec=1s
+Unit=kto-stats-push.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    if install -m 0644 "$tmp" /etc/systemd/system/kto-stats-push.timer; then
+        rm -f "$tmp"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now kto-stats-push.timer >/dev/null 2>&1 || true
+        systemctl restart kto-stats-push.timer >/dev/null 2>&1 || true
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+apply_collector_push_interval() {
+    local response="$1" desired current
+    command -v jq >/dev/null 2>&1 || return 0
+    desired="$(printf '%s' "$response" | jq -r '.push_interval_sec // empty' 2>/dev/null || true)"
+    [[ "$desired" =~ ^[0-9]+$ ]] || return 0
+    if (( desired < 5 || desired > 3600 )); then
+        return 0
+    fi
+    current="$(int_or_zero "${KTO_PUSH_INTERVAL:-0}")"
+    if [[ "$current" == "$desired" ]]; then
+        return 0
+    fi
+    if set_push_config_value "KTO_PUSH_INTERVAL" "$desired" && write_push_timer_interval "$desired"; then
+        KTO_PUSH_INTERVAL="$desired"
+        echo "push ${PUSH_BUILD}: interval updated ${current}s -> ${desired}s"
+    else
+        echo "push ${PUSH_BUILD}: interval update failed ${current}s -> ${desired}s" >&2
+    fi
 }
 
 update_task_already_finished() {
@@ -1189,6 +1264,7 @@ if ! payload="$(jq -n \
     --argjson cpu_percent "$cpu_percent" \
     --argjson uptime_sec "$uptime_sec" \
     --argjson metrics_ok "$metrics_ok" \
+    --argjson push_interval_sec "$(int_or_zero "$KTO_PUSH_INTERVAL")" \
     --argjson scan_wrong_sni_total "$scan_wrong_sni_total" \
     --argjson scan_wrong_sni_sources "$scan_wrong_sni_sources" \
     --argjson scan_wrong_sni_top "$scan_wrong_sni_top" \
@@ -1223,6 +1299,7 @@ if ! payload="$(jq -n \
         cpu_percent: $cpu_percent,
         uptime_sec: $uptime_sec,
         metrics_ok: $metrics_ok,
+        push_interval_sec: $push_interval_sec,
         scan_wrong_sni_total: $scan_wrong_sni_total,
         scan_wrong_sni_sources: $scan_wrong_sni_sources,
         scan_wrong_sni_top: $scan_wrong_sni_top,
@@ -1269,6 +1346,7 @@ if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
     apply_collector_haproxy_config "$response"
     apply_collector_node_name_config "$response"
     apply_collector_ip_limit_config "$response"
+    apply_collector_push_interval "$response"
     apply_ip_limit_blocks "$response"
     apply_collector_update_task "$response"
     echo "push ${PUSH_BUILD}: ok node=${KTO_PUSH_NODE_NAME} ram=${ram_percent}% cpu=${cpu_percent}% uptime=${uptime_sec}s${ip_limit_extra}"
