@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v202"
+COLLECTOR_BUILD = "v203"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -797,6 +797,9 @@ def load_update_state():
                 "local_required": bool(current.get("local_required", True)),
                 "targets": targets,
                 "notified_at": int(current.get("notified_at") or 0),
+                "notify_chat_id": str(current.get("notify_chat_id") or "").strip()[:80],
+                "notify_message_id": str(current.get("notify_message_id") or "").strip()[:80],
+                "quiet_done": bool(current.get("quiet_done", False)),
             }
         results = {}
         raw_results = loaded.get("results") if isinstance(loaded.get("results"), dict) else {}
@@ -840,7 +843,7 @@ def current_update_targets(scope="all"):
     return targets
 
 
-def queue_update_task(requested_by, action="push_update", scope="all", targets=None, local_required=True):
+def queue_update_task(requested_by, action="push_update", scope="all", targets=None, local_required=True, notify=None, quiet_done=False):
     ts = now_ts()
     action = str(action or "push_update").strip()
     if action not in ("push_update", "node_update", "optimize", "optimize_status"):
@@ -858,6 +861,9 @@ def queue_update_task(requested_by, action="push_update", scope="all", targets=N
             "local_required": bool(local_required),
             "targets": selected_targets,
             "notified_at": 0,
+            "notify_chat_id": str((notify or {}).get("chat_id") or "").strip()[:80] if isinstance(notify, dict) else "",
+            "notify_message_id": str((notify or {}).get("message_id") or "").strip()[:80] if isinstance(notify, dict) else "",
+            "quiet_done": bool(quiet_done),
         }
         UPDATE_STATE["current"] = job
         UPDATE_STATE["results"] = {}
@@ -5755,6 +5761,34 @@ def optimize_status_label(status):
     return "НЕТ"
 
 
+def fit_cell(value, width):
+    text = clean_display_text(value)
+    if len(text) <= width:
+        return text.ljust(width)
+    if width <= 1:
+        return text[:width]
+    return (text[: width - 1] + "…").ljust(width)
+
+
+def optimize_text_table(rows):
+    if not rows:
+        return ""
+    lines = [
+        f"{fit_cell('Проверка', 18)} {fit_cell('Статус', 6)} {fit_cell('Сейчас', 24)} Нужно",
+        f"{'-' * 18} {'-' * 6} {'-' * 24} {'-' * 24}",
+    ]
+    for row in rows[:30]:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"{fit_cell(row.get('name') or '-', 18)} "
+            f"{fit_cell(optimize_status_label(row.get('status')), 6)} "
+            f"{fit_cell(row.get('current') or '-', 24)} "
+            f"{clean_display_text(row.get('desired') or '-')}"
+        )
+    return "\n".join(lines)
+
+
 def optimize_result_payload(result, title="Optimize status"):
     result = result if isinstance(result, dict) else {}
     details = result.get("details") if isinstance(result.get("details"), dict) else {}
@@ -5804,21 +5838,21 @@ def optimize_result_payload(result, title="Optimize status"):
     rich_html = "\n".join(rich_lines)
     if table_html:
         rich_html += "\n" + table_html
+    elif not rows:
+        rich_html += (
+            "\n\n<b>Проверки:</b>\n"
+            "<blockquote>Нода вернула итог без деталей. Обнови push на этой машине до v203 и повтори команду.</blockquote>"
+        )
 
     text_lines = list(rich_lines)
     if rows:
-        text_lines += ["", "<b>Проверки:</b>"]
-        for row in rows[:30]:
-            if not isinstance(row, dict):
-                continue
-            text_lines.append(
-                "<blockquote>"
-                f"{html.escape(clean_display_text(row.get('name') or '-'))}: "
-                f"{html.escape(optimize_status_label(row.get('status')))} | "
-                f"{html.escape(clean_display_text(row.get('current') or '-'))} -> "
-                f"{html.escape(clean_display_text(row.get('desired') or '-'))}"
-                "</blockquote>"
-            )
+        text_lines += ["", "<b>Проверки:</b>", f"<pre>{html.escape(optimize_text_table(rows))}</pre>"]
+    else:
+        text_lines += [
+            "",
+            "<b>Проверки:</b>",
+            "<blockquote>Нода вернула итог без деталей. Обнови push на этой машине до v203 и повтори команду.</blockquote>",
+        ]
     return rich_html, "\n".join(text_lines)
 
 
@@ -5839,11 +5873,15 @@ def optimize_done_payload_unlocked(snapshot, title):
 def maybe_send_update_done_notification():
     message = ""
     rich_message = ""
+    notify_chat_id = ""
+    notify_message_id = ""
     with LOCK:
         snapshot = update_progress_snapshot_unlocked()
         current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
         if not snapshot.get("done") or snapshot.get("notified_at"):
             return
+        notify_chat_id = str(current.get("notify_chat_id") or "")
+        notify_message_id = str(current.get("notify_message_id") or "")
         current["notified_at"] = now_ts()
         UPDATE_STATE["current"] = current
         save_update_state()
@@ -5852,10 +5890,16 @@ def maybe_send_update_done_notification():
         if str(snapshot.get("action") or "") in ("optimize", "optimize_status"):
             title = "Optimize завершён" if success else "Optimize завершён с ошибками"
             rich_message, message = optimize_done_payload_unlocked(snapshot, title)
+            rich_message = ""
         else:
             message = update_status_message_from_snapshot(snapshot, title=title)
         markup = update_retry_markup(snapshot)
     if message:
+        if notify_chat_id and notify_message_id:
+            if rich_message and edit_rich_message_text(notify_chat_id, notify_message_id, rich_message, reply_markup=markup):
+                return
+            if edit_message_text(notify_chat_id, notify_message_id, message, reply_markup=markup):
+                return
         if rich_message and send_rich_message(rich_message, reply_markup=markup):
             return
         send_message(message, reply_markup=markup)
@@ -6006,12 +6050,27 @@ def handle_optimize_command(text, chat_id, from_id, action):
     if not node_key:
         send_message("<b>Не смог получить ключ машины.</b>")
         return
-    start_update_job(
-        action,
-        "single",
+    verb = "Оптимизирую" if action == "optimize" else "Проверяю оптимизацию"
+    placeholder = send_message(
+        f"<b>{verb}</b>\n"
+        f"{ALERT_SEPARATOR}\n"
+        f"{detail_line('Машина', node_name)}\n"
+        "<i>Жду ближайший push от машины.</i>"
+    )
+    notify = {}
+    if isinstance(placeholder, dict):
+        notify = {
+            "chat_id": str((placeholder.get("chat") or {}).get("id") or chat_id),
+            "message_id": str(placeholder.get("message_id") or ""),
+        }
+    queue_update_task(
         from_id,
+        action,
+        scope="single",
         local_required=False,
         targets={node_key: node_name},
+        notify=notify,
+        quiet_done=True,
     )
 
 

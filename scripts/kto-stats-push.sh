@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v202"
+PUSH_BUILD="v203"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -756,6 +756,23 @@ optimize_details_json() {
         }' 2>/dev/null || echo '{}'
 }
 
+optimize_details_fallback_json() {
+    local mode="$1" before="$2" after="$3"
+    jq -n -c \
+        --arg mode "$mode" \
+        --argjson before "${before:-[]}" \
+        --argjson after "${after:-[]}" \
+        '{
+            kind: "optimize",
+            mode: $mode,
+            before: $before,
+            after: $after,
+            missing_before: ($before | map(select(.status == "miss")) | map(.name)),
+            fixed_count: 0,
+            remaining_count: ($after | map(select(.status == "miss")) | length)
+        }' 2>/dev/null || echo '{}'
+}
+
 optimize_ensure_hostname_hosts() {
     local host short tmp
     opt_hostname_hosts_configured && return 0
@@ -861,6 +878,9 @@ apply_optimize_task() {
     after="$(optimize_check_json)"
     remaining="$(optimize_missing_count "$after")"
     details="$(optimize_details_json "$mode" "$before" "$after")"
+    if ! printf '%s' "$details" | jq -e '.kind == "optimize" and (.after | type == "array") and (.after | length > 0)' >/dev/null 2>&1; then
+        details="$(optimize_details_fallback_json "$mode" "$before" "$after")"
+    fi
 
     status="ok"
     if [[ "$mode" == "apply" ]]; then
