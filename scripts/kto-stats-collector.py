@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v204"
+COLLECTOR_BUILD = "v205"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -264,7 +264,7 @@ SNI_STATE = {"nodes": {}, "pending": {}}
 NODE_NAME_STATE = {"nodes": {}, "pending": {}}
 BL_GROUP_STATE = {"groups": {}, "pending": {}}
 REMNA_NODE_STATE = {"nodes": {}}
-UPDATE_STATE = {"current": {}, "results": {}, "local": {}}
+UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}}
 IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
 ALERT_SEPARATOR = "➖" * 9
@@ -765,6 +765,38 @@ def clean_update_details(value):
     }
 
 
+def clean_update_retry_tokens(value):
+    if not isinstance(value, dict):
+        return {}
+    current = now_ts()
+    items = []
+    for compound, item in value.items():
+        if not isinstance(item, dict):
+            continue
+        compound = str(compound or "").strip()[:80]
+        action = str(item.get("action") or "").strip()[:40]
+        token = str(item.get("token") or "").strip()[:24]
+        key = str(item.get("key") or "").strip()[:120]
+        name = clean_display_text(item.get("name") or key)[:120]
+        try:
+            created_at = int(item.get("created_at") or 0)
+        except Exception:
+            created_at = 0
+        if not compound or not action or not token or not key:
+            continue
+        if created_at and current - created_at > 7 * 86400:
+            continue
+        items.append((created_at, compound, {
+            "action": action,
+            "token": token,
+            "key": key,
+            "name": name or key,
+            "created_at": created_at or current,
+        }))
+    items.sort(key=lambda row: row[0], reverse=True)
+    return {compound: item for _, compound, item in items[:300]}
+
+
 def load_update_state():
     global UPDATE_STATE
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -813,9 +845,10 @@ def load_update_state():
                 result["node"] = str(item.get("node") or key).strip()[:120] if isinstance(item, dict) else key
                 results[key] = result
         local = clean_update_result(loaded.get("local"))
-        UPDATE_STATE = {"current": clean_current, "results": results, "local": local}
+        retry_tokens = clean_update_retry_tokens(loaded.get("retry_tokens"))
+        UPDATE_STATE = {"current": clean_current, "results": results, "local": local, "retry_tokens": retry_tokens}
     except Exception:
-        UPDATE_STATE = {"current": {}, "results": {}, "local": {}}
+        UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}}
 
 
 def save_update_state():
@@ -5697,6 +5730,60 @@ def update_retry_token(node_key):
     return hashlib.sha1(str(node_key or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
+def update_retry_compound(action, token):
+    return f"{str(action or '').strip()[:40]}:{str(token or '').strip()[:24]}"
+
+
+def register_update_retry_token(action, key, name):
+    action = str(action or "push_update").strip()[:40]
+    key = str(key or "").strip()[:120]
+    if not key:
+        return ""
+    token = update_retry_token(key)
+    compound = update_retry_compound(action, token)
+    current = now_ts()
+    with LOCK:
+        tokens = UPDATE_STATE.setdefault("retry_tokens", {})
+        tokens[compound] = {
+            "action": action,
+            "token": token,
+            "key": key,
+            "name": clean_display_text(name or key)[:120] or key,
+            "created_at": current,
+        }
+        if len(tokens) > 300:
+            ordered = sorted(
+                tokens.items(),
+                key=lambda row: int((row[1] if isinstance(row[1], dict) else {}).get("created_at") or 0),
+                reverse=True,
+            )
+            UPDATE_STATE["retry_tokens"] = dict(ordered[:300])
+        save_update_state()
+    return token
+
+
+def lookup_update_retry_token(action, token):
+    compound = update_retry_compound(action, token)
+    with LOCK:
+        tokens = UPDATE_STATE.get("retry_tokens") if isinstance(UPDATE_STATE.get("retry_tokens"), dict) else {}
+        item = tokens.get(compound)
+        if not isinstance(item, dict):
+            return None
+        try:
+            created_at = int(item.get("created_at") or 0)
+        except Exception:
+            created_at = 0
+        if created_at and now_ts() - created_at > 7 * 86400:
+            tokens.pop(compound, None)
+            save_update_state()
+            return None
+        return {
+            "key": str(item.get("key") or "").strip()[:120],
+            "name": clean_display_text(item.get("name") or item.get("key") or "")[:120],
+            "action": str(item.get("action") or action).strip()[:40],
+        }
+
+
 def update_retry_markup(snapshot):
     errors = snapshot.get("errors") if isinstance(snapshot.get("errors"), list) else []
     rows = []
@@ -5706,7 +5793,8 @@ def update_retry_markup(snapshot):
         if not key:
             continue
         name = clean_display_text(item.get("node") or key)[:40]
-        rows.append([{"text": name or key, "callback_data": f"upd:r:{action}:{update_retry_token(key)}"}])
+        token = register_update_retry_token(action, key, name or key)
+        rows.append([{"text": name or key, "callback_data": f"upd:r:{action}:{token}"}])
         if len(rows) >= 10:
             break
     return {"inline_keyboard": rows} if rows else None
@@ -6364,6 +6452,23 @@ def handle_bl_group_callback(callback):
     return True
 
 
+def update_retry_button_text(callback, data):
+    message = callback.get("message") if isinstance(callback, dict) else {}
+    markup = message.get("reply_markup") if isinstance(message, dict) else {}
+    rows = markup.get("inline_keyboard") if isinstance(markup, dict) else []
+    if not isinstance(rows, list):
+        return ""
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        for button in row:
+            if not isinstance(button, dict):
+                continue
+            if str(button.get("callback_data") or "") == data:
+                return clean_display_text(button.get("text") or "")
+    return ""
+
+
 def handle_update_callback(callback):
     callback_id = str(callback.get("id") or "")
     data = str(callback.get("data") or "")
@@ -6381,21 +6486,31 @@ def handle_update_callback(callback):
         return True
     action = parts[2].strip()
     token = parts[3].strip()
+    selected_key = ""
+    selected_name = ""
     with LOCK:
         current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
-        if action != str(current.get("action") or "push_update"):
-            answer_callback(callback_id, "задача уже другая")
-            return True
-        targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
-        selected_key = ""
-        selected_name = ""
-        for key, name in targets.items():
-            if update_retry_token(key) == token:
-                selected_key = str(key)
-                selected_name = clean_display_text(name or key)
-                break
+        if action == str(current.get("action") or "push_update"):
+            targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
+            for key, name in targets.items():
+                if update_retry_token(key) == token:
+                    selected_key = str(key)
+                    selected_name = clean_display_text(name or key)
+                    break
     if not selected_key:
-        answer_callback(callback_id, "машина не найдена")
+        retry_item = lookup_update_retry_token(action, token)
+        if retry_item:
+            selected_key = retry_item.get("key") or ""
+            selected_name = retry_item.get("name") or selected_key
+    if not selected_key:
+        button_text = update_retry_button_text(callback, data)
+        if button_text:
+            node = find_node(button_text)
+            if node is not None:
+                selected_key = node_canonical_key(node)
+                selected_name = node_display_name(node, selected_key)
+    if not selected_key:
+        answer_callback(callback_id, "retry устарел")
         return True
     answer_callback(callback_id, "запустил retry")
     start_update_job(
