@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v200"
+COLLECTOR_BUILD = "v201"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -182,6 +182,23 @@ if REMNA_NODE_POLL_SEC < 5:
     REMNA_NODE_POLL_SEC = 5
 if REMNA_NODE_POLL_SEC > 300:
     REMNA_NODE_POLL_SEC = 300
+REMNA_OFFLINE_GUARD_ENABLED = str(cfg.get("KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED", "1")).lower() in ("1", "yes", "true", "on", "enabled")
+try:
+    REMNA_OFFLINE_STATE_MAX_AGE_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_OFFLINE_STATE_MAX_AGE_SEC", "60") or "60")
+except Exception:
+    REMNA_OFFLINE_STATE_MAX_AGE_SEC = 60
+if REMNA_OFFLINE_STATE_MAX_AGE_SEC < REMNA_NODE_POLL_SEC:
+    REMNA_OFFLINE_STATE_MAX_AGE_SEC = REMNA_NODE_POLL_SEC
+if REMNA_OFFLINE_STATE_MAX_AGE_SEC > 600:
+    REMNA_OFFLINE_STATE_MAX_AGE_SEC = 600
+try:
+    REMNA_OFFLINE_LOG_GRACE_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_OFFLINE_LOG_GRACE_SEC", "30") or "30")
+except Exception:
+    REMNA_OFFLINE_LOG_GRACE_SEC = 30
+if REMNA_OFFLINE_LOG_GRACE_SEC < 0:
+    REMNA_OFFLINE_LOG_GRACE_SEC = 0
+if REMNA_OFFLINE_LOG_GRACE_SEC > 600:
+    REMNA_OFFLINE_LOG_GRACE_SEC = 600
 try:
     REMNA_TOP_IP_JOB_TIMEOUT_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_TOP_IP_JOB_TIMEOUT_SEC", "25") or "25")
 except Exception:
@@ -2658,6 +2675,69 @@ def desired_push_interval_sec(node):
         return BL_PUSH_INTERVAL_SEC
     except Exception:
         return 0
+
+
+def remnawave_state_for_node(node):
+    if not isinstance(node, dict):
+        return None
+    keys = set(node_alias_keys(node))
+    for value in (node.get("ip"), node.get("hostname"), node.get("id"), node.get("name")):
+        key = canonical_node_key(value)
+        if key:
+            keys.add(key)
+    if not keys:
+        return None
+    with LOCK:
+        state_nodes = REMNA_NODE_STATE.setdefault("nodes", {})
+        for item in state_nodes.values():
+            if not isinstance(item, dict):
+                continue
+            item_keys = {
+                canonical_node_key(item.get("key")),
+                canonical_node_key(item.get("name")),
+                canonical_node_key(item.get("address")),
+            }
+            item_keys.discard("")
+            if keys.intersection(item_keys):
+                return dict(item)
+    return None
+
+
+def remnawave_log_guard_reason(node, current, age, stale_sec):
+    remna = node.get("remna") if isinstance(node, dict) else {}
+    if not isinstance(remna, dict):
+        return ""
+    status = clean_display_text(remna.get("status") or "").strip().lower()
+    try:
+        error_count = int(remna.get("error_count") or 0)
+    except Exception:
+        error_count = 0
+    last_error = clean_display_text(remna.get("last_error") or "").strip()
+    if not status and error_count <= 0 and not last_error:
+        return ""
+    if status and status != "running":
+        return ""
+    if error_count > 0 or last_error:
+        return ""
+    if age <= stale_sec + REMNA_OFFLINE_LOG_GRACE_SEC:
+        return "Remnawave diagnostics are clean"
+    return ""
+
+
+def remnawave_offline_guard_reason(node, current, age, stale_sec):
+    if not REMNA_OFFLINE_GUARD_ENABLED or node_is_wl(node):
+        return ""
+    state = remnawave_state_for_node(node)
+    if isinstance(state, dict):
+        seen_at = int(state.get("seen_at") or 0)
+        state_age = current - seen_at if seen_at > 0 else REMNA_OFFLINE_STATE_MAX_AGE_SEC + 1
+        if state_age <= REMNA_OFFLINE_STATE_MAX_AGE_SEC:
+            if bool(state.get("disabled")):
+                return "disabled in Remnawave"
+            if bool(state.get("connected")):
+                return "Remnawave still sees node connected"
+            return ""
+    return remnawave_log_guard_reason(node, current, age, stale_sec)
 
 
 def node_is_exact_bypass(node):
@@ -5189,6 +5269,7 @@ def offline_loop():
                 for node_id, node in NODES.items():
                     age = current - int(node.get("last_seen", 0) or 0)
                     stale_sec = node_stale_sec(node)
+                    guard_reason = remnawave_offline_guard_reason(node, current, age, stale_sec)
                     if age <= stale_sec:
                         if node.pop("offline_pending_since", None) is not None:
                             changed = True
@@ -5196,7 +5277,21 @@ def offline_loop():
                             node["offline_alerted"] = False
                             node.pop("offline_confirmed", None)
                             node.pop("offline_since", None)
+                            node.pop("offline_guard_reason", None)
                             revoke_fall(node)
+                            changed = True
+                        continue
+                    if guard_reason:
+                        if node.pop("offline_pending_since", None) is not None:
+                            changed = True
+                        if node.get("offline_alerted") and not node_is_wl(node):
+                            node["offline_alerted"] = False
+                            node.pop("offline_confirmed", None)
+                            node.pop("offline_since", None)
+                            revoke_fall(node)
+                            changed = True
+                        if node.get("offline_guard_reason") != guard_reason:
+                            node["offline_guard_reason"] = guard_reason
                             changed = True
                         continue
                     if node.get("offline_alerted"):
@@ -5214,6 +5309,7 @@ def offline_loop():
                     node["offline_confirmed"] = True
                     node["offline_since"] = pending_since or current
                     node.pop("offline_pending_since", None)
+                    node.pop("offline_guard_reason", None)
                     record_fall(node)
                     alerts.append((node_id, dict(node), age))
                     changed = True

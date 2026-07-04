@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v200"
+SCRIPT_BUILD="v201"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -82,6 +82,9 @@ IP_LIMIT_PENALTY_SEC_DEFAULT="${KTO_IP_LIMIT_PENALTY_SEC_DEFAULT:-60}"
 REMNA_API_CACHE_SEC_DEFAULT="${KTO_COLLECTOR_REMNA_API_CACHE_SEC_DEFAULT:-300}"
 REMNA_NODE_ALERT_ENABLED_DEFAULT="${KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED_DEFAULT:-1}"
 REMNA_NODE_POLL_SEC_DEFAULT="${KTO_COLLECTOR_REMNA_NODE_POLL_SEC_DEFAULT:-15}"
+REMNA_OFFLINE_GUARD_ENABLED_DEFAULT="${KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED_DEFAULT:-1}"
+REMNA_OFFLINE_STATE_MAX_AGE_SEC_DEFAULT="${KTO_COLLECTOR_REMNA_OFFLINE_STATE_MAX_AGE_SEC_DEFAULT:-60}"
+REMNA_OFFLINE_LOG_GRACE_SEC_DEFAULT="${KTO_COLLECTOR_REMNA_OFFLINE_LOG_GRACE_SEC_DEFAULT:-30}"
 ASN_LOOKUP_ENABLED_DEFAULT="${KTO_COLLECTOR_ASN_LOOKUP_ENABLED_DEFAULT:-1}"
 ASN_CACHE_SEC_DEFAULT="${KTO_COLLECTOR_ASN_CACHE_SEC_DEFAULT:-604800}"
 ASN_TIMEOUT_SEC_DEFAULT="${KTO_COLLECTOR_ASN_TIMEOUT_SEC_DEFAULT:-2}"
@@ -3647,10 +3650,10 @@ install_stats_collector() {
 
     local listen_host listen_port secret bot_token chat_id allowed_user stale_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec expected_nodes daily_report_time existing_config=0
     local ip_limit_enabled ip_limit_source ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_penalty_sec
-    local remna_api_url remna_api_token remna_api_cache_sec remna_node_alert_enabled remna_node_poll_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
+    local remna_api_url remna_api_token remna_api_cache_sec remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
     local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_bl_stale safe_bl_offline_confirm safe_bl_stale_fallback safe_bl_push_interval safe_expected safe_tz safe_daily
     local safe_ip_limit_enabled safe_ip_limit_source safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_scan_sec safe_ip_limit_alert_threshold safe_ip_limit_alert_top safe_ip_limit_enforce_enabled safe_ip_limit_penalty_sec
-    local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_remna_node_alert_enabled safe_remna_node_poll_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
+    local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_remna_node_alert_enabled safe_remna_node_poll_sec safe_remna_offline_guard_enabled safe_remna_offline_state_max_age_sec safe_remna_offline_log_grace_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
 
     if "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
         listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -3682,6 +3685,9 @@ install_stats_collector() {
         remna_api_cache_sec="$(config_get KTO_COLLECTOR_REMNA_API_CACHE_SEC "$STATS_COLLECTOR_CONFIG")"
         remna_node_alert_enabled="$(config_get KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED "$STATS_COLLECTOR_CONFIG")"
         remna_node_poll_sec="$(config_get KTO_COLLECTOR_REMNA_NODE_POLL_SEC "$STATS_COLLECTOR_CONFIG")"
+        remna_offline_guard_enabled="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED "$STATS_COLLECTOR_CONFIG")"
+        remna_offline_state_max_age_sec="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_STATE_MAX_AGE_SEC "$STATS_COLLECTOR_CONFIG")"
+        remna_offline_log_grace_sec="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_LOG_GRACE_SEC "$STATS_COLLECTOR_CONFIG")"
         asn_lookup_enabled="$(config_get KTO_COLLECTOR_ASN_LOOKUP_ENABLED "$STATS_COLLECTOR_CONFIG")"
         asn_cache_sec="$(config_get KTO_COLLECTOR_ASN_CACHE_SEC "$STATS_COLLECTOR_CONFIG")"
         asn_timeout_sec="$(config_get KTO_COLLECTOR_ASN_TIMEOUT_SEC "$STATS_COLLECTOR_CONFIG")"
@@ -3721,6 +3727,9 @@ install_stats_collector() {
         remna_api_cache_sec="${remna_api_cache_sec:-$REMNA_API_CACHE_SEC_DEFAULT}"
         remna_node_alert_enabled="${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT}"
         remna_node_poll_sec="${remna_node_poll_sec:-$REMNA_NODE_POLL_SEC_DEFAULT}"
+        remna_offline_guard_enabled="${remna_offline_guard_enabled:-$REMNA_OFFLINE_GUARD_ENABLED_DEFAULT}"
+        remna_offline_state_max_age_sec="${remna_offline_state_max_age_sec:-$REMNA_OFFLINE_STATE_MAX_AGE_SEC_DEFAULT}"
+        remna_offline_log_grace_sec="${remna_offline_log_grace_sec:-$REMNA_OFFLINE_LOG_GRACE_SEC_DEFAULT}"
         asn_lookup_enabled="${asn_lookup_enabled:-$ASN_LOOKUP_ENABLED_DEFAULT}"
         asn_cache_sec="${asn_cache_sec:-$ASN_CACHE_SEC_DEFAULT}"
         asn_timeout_sec="${asn_timeout_sec:-$ASN_TIMEOUT_SEC_DEFAULT}"
@@ -3754,6 +3763,9 @@ install_stats_collector() {
         remna_api_cache_sec="$REMNA_API_CACHE_SEC_DEFAULT"
         remna_node_alert_enabled="$REMNA_NODE_ALERT_ENABLED_DEFAULT"
         remna_node_poll_sec="$REMNA_NODE_POLL_SEC_DEFAULT"
+        remna_offline_guard_enabled="$REMNA_OFFLINE_GUARD_ENABLED_DEFAULT"
+        remna_offline_state_max_age_sec="$REMNA_OFFLINE_STATE_MAX_AGE_SEC_DEFAULT"
+        remna_offline_log_grace_sec="$REMNA_OFFLINE_LOG_GRACE_SEC_DEFAULT"
         asn_lookup_enabled="$ASN_LOOKUP_ENABLED_DEFAULT"
         asn_cache_sec="$ASN_CACHE_SEC_DEFAULT"
         asn_timeout_sec="$ASN_TIMEOUT_SEC_DEFAULT"
@@ -3772,6 +3784,15 @@ install_stats_collector() {
     fi
     if [[ -n "${KTO_COLLECTOR_REMNA_NODE_POLL_SEC:-}" ]]; then
         remna_node_poll_sec="$KTO_COLLECTOR_REMNA_NODE_POLL_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED:-}" ]]; then
+        remna_offline_guard_enabled="$KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED"
+    fi
+    if [[ -n "${KTO_COLLECTOR_REMNA_OFFLINE_STATE_MAX_AGE_SEC:-}" ]]; then
+        remna_offline_state_max_age_sec="$KTO_COLLECTOR_REMNA_OFFLINE_STATE_MAX_AGE_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_REMNA_OFFLINE_LOG_GRACE_SEC:-}" ]]; then
+        remna_offline_log_grace_sec="$KTO_COLLECTOR_REMNA_OFFLINE_LOG_GRACE_SEC"
     fi
     if [[ -n "${KTO_COLLECTOR_BL_STALE_SEC:-}" ]]; then
         bl_stale_sec="$KTO_COLLECTOR_BL_STALE_SEC"
@@ -3858,6 +3879,9 @@ install_stats_collector() {
     safe_remna_api_cache_sec="$(escape_config_value "$remna_api_cache_sec")"
     safe_remna_node_alert_enabled="$(escape_config_value "$remna_node_alert_enabled")"
     safe_remna_node_poll_sec="$(escape_config_value "$remna_node_poll_sec")"
+    safe_remna_offline_guard_enabled="$(escape_config_value "$remna_offline_guard_enabled")"
+    safe_remna_offline_state_max_age_sec="$(escape_config_value "$remna_offline_state_max_age_sec")"
+    safe_remna_offline_log_grace_sec="$(escape_config_value "$remna_offline_log_grace_sec")"
     safe_asn_lookup_enabled="$(escape_config_value "$asn_lookup_enabled")"
     safe_asn_cache_sec="$(escape_config_value "$asn_cache_sec")"
     safe_asn_timeout_sec="$(escape_config_value "$asn_timeout_sec")"
@@ -3901,6 +3925,9 @@ KTO_COLLECTOR_REMNA_API_TOKEN="$safe_remna_api_token"
 KTO_COLLECTOR_REMNA_API_CACHE_SEC="$safe_remna_api_cache_sec"
 KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED="$safe_remna_node_alert_enabled"
 KTO_COLLECTOR_REMNA_NODE_POLL_SEC="$safe_remna_node_poll_sec"
+KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED="$safe_remna_offline_guard_enabled"
+KTO_COLLECTOR_REMNA_OFFLINE_STATE_MAX_AGE_SEC="$safe_remna_offline_state_max_age_sec"
+KTO_COLLECTOR_REMNA_OFFLINE_LOG_GRACE_SEC="$safe_remna_offline_log_grace_sec"
 KTO_COLLECTOR_ASN_LOOKUP_ENABLED="$safe_asn_lookup_enabled"
 KTO_COLLECTOR_ASN_CACHE_SEC="$safe_asn_cache_sec"
 KTO_COLLECTOR_ASN_TIMEOUT_SEC="$safe_asn_timeout_sec"
@@ -3937,6 +3964,7 @@ EOF
     if [[ -n "$remna_api_token" ]]; then
         ok "Remnawave API enrichment: включён"
         ok "Remnawave node alerts: ${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT}, poll ${remna_node_poll_sec:-$REMNA_NODE_POLL_SEC_DEFAULT}s"
+        ok "Remnawave offline guard: ${remna_offline_guard_enabled:-$REMNA_OFFLINE_GUARD_ENABLED_DEFAULT}, state ${remna_offline_state_max_age_sec:-$REMNA_OFFLINE_STATE_MAX_AGE_SEC_DEFAULT}s, logs ${remna_offline_log_grace_sec:-$REMNA_OFFLINE_LOG_GRACE_SEC_DEFAULT}s"
     else
         warn "Remnawave API enrichment: токен не задан"
     fi
@@ -3957,7 +3985,7 @@ stats_collector_status() {
     header
     require_panel_mode
     need_root
-    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec remna_test_id remna_test_log remna_code remna_probe
+    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec remna_test_id remna_test_log remna_code remna_probe
     local ip_limit_enabled ip_limit_source ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_penalty_sec ip_limit_max_events asn_lookup_enabled asn_cache_sec
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -3966,6 +3994,9 @@ stats_collector_status() {
     remna_api_token="$(config_get KTO_COLLECTOR_REMNA_API_TOKEN "$STATS_COLLECTOR_CONFIG")"
     remna_node_alert_enabled="$(config_get KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED "$STATS_COLLECTOR_CONFIG")"
     remna_node_poll_sec="$(config_get KTO_COLLECTOR_REMNA_NODE_POLL_SEC "$STATS_COLLECTOR_CONFIG")"
+    remna_offline_guard_enabled="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED "$STATS_COLLECTOR_CONFIG")"
+    remna_offline_state_max_age_sec="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_STATE_MAX_AGE_SEC "$STATS_COLLECTOR_CONFIG")"
+    remna_offline_log_grace_sec="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_LOG_GRACE_SEC "$STATS_COLLECTOR_CONFIG")"
     bl_stale_sec="$(config_get KTO_COLLECTOR_BL_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
     bl_offline_confirm_sec="$(config_get KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC "$STATS_COLLECTOR_CONFIG")"
     bl_stale_fallback_sec="$(config_get KTO_COLLECTOR_BL_STALE_FALLBACK_SEC "$STATS_COLLECTOR_CONFIG")"
@@ -3996,6 +4027,7 @@ stats_collector_status() {
     print_row "bl push" "target ${bl_push_interval_sec:-$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT}s / fallback ${bl_stale_fallback_sec:-$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT}s" 1
     print_row "Remnawave API" "${remna_api_url:-empty} / $([[ -n "$remna_api_token" ]] && echo token-set || echo no-token)" "$([[ -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
     print_row "Remnawave node alert" "${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT} / poll ${remna_node_poll_sec:-$REMNA_NODE_POLL_SEC_DEFAULT}s" "$([[ "${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT}" == "1" && -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
+    print_row "Remnawave offline guard" "${remna_offline_guard_enabled:-$REMNA_OFFLINE_GUARD_ENABLED_DEFAULT} / state ${remna_offline_state_max_age_sec:-$REMNA_OFFLINE_STATE_MAX_AGE_SEC_DEFAULT}s / logs ${remna_offline_log_grace_sec:-$REMNA_OFFLINE_LOG_GRACE_SEC_DEFAULT}s" "$([[ "${remna_offline_guard_enabled:-$REMNA_OFFLINE_GUARD_ENABLED_DEFAULT}" == "1" ]] && echo 1 || echo 0)"
     print_row "ip source" "${ip_limit_source:-$IP_LIMIT_SOURCE_DEFAULT} / enabled ${ip_limit_enabled:-0}" 1
     print_row "ip alert" ">${ip_limit_alert_threshold:-$IP_LIMIT_ALERT_THRESHOLD_DEFAULT} IP / top ${ip_limit_alert_top:-$IP_LIMIT_ALERT_TOP_DEFAULT} / scan ${ip_limit_scan_sec:-$IP_LIMIT_COLLECTOR_SCAN_SEC_DEFAULT}s"
     print_row "ip enforce" "${ip_limit_enforce_enabled:-0} / ${ip_limit_penalty_sec:-$IP_LIMIT_PENALTY_SEC_DEFAULT}s" "$([[ "${ip_limit_enforce_enabled:-0}" == "1" ]] && echo 1 || echo 0)"
