@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v197"
+SCRIPT_BUILD="v198"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -59,6 +59,7 @@ STATS_COLLECTOR_URL_DEFAULT="${KTO_STATS_COLLECTOR_URL_DEFAULT:-http://${PANEL_I
 STATS_PUSH_INTERVAL_DEFAULT="15"
 STATS_COLLECTOR_STALE_SEC_DEFAULT="60"
 STATS_COLLECTOR_BL_STALE_SEC_DEFAULT="${KTO_COLLECTOR_BL_STALE_SEC_DEFAULT:-15}"
+STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT="${KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT:-5}"
 STATS_COLLECTOR_TZ_DEFAULT="Europe/Moscow"
 STATS_ALLOWED_USER_ID_DEFAULT="646296998"
 STATS_EXPECTED_NODES_DEFAULT="10"
@@ -3642,10 +3643,10 @@ install_stats_collector() {
     require_panel_mode
     need_root
 
-    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec bl_stale_sec expected_nodes daily_report_time existing_config=0
+    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec bl_stale_sec bl_offline_confirm_sec expected_nodes daily_report_time existing_config=0
     local ip_limit_enabled ip_limit_source ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_penalty_sec
     local remna_api_url remna_api_token remna_api_cache_sec remna_node_alert_enabled remna_node_poll_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
-    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_bl_stale safe_expected safe_tz safe_daily
+    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_bl_stale safe_bl_offline_confirm safe_expected safe_tz safe_daily
     local safe_ip_limit_enabled safe_ip_limit_source safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_scan_sec safe_ip_limit_alert_threshold safe_ip_limit_alert_top safe_ip_limit_enforce_enabled safe_ip_limit_penalty_sec
     local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_remna_node_alert_enabled safe_remna_node_poll_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
 
@@ -3658,6 +3659,7 @@ install_stats_collector() {
         allowed_user="$(config_get KTO_COLLECTOR_ALLOWED_USER_ID "$STATS_COLLECTOR_CONFIG")"
         stale_sec="$(config_get KTO_COLLECTOR_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
         bl_stale_sec="$(config_get KTO_COLLECTOR_BL_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
+        bl_offline_confirm_sec="$(config_get KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC "$STATS_COLLECTOR_CONFIG")"
         expected_nodes="$(config_get KTO_COLLECTOR_EXPECTED_NODES "$STATS_COLLECTOR_CONFIG")"
         daily_report_time="$(config_get KTO_COLLECTOR_DAILY_REPORT_TIME "$STATS_COLLECTOR_CONFIG")"
         ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
@@ -3692,6 +3694,7 @@ install_stats_collector() {
         allowed_user="${allowed_user:-$STATS_ALLOWED_USER_ID_DEFAULT}"
         stale_sec="${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}"
         bl_stale_sec="${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}"
+        bl_offline_confirm_sec="${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}"
         expected_nodes="${expected_nodes:-$STATS_EXPECTED_NODES_DEFAULT}"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
         ip_limit_source="${ip_limit_source:-$IP_LIMIT_SOURCE_DEFAULT}"
@@ -3724,6 +3727,7 @@ install_stats_collector() {
         allowed_user="$(ask_int "Разрешенный Telegram user id" "$STATS_ALLOWED_USER_ID_DEFAULT" 1 999999999999)"
         stale_sec="$(ask_int "Алерт offline после секунд" "$STATS_COLLECTOR_STALE_SEC_DEFAULT" 30 86400)"
         bl_stale_sec="$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT"
+        bl_offline_confirm_sec="$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT"
         expected_nodes="$(ask_int "Ожидаемое кол-во обходов" "$STATS_EXPECTED_NODES_DEFAULT" 1 9999)"
         daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
         ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
@@ -3763,6 +3767,9 @@ install_stats_collector() {
     fi
     if [[ -n "${KTO_COLLECTOR_BL_STALE_SEC:-}" ]]; then
         bl_stale_sec="$KTO_COLLECTOR_BL_STALE_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC:-}" ]]; then
+        bl_offline_confirm_sec="$KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC"
     fi
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ENABLED:-}" ]]; then
         ip_limit_enabled="$KTO_COLLECTOR_IP_LIMIT_ENABLED"
@@ -3815,6 +3822,7 @@ install_stats_collector() {
     safe_user="$(escape_config_value "$allowed_user")"
     safe_stale="$(escape_config_value "$stale_sec")"
     safe_bl_stale="$(escape_config_value "$bl_stale_sec")"
+    safe_bl_offline_confirm="$(escape_config_value "$bl_offline_confirm_sec")"
     safe_expected="$(escape_config_value "$expected_nodes")"
     safe_tz="$(escape_config_value "$STATS_COLLECTOR_TZ_DEFAULT")"
     safe_daily="$(escape_config_value "$daily_report_time")"
@@ -3855,6 +3863,7 @@ KTO_COLLECTOR_ALLOWED_USER_ID="$safe_user"
 KTO_COLLECTOR_STATE_DIR="$STATS_COLLECTOR_STATE_DIR"
 KTO_COLLECTOR_STALE_SEC="$safe_stale"
 KTO_COLLECTOR_BL_STALE_SEC="$safe_bl_stale"
+KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC="$safe_bl_offline_confirm"
 KTO_COLLECTOR_EXPECTED_NODES="$safe_expected"
 KTO_COLLECTOR_TZ="$safe_tz"
 KTO_COLLECTOR_DAILY_REPORT_TIME="$safe_daily"
@@ -3905,7 +3914,7 @@ EOF
     else
         ok "Ежедневный отчёт: выключен"
     fi
-    ok "BL offline alert: ${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s"
+    ok "BL offline alert: ${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s + confirm ${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}s"
     if [[ -n "$remna_api_token" ]]; then
         ok "Remnawave API enrichment: включён"
         ok "Remna node alerts: ${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT}, poll ${remna_node_poll_sec:-$REMNA_NODE_POLL_SEC_DEFAULT}s"
@@ -3929,7 +3938,7 @@ stats_collector_status() {
     header
     require_panel_mode
     need_root
-    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec bl_stale_sec remna_test_id remna_test_log remna_code remna_probe
+    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec bl_stale_sec bl_offline_confirm_sec remna_test_id remna_test_log remna_code remna_probe
     local ip_limit_enabled ip_limit_source ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_penalty_sec ip_limit_max_events asn_lookup_enabled asn_cache_sec
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -3939,6 +3948,7 @@ stats_collector_status() {
     remna_node_alert_enabled="$(config_get KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED "$STATS_COLLECTOR_CONFIG")"
     remna_node_poll_sec="$(config_get KTO_COLLECTOR_REMNA_NODE_POLL_SEC "$STATS_COLLECTOR_CONFIG")"
     bl_stale_sec="$(config_get KTO_COLLECTOR_BL_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
+    bl_offline_confirm_sec="$(config_get KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC "$STATS_COLLECTOR_CONFIG")"
     ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
     ip_limit_source="$(config_get KTO_COLLECTOR_IP_LIMIT_SOURCE "$STATS_COLLECTOR_CONFIG")"
     ip_limit_scan_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_SCAN_SEC "$STATS_COLLECTOR_CONFIG")"
@@ -3961,7 +3971,7 @@ stats_collector_status() {
     print_row "конфиг" "$STATS_COLLECTOR_CONFIG" "$([[ -s "$STATS_COLLECTOR_CONFIG" ]] && echo 1 || echo 0)"
     print_row "данные" "$STATS_COLLECTOR_STATE_DIR" "$([[ -d "$STATS_COLLECTOR_STATE_DIR" ]] && echo 1 || echo 0)"
     print_row "адрес" "${listen_host}:${listen_port}" "$([[ -n "$listen_port" ]] && echo 1 || echo 0)"
-    print_row "bl stale" "${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s" 1
+    print_row "bl stale" "${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s + confirm ${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}s" 1
     print_row "remna api" "${remna_api_url:-empty} / $([[ -n "$remna_api_token" ]] && echo token-set || echo no-token)" "$([[ -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
     print_row "remna node alert" "${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT} / poll ${remna_node_poll_sec:-$REMNA_NODE_POLL_SEC_DEFAULT}s" "$([[ "${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT}" == "1" && -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
     print_row "ip source" "${ip_limit_source:-$IP_LIMIT_SOURCE_DEFAULT} / enabled ${ip_limit_enabled:-0}" 1

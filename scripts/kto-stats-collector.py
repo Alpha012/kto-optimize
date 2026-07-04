@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v197"
+COLLECTOR_BUILD = "v198"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -57,6 +57,14 @@ except Exception:
     BL_STALE_SEC = 15
 if BL_STALE_SEC < 5:
     BL_STALE_SEC = 5
+try:
+    BL_OFFLINE_CONFIRM_SEC = int(cfg.get("KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC", "5") or "5")
+except Exception:
+    BL_OFFLINE_CONFIRM_SEC = 5
+if BL_OFFLINE_CONFIRM_SEC < 0:
+    BL_OFFLINE_CONFIRM_SEC = 0
+if BL_OFFLINE_CONFIRM_SEC > 60:
+    BL_OFFLINE_CONFIRM_SEC = 60
 OFFLINE_LOOP_SEC = CHECK_INTERVAL
 if BL_STALE_SEC < CHECK_INTERVAL:
     OFFLINE_LOOP_SEC = max(1, min(5, BL_STALE_SEC, CHECK_INTERVAL))
@@ -2597,6 +2605,13 @@ def node_stale_sec(node):
         return STALE_SEC
 
 
+def node_offline_confirm_sec(node):
+    try:
+        return 0 if node_is_wl(node) else BL_OFFLINE_CONFIRM_SEC
+    except Exception:
+        return 0
+
+
 def node_is_exact_bypass(node):
     values = [
         node.get("name") if isinstance(node, dict) else "",
@@ -4998,7 +5013,7 @@ def update_node(payload, remote_ip=""):
     }
     with LOCK:
         old = NODES.get(node_id, {})
-        was_offline = bool(old.get("offline_alerted"))
+        was_offline = bool(old.get("offline_alerted")) and bool(old.get("offline_confirmed", True))
         if was_offline:
             offline_since = int(old.get("offline_since") or old.get("last_seen") or current)
             record_downtime(current - offline_since, record)
@@ -5117,16 +5132,33 @@ def offline_loop():
             with LOCK:
                 for node_id, node in NODES.items():
                     age = current - int(node.get("last_seen", 0) or 0)
-                    if age > node_stale_sec(node) and not node.get("offline_alerted"):
-                        node["offline_alerted"] = True
-                        node["offline_since"] = current
-                        record_fall(node)
-                        alerts.append((node_id, dict(node), age))
-                        changed = True
+                    stale_sec = node_stale_sec(node)
+                    if age <= stale_sec:
+                        if node.pop("offline_pending_since", None) is not None:
+                            changed = True
+                        continue
+                    if node.get("offline_alerted"):
+                        continue
+                    confirm_sec = node_offline_confirm_sec(node)
+                    pending_since = int(node.get("offline_pending_since") or 0)
+                    if confirm_sec > 0:
+                        if pending_since <= 0:
+                            node["offline_pending_since"] = current
+                            changed = True
+                            continue
+                        if current - pending_since < confirm_sec:
+                            continue
+                    node["offline_alerted"] = True
+                    node["offline_confirmed"] = True
+                    node["offline_since"] = pending_since or current
+                    node.pop("offline_pending_since", None)
+                    record_fall(node)
+                    alerts.append((node_id, dict(node), age))
+                    changed = True
                 if changed:
                     save_nodes()
             for node_id, node, age in alerts:
-                log(f"node offline: {node_id} age={age}s stale={node_stale_sec(node)}s")
+                log(f"node offline: {node_id} age={age}s stale={node_stale_sec(node)}s confirm={node_offline_confirm_sec(node)}s")
                 alert_offline(node_id, node, age)
         except Exception as exc:
             log(f"offline loop failed: {exc}")
