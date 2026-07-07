@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v214"
+COLLECTOR_BUILD = "v215"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -6697,6 +6697,7 @@ def start_update_job(action, scope, requested_by, local_required=True, targets=N
             "",
             "<i>Любая машина, которая ещё пришлёт push, получит команду удалить свой push/timer/config.</i>",
             "<i>Задача останется активной, пока её не заменит следующая update-команда.</i>",
+            "<i>Остановить: <code>/clean_all stop</code></i>",
             f"<i>Статус: <code>{update_status_command(action)}</code></i>",
         ]
     send_message("\n".join(lines))
@@ -6765,11 +6766,37 @@ def clean_all_cleared_message(cleared):
     ])
 
 
+def stop_clean_all():
+    with LOCK:
+        active = clean_all_active_unlocked()
+        if active:
+            UPDATE_STATE["current"] = {}
+            UPDATE_STATE["results"] = {}
+            UPDATE_STATE["local"] = {}
+            save_update_state()
+        return active
+
+
 def handle_clean_all(text, chat_id, from_id):
     parts = text.split()
-    if len(parts) > 1 and parts[1].lower() in ("status", "статус"):
+    action = parts[1].lower() if len(parts) > 1 else ""
+    if action in ("status", "статус"):
         body, markup = update_status_payload()
         send_message(body, reply_markup=markup)
+        return
+    if action in ("stop", "off", "cancel", "disable", "стоп", "выкл", "отмена"):
+        if stop_clean_all():
+            send_message(
+                "<b>Clean all остановлен</b>\n"
+                f"{ALERT_SEPARATOR}\n"
+                "<i>Новые push больше не будут получать self-delete и снова будут писаться в стату.</i>"
+            )
+        else:
+            send_message(
+                "<b>Clean all не активен</b>\n"
+                f"{ALERT_SEPARATOR}\n"
+                "<i>Self-delete задача сейчас не висит.</i>"
+            )
         return
     start_update_job("push_delete", "live", from_id, local_required=False, targets={}, live_targets=True)
     send_message(clean_all_cleared_message(clear_collector_runtime_stats()))
