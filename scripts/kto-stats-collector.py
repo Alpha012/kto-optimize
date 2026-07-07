@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v212"
+COLLECTOR_BUILD = "v213"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -5209,8 +5209,9 @@ def ip_limit_user_card(query):
         text = (
             "<b>IP лимит пользователя</b>\n"
             f"{ALERT_SEPARATOR}\n"
-            "<b>Пример:</b> <code>/ip_limit 3</code>\n"
-            "<b>Telegram ID:</b> <code>/ip_limit tg:646296998</code>"
+            "<b>Пример:</b> <code>/limit_ip 3</code>\n"
+            "<b>Алиас:</b> <code>/ip_limit 3</code>\n"
+            "<b>Telegram ID:</b> <code>/limit_ip tg:646296998</code>"
         )
         return text, None
     info = remna_user_lookup(query)
@@ -7655,7 +7656,7 @@ def bot_loop():
                     handle_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/top_ip":
                     handle_top_ip(text)
-                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_limit":
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command in ("/ip_limit", "/limit_ip"):
                     handle_ip_limit(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_enable":
                     handle_ip_enable(text, force=False)
