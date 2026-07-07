@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v210"
+SCRIPT_BUILD="v211"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -4252,7 +4252,7 @@ install_stats_push_client() {
 
     if (( existing_config == 1 )); then
         interval="${interval:-$STATS_PUSH_INTERVAL_DEFAULT}"
-        node_id="$node_name"
+        node_id="${node_id:-$node_name}"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
         ip_limit_log_file="${ip_limit_log_file:-}"
         ip_limit_docker_container="${ip_limit_docker_container:-$REMNA_CONTAINER}"
@@ -4416,6 +4416,90 @@ stats_push_status() {
     print_row "push timer" "$STATS_PUSH_TIMER" "$timer_state"
 }
 
+stats_push_delete_client() {
+    local had_push=0
+    if "${SUDO[@]}" test -e "$STATS_PUSH_CONFIG" 2>/dev/null \
+        || "${SUDO[@]}" test -e "$STATS_PUSH_SCRIPT" 2>/dev/null \
+        || "${SUDO[@]}" systemctl cat "$STATS_PUSH_TIMER" >/dev/null 2>&1 \
+        || "${SUDO[@]}" systemctl cat "$STATS_PUSH_SERVICE" >/dev/null 2>&1; then
+        had_push=1
+    fi
+
+    stage "Удаляю push статистики"
+    cmd "${SUDO[@]}" systemctl disable --now "$STATS_PUSH_TIMER" "$STATS_PUSH_SERVICE" || true
+    cmd "${SUDO[@]}" rm -f \
+        "$STATS_PUSH_CONFIG" \
+        "$STATS_PUSH_SCRIPT" \
+        "/etc/systemd/system/${STATS_PUSH_TIMER}" \
+        "/etc/systemd/system/${STATS_PUSH_SERVICE}"
+    cmd "${SUDO[@]}" rm -rf /var/lib/kto-stats-push
+    cmd "${SUDO[@]}" systemctl daemon-reload || true
+    cmd "${SUDO[@]}" systemctl reset-failed "$STATS_PUSH_TIMER" "$STATS_PUSH_SERVICE" || true
+    if (( had_push == 1 )); then
+        ok "Push статистики полностью удалён"
+    else
+        ok "Push статистики не был настроен"
+    fi
+}
+
+stats_collector_clear_runtime_state() {
+    local had_collector=0 unit_exists=0 backup_dir ts moved=0 file
+    if "${SUDO[@]}" test -d "$STATS_COLLECTOR_STATE_DIR" 2>/dev/null \
+        || "${SUDO[@]}" systemctl cat "$STATS_COLLECTOR_SERVICE" >/dev/null 2>&1; then
+        had_collector=1
+    fi
+    if (( had_collector == 0 )); then
+        ok "State коллектора не найден"
+        return 0
+    fi
+
+    if "${SUDO[@]}" systemctl cat "$STATS_COLLECTOR_SERVICE" >/dev/null 2>&1; then
+        unit_exists=1
+        cmd "${SUDO[@]}" systemctl stop "$STATS_COLLECTOR_SERVICE" || true
+    fi
+
+    ts="$(date +%Y%m%d-%H%M%S)"
+    backup_dir="${STATS_COLLECTOR_STATE_DIR}/backup-before-delete-${ts}"
+    cmd "${SUDO[@]}" mkdir -p "$backup_dir"
+
+    for file in \
+        nodes.json \
+        falls.json \
+        daily_report_date \
+        node_names.json \
+        bl_groups.json \
+        stats_off.json \
+        update_state.json \
+        remna_nodes.json \
+        ip_limit.sqlite \
+        ip_limit.sqlite-shm \
+        ip_limit.sqlite-wal; do
+        if "${SUDO[@]}" test -e "${STATS_COLLECTOR_STATE_DIR}/${file}" 2>/dev/null; then
+            cmd "${SUDO[@]}" mv "${STATS_COLLECTOR_STATE_DIR}/${file}" "${backup_dir}/${file}"
+            moved=1
+        fi
+    done
+
+    if (( unit_exists == 1 )); then
+        cmd "${SUDO[@]}" systemctl start "$STATS_COLLECTOR_SERVICE" || true
+    fi
+
+    if (( moved == 1 )); then
+        ok "State коллектора очищен"
+        ok "Бэкап: ${backup_dir}"
+    else
+        ok "В state коллектора нечего чистить"
+    fi
+}
+
+stats_push_delete_all() {
+    header
+    need_root
+    stats_push_delete_client
+    stats_collector_clear_runtime_state
+    ok "Готово. Машины появятся заново только после новой настройки/запуска push."
+}
+
 run_stats_push_debug() {
     header
     require_push_mode
@@ -4520,6 +4604,7 @@ stats_push_menu() {
         echo -e "2) Отправить push сейчас"
         echo -e "3) Статус push"
         echo -e "4) Диагностика push"
+        echo -e "5) Полностью удалить push / очистить collector state"
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -4540,6 +4625,10 @@ stats_push_menu() {
                 ;;
             4)
                 run_stats_push_debug
+                system_check_pause
+                ;;
+            5)
+                stats_push_delete_all
                 system_check_pause
                 ;;
             0)
@@ -4751,6 +4840,8 @@ menu() {
         actions+=("stats-collector")
         labels+=("Статус коллектора")
         actions+=("stats-collector-status")
+        labels+=("Очистить список статистики")
+        actions+=("stats-push-delete")
     else
         labels+=("Speedtest")
         actions+=("speedtest")
@@ -4806,6 +4897,7 @@ menu() {
         status) show_status ;;
         stats-collector) install_stats_collector ;;
         stats-collector-status) stats_collector_status ;;
+        stats-push-delete) stats_push_delete_all ;;
         speedtest) install_speedtest ;;
         speedtest-ru) speedtest_ru ;;
         ipcheck-place) ipcheck_place ;;
@@ -4854,6 +4946,7 @@ main() {
         stats-push-send) send_stats_push_once ;;
         stats-push-status) stats_push_status ;;
         stats-push-debug|push-debug) run_stats_push_debug ;;
+        stats-push-delete|push-delete|stats-delete|stats-clear) stats_push_delete_all ;;
         *) menu ;;
     esac
 }
