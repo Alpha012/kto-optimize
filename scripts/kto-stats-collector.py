@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v213"
+COLLECTOR_BUILD = "v214"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -988,6 +988,20 @@ def load_update_state():
 
 def save_update_state():
     atomic_write(UPDATE_STATE_FILE, json.dumps(UPDATE_STATE, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def clean_all_active_unlocked():
+    current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
+    return bool(
+        str(current.get("id") or "")
+        and str(current.get("action") or "") == "push_delete"
+        and bool(current.get("live_targets"))
+    )
+
+
+def clean_all_active():
+    with LOCK:
+        return clean_all_active_unlocked()
 
 
 def node_scope_matches(node, scope):
@@ -2261,6 +2275,23 @@ def remna_user_item_id(user_item):
     return ""
 
 
+def remna_user_item_info(user_item):
+    if not isinstance(user_item, dict):
+        return {}
+    user = user_item.get("user")
+    if isinstance(user, dict):
+        return user
+    user_keys = {
+        "id", "uuid", "username", "email", "tag", "telegramId", "status",
+        "expireAt", "trafficLimitBytes", "userTraffic", "hwidDeviceLimit",
+        "hwidLimit", "deviceLimit", "devicesLimit", "hwidDevicesLimit",
+        "hwidDeviceCount", "deviceCount",
+    }
+    if any(key in user_item for key in user_keys):
+        return user_item
+    return {}
+
+
 def remna_ip_item_value(ip_item):
     if isinstance(ip_item, str):
         return ip_item
@@ -2311,6 +2342,10 @@ def remna_active_user_ips_from_result(result, node, ts):
         user_id = remna_user_item_id(user_item)
         if not user_id:
             continue
+        user_info = remna_user_item_info(user_item)
+        if user_info:
+            remna_user_cache_put(user_info)
+            user_id = ip_limit_primary_key(user_id, user_info) or user_id
         for ip_item in remna_user_ip_items(user_item):
             ip = remna_ip_item_value(ip_item)
             if ip.startswith("::ffff:"):
@@ -2322,6 +2357,7 @@ def remna_active_user_ips_from_result(result, node, ts):
                 "ip": normalize_ip(ip),
                 "node": node_name[:80] or "-",
                 "last_seen": remna_ip_item_last_seen(ip_item, ts),
+                "user_info": user_info,
             })
     return rows
 
@@ -2416,6 +2452,8 @@ def remna_top_ip_rows(rows, active_after=0):
         if active_after and last_seen > 0 and last_seen < active_after:
             continue
         entry = grouped.setdefault(user, {"user": user, "ips": {}, "last_seen": 0})
+        if isinstance(row.get("user_info"), dict) and row.get("user_info") and not isinstance(entry.get("user_info"), dict):
+            entry["user_info"] = row.get("user_info")
         ip_entry = entry["ips"].setdefault(ip, {"ip": ip, "nodes": set(), "last_seen": 0})
         node = str(row.get("node") or "").strip()
         if node:
@@ -2434,7 +2472,12 @@ def remna_top_ip_rows(rows, active_after=0):
                 "last_seen": item["last_seen"],
             })
         ips.sort(key=lambda item: (-int(item.get("last_seen") or 0), item.get("ip") or ""))
-        result.append({"user": entry["user"], "ips": ips, "last_seen": entry["last_seen"]})
+        result.append({
+            "user": entry["user"],
+            "ips": ips,
+            "last_seen": entry["last_seen"],
+            "user_info": entry.get("user_info") if isinstance(entry.get("user_info"), dict) else {},
+        })
     result.sort(key=lambda item: (-len(item["ips"]), -int(item.get("last_seen") or 0), natural_sort_key(item["user"])))
     return result
 
@@ -2629,7 +2672,11 @@ def remna_user_expire(info):
 def remna_user_hwid_limit(info):
     if not isinstance(info, dict):
         return None
-    for key in ("hwidDeviceLimit", "hwidLimit", "deviceLimit", "devicesLimit"):
+    for key in (
+        "hwidDeviceLimit", "hwidDevicesLimit", "hwidLimit", "hwid_limit",
+        "deviceLimit", "device_limit", "devicesLimit", "devices_limit",
+        "maxDevices", "max_devices",
+    ):
         if key not in info:
             continue
         value = info.get(key)
@@ -5059,7 +5106,7 @@ def ip_limit_report(query=""):
 
 def top_ip_user_line(index, row):
     user = str(row.get("user") or "").strip()
-    info = remna_user_info(user)
+    info = row.get("user_info") if isinstance(row.get("user_info"), dict) and row.get("user_info") else remna_user_info(user)
     telegram_id = "-"
     if isinstance(info, dict):
         telegram_id = str(info.get("telegramId") or "-").strip() or "-"
@@ -5132,11 +5179,20 @@ def remna_ip_limit_alert_rows(rows, ts):
     result = []
     for row in top_rows:
         user = str(row.get("user") or "").strip()
-        info = remna_user_info(user)
-        limit, _ = ip_limit_effective_limit(user, info)
-        if limit <= 0 or limit > IP_LIMIT_ALERT_THRESHOLD:
+        active_ips = len(row.get("ips") or [])
+        if active_ips <= IP_LIMIT_ALERT_THRESHOLD:
             continue
-        result.append(row)
+        info = row.get("user_info") if isinstance(row.get("user_info"), dict) and row.get("user_info") else remna_user_info(user)
+        limit, source = ip_limit_effective_limit(user, info)
+        if limit <= 0 or limit > IP_LIMIT_ALERT_THRESHOLD or active_ips <= limit:
+            continue
+        item = dict(row)
+        if isinstance(info, dict) and info:
+            item["user"] = ip_limit_primary_key(user, info) or user
+            item["user_info"] = info
+        item["effective_limit"] = limit
+        item["limit_source"] = source
+        result.append(item)
     return result
 
 
@@ -5147,7 +5203,7 @@ def remna_ip_limit_top_message(top_rows, snapshot):
         f"{LOST_EMOJI} #ipLimitTop",
         "<b>Много активных IP</b>",
         ALERT_SEPARATOR,
-        detail_line("Порог", f">{IP_LIMIT_ALERT_THRESHOLD} IP"),
+        detail_line("Порог", f">{IP_LIMIT_ALERT_THRESHOLD} IP и выше личного лимита"),
         detail_line("Максимум", f"{max_ips} IP"),
         detail_line("Окно", format_duration_ru(REMNA_TOP_IP_ACTIVE_SEC)),
         detail_line("Ноды", f"{snapshot.get('nodes_polled', 0)}/{snapshot.get('nodes_total', 0)}"),
@@ -5586,6 +5642,7 @@ def update_node(payload, remote_ip=""):
         "offline_alerted": False,
     }
     with LOCK:
+        suppress_runtime_stats = clean_all_active_unlocked()
         record_key = node_record_key(record) or node_canonical_key(record) or node_id
         old = NODES.get(record_key, {})
         if not old:
@@ -5593,32 +5650,41 @@ def update_node(payload, remote_ip=""):
                 if existing_id != record_key and (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key:
                     old = existing_node
                     break
-        was_offline = bool(old.get("offline_alerted")) and bool(old.get("offline_confirmed", True))
-        if node_stats_disabled(record):
-            if was_offline:
-                revoke_fall(record)
-            was_offline = False
-        elif was_offline:
-            offline_since = int(old.get("offline_since") or old.get("last_seen") or current)
-            record_downtime(current - offline_since, record)
-        scan_alerted_at = int(old.get("scan_alerted_at") or 0)
-        record["scan_alerted_at"] = scan_alerted_at
-        record["push_miss_alerted_at"] = int(old.get("push_miss_alerted_at") or 0)
-        record["push_history"] = clean_push_history(old.get("push_history"), current, node_push_interval_sec(record) or BL_PUSH_INTERVAL_SEC)
-        if old and "scan_wrong_sni_total" in old and SCAN_ALERT_DELTA > 0:
-            old_scan_total = int(old.get("scan_wrong_sni_total") or 0)
-            scan_delta = record["scan_wrong_sni_total"] - old_scan_total
-            if scan_delta >= SCAN_ALERT_DELTA and current - scan_alerted_at >= SCAN_ALERT_COOLDOWN:
-                record["scan_alerted_at"] = current
-                scan_alert_node = dict(record)
-                scan_alert_delta = scan_delta
         removed = []
-        for existing_id, existing_node in list(NODES.items()):
-            if existing_id != record_key and (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key:
-                del NODES[existing_id]
-                removed.append(existing_id)
-        NODES[record_key] = record
-        save_nodes()
+        if suppress_runtime_stats:
+            for existing_id, existing_node in list(NODES.items()):
+                if existing_id == record_key or (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key:
+                    del NODES[existing_id]
+                    removed.append(existing_id)
+            if removed:
+                save_nodes()
+            was_offline = False
+        else:
+            was_offline = bool(old.get("offline_alerted")) and bool(old.get("offline_confirmed", True))
+            if node_stats_disabled(record):
+                if was_offline:
+                    revoke_fall(record)
+                was_offline = False
+            elif was_offline:
+                offline_since = int(old.get("offline_since") or old.get("last_seen") or current)
+                record_downtime(current - offline_since, record)
+            scan_alerted_at = int(old.get("scan_alerted_at") or 0)
+            record["scan_alerted_at"] = scan_alerted_at
+            record["push_miss_alerted_at"] = int(old.get("push_miss_alerted_at") or 0)
+            record["push_history"] = clean_push_history(old.get("push_history"), current, node_push_interval_sec(record) or BL_PUSH_INTERVAL_SEC)
+            if old and "scan_wrong_sni_total" in old and SCAN_ALERT_DELTA > 0:
+                old_scan_total = int(old.get("scan_wrong_sni_total") or 0)
+                scan_delta = record["scan_wrong_sni_total"] - old_scan_total
+                if scan_delta >= SCAN_ALERT_DELTA and current - scan_alerted_at >= SCAN_ALERT_COOLDOWN:
+                    record["scan_alerted_at"] = current
+                    scan_alert_node = dict(record)
+                    scan_alert_delta = scan_delta
+            for existing_id, existing_node in list(NODES.items()):
+                if existing_id != record_key and (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key:
+                    del NODES[existing_id]
+                    removed.append(existing_id)
+            NODES[record_key] = record
+            save_nodes()
     if removed:
         log(f"removed duplicate node records for {record_key}: {', '.join(removed)}")
     if was_offline:
@@ -5628,7 +5694,8 @@ def update_node(payload, remote_ip=""):
         log(f"scan spike: {record_key} delta={scan_alert_delta}")
         alert_scan_spike(scan_alert_node, scan_alert_delta)
     process_update_result(payload.get("update_result"), record, current)
-    process_ip_limit_events(payload.get("ip_limit_events"), record.get("name") or node_id, current)
+    if not suppress_runtime_stats:
+        process_ip_limit_events(payload.get("ip_limit_events"), record.get("name") or node_id, current)
     return record
 
 
@@ -5685,7 +5752,7 @@ class Handler(BaseHTTPRequestHandler):
                 "id": node["id"],
                 "last_seen": node["last_seen"],
                 "ssh_allowed_ips": ssh_allowed_ips_snapshot(),
-                "ip_limit_blocks": ip_limit_blocks_for_node(node, now_ts()),
+                "ip_limit_blocks": [] if clean_all_active() else ip_limit_blocks_for_node(node, now_ts()),
             }
             ip_policy = ip_limit_node_policy(node)
             if ip_policy is not None:
@@ -6657,6 +6724,47 @@ def handle_update_nodes(text, chat_id, from_id):
     start_update_job("node_update", "all", from_id, local_required=False)
 
 
+def clear_collector_runtime_stats():
+    cleared = {}
+    with LOCK:
+        cleared["nodes"] = len(NODES)
+        NODES.clear()
+        save_nodes()
+
+        fall_nodes = FALLS.get("nodes") if isinstance(FALLS.get("nodes"), dict) else {}
+        cleared["falls"] = sum(int(item.get("count") or 0) for item in fall_nodes.values() if isinstance(item, dict))
+        FALLS.clear()
+        save_falls()
+
+        remna_nodes = REMNA_NODE_STATE.get("nodes") if isinstance(REMNA_NODE_STATE.get("nodes"), dict) else {}
+        cleared["remna_nodes"] = len(remna_nodes)
+        REMNA_NODE_STATE["nodes"] = {}
+        save_remna_node_state()
+
+        db = ip_limit_db()
+        for table in ("ip_limit_events", "ip_limit_alerts", "ip_limit_blocks", "ip_limit_penalties", "ip_limit_pending"):
+            row = db.execute(f"SELECT COUNT(*) AS value FROM {table}").fetchone()
+            cleared[table] = int(row["value"] if row else 0)
+            db.execute(f"DELETE FROM {table}")
+        db.execute("DELETE FROM ip_limit_meta WHERE key = ?", ("remna_top_alert_last",))
+        save_ip_limit_state()
+    return cleared
+
+
+def clean_all_cleared_message(cleared):
+    ip_rows = sum(int(cleared.get(table) or 0) for table in ("ip_limit_events", "ip_limit_alerts", "ip_limit_blocks", "ip_limit_penalties", "ip_limit_pending"))
+    return "\n".join([
+        "<b>Локальная стата очищена</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машины", cleared.get("nodes", 0)),
+        detail_line("Падения", cleared.get("falls", 0)),
+        detail_line("Remnawave ноды", cleared.get("remna_nodes", 0)),
+        detail_line("IP-limit runtime", ip_rows),
+        "",
+        "<i>Настройки групп, rename, SNI и лимиты пользователей не трогал.</i>",
+    ])
+
+
 def handle_clean_all(text, chat_id, from_id):
     parts = text.split()
     if len(parts) > 1 and parts[1].lower() in ("status", "статус"):
@@ -6664,6 +6772,7 @@ def handle_clean_all(text, chat_id, from_id):
         send_message(body, reply_markup=markup)
         return
     start_update_job("push_delete", "live", from_id, local_required=False, targets={}, live_targets=True)
+    send_message(clean_all_cleared_message(clear_collector_runtime_stats()))
 
 
 def handle_update_node_status(text, chat_id, from_id):
