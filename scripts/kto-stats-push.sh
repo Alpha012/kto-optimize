@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v211"
+PUSH_BUILD="v212"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -1252,6 +1252,11 @@ apply_collector_update_task() {
         return 0
     fi
 
+    if [[ "$action" == "push_delete" ]]; then
+        apply_push_delete_task "$job_id"
+        return 0
+    fi
+
     if [[ "$action" == "optimize" ]]; then
         apply_optimize_task "$job_id" "apply"
         return 0
@@ -1297,6 +1302,22 @@ apply_collector_update_task() {
         write_update_result "$job_id" "error" "install /usr/local/bin/kto-stats-push failed"
         echo "push ${PUSH_BUILD}: update failed: install /usr/local/bin/kto-stats-push failed" >&2
     fi
+}
+
+apply_push_delete_task() {
+    local job_id="$1"
+    write_update_result "$job_id" "ok" "push deleted" "$PUSH_BUILD"
+    echo "push ${PUSH_BUILD}: deleting push service by collector request"
+    systemctl disable --now kto-stats-push.timer >/dev/null 2>&1 || true
+    systemctl disable kto-stats-push.service >/dev/null 2>&1 || true
+    rm -f \
+        /etc/kto-stats-push.conf \
+        /etc/systemd/system/kto-stats-push.timer \
+        /etc/systemd/system/kto-stats-push.service \
+        /usr/local/bin/kto-stats-push
+    rm -rf /var/lib/kto-stats-push
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed kto-stats-push.timer kto-stats-push.service >/dev/null 2>&1 || true
 }
 
 apply_node_update_task() {
@@ -1873,6 +1894,7 @@ month_total=$(( month_rx + month_tx ))
 if ! payload="$(jq -n \
     --arg id "$KTO_PUSH_NODE_ID" \
     --arg name "$KTO_PUSH_NODE_NAME" \
+    --arg push_build "$PUSH_BUILD" \
     --arg iface "$KTO_PUSH_IFACE" \
     --arg hostname "$hostname_value" \
     --arg error "$error" \
@@ -1909,6 +1931,7 @@ if ! payload="$(jq -n \
     '{
         id: $id,
         name: $name,
+        push_build: $push_build,
         iface: $iface,
         hostname: $hostname,
         day_rx: $day_rx,

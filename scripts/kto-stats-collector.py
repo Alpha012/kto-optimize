@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v211"
+COLLECTOR_BUILD = "v212"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -968,6 +968,7 @@ def load_update_state():
                 "notify_chat_id": str(current.get("notify_chat_id") or "").strip()[:80],
                 "notify_message_id": str(current.get("notify_message_id") or "").strip()[:80],
                 "quiet_done": bool(current.get("quiet_done", False)),
+                "live_targets": bool(current.get("live_targets", False)),
             }
         results = {}
         raw_results = loaded.get("results") if isinstance(loaded.get("results"), dict) else {}
@@ -1013,10 +1014,10 @@ def current_update_targets(scope="all"):
     return targets
 
 
-def queue_update_task(requested_by, action="push_update", scope="all", targets=None, local_required=True, notify=None, quiet_done=False):
+def queue_update_task(requested_by, action="push_update", scope="all", targets=None, local_required=True, notify=None, quiet_done=False, live_targets=False):
     ts = now_ts()
     action = str(action or "push_update").strip()
-    if action not in ("push_update", "node_update", "optimize", "optimize_status"):
+    if action not in ("push_update", "node_update", "optimize", "optimize_status", "push_delete"):
         action = "push_update"
     scope = str(scope or "all").strip().lower()
     with LOCK:
@@ -1034,6 +1035,7 @@ def queue_update_task(requested_by, action="push_update", scope="all", targets=N
             "notify_chat_id": str((notify or {}).get("chat_id") or "").strip()[:80] if isinstance(notify, dict) else "",
             "notify_message_id": str((notify or {}).get("message_id") or "").strip()[:80] if isinstance(notify, dict) else "",
             "quiet_done": bool(quiet_done),
+            "live_targets": bool(live_targets),
         }
         UPDATE_STATE["current"] = job
         UPDATE_STATE["results"] = {}
@@ -1058,11 +1060,40 @@ def update_task_for_node(node):
         if targets and node_key not in targets:
             return None
         result = UPDATE_STATE.setdefault("results", {}).get(node_key)
+        action = str(current.get("action") or "push_update")
+        if action == "push_delete":
+            result_message = clean_display_text((result or {}).get("message") or "") if isinstance(result, dict) else ""
+            if isinstance(result, dict) and result.get("id") == job_id and result.get("status") in ("ok", "error") and result_message in ("push delete sent", "push deleted"):
+                return None
+            task_action = "push_delete"
+            if build_number((node or {}).get("push_build")) < 212 and build_number((result or {}).get("build") if isinstance(result, dict) else "") < 212:
+                task_action = "push_update"
+            task_id = job_id
+            if task_action == "push_update":
+                task_id = f"{job_id}:bootstrap"
+                if isinstance(result, dict) and result.get("id") == task_id and result.get("status") == "error":
+                    task_id = f"{task_id}:{now_ts() // 60}"
+            if task_action == "push_delete":
+                UPDATE_STATE.setdefault("results", {})[node_key] = {
+                    "id": job_id,
+                    "status": "ok",
+                    "build": COLLECTOR_BUILD,
+                    "message": "push delete sent",
+                    "updated_at": now_ts(),
+                    "node": node_display_name(node, node_key)[:120],
+                }
+                save_update_state()
+            return {
+                "id": task_id,
+                "action": task_action,
+                "raw_base": str(current.get("raw_base") or RAW_BASE).rstrip("/"),
+                "collector_build": COLLECTOR_BUILD,
+            }
         if isinstance(result, dict) and result.get("id") == job_id and result.get("status") in ("ok", "error"):
             return None
         return {
             "id": job_id,
-            "action": str(current.get("action") or "push_update"),
+            "action": action,
             "raw_base": str(current.get("raw_base") or RAW_BASE).rstrip("/"),
             "collector_build": COLLECTOR_BUILD,
         }
@@ -1835,6 +1866,16 @@ def node_record_key(node):
         if value and value not in ("unknown", "localhost", "none", "null"):
             return f"{prefix}_{value}"
     return ""
+
+
+def build_number(value):
+    match = re.search(r"(\d+)", str(value or ""))
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except Exception:
+        return 0
 
 
 def tg_call(method, data=None, timeout=25):
@@ -5511,6 +5552,7 @@ def update_node(payload, remote_ip=""):
     record = {
         "id": node_id,
         "name": node_name or node_id,
+        "push_build": clean_display_text(payload.get("push_build") or payload.get("build") or ""),
         "ip": remote_ip_value,
         "uptime_sec": int(payload.get("uptime_sec") or 0),
         "iface": str(payload.get("iface") or ""),
@@ -5976,6 +6018,11 @@ def update_progress_snapshot_unlocked():
     action = str(current.get("action") or "push_update")
     scope = str(current.get("scope") or "all")
     local_required = bool(current.get("local_required", True))
+    live_targets = bool(current.get("live_targets", False))
+    if live_targets and not targets and job_id:
+        for key, item in results.items():
+            if isinstance(item, dict) and item.get("id") == job_id:
+                targets[str(key)] = clean_display_text(item.get("node") or key)
     ok_count = 0
     error_count = 0
     running_count = 0
@@ -6018,12 +6065,13 @@ def update_progress_snapshot_unlocked():
         local_error = dict(local)
         local_error["node"] = "collector"
         errors.insert(0, local_error)
-    done = bool(job_id) and local_status in ("ok", "error") and wait_count == 0 and running_count == 0
+    done = bool(job_id) and not live_targets and local_status in ("ok", "error") and wait_count == 0 and running_count == 0
     return {
         "job_id": job_id,
         "action": action,
         "scope": scope,
         "local_required": local_required,
+        "live_targets": live_targets,
         "local_status": local_status or "wait",
         "ok_count": ok_count,
         "error_count": error_count,
@@ -6046,6 +6094,8 @@ def update_action_label(action):
         return "system optimize"
     if action == "optimize_status":
         return "system optimize check"
+    if action == "push_delete":
+        return "push self-delete"
     return "push script"
 
 
@@ -6061,6 +6111,8 @@ def update_scope_label(scope):
         return "1 машина"
     if scope == "list":
         return "список"
+    if scope == "live":
+        return "любой push"
     return "все"
 
 
@@ -6507,6 +6559,8 @@ def update_start_title(action, scope, retry=False):
         return "Optimize запущен"
     if action == "optimize_status":
         return "Optimize status запущен"
+    if action == "push_delete":
+        return "Clean all запущен"
     if scope == "wl":
         return "Update WL запущен"
     if scope == "bl":
@@ -6519,11 +6573,13 @@ def update_start_title(action, scope, retry=False):
 def update_status_command(action):
     if action == "node_update":
         return "/update_node_status"
+    if action == "push_delete":
+        return "/clean_all status"
     return "/update_collector status"
 
 
-def start_update_job(action, scope, requested_by, local_required=True, targets=None, retry=False):
-    job = queue_update_task(requested_by, action=action, scope=scope, targets=targets, local_required=local_required)
+def start_update_job(action, scope, requested_by, local_required=True, targets=None, retry=False, live_targets=False):
+    job = queue_update_task(requested_by, action=action, scope=scope, targets=targets, local_required=local_required, live_targets=live_targets)
     total_nodes = len(job.get("targets") if isinstance(job.get("targets"), dict) else {})
     lines = [
         f"<b>{update_start_title(action, scope, retry=retry)}</b>",
@@ -6532,7 +6588,9 @@ def start_update_job(action, scope, requested_by, local_required=True, targets=N
         detail_line("Тип", update_action_label(action)),
         detail_line("Группа", update_scope_label(scope)),
     ]
-    if str(scope or "").lower() not in ("panel", "collector"):
+    if live_targets:
+        lines.append(detail_line("Режим", "любой будущий push"))
+    elif str(scope or "").lower() not in ("panel", "collector"):
         lines.append(detail_line("Машин в очереди", total_nodes))
     if action == "push_update":
         lines.append(detail_line("Raw", job.get("raw_base")))
@@ -6566,6 +6624,13 @@ def start_update_job(action, scope, requested_by, local_required=True, targets=N
             "<i>Машина только проверит оптимизацию при ближайшем push, без правок.</i>",
             f"<i>Статус: <code>{update_status_command(action)}</code></i>",
         ]
+    elif action == "push_delete":
+        lines += [
+            "",
+            "<i>Любая машина, которая ещё пришлёт push, получит команду удалить свой push/timer/config.</i>",
+            "<i>Задача останется активной, пока её не заменит следующая update-команда.</i>",
+            f"<i>Статус: <code>{update_status_command(action)}</code></i>",
+        ]
     send_message("\n".join(lines))
     if action == "push_update" and local_required:
         start_local_collector_update(job)
@@ -6589,6 +6654,15 @@ def handle_update_nodes(text, chat_id, from_id):
         send_message(body, reply_markup=markup)
         return
     start_update_job("node_update", "all", from_id, local_required=False)
+
+
+def handle_clean_all(text, chat_id, from_id):
+    parts = text.split()
+    if len(parts) > 1 and parts[1].lower() in ("status", "статус"):
+        body, markup = update_status_payload()
+        send_message(body, reply_markup=markup)
+        return
+    start_update_job("push_delete", "live", from_id, local_required=False, targets={}, live_targets=True)
 
 
 def handle_update_node_status(text, chat_id, from_id):
@@ -7565,6 +7639,8 @@ def bot_loop():
                     handle_update_node_status(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/update_nodes":
                     handle_update_nodes(text, chat_id, from_id)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/clean_all":
+                    handle_clean_all(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/optimize":
                     handle_optimize_command(text, chat_id, from_id, "optimize")
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/optimize_status":
