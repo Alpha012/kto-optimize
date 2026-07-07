@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v208"
+SCRIPT_BUILD="v209"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -61,7 +61,10 @@ STATS_COLLECTOR_STALE_SEC_DEFAULT="60"
 STATS_COLLECTOR_BL_STALE_SEC_DEFAULT="${KTO_COLLECTOR_BL_STALE_SEC_DEFAULT:-15}"
 STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT="${KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT:-5}"
 STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT="${KTO_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT:-45}"
-STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT="${KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT:-5}"
+STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT="${KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT:-1}"
+STATS_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT="${KTO_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT:-60}"
+STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT="${KTO_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT:-30}"
+STATS_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT="${KTO_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT:-300}"
 STATS_COLLECTOR_TZ_DEFAULT="Europe/Moscow"
 STATS_ALLOWED_USER_ID_DEFAULT="646296998"
 STATS_EXPECTED_NODES_DEFAULT="10"
@@ -3667,6 +3670,9 @@ install_stats_collector() {
         bl_offline_confirm_sec="$(config_get KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC "$STATS_COLLECTOR_CONFIG")"
         bl_stale_fallback_sec="$(config_get KTO_COLLECTOR_BL_STALE_FALLBACK_SEC "$STATS_COLLECTOR_CONFIG")"
         bl_push_interval_sec="$(config_get KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC "$STATS_COLLECTOR_CONFIG")"
+        push_miss_window_sec="$(config_get KTO_COLLECTOR_PUSH_MISS_WINDOW_SEC "$STATS_COLLECTOR_CONFIG")"
+        push_miss_threshold="$(config_get KTO_COLLECTOR_PUSH_MISS_THRESHOLD "$STATS_COLLECTOR_CONFIG")"
+        push_miss_alert_cooldown="$(config_get KTO_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN "$STATS_COLLECTOR_CONFIG")"
         expected_nodes="$(config_get KTO_COLLECTOR_EXPECTED_NODES "$STATS_COLLECTOR_CONFIG")"
         daily_report_time="$(config_get KTO_COLLECTOR_DAILY_REPORT_TIME "$STATS_COLLECTOR_CONFIG")"
         ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
@@ -3707,6 +3713,12 @@ install_stats_collector() {
         bl_offline_confirm_sec="${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}"
         bl_stale_fallback_sec="${bl_stale_fallback_sec:-$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT}"
         bl_push_interval_sec="${bl_push_interval_sec:-$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT}"
+        if [[ "$bl_push_interval_sec" == "5" ]]; then
+            bl_push_interval_sec="$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT"
+        fi
+        push_miss_window_sec="${push_miss_window_sec:-$STATS_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT}"
+        push_miss_threshold="${push_miss_threshold:-$STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT}"
+        push_miss_alert_cooldown="${push_miss_alert_cooldown:-$STATS_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT}"
         expected_nodes="${expected_nodes:-$STATS_EXPECTED_NODES_DEFAULT}"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
         ip_limit_source="${ip_limit_source:-$IP_LIMIT_SOURCE_DEFAULT}"
@@ -3745,6 +3757,9 @@ install_stats_collector() {
         bl_offline_confirm_sec="$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT"
         bl_stale_fallback_sec="$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT"
         bl_push_interval_sec="$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT"
+        push_miss_window_sec="$STATS_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT"
+        push_miss_threshold="$STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT"
+        push_miss_alert_cooldown="$STATS_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT"
         expected_nodes="$(ask_int "Ожидаемое кол-во обходов" "$STATS_EXPECTED_NODES_DEFAULT" 1 9999)"
         daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
         ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
@@ -3806,6 +3821,15 @@ install_stats_collector() {
     if [[ -n "${KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC:-}" ]]; then
         bl_push_interval_sec="$KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC"
     fi
+    if [[ -n "${KTO_COLLECTOR_PUSH_MISS_WINDOW_SEC:-}" ]]; then
+        push_miss_window_sec="$KTO_COLLECTOR_PUSH_MISS_WINDOW_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_PUSH_MISS_THRESHOLD:-}" ]]; then
+        push_miss_threshold="$KTO_COLLECTOR_PUSH_MISS_THRESHOLD"
+    fi
+    if [[ -n "${KTO_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN:-}" ]]; then
+        push_miss_alert_cooldown="$KTO_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN"
+    fi
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ENABLED:-}" ]]; then
         ip_limit_enabled="$KTO_COLLECTOR_IP_LIMIT_ENABLED"
     fi
@@ -3860,6 +3884,9 @@ install_stats_collector() {
     safe_bl_offline_confirm="$(escape_config_value "$bl_offline_confirm_sec")"
     safe_bl_stale_fallback="$(escape_config_value "$bl_stale_fallback_sec")"
     safe_bl_push_interval="$(escape_config_value "$bl_push_interval_sec")"
+    safe_push_miss_window="$(escape_config_value "$push_miss_window_sec")"
+    safe_push_miss_threshold="$(escape_config_value "$push_miss_threshold")"
+    safe_push_miss_cooldown="$(escape_config_value "$push_miss_alert_cooldown")"
     safe_expected="$(escape_config_value "$expected_nodes")"
     safe_tz="$(escape_config_value "$STATS_COLLECTOR_TZ_DEFAULT")"
     safe_daily="$(escape_config_value "$daily_report_time")"
@@ -3906,6 +3933,9 @@ KTO_COLLECTOR_BL_STALE_SEC="$safe_bl_stale"
 KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC="$safe_bl_offline_confirm"
 KTO_COLLECTOR_BL_STALE_FALLBACK_SEC="$safe_bl_stale_fallback"
 KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC="$safe_bl_push_interval"
+KTO_COLLECTOR_PUSH_MISS_WINDOW_SEC="$safe_push_miss_window"
+KTO_COLLECTOR_PUSH_MISS_THRESHOLD="$safe_push_miss_threshold"
+KTO_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN="$safe_push_miss_cooldown"
 KTO_COLLECTOR_EXPECTED_NODES="$safe_expected"
 KTO_COLLECTOR_TZ="$safe_tz"
 KTO_COLLECTOR_DAILY_REPORT_TIME="$safe_daily"
@@ -3960,7 +3990,7 @@ EOF
         ok "Ежедневный отчёт: выключен"
     fi
     ok "BL offline alert: ${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s + confirm ${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}s"
-    ok "BL push target: ${bl_push_interval_sec:-$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT}s, old-node fallback ${bl_stale_fallback_sec:-$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT}s"
+    ok "BL push target: ${bl_push_interval_sec:-$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT}s, miss >${push_miss_threshold:-$STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT}/${push_miss_window_sec:-$STATS_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT}s"
     if [[ -n "$remna_api_token" ]]; then
         ok "Remnawave API enrichment: включён"
         ok "Remnawave node alerts: ${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT}, poll ${remna_node_poll_sec:-$REMNA_NODE_POLL_SEC_DEFAULT}s"
@@ -3985,7 +4015,7 @@ stats_collector_status() {
     header
     require_panel_mode
     need_root
-    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec remna_test_id remna_test_log remna_code remna_probe
+    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown remna_test_id remna_test_log remna_code remna_probe
     local ip_limit_enabled ip_limit_source ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_penalty_sec ip_limit_max_events asn_lookup_enabled asn_cache_sec
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -4001,6 +4031,9 @@ stats_collector_status() {
     bl_offline_confirm_sec="$(config_get KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC "$STATS_COLLECTOR_CONFIG")"
     bl_stale_fallback_sec="$(config_get KTO_COLLECTOR_BL_STALE_FALLBACK_SEC "$STATS_COLLECTOR_CONFIG")"
     bl_push_interval_sec="$(config_get KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC "$STATS_COLLECTOR_CONFIG")"
+    push_miss_window_sec="$(config_get KTO_COLLECTOR_PUSH_MISS_WINDOW_SEC "$STATS_COLLECTOR_CONFIG")"
+    push_miss_threshold="$(config_get KTO_COLLECTOR_PUSH_MISS_THRESHOLD "$STATS_COLLECTOR_CONFIG")"
+    push_miss_alert_cooldown="$(config_get KTO_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN "$STATS_COLLECTOR_CONFIG")"
     ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
     ip_limit_source="$(config_get KTO_COLLECTOR_IP_LIMIT_SOURCE "$STATS_COLLECTOR_CONFIG")"
     ip_limit_scan_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_SCAN_SEC "$STATS_COLLECTOR_CONFIG")"
@@ -4025,6 +4058,7 @@ stats_collector_status() {
     print_row "адрес" "${listen_host}:${listen_port}" "$([[ -n "$listen_port" ]] && echo 1 || echo 0)"
     print_row "bl stale" "${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s + confirm ${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}s" 1
     print_row "bl push" "target ${bl_push_interval_sec:-$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT}s / fallback ${bl_stale_fallback_sec:-$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT}s" 1
+    print_row "push miss" ">${push_miss_threshold:-$STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT}/${push_miss_window_sec:-$STATS_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT}s cooldown ${push_miss_alert_cooldown:-$STATS_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT}s" 1
     print_row "Remnawave API" "${remna_api_url:-empty} / $([[ -n "$remna_api_token" ]] && echo token-set || echo no-token)" "$([[ -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
     print_row "Remnawave node alert" "${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT} / poll ${remna_node_poll_sec:-$REMNA_NODE_POLL_SEC_DEFAULT}s" "$([[ "${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT}" == "1" && -n "$remna_api_url" && -n "$remna_api_token" ]] && echo 1 || echo 0)"
     print_row "Remnawave offline guard" "${remna_offline_guard_enabled:-$REMNA_OFFLINE_GUARD_ENABLED_DEFAULT} / state ${remna_offline_state_max_age_sec:-$REMNA_OFFLINE_STATE_MAX_AGE_SEC_DEFAULT}s / logs ${remna_offline_log_grace_sec:-$REMNA_OFFLINE_LOG_GRACE_SEC_DEFAULT}s" "$([[ "${remna_offline_guard_enabled:-$REMNA_OFFLINE_GUARD_ENABLED_DEFAULT}" == "1" ]] && echo 1 || echo 0)"
@@ -4257,7 +4291,7 @@ install_stats_push_client() {
             return 1
         fi
         secret="$(ask_secret_value "Секрет коллектора" "${secret:-}")"
-        interval="$(ask_int "Интервал push, сек" "${interval:-$STATS_PUSH_INTERVAL_DEFAULT}" 5 3600)"
+        interval="$(ask_int "Интервал push, сек" "${interval:-$STATS_PUSH_INTERVAL_DEFAULT}" 1 3600)"
         ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
         ip_limit_log_file=""
         ip_limit_docker_container="$REMNA_CONTAINER"

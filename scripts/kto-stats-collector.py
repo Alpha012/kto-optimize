@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v208"
+COLLECTOR_BUILD = "v209"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -72,13 +72,33 @@ except Exception:
 if BL_STALE_FALLBACK_SEC < BL_STALE_SEC:
     BL_STALE_FALLBACK_SEC = BL_STALE_SEC
 try:
-    BL_PUSH_INTERVAL_SEC = int(cfg.get("KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC", "5") or "5")
+    BL_PUSH_INTERVAL_SEC = int(cfg.get("KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC", "1") or "1")
 except Exception:
-    BL_PUSH_INTERVAL_SEC = 5
-if BL_PUSH_INTERVAL_SEC < 5:
-    BL_PUSH_INTERVAL_SEC = 5
+    BL_PUSH_INTERVAL_SEC = 1
+if BL_PUSH_INTERVAL_SEC < 1:
+    BL_PUSH_INTERVAL_SEC = 1
 if BL_PUSH_INTERVAL_SEC > 3600:
     BL_PUSH_INTERVAL_SEC = 3600
+try:
+    PUSH_MISS_WINDOW_SEC = int(cfg.get("KTO_COLLECTOR_PUSH_MISS_WINDOW_SEC", "60") or "60")
+except Exception:
+    PUSH_MISS_WINDOW_SEC = 60
+if PUSH_MISS_WINDOW_SEC < 10:
+    PUSH_MISS_WINDOW_SEC = 10
+if PUSH_MISS_WINDOW_SEC > 3600:
+    PUSH_MISS_WINDOW_SEC = 3600
+try:
+    PUSH_MISS_THRESHOLD = int(cfg.get("KTO_COLLECTOR_PUSH_MISS_THRESHOLD", "30") or "30")
+except Exception:
+    PUSH_MISS_THRESHOLD = 30
+if PUSH_MISS_THRESHOLD < 1:
+    PUSH_MISS_THRESHOLD = 1
+try:
+    PUSH_MISS_ALERT_COOLDOWN = int(cfg.get("KTO_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN", "300") or "300")
+except Exception:
+    PUSH_MISS_ALERT_COOLDOWN = 300
+if PUSH_MISS_ALERT_COOLDOWN < 0:
+    PUSH_MISS_ALERT_COOLDOWN = 0
 OFFLINE_LOOP_SEC = CHECK_INTERVAL
 if BL_STALE_SEC < CHECK_INTERVAL:
     OFFLINE_LOOP_SEC = max(1, min(5, BL_STALE_SEC, CHECK_INTERVAL))
@@ -252,6 +272,7 @@ SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
 SNI_ALLOW_FILE = os.path.join(STATE_DIR, "sni_allow.json")
 NODE_NAMES_FILE = os.path.join(STATE_DIR, "node_names.json")
 BL_GROUPS_FILE = os.path.join(STATE_DIR, "bl_groups.json")
+STATS_OFF_FILE = os.path.join(STATE_DIR, "stats_off.json")
 REMNA_NODES_FILE = os.path.join(STATE_DIR, "remna_nodes.json")
 IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
 IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
@@ -263,6 +284,7 @@ SSH_ALLOWED_IPS = []
 SNI_STATE = {"nodes": {}, "pending": {}}
 NODE_NAME_STATE = {"nodes": {}, "pending": {}}
 BL_GROUP_STATE = {"groups": {}, "pending": {}}
+STATS_OFF_STATE = {"nodes": {}}
 REMNA_NODE_STATE = {"nodes": {}}
 UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
 IP_LIMIT_DB = None
@@ -642,6 +664,48 @@ def load_bl_group_state():
 
 def save_bl_group_state():
     atomic_write(BL_GROUPS_FILE, json.dumps(BL_GROUP_STATE, ensure_ascii=False, indent=2))
+
+
+def load_stats_off_state():
+    global STATS_OFF_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(STATS_OFF_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        raw_nodes = loaded.get("nodes") if isinstance(loaded, dict) else {}
+        if not isinstance(raw_nodes, dict):
+            raw_nodes = {}
+        clean_nodes = {}
+        for key, item in raw_nodes.items():
+            node_key = canonical_node_key(key)
+            if not node_key:
+                continue
+            if isinstance(item, dict):
+                name = clean_display_text(item.get("name") or node_key)[:120] or node_key
+                raw_aliases = item.get("aliases") if isinstance(item.get("aliases"), list) else []
+                updated_at = int(item.get("updated_at") or 0)
+            else:
+                name = clean_display_text(item or node_key)[:120] or node_key
+                raw_aliases = []
+                updated_at = 0
+            aliases = {node_key, canonical_node_key(name)}
+            for alias in raw_aliases:
+                alias = canonical_node_key(alias)
+                if alias:
+                    aliases.add(alias)
+            aliases.discard("")
+            clean_nodes[node_key] = {
+                "name": name,
+                "aliases": sorted(aliases, key=natural_sort_key),
+                "updated_at": updated_at,
+            }
+        STATS_OFF_STATE = {"nodes": clean_nodes}
+    except Exception:
+        STATS_OFF_STATE = {"nodes": {}}
+
+
+def save_stats_off_state():
+    atomic_write(STATS_OFF_FILE, json.dumps(STATS_OFF_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def load_remna_node_state():
@@ -2827,6 +2891,8 @@ def node_stale_sec(node):
             push_interval = 0
         if push_interval <= 0:
             return max(BL_STALE_SEC, BL_STALE_FALLBACK_SEC)
+        if push_interval <= 2:
+            return max(BL_STALE_SEC, PUSH_MISS_THRESHOLD + 1)
         return max(BL_STALE_SEC, push_interval * 3)
     except Exception:
         return STALE_SEC
@@ -2846,6 +2912,102 @@ def desired_push_interval_sec(node):
         return BL_PUSH_INTERVAL_SEC
     except Exception:
         return 0
+
+
+def node_push_interval_sec(node):
+    try:
+        interval = int((node or {}).get("push_interval_sec") or 0)
+    except Exception:
+        interval = 0
+    if interval <= 0:
+        interval = desired_push_interval_sec(node)
+    if interval <= 0:
+        return 0
+    return max(1, min(3600, int(interval)))
+
+
+def push_history_limit(interval):
+    interval = max(1, int(interval or 1))
+    window = max(PUSH_MISS_WINDOW_SEC * 2, 120)
+    return max(120, int(window / interval) + 20)
+
+
+def clean_push_history(values, current, interval):
+    cutoff = int(current) - max(PUSH_MISS_WINDOW_SEC * 2, 120)
+    result = []
+    if isinstance(values, list):
+        for raw in values:
+            try:
+                seen = int(raw)
+            except Exception:
+                continue
+            if cutoff <= seen <= int(current):
+                result.append(seen)
+    result.append(int(current))
+    result = sorted(set(result))
+    limit = push_history_limit(interval)
+    if len(result) > limit:
+        result = result[-limit:]
+    return result
+
+
+def node_push_miss_stats(node, current=None):
+    current = int(current or now_ts())
+    interval = node_push_interval_sec(node)
+    if interval <= 0:
+        return {"enabled": False}
+    window = PUSH_MISS_WINDOW_SEC
+    expected = max(1, int(window / interval))
+    all_history = []
+    window_history = []
+    for raw in (node or {}).get("push_history") or []:
+        try:
+            seen = int(raw)
+        except Exception:
+            continue
+        if seen <= current:
+            all_history.append(seen)
+        if current - window < seen <= current:
+            window_history.append(seen)
+    all_history.sort()
+    window_history.sort()
+    first_seen = all_history[0] if all_history else int((node or {}).get("last_seen") or 0)
+    actual = len(window_history)
+    ready = (first_seen > 0 and current - first_seen >= window) or actual >= expected
+    missed = max(0, expected - actual)
+    return {
+        "enabled": True,
+        "ready": ready,
+        "window": window,
+        "interval": interval,
+        "expected": expected,
+        "actual": actual,
+        "missed": missed,
+    }
+
+
+def node_push_miss_blocks_alert(node, current):
+    if node_is_wl(node):
+        return False
+    if node_push_interval_sec(node) > 2:
+        return False
+    stats = node_push_miss_stats(node, current)
+    if int(stats.get("expected") or 0) <= PUSH_MISS_THRESHOLD:
+        return False
+    if not stats.get("enabled"):
+        return False
+    if not stats.get("ready"):
+        return True
+    return int(stats.get("missed") or 0) <= PUSH_MISS_THRESHOLD
+
+
+def node_push_miss_exceeded(node, current):
+    if node_push_interval_sec(node) > 2:
+        return False
+    stats = node_push_miss_stats(node, current)
+    if int(stats.get("expected") or 0) <= PUSH_MISS_THRESHOLD:
+        return False
+    return bool(stats.get("ready")) and int(stats.get("missed") or 0) > PUSH_MISS_THRESHOLD
 
 
 def remnawave_state_for_node(node):
@@ -2953,7 +3115,7 @@ def bl_node_sort_key(node):
 
 def aggregate_message(scope="all"):
     with LOCK:
-        all_nodes = dedupe_nodes(NODES.values())
+        all_nodes = [node for node in dedupe_nodes(NODES.values()) if not node_stats_disabled(node)]
     ts = now_ts()
     scope = str(scope or "all").strip().lower()
     expected_total = None
@@ -3003,7 +3165,7 @@ def aggregate_message(scope="all"):
 
 def aggregate_summary_message(scope="bl"):
     with LOCK:
-        all_nodes = dedupe_nodes(NODES.values())
+        all_nodes = [node for node in dedupe_nodes(NODES.values()) if not node_stats_disabled(node)]
     ts = now_ts()
     scope = str(scope or "bl").strip().lower()
     if scope == "bl":
@@ -3125,7 +3287,7 @@ def rich_status_summary(nodes, ts, expected_total):
 
 def aggregate_wl_rich_message():
     with LOCK:
-        all_nodes = dedupe_nodes(NODES.values())
+        all_nodes = [node for node in dedupe_nodes(NODES.values()) if not node_stats_disabled(node)]
     ts = now_ts()
     wl_nodes = [node for node in all_nodes if node_is_wl(node)]
     nodes = [node for node in wl_nodes if node_is_exact_bypass(node)]
@@ -3865,7 +4027,15 @@ def node_alert_message(kind, node_id, node, reason="-"):
 
 
 def alert_offline(node_id, node, age):
-    return send_message(node_alert_message("down", node_id, node, f"Нет push {format_age(age)}"))
+    reason = f"Нет push {format_age(age)}"
+    stats = node_push_miss_stats(node, now_ts())
+    if stats.get("ready") and int(stats.get("missed") or 0) > PUSH_MISS_THRESHOLD:
+        reason = (
+            f"Нет push {format_age(age)}; "
+            f"пропущено {int(stats.get('missed') or 0)}/{int(stats.get('expected') or 0)} "
+            f"за {format_duration_ru(int(stats.get('window') or 0))}"
+        )
+    return send_message(node_alert_message("down", node_id, node, reason))
 
 
 def alert_online(node_id, node):
@@ -4102,9 +4272,26 @@ def node_alias_keys(node):
     return aliases
 
 
+def node_stats_disabled(node):
+    aliases = node_alias_keys(node)
+    if not aliases:
+        return False
+    with LOCK:
+        nodes = STATS_OFF_STATE.setdefault("nodes", {})
+        for key, item in nodes.items():
+            disabled_aliases = {canonical_node_key(key)}
+            if isinstance(item, dict):
+                disabled_aliases.update(canonical_node_key(value) for value in item.get("aliases") or [])
+                disabled_aliases.add(canonical_node_key(item.get("name")))
+            disabled_aliases.discard("")
+            if aliases.intersection(disabled_aliases):
+                return True
+    return False
+
+
 def current_bl_nodes():
     with LOCK:
-        nodes = [dict(node) for node in dedupe_nodes(NODES.values()) if not node_is_wl(node)]
+        nodes = [dict(node) for node in dedupe_nodes(NODES.values()) if not node_is_wl(node) and not node_stats_disabled(node)]
     return nodes
 
 
@@ -5318,11 +5505,17 @@ def update_node(payload, remote_ip=""):
     with LOCK:
         old = NODES.get(node_id, {})
         was_offline = bool(old.get("offline_alerted")) and bool(old.get("offline_confirmed", True))
-        if was_offline:
+        if node_stats_disabled(record):
+            if was_offline:
+                revoke_fall(record)
+            was_offline = False
+        elif was_offline:
             offline_since = int(old.get("offline_since") or old.get("last_seen") or current)
             record_downtime(current - offline_since, record)
         scan_alerted_at = int(old.get("scan_alerted_at") or 0)
         record["scan_alerted_at"] = scan_alerted_at
+        record["push_miss_alerted_at"] = int(old.get("push_miss_alerted_at") or 0)
+        record["push_history"] = clean_push_history(old.get("push_history"), current, node_push_interval_sec(record) or BL_PUSH_INTERVAL_SEC)
         if old and "scan_wrong_sni_total" in old and SCAN_ALERT_DELTA > 0:
             old_scan_total = int(old.get("scan_wrong_sni_total") or 0)
             scan_delta = record["scan_wrong_sni_total"] - old_scan_total
@@ -5438,6 +5631,17 @@ def offline_loop():
             alerts = []
             with LOCK:
                 for node_id, node in NODES.items():
+                    if node_stats_disabled(node):
+                        if node.pop("offline_pending_since", None) is not None:
+                            changed = True
+                        if node.get("offline_alerted"):
+                            node["offline_alerted"] = False
+                            node.pop("offline_confirmed", None)
+                            node.pop("offline_since", None)
+                            node.pop("offline_guard_reason", None)
+                            revoke_fall(node)
+                            changed = True
+                        continue
                     age = current - int(node.get("last_seen", 0) or 0)
                     stale_sec = node_stale_sec(node)
                     guard_reason = remnawave_offline_guard_reason(node, current, age, stale_sec)
@@ -5467,6 +5671,12 @@ def offline_loop():
                         continue
                     if node.get("offline_alerted"):
                         continue
+                    if node_push_miss_blocks_alert(node, current):
+                        continue
+                    if node_push_miss_exceeded(node, current):
+                        last_miss_alert = int(node.get("push_miss_alerted_at") or 0)
+                        if PUSH_MISS_ALERT_COOLDOWN > 0 and current - last_miss_alert < PUSH_MISS_ALERT_COOLDOWN:
+                            continue
                     confirm_sec = node_offline_confirm_sec(node)
                     pending_since = int(node.get("offline_pending_since") or 0)
                     if confirm_sec > 0:
@@ -5479,6 +5689,8 @@ def offline_loop():
                     node["offline_alerted"] = True
                     node["offline_confirmed"] = True
                     node["offline_since"] = pending_since or current
+                    if node_push_miss_exceeded(node, current):
+                        node["push_miss_alerted_at"] = current
                     node.pop("offline_pending_since", None)
                     node.pop("offline_guard_reason", None)
                     record_fall(node)
@@ -6540,6 +6752,85 @@ def handle_stats_bl(text=None):
     send_message(body, reply_markup=markup)
 
 
+def stats_toggle_queries(text):
+    parts = str(text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return []
+    raw = parts[1]
+    result = []
+    for line in raw.splitlines():
+        for item in re.split(r"\s*\|\s*", line):
+            item = clean_display_text(item)
+            if item:
+                result.append(item)
+    return result
+
+
+def handle_stats_monitoring(text, enabled):
+    queries = stats_toggle_queries(text)
+    command = "/stats_on" if enabled else "/stats_off"
+    if not queries:
+        send_message(
+            f"<b>Пример:</b> <code>{command} Германия</code>\n"
+            "Можно списком, каждая машина с новой строки."
+        )
+        return
+    changed = []
+    already = []
+    missing = []
+    ts = now_ts()
+    with LOCK:
+        nodes_state = STATS_OFF_STATE.setdefault("nodes", {})
+        for query in queries:
+            node = find_node(query)
+            if node is None:
+                missing.append(query)
+                continue
+            node_key = node_canonical_key(node)
+            node_name = node_display_name(node, node_key)
+            aliases = node_alias_keys(node)
+            if not node_key:
+                missing.append(query)
+                continue
+            if enabled:
+                removed = False
+                for key, item in list(nodes_state.items()):
+                    disabled_aliases = {canonical_node_key(key)}
+                    if isinstance(item, dict):
+                        disabled_aliases.update(canonical_node_key(value) for value in item.get("aliases") or [])
+                        disabled_aliases.add(canonical_node_key(item.get("name")))
+                    disabled_aliases.discard("")
+                    if aliases.intersection(disabled_aliases):
+                        nodes_state.pop(key, None)
+                        removed = True
+                if removed:
+                    changed.append(node_name)
+                else:
+                    already.append(node_name)
+            else:
+                item = {
+                    "name": node_name[:120],
+                    "aliases": sorted({alias for alias in aliases if alias}, key=natural_sort_key),
+                    "updated_at": ts,
+                }
+                if node_stats_disabled(node):
+                    already.append(node_name)
+                else:
+                    nodes_state[node_key] = item
+                    changed.append(node_name)
+        if changed:
+            save_stats_off_state()
+    title = "Стата включена" if enabled else "Стата выключена"
+    lines = [f"<b>{title}</b>", ALERT_SEPARATOR]
+    if changed:
+        lines += ["<b>Изменено:</b>", "<blockquote>" + "\n".join(html.escape(name) for name in changed) + "</blockquote>"]
+    if already:
+        lines += ["", "<b>Уже было так:</b>", "<blockquote>" + "\n".join(html.escape(name) for name in already) + "</blockquote>"]
+    if missing:
+        lines += ["", "<b>Не нашёл:</b>", "<blockquote>" + "\n".join(html.escape(name) for name in missing[:30]) + "</blockquote>"]
+    send_message("\n".join(lines))
+
+
 def set_pending_bl_group(chat_id, from_id, action, group_id=""):
     key = pending_key(chat_id, from_id)
     with LOCK:
@@ -7201,6 +7492,10 @@ def bot_loop():
                     send_message(aggregate_message("wl_full"))
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_bl":
                     handle_stats_bl(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_off":
+                    handle_stats_monitoring(text, enabled=False)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_on":
+                    handle_stats_monitoring(text, enabled=True)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statsrevoke":
                     handle_statsrevoke(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete":
@@ -7268,6 +7563,7 @@ def main():
     load_sni_state()
     load_node_name_state()
     load_bl_group_state()
+    load_stats_off_state()
     load_remna_node_state()
     load_update_state()
     load_ip_limit_state()

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v208"
+PUSH_BUILD="v209"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -598,7 +598,7 @@ apply_collector_push_interval() {
     command -v jq >/dev/null 2>&1 || return 0
     desired="$(printf '%s' "$response" | jq -r '.push_interval_sec // empty' 2>/dev/null || true)"
     [[ "$desired" =~ ^[0-9]+$ ]] || return 0
-    if (( desired < 5 || desired > 3600 )); then
+    if (( desired < 1 || desired > 3600 )); then
         return 0
     fi
     current="$(int_or_zero "${KTO_PUSH_INTERVAL:-0}")"
