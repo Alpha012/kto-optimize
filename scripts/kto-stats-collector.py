@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v219"
+COLLECTOR_BUILD = "v220"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1873,9 +1873,20 @@ def node_canonical_key(node):
     return canonical_node_key(node.get("name") or node.get("id") or "")
 
 
+def exact_bypass_record_key(value):
+    key = canonical_node_key(value)
+    if re.fullmatch(r"обход\d+", key or ""):
+        return f"bypass_{key}"
+    return ""
+
+
 def node_record_key(node):
     if not isinstance(node, dict):
         return canonical_node_key(node)
+    for field in ("name", "id", "hostname"):
+        key = exact_bypass_record_key(node.get(field))
+        if key:
+            return key
     for prefix, field in (("host", "hostname"), ("ip", "ip"), ("id", "id"), ("name", "name")):
         value = canonical_node_key(node.get(field))
         if value and value not in ("unknown", "localhost", "none", "null"):
