@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v209"
+COLLECTOR_BUILD = "v210"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -563,10 +563,12 @@ def load_node_name_state():
             if isinstance(item, str):
                 raw_name = item
                 raw_aliases = [key]
+                target = ""
                 updated_at = 0
             elif isinstance(item, dict):
                 raw_name = item.get("name")
                 raw_aliases = item.get("aliases") if isinstance(item.get("aliases"), list) else []
+                target = canonical_node_key(item.get("target") or "")
                 updated_at = int(item.get("updated_at") or 0)
             else:
                 continue
@@ -574,17 +576,21 @@ def load_node_name_state():
                 name = normalize_node_name(raw_name)
             except Exception:
                 continue
-            aliases = {canonical_node_key(key), canonical_node_key(name)}
+            name_key = canonical_node_key(name)
+            aliases = {canonical_node_key(key)}
             for alias in raw_aliases:
                 alias = canonical_node_key(alias)
-                if alias:
+                if alias and alias != name_key:
                     aliases.add(alias)
             aliases.discard("")
-            clean_nodes[key] = {
+            clean_item = {
                 "name": name,
                 "aliases": sorted(aliases, key=natural_sort_key),
                 "updated_at": updated_at,
             }
+            if target:
+                clean_item["target"] = target
+            clean_nodes[key] = clean_item
         clean_pending = pending if isinstance(pending, dict) else {}
         NODE_NAME_STATE = {"nodes": clean_nodes, "pending": clean_pending}
     except Exception:
@@ -1001,7 +1007,7 @@ def current_update_targets(scope="all"):
     for node in dedupe_nodes(NODES.values()):
         if not node_scope_matches(node, scope):
             continue
-        key = node_canonical_key(node)
+        key = node_record_key(node) or node_canonical_key(node)
         if key:
             targets[key] = node_display_name(node, key)[:120]
     return targets
@@ -1040,7 +1046,7 @@ def queue_update_task(requested_by, action="push_update", scope="all", targets=N
 
 
 def update_task_for_node(node):
-    node_key = node_canonical_key(node)
+    node_key = node_record_key(node) or node_canonical_key(node)
     if not node_key:
         return None
     with LOCK:
@@ -1066,7 +1072,7 @@ def process_update_result(raw, node, ts):
     result = clean_update_result(raw)
     if not result.get("id") or not result.get("status"):
         return
-    node_key = node_canonical_key(node)
+    node_key = node_record_key(node) or node_canonical_key(node)
     if not node_key:
         return
     result["node"] = node_display_name(node, node_key)[:120]
@@ -1819,6 +1825,16 @@ def canonical_node_key(value):
 
 def node_canonical_key(node):
     return canonical_node_key(node.get("name") or node.get("id") or "")
+
+
+def node_record_key(node):
+    if not isinstance(node, dict):
+        return canonical_node_key(node)
+    for prefix, field in (("host", "hostname"), ("ip", "ip"), ("id", "id"), ("name", "name")):
+        value = canonical_node_key(node.get(field))
+        if value and value not in ("unknown", "localhost", "none", "null"):
+            return f"{prefix}_{value}"
+    return ""
 
 
 def tg_call(method, data=None, timeout=25):
@@ -2801,7 +2817,7 @@ def downtime_totals(nodes, ts, filtered=False):
 def dedupe_nodes(values):
     deduped = {}
     for node in values:
-        key = node_canonical_key(node)
+        key = node_record_key(node) or node_canonical_key(node)
         current = deduped.get(key)
         if current is None or int(node.get("last_seen", 0) or 0) > int(current.get("last_seen", 0) or 0):
             deduped[key] = node
@@ -3422,6 +3438,9 @@ def detail_line(label, value):
 def node_base_aliases(node):
     aliases = set()
     if isinstance(node, dict):
+        record_key = canonical_node_key(node_record_key(node))
+        if record_key:
+            aliases.add(record_key)
         for key in ("id", "name", "hostname"):
             alias = canonical_node_key(node.get(key))
             if alias:
@@ -3437,8 +3456,15 @@ def node_name_override_for_node(node):
     aliases = node_base_aliases(node)
     if not aliases:
         return ""
+    target = canonical_node_key(node_record_key(node))
     with LOCK:
         nodes = NODE_NAME_STATE.setdefault("nodes", {})
+        if target:
+            for item in nodes.values():
+                if isinstance(item, dict) and canonical_node_key(item.get("target") or "") == target:
+                    name = clean_display_text(item.get("name") or "")
+                    if name:
+                        return name
         for key in aliases:
             item = nodes.get(key)
             if isinstance(item, dict):
@@ -3448,7 +3474,9 @@ def node_name_override_for_node(node):
         for item in nodes.values():
             if not isinstance(item, dict):
                 continue
+            name_key = canonical_node_key(item.get("name") or "")
             item_aliases = {canonical_node_key(value) for value in item.get("aliases") or []}
+            item_aliases.discard(name_key)
             if aliases.intersection(item_aliases):
                 name = clean_display_text(item.get("name") or "")
                 if name:
@@ -3467,21 +3495,38 @@ def node_display_ip(node):
     return str(node.get("ip") or "-")
 
 
-def find_node(query):
+def find_nodes(query):
     needle = canonical_node_key(query)
     if not needle:
-        return None
+        return []
+    matches = []
+    seen = set()
     with LOCK:
         for node in NODES.values():
             candidates = [
+                node_record_key(node),
                 node.get("id"),
                 node.get("name"),
                 node.get("hostname"),
+                node.get("ip"),
                 node_name_override_for_node(node),
             ]
             aliases = node_alias_keys(node)
-            if canonical_node_key(needle) in aliases or any(canonical_node_key(value) == needle for value in candidates):
-                return dict(node)
+            if needle in aliases or any(canonical_node_key(value) == needle for value in candidates):
+                item = dict(node)
+                key = node_record_key(item) or node_canonical_key(item)
+                if key and key in seen:
+                    continue
+                seen.add(key)
+                matches.append(item)
+    matches.sort(key=lambda node: int(node.get("last_seen", 0) or 0), reverse=True)
+    return matches
+
+
+def find_node(query):
+    matches = find_nodes(query)
+    if matches:
+        return matches[0]
     return None
 
 
@@ -3819,7 +3864,7 @@ def handle_pending_sni(chat_id, from_id, text):
 
 def set_pending_rename(chat_id, from_id, node):
     key = pending_key(chat_id, from_id)
-    node_key = node_canonical_key(node)
+    node_key = node_record_key(node) or node_canonical_key(node)
     with LOCK:
         NODE_NAME_STATE.setdefault("pending", {})[key] = {
             "action": "rename",
@@ -3895,44 +3940,32 @@ def rename_fall_counters(aliases, new_name):
 def set_node_name_override(node, new_name):
     new_name = normalize_node_name(new_name)
     old_aliases = node_base_aliases(node)
-    old_key = node_canonical_key(node)
+    old_key = node_record_key(node) or node_canonical_key(node)
     new_key = canonical_node_key(new_name)
     if not old_key or not new_key:
         raise ValueError("empty node key")
     aliases = set(old_aliases)
-    aliases.add(old_key)
-    aliases.add(new_key)
+    aliases.add(canonical_node_key(old_key))
+    aliases.discard(new_key)
     with LOCK:
         for key, item in list(NODE_NAME_STATE.setdefault("nodes", {}).items()):
             item_aliases = {canonical_node_key(value) for value in (item.get("aliases") or [])} if isinstance(item, dict) else {canonical_node_key(key)}
-            if aliases.intersection(item_aliases) or key in aliases:
+            if aliases.intersection(item_aliases) or canonical_node_key(key) in aliases or (isinstance(item, dict) and canonical_node_key(item.get("target") or "") == canonical_node_key(old_key)):
                 NODE_NAME_STATE["nodes"].pop(key, None)
         NODE_NAME_STATE.setdefault("nodes", {})[old_key] = {
             "name": new_name,
             "aliases": sorted(aliases, key=natural_sort_key),
+            "target": canonical_node_key(old_key),
             "updated_at": now_ts(),
         }
         save_node_name_state()
-
-        best_record = None
-        for existing_id, existing_node in list(NODES.items()):
-            existing_aliases = node_base_aliases(existing_node)
-            if existing_aliases.intersection(aliases):
-                if best_record is None or int(existing_node.get("last_seen", 0) or 0) >= int(best_record.get("last_seen", 0) or 0):
-                    best_record = dict(existing_node)
-                del NODES[existing_id]
-        if best_record is not None:
-            best_record["id"] = new_name
-            best_record["name"] = new_name
-            NODES[new_name] = best_record
-            save_nodes()
 
         for key, item in SNI_STATE.setdefault("nodes", {}).items():
             if isinstance(item, dict) and (canonical_node_key(key) in aliases or canonical_node_key(item.get("name")) in aliases):
                 item["name"] = new_name[:120]
         save_sni_state()
 
-        move_bl_group_nodes_on_rename(aliases, new_key, new_name)
+        move_bl_group_nodes_on_rename(aliases, old_key, new_name)
         rename_fall_counters(aliases, new_name)
     move_ip_limit_policy_on_rename(aliases, new_key, new_name)
     return new_name, old_key, new_key
@@ -3981,11 +4014,17 @@ def handle_pending_rename(chat_id, from_id, text):
         send_message("<b>Машина больше не найдена.</b>")
         return True
     old_aliases = node_base_aliases(node)
-    existing = find_node(new_name)
-    if existing is not None and not node_base_aliases(existing).intersection(old_aliases):
+    existing_matches = find_nodes(new_name)
+    target_key = node_record_key(node) or node_canonical_key(node)
+    busy = [item for item in existing_matches if (node_record_key(item) or node_canonical_key(item)) != target_key]
+    if busy:
+        examples = []
+        for item in busy[:5]:
+            examples.append(f"{node_display_name(item)} / {node_display_ip(item)}")
         send_message(
             "<b>Такое имя уже занято.</b>\n\n"
-            f"{detail_line('Название', new_name)}"
+            f"{detail_line('Название', new_name)}\n"
+            "<blockquote>" + "\n".join(html.escape(line) for line in examples) + "</blockquote>"
         )
         return True
     old_name = node_display_name(node)
@@ -5453,12 +5492,13 @@ def remna_node_loop():
 
 def update_node(payload, remote_ip=""):
     raw_id = clean_display_text(payload.get("id") or "")
-    node_name = clean_display_text(payload.get("name") or raw_id or payload.get("hostname") or "")
-    node_id = node_name or raw_id or clean_display_text(payload.get("hostname") or "")
-    override_name = node_name_override_for_node({"id": raw_id, "name": node_name, "hostname": payload.get("hostname")})
+    hostname_value = clean_display_text(payload.get("hostname") or "")
+    remote_ip_value = str(remote_ip or payload.get("ip") or "")
+    node_name = clean_display_text(payload.get("name") or raw_id or hostname_value or "")
+    node_id = raw_id or hostname_value or node_name
+    override_name = node_name_override_for_node({"id": raw_id, "name": node_name, "hostname": hostname_value, "ip": remote_ip_value})
     if override_name:
         node_name = override_name
-        node_id = override_name
     if not node_id:
         raise ValueError("id/name is required")
     current = now_ts()
@@ -5471,10 +5511,10 @@ def update_node(payload, remote_ip=""):
     record = {
         "id": node_id,
         "name": node_name or node_id,
-        "ip": str(remote_ip or payload.get("ip") or ""),
+        "ip": remote_ip_value,
         "uptime_sec": int(payload.get("uptime_sec") or 0),
         "iface": str(payload.get("iface") or ""),
-        "hostname": str(payload.get("hostname") or ""),
+        "hostname": hostname_value,
         "day_total": int(payload.get("day_total") or 0),
         "day_rx": int(payload.get("day_rx") or 0),
         "day_tx": int(payload.get("day_tx") or 0),
@@ -5503,7 +5543,13 @@ def update_node(payload, remote_ip=""):
         "offline_alerted": False,
     }
     with LOCK:
-        old = NODES.get(node_id, {})
+        record_key = node_record_key(record) or node_canonical_key(record) or node_id
+        old = NODES.get(record_key, {})
+        if not old:
+            for existing_id, existing_node in NODES.items():
+                if existing_id != record_key and (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key:
+                    old = existing_node
+                    break
         was_offline = bool(old.get("offline_alerted")) and bool(old.get("offline_confirmed", True))
         if node_stats_disabled(record):
             if was_offline:
@@ -5523,21 +5569,20 @@ def update_node(payload, remote_ip=""):
                 record["scan_alerted_at"] = current
                 scan_alert_node = dict(record)
                 scan_alert_delta = scan_delta
-        canonical = node_canonical_key(record)
         removed = []
         for existing_id, existing_node in list(NODES.items()):
-            if existing_id != node_id and node_canonical_key(existing_node) == canonical:
+            if existing_id != record_key and (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key:
                 del NODES[existing_id]
                 removed.append(existing_id)
-        NODES[node_id] = record
+        NODES[record_key] = record
         save_nodes()
     if removed:
-        log(f"removed duplicate node records for {node_id}: {', '.join(removed)}")
+        log(f"removed duplicate node records for {record_key}: {', '.join(removed)}")
     if was_offline:
-        log(f"node online: {node_id}")
-        alert_online(node_id, record)
+        log(f"node online: {record_key}")
+        alert_online(record_key, record)
     if scan_alert_node:
-        log(f"scan spike: {node_id} delta={scan_alert_delta}")
+        log(f"scan spike: {record_key} delta={scan_alert_delta}")
         alert_scan_spike(scan_alert_node, scan_alert_delta)
     process_update_result(payload.get("update_result"), record, current)
     process_ip_limit_events(payload.get("ip_limit_events"), record.get("name") or node_id, current)

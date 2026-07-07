@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v209"
+PUSH_BUILD="v210"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -1515,19 +1515,12 @@ apply_collector_node_name_config() {
     [[ -n "$desired" ]] || return 0
     desired="$(normalize_node_name_from_collector "$desired" 2>/dev/null || true)"
     [[ -n "$desired" ]] || return 0
-    [[ "$desired" != "$KTO_PUSH_NODE_NAME" || "$desired" != "${KTO_PUSH_NODE_ID:-}" ]] || return 0
+    [[ "$desired" != "$KTO_PUSH_NODE_NAME" ]] || return 0
     if [[ "$desired" != "$KTO_PUSH_NODE_NAME" ]]; then
         if set_push_config_value "KTO_PUSH_NODE_NAME" "$desired"; then
             changed=1
         else
             echo "push ${PUSH_BUILD}: node name config write failed" >&2
-        fi
-    fi
-    if [[ "$desired" != "${KTO_PUSH_NODE_ID:-}" ]]; then
-        if set_push_config_value "KTO_PUSH_NODE_ID" "$desired"; then
-            changed=1
-        else
-            echo "push ${PUSH_BUILD}: node id config write failed" >&2
         fi
     fi
     if (( changed == 1 )); then
