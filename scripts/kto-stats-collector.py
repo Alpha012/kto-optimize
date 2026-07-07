@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v216"
+COLLECTOR_BUILD = "v217"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -49,6 +49,7 @@ BOT_TOKEN = cfg.get("KTO_COLLECTOR_BOT_TOKEN", "")
 CHAT_ID = cfg.get("KTO_COLLECTOR_CHAT_ID", "")
 ALLOWED_USER_ID = str(cfg.get("KTO_COLLECTOR_ALLOWED_USER_ID", "646296998"))
 STATE_DIR = cfg.get("KTO_COLLECTOR_STATE_DIR", "/var/lib/kto-stats-collector")
+RICH_STATS_ENABLED = str(cfg.get("KTO_COLLECTOR_RICH_STATS_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 STALE_SEC = int(cfg.get("KTO_COLLECTOR_STALE_SEC", "60"))
 CHECK_INTERVAL = int(cfg.get("KTO_COLLECTOR_CHECK_INTERVAL", "30"))
 try:
@@ -3413,10 +3414,11 @@ def aggregate_wl_rich_message():
     return "".join(part for part in parts if part)
 
 
-def send_stats_wl():
-    rich_html = aggregate_wl_rich_message()
-    if send_rich_message(rich_html):
-        return
+def send_stats_wl(use_rich=False):
+    if use_rich or RICH_STATS_ENABLED:
+        rich_html = aggregate_wl_rich_message()
+        if send_rich_message(rich_html):
+            return
     send_message(aggregate_message("wl"))
 
 
@@ -3504,9 +3506,10 @@ def bl_group_stats_rich_message(group_id=None, ungrouped=False):
 
 def edit_or_send_bl_group_stats(chat_id, message_id, group_id=None, ungrouped=False):
     markup = bl_group_action_markup(group_id, ungrouped=ungrouped)
-    rich_html = bl_group_stats_rich_message(group_id, ungrouped=ungrouped)
-    if edit_rich_message_text(chat_id, message_id, rich_html, reply_markup=markup):
-        return
+    if RICH_STATS_ENABLED:
+        rich_html = bl_group_stats_rich_message(group_id, ungrouped=ungrouped)
+        if edit_rich_message_text(chat_id, message_id, rich_html, reply_markup=markup):
+            return
     body = bl_group_stats_message(group_id, ungrouped=ungrouped)
     if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
         send_message(body, reply_markup=markup)
@@ -7809,6 +7812,8 @@ def bot_loop():
                     send_message(aggregate_message())
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl":
                     send_stats_wl()
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl_table":
+                    send_stats_wl(use_rich=True)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl_full":
                     send_message(aggregate_message("wl_full"))
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_bl":
