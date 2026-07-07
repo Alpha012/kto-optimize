@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v217"
+COLLECTOR_BUILD = "v218"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3414,7 +3414,7 @@ def aggregate_wl_rich_message():
     return "".join(part for part in parts if part)
 
 
-def send_stats_wl(use_rich=False):
+def send_stats_wl(use_rich=True):
     if use_rich or RICH_STATS_ENABLED:
         rich_html = aggregate_wl_rich_message()
         if send_rich_message(rich_html):
