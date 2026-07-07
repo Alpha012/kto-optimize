@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v215"
+COLLECTOR_BUILD = "v216"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -7463,6 +7463,71 @@ def handle_top_ip(text):
     send_message(body)
 
 
+def push_debug_kind(node):
+    hidden = node_stats_disabled(node)
+    if node_is_wl(node):
+        kind = "WL exact" if node_is_exact_bypass(node) else "WL other"
+    else:
+        kind = "BL"
+    if hidden:
+        kind = f"{kind}, hidden"
+    return kind
+
+
+def push_debug_message(text):
+    parts = text.split(maxsplit=1)
+    query = canonical_node_key(parts[1]) if len(parts) > 1 and parts[1].strip() else ""
+    ts = now_ts()
+    with LOCK:
+        nodes = [dict(node) for node in dedupe_nodes(NODES.values())]
+        clean_active = clean_all_active_unlocked()
+    if query:
+        nodes = [
+            node for node in nodes
+            if query in {canonical_node_key(node.get("name")), canonical_node_key(node.get("id")), canonical_node_key(node.get("hostname")), canonical_node_key(node.get("ip"))}
+            or query in canonical_node_key(node.get("name"))
+        ]
+    nodes.sort(key=lambda node: int(node.get("last_seen") or 0), reverse=True)
+    visible = [node for node in nodes if not node_stats_disabled(node)]
+    hidden_count = len(nodes) - len(visible)
+    wl_exact = [node for node in visible if node_is_wl(node) and node_is_exact_bypass(node)]
+    wl_other = [node for node in visible if node_is_wl(node) and not node_is_exact_bypass(node)]
+    bl_nodes = [node for node in visible if not node_is_wl(node)]
+    lines = [
+        "<b>Push debug</b>",
+        ALERT_SEPARATOR,
+        detail_line("Clean all", "ACTIVE" if clean_active else "off"),
+        detail_line("Всего в collector", len(nodes)),
+        detail_line("WL exact", len(wl_exact)),
+        detail_line("WL other", len(wl_other)),
+        detail_line("BL", len(bl_nodes)),
+        detail_line("Hidden stats_off", hidden_count),
+    ]
+    if query:
+        lines.append(detail_line("Фильтр", parts[1].strip()))
+    if clean_active:
+        lines += ["", "<b>Внимание:</b> <code>/clean_all stop</code> сначала, иначе новые push будут гаситься."]
+    lines.append("")
+    if not nodes:
+        lines.append("<blockquote>Collector сейчас не видит таких push-записей.</blockquote>")
+        return "\n".join(lines)
+    rows = []
+    for node in nodes[:40]:
+        name = clean_display_text(node.get("name") or node.get("id") or node.get("hostname") or "-")
+        age = format_age(ts - int(node.get("last_seen") or 0)) if int(node.get("last_seen") or 0) > 0 else "-"
+        build = clean_display_text(node.get("push_build") or "-")
+        ip = clean_display_text(node.get("ip") or "-")
+        rows.append(f"{html.escape(name)} | {html.escape(push_debug_kind(node))} | {html.escape(age)} | {html.escape(build)} | {html.escape(ip)}")
+    if len(nodes) > 40:
+        rows.append(f"... ещё {len(nodes) - 40}")
+    lines.append("<blockquote>" + "\n".join(rows) + "</blockquote>")
+    return "\n".join(lines)
+
+
+def handle_push_debug(text):
+    send_message(push_debug_message(text))
+
+
 def handle_ip_limit(text):
     parts = text.split(maxsplit=1)
     query = parts[1].strip() if len(parts) > 1 else ""
@@ -7792,6 +7857,8 @@ def bot_loop():
                     handle_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/top_ip":
                     handle_top_ip(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/push_debug":
+                    handle_push_debug(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command in ("/ip_limit", "/limit_ip"):
                     handle_ip_limit(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_enable":
