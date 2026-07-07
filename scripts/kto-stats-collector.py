@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v218"
+COLLECTOR_BUILD = "v219"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -112,9 +112,9 @@ except Exception:
 if EXPECTED_NODES < 1:
     EXPECTED_NODES = 10
 try:
-    SCAN_ALERT_DELTA = int(cfg.get("KTO_COLLECTOR_SCAN_ALERT_DELTA", "50") or "50")
+    SCAN_ALERT_DELTA = int(cfg.get("KTO_COLLECTOR_SCAN_ALERT_DELTA", "0") or "0")
 except Exception:
-    SCAN_ALERT_DELTA = 50
+    SCAN_ALERT_DELTA = 0
 try:
     SCAN_ALERT_COOLDOWN = int(cfg.get("KTO_COLLECTOR_SCAN_ALERT_COOLDOWN", "600") or "600")
 except Exception:
