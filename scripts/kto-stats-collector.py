@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v223"
+COLLECTOR_BUILD = "v224"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1873,6 +1873,10 @@ def node_canonical_key(node):
     return canonical_node_key(node.get("name") or node.get("id") or "")
 
 
+def node_group_key(node):
+    return canonical_node_key(node_record_key(node) or node_canonical_key(node))
+
+
 def exact_bypass_record_key(value):
     key = canonical_node_key(value)
     if re.fullmatch(r"обход\d+", key or ""):
@@ -1886,6 +1890,15 @@ def human_name_record_key(node):
     name = canonical_node_key(node.get("name"))
     if not name or name in ("unknown", "localhost", "none", "null"):
         return ""
+    ip = canonical_node_key(node.get("ip"))
+    if ip:
+        return f"name_{name}_ip_{ip}"
+    host = canonical_node_key(node.get("hostname"))
+    if host and host not in ("unknown", "localhost", "none", "null") and host != name:
+        return f"name_{name}_host_{host}"
+    node_id = canonical_node_key(node.get("id"))
+    if node_id and node_id not in ("unknown", "localhost", "none", "null") and node_id != name:
+        return f"name_{name}_id_{node_id}"
     for field in ("hostname", "id"):
         other = canonical_node_key(node.get(field))
         if other and name == other:
@@ -3559,7 +3572,7 @@ def node_base_aliases(node):
         record_key = canonical_node_key(node_record_key(node))
         if record_key:
             aliases.add(record_key)
-        for key in ("id", "name", "hostname"):
+        for key in ("id", "name", "hostname", "ip"):
             alias = canonical_node_key(node.get(key))
             if alias:
                 aliases.add(alias)
@@ -4429,6 +4442,33 @@ def node_alias_keys(node):
     return aliases
 
 
+def node_identity_keys(node):
+    keys = set()
+    if not isinstance(node, dict):
+        key = canonical_node_key(node)
+        return {key} if key else set()
+    record_key = canonical_node_key(node_record_key(node) or "")
+    if record_key:
+        keys.add(record_key)
+    for field in ("ip", "hostname"):
+        key = canonical_node_key(node.get(field))
+        if key and key not in ("unknown", "localhost", "none", "null"):
+            keys.add(key)
+    node_id = canonical_node_key(node.get("id"))
+    node_name = canonical_node_key(node.get("name"))
+    if node_id and node_id != node_name:
+        keys.add(node_id)
+    return keys
+
+
+def node_same_identity(left, right):
+    left_keys = node_identity_keys(left)
+    right_keys = node_identity_keys(right)
+    if not left_keys or not right_keys:
+        return False
+    return bool(left_keys.intersection(right_keys))
+
+
 def node_stats_disabled(node):
     aliases = node_alias_keys(node)
     if not aliases:
@@ -4511,7 +4551,7 @@ def bl_group_nodes(group, nodes=None):
         node = lookup.get(canonical_node_key(key))
         if not node:
             continue
-        node_key = node_canonical_key(node)
+        node_key = node_group_key(node)
         if node_key in seen:
             continue
         seen.add(node_key)
@@ -4538,7 +4578,7 @@ def reorder_bl_group_nodes(group_id, ordered_nodes):
     for node in ordered_nodes:
         if not isinstance(node, dict):
             continue
-        key = node_canonical_key(node)
+        key = node_group_key(node)
         if not key:
             continue
         prepared.append((key, node_display_name(node, key)[:120], node_alias_keys(node)))
@@ -4662,7 +4702,7 @@ def add_nodes_to_bl_group(group_id, nodes):
     group_id = str(group_id or "").strip()
     prepared = []
     for node in nodes:
-        key = node_canonical_key(node)
+        key = node_group_key(node)
         if not key:
             continue
         prepared.append((key, node_display_name(node, key)[:120], node_alias_keys(node)))
@@ -5677,13 +5717,16 @@ def update_node(payload, remote_ip=""):
         old = NODES.get(record_key, {})
         if not old:
             for existing_id, existing_node in NODES.items():
-                if existing_id != record_key and (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key:
+                if existing_id != record_key and (
+                    (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key
+                    or node_same_identity(existing_node, record)
+                ):
                     old = existing_node
                     break
         removed = []
         if suppress_runtime_stats:
             for existing_id, existing_node in list(NODES.items()):
-                if existing_id == record_key or (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key:
+                if existing_id == record_key or (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key or node_same_identity(existing_node, record):
                     del NODES[existing_id]
                     removed.append(existing_id)
             if removed:
@@ -5710,7 +5753,10 @@ def update_node(payload, remote_ip=""):
                     scan_alert_node = dict(record)
                     scan_alert_delta = scan_delta
             for existing_id, existing_node in list(NODES.items()):
-                if existing_id != record_key and (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key:
+                if existing_id != record_key and (
+                    (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key
+                    or node_same_identity(existing_node, record)
+                ):
                     del NODES[existing_id]
                     removed.append(existing_id)
             NODES[record_key] = record
