@@ -18,7 +18,7 @@ import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v224"
+COLLECTOR_BUILD = "v225"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4450,14 +4450,13 @@ def node_identity_keys(node):
     record_key = canonical_node_key(node_record_key(node) or "")
     if record_key:
         keys.add(record_key)
-    for field in ("ip", "hostname"):
-        key = canonical_node_key(node.get(field))
-        if key and key not in ("unknown", "localhost", "none", "null"):
-            keys.add(key)
+    ip = canonical_node_key(node.get("ip"))
+    if ip and ip not in ("unknown", "localhost", "none", "null"):
+        keys.add(f"ip_{ip}")
     node_id = canonical_node_key(node.get("id"))
     node_name = canonical_node_key(node.get("name"))
-    if node_id and node_id != node_name:
-        keys.add(node_id)
+    if node_id and node_id != node_name and node_id not in ("unknown", "localhost", "none", "null"):
+        keys.add(f"id_{node_id}")
     return keys
 
 
