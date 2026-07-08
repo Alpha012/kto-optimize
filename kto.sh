@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v222"
+SCRIPT_BUILD="v223"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -368,6 +368,7 @@ parallel_run_tasks() {
     local -a pids=()
     local -a titles=()
     local -a logs=()
+    local -a failed_titles=()
 
     tmp_dir="$(mktemp -d)"
 
@@ -395,6 +396,7 @@ parallel_run_tasks() {
             rc=$?
             echo "[ERR] parallel: ${titles[$idx]} rc=${rc}" >> "$parent_log"
             failed=1
+            failed_titles+=("${titles[$idx]}")
         fi
     done
 
@@ -406,8 +408,18 @@ parallel_run_tasks() {
         } >> "$parent_log"
     done
 
+    if (( failed != 0 )); then
+        {
+            echo
+            echo "[WARN] parallel block finished with non-critical errors:"
+            for title in "${failed_titles[@]}"; do
+                echo " - ${title}"
+            done
+        } >> "$parent_log"
+    fi
+
     rm -rf "$tmp_dir"
-    return "$failed"
+    return 0
 }
 
 command_exists() {
@@ -1954,23 +1966,38 @@ EOF
 }
 
 opt_liquorix_kernel() {
+    local installed=0
+
     if [[ "$(uname -m)" == "x86_64" ]] && grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
         if liquorix_installed; then
             echo "Liquorix skipped: packages already installed" >> "$LOG_FILE"
             return 0
         fi
         if liquorix_source_configured; then
-            apt_update_quiet
+            if ! apt_update_quiet; then
+                warn "Liquorix: apt update не прошёл, kernel пропущен."
+                return 0
+            fi
         else
-            cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y
-            apt_update_force
+            if ! cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y; then
+                warn "Liquorix: не смог добавить PPA, kernel пропущен."
+                return 0
+            fi
+            if ! apt_update_force; then
+                warn "Liquorix: apt update после PPA не прошёл, kernel пропущен."
+                return 0
+            fi
         fi
         for _ in 1 2 3; do
             if apt_install_quiet linux-image-liquorix-amd64 linux-headers-liquorix-amd64; then
+                installed=1
                 break
             fi
             sleep 2
         done
+        if (( installed == 0 )); then
+            warn "Liquorix: пакеты kernel не поставились, продолжаю оптимизацию без падения."
+        fi
     else
         echo "Liquorix skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
     fi
