@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v221"
+SCRIPT_BUILD="v222"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -360,6 +360,54 @@ progress_step() {
 
     PROGRESS_CURRENT=$(( PROGRESS_CURRENT + 1 ))
     progress_line "$to" "$title" 'OK'
+}
+
+parallel_run_tasks() {
+    local parent_log="$LOG_FILE"
+    local tmp_dir idx title fn log pid rc failed=0
+    local -a pids=()
+    local -a titles=()
+    local -a logs=()
+
+    tmp_dir="$(mktemp -d)"
+
+    while (( $# >= 2 )); do
+        title="$1"
+        fn="$2"
+        shift 2
+        idx="${#pids[@]}"
+        log="${tmp_dir}/task-${idx}.log"
+        (
+            LOG_FILE="$log"
+            echo "===== parallel ${title} $(date -Is) =====" >> "$LOG_FILE"
+            "$fn"
+        ) &
+        pid="$!"
+        pids+=("$pid")
+        titles+=("$title")
+        logs+=("$log")
+    done
+
+    for idx in "${!pids[@]}"; do
+        if wait "${pids[$idx]}"; then
+            echo "[OK] parallel: ${titles[$idx]}" >> "$parent_log"
+        else
+            rc=$?
+            echo "[ERR] parallel: ${titles[$idx]} rc=${rc}" >> "$parent_log"
+            failed=1
+        fi
+    done
+
+    for idx in "${!logs[@]}"; do
+        {
+            echo
+            echo "===== parallel log: ${titles[$idx]} ====="
+            cat "${logs[$idx]}" 2>/dev/null || true
+        } >> "$parent_log"
+    done
+
+    rm -rf "$tmp_dir"
+    return "$failed"
 }
 
 command_exists() {
@@ -1611,6 +1659,20 @@ opt_install_packages() {
     apt_install_quiet "${packages[@]}"
 }
 
+optimization_fast_packages() {
+    {
+        optimization_packages
+        printf '%s\n' cron fail2ban util-linux kmod
+    } | awk 'NF && !seen[$0]++'
+}
+
+opt_install_fast_packages() {
+    local packages
+    mapfile -t packages < <(optimization_fast_packages)
+    apt_update_quiet
+    apt_install_quiet "${packages[@]}"
+}
+
 backup_resolv_conf() {
     if "${SUDO[@]}" test -e /etc/resolv.conf 2>/dev/null && ! "${SUDO[@]}" test -e /etc/resolv.conf.kto-backup 2>/dev/null; then
         cmd "${SUDO[@]}" cp -a /etc/resolv.conf /etc/resolv.conf.kto-backup || true
@@ -1912,6 +1974,13 @@ opt_liquorix_kernel() {
     else
         echo "Liquorix skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
     fi
+}
+
+opt_kernel_network_memory_parallel() {
+    parallel_run_tasks \
+        "kernel" opt_liquorix_kernel \
+        "network limits" opt_network_limits \
+        "memory guard" opt_memory_guard
 }
 
 opt_network_limits() {
@@ -2903,13 +2972,11 @@ optimize_system() {
     export NEEDRESTART_MODE=a
     export NEEDRESTART_SUSPEND=1
 
-    progress_start 9
+    progress_start 7
     progress_step "Готовлю систему" opt_prepare_system
-    progress_step "Ставлю пакеты" opt_install_packages
+    progress_step "Ставлю базовые пакеты" opt_install_fast_packages
+    progress_step "Kernel, сеть и память" opt_kernel_network_memory_parallel
     progress_step "Настраиваю хранение" opt_storage_guard
-    progress_step "Обновляю kernel" opt_liquorix_kernel
-    progress_step "Настраиваю сеть" opt_network_limits
-    progress_step "Настраиваю память" opt_memory_guard
     progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
     progress_step "Подключаю AntiScanner" opt_antiscanner
     progress_step "Настраиваю Fail2ban" opt_fail2ban
