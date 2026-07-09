@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v226"
+SCRIPT_BUILD="v227"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3383,10 +3383,30 @@ install_speedtest() {
 speedtest_ru() {
     header
     need_root
+    local bench_script
     stage "Запускаю Speedtest (RU)"
-    apt_install_with_update_if_missing wget
-    echo "running: wget -qO- bench.gig.ovh | bash" >> "$LOG_FILE"
-    bash -c 'wget -qO- bench.gig.ovh | bash'
+    apt_install_with_update_if_missing wget ca-certificates perl
+
+    bench_script="$(mktemp)"
+    cleanup_speedtest_ru() {
+        trap - RETURN
+        rm -f "$bench_script"
+    }
+    trap cleanup_speedtest_ru RETURN
+
+    must "Скачивание bench.gig.ovh" wget -qO "$bench_script" bench.gig.ovh
+    if ! grep -q "run_iperf3_test" "$bench_script" || ! grep -q "Server unreachable" "$bench_script"; then
+        fail "bench.gig.ovh вернул неожиданный скрипт"
+        return 1
+    fi
+
+    perl -0pi -e '
+        s/# Check if command exists\n_exists\(\) \{\n    command -v "\$1" >\/dev\/null 2>&1\n\}/# Check if command exists\n_exists() {\n    command -v "\$1" >\/dev\/null 2>\&1\n}\n\nkto_reachable() {\n    local server="\$1"\n    local port="\$2"\n    ping -c 1 -W 2 "\$server" >\/dev\/null 2>\&1 \&\& return 0\n    timeout 3 bash -c "cat < \/dev\/null > \/dev\/tcp\/\$server\/\$port" >\/dev\/null 2>\&1\n}/;
+        s/if ! ping -c 1 -W 2 "\$server" >\/dev\/null 2>&1; then/if ! kto_reachable "\$server" "\$port"; then/;
+    ' "$bench_script"
+
+    echo "running: wget -qO- bench.gig.ovh | bash (patched: ping or tcp iperf port)" >> "$LOG_FILE"
+    bash "$bench_script"
 }
 
 ipcheck_place() {
