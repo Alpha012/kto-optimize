@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v228"
+SCRIPT_BUILD="v229"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3407,12 +3407,28 @@ install_speedtest() {
     fi
 }
 
+ensure_speedtest_ru_tools() {
+    apt_install_with_update_if_missing wget ca-certificates perl iperf3
+    if [[ -x /usr/bin/iperf3 ]] && timeout --foreground 5s /usr/bin/iperf3 --version >> "$LOG_FILE" 2>&1; then
+        export PATH="/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin:${PATH}"
+        return 0
+    fi
+    if command_exists iperf3 && timeout --foreground 5s iperf3 --version >> "$LOG_FILE" 2>&1; then
+        return 0
+    fi
+    fail "iperf3 не установлен или не запускается"
+    return 1
+}
+
 speedtest_ru() {
     header
     need_root
-    local bench_script
+    local bench_script bench_mode
+    local -a bench_args=()
+    bench_mode="${1:-${KTO_SPEEDTEST_RU_MODE:-single}}"
+
     stage "Запускаю Speedtest (RU)"
-    apt_install_with_update_if_missing wget ca-certificates perl
+    ensure_speedtest_ru_tools
 
     bench_script="$(mktemp)"
     cleanup_speedtest_ru() {
@@ -3432,8 +3448,24 @@ speedtest_ru() {
         s/if ! ping -c 1 -W 2 "\$server" >\/dev\/null 2>&1; then/if ! kto_reachable "\$server" "\$port"; then/;
     ' "$bench_script"
 
-    echo "running: wget -qO- bench.gig.ovh | bash (patched: ping or tcp iperf port)" >> "$LOG_FILE"
-    bash "$bench_script"
+    case "$bench_mode" in
+        ""|single|--single|-s)
+            bench_args=(--single)
+            ;;
+        multi|--multi|-m)
+            bench_args=(--multi)
+            ;;
+        all|--all|-a)
+            bench_args=(--all)
+            ;;
+        *)
+            warn "Неизвестный режим speedtest-ru '${bench_mode}', использую single."
+            bench_args=(--single)
+            ;;
+    esac
+
+    echo "running: wget -qO- bench.gig.ovh | bash -s -- ${bench_args[*]} (patched: ping or tcp iperf port, prefer system iperf3)" >> "$LOG_FILE"
+    env PATH="/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin:${PATH}" bash "$bench_script" "${bench_args[@]}"
 }
 
 ipcheck_place() {
@@ -5080,7 +5112,7 @@ main() {
         warp) install_warp_native ;;
         status) show_status ;;
         speedtest) install_speedtest "${2:-}" ;;
-        speedtest-ru|speedtestru|bench-ru|benchru) speedtest_ru ;;
+        speedtest-ru|speedtestru|bench-ru|benchru) speedtest_ru "${2:-}" ;;
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
         ssl) issue_ssl_certificate ;;
