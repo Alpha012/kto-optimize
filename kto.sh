@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v225"
+SCRIPT_BUILD="v226"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3385,8 +3385,8 @@ speedtest_ru() {
     need_root
     stage "Запускаю Speedtest (RU)"
     apt_install_with_update_if_missing wget
-    echo "running: wget -qO- bench.tlab.pw | bash" >> "$LOG_FILE"
-    bash -c 'wget -qO- bench.tlab.pw | bash'
+    echo "running: wget -qO- bench.gig.ovh | bash" >> "$LOG_FILE"
+    bash -c 'wget -qO- bench.gig.ovh | bash'
 }
 
 ipcheck_place() {
