@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v227"
+SCRIPT_BUILD="v228"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -1966,41 +1966,67 @@ EOF
 }
 
 opt_liquorix_kernel() {
-    local installed=0
+    local attempt installed=0
 
-    if [[ "$(uname -m)" == "x86_64" ]] && grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
-        if liquorix_installed; then
-            echo "Liquorix skipped: packages already installed" >> "$LOG_FILE"
-            return 0
-        fi
-        if liquorix_source_configured; then
-            if ! apt_update_quiet; then
-                warn "Liquorix: apt update не прошёл, kernel пропущен."
-                return 0
-            fi
-        else
-            if ! cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y; then
-                warn "Liquorix: не смог добавить PPA, kernel пропущен."
-                return 0
-            fi
-            if ! apt_update_force; then
-                warn "Liquorix: apt update после PPA не прошёл, kernel пропущен."
-                return 0
-            fi
-        fi
-        for _ in 1 2 3; do
-            if apt_install_quiet linux-image-liquorix-amd64 linux-headers-liquorix-amd64; then
-                installed=1
-                break
-            fi
-            sleep 2
-        done
-        if (( installed == 0 )); then
-            warn "Liquorix: пакеты kernel не поставились, продолжаю оптимизацию без падения."
-        fi
-    else
+    if [[ "$(uname -m)" != "x86_64" ]] || ! grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
         echo "Liquorix skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
+        return 0
     fi
+
+    if liquorix_installed; then
+        echo "Liquorix skipped: packages already installed" >> "$LOG_FILE"
+        return 0
+    fi
+
+    if liquorix_source_configured; then
+        apt_update_quiet || echo "Liquorix apt update failed, trying current apt cache" >> "$LOG_FILE"
+    else
+        if ! cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y; then
+            warn "Liquorix: не смог добавить PPA."
+            return 1
+        fi
+        if ! apt_update_force; then
+            warn "Liquorix: apt update после PPA не прошёл."
+            return 1
+        fi
+    fi
+
+    for attempt in 1 2 3 4; do
+        if (( attempt > 1 )); then
+            echo "Liquorix install retry ${attempt}" >> "$LOG_FILE"
+            cmd "${SUDO[@]}" dpkg --configure -a || true
+            apt_update_force || true
+        fi
+        if apt_install_quiet linux-image-liquorix-amd64 linux-headers-liquorix-amd64 && liquorix_installed; then
+            installed=1
+            break
+        fi
+        sleep $(( attempt * 2 ))
+    done
+
+    if (( installed == 0 )); then
+        warn "Liquorix: пакеты kernel не поставились после повторов."
+        return 1
+    fi
+
+    return 0
+}
+
+opt_kernel_final_check() {
+    if [[ "$(uname -m)" != "x86_64" ]] || ! grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
+        return 0
+    fi
+    if liquorix_installed; then
+        echo "Liquorix final check: packages installed" >> "$LOG_FILE"
+        return 0
+    fi
+    warn "Liquorix: не установлен после первого этапа, повторяю отдельно."
+    if opt_liquorix_kernel && liquorix_installed; then
+        ok "Liquorix kernel установлен. После оптимизации нужен reboot."
+        return 0
+    fi
+    warn "Liquorix kernel не удалось установить. Остальная оптимизация продолжена; смотри лог: $LOG_FILE"
+    return 0
 }
 
 opt_kernel_network_memory_parallel() {
@@ -2999,10 +3025,11 @@ optimize_system() {
     export NEEDRESTART_MODE=a
     export NEEDRESTART_SUSPEND=1
 
-    progress_start 7
+    progress_start 8
     progress_step "Готовлю систему" opt_prepare_system
     progress_step "Ставлю базовые пакеты" opt_install_fast_packages
     progress_step "Kernel, сеть и память" opt_kernel_network_memory_parallel
+    progress_step "Проверяю kernel" opt_kernel_final_check
     progress_step "Настраиваю хранение" opt_storage_guard
     progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
     progress_step "Подключаю AntiScanner" opt_antiscanner
