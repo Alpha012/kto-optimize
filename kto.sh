@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v229"
+SCRIPT_BUILD="v230"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
@@ -3468,6 +3468,300 @@ speedtest_ru() {
     env PATH="/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin:${PATH}" bash "$bench_script" "${bench_args[@]}"
 }
 
+NETTEST_DNS_BAD=0
+NETTEST_HTTPS_BAD=0
+NETTEST_RAW_OK=0
+NETTEST_RAW_BAD=0
+NETTEST_PING_BAD=0
+NETTEST_WARN=0
+
+network_test_badge() {
+    case "$1" in
+        ok) printf '%bOK%b' "$GREEN" "$NC" ;;
+        warn) printf '%bWARN%b' "$YELLOW" "$NC" ;;
+        fail) printf '%bFAIL%b' "$RED" "$NC" ;;
+        skip) printf '%bSKIP%b' "$DIM" "$NC" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+network_test_row() {
+    local name="$1"
+    local value="$2"
+    local status="${3:-}"
+    if [[ -n "$status" ]]; then
+        printf " %-22s %b %b\n" "$name" "$value" "$(network_test_badge "$status")"
+    else
+        printf " %-22s %b\n" "$name" "$value"
+    fi
+}
+
+network_test_short() {
+    local text="$1"
+    text="${text//$'\r'/ }"
+    text="${text//$'\n'/ }"
+    text="$(sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//' <<< "$text")"
+    printf '%.160s' "$text"
+}
+
+network_test_resolve() {
+    local host="$1"
+    local ips status
+    ips="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd ' ' - || true)"
+    if [[ -n "$ips" ]]; then
+        status="ok"
+    else
+        status="fail"
+        (( NETTEST_DNS_BAD += 1 ))
+        ips="не резолвится"
+    fi
+    network_test_row "DNS ${host}" "$ips" "$status"
+}
+
+network_test_tcp() {
+    local host="$1"
+    local port="${2:-443}"
+    local timeout_sec="${3:-4}"
+    if command_exists timeout; then
+        timeout --foreground "${timeout_sec}s" bash -c 'cat </dev/null >/dev/tcp/"$1"/"$2"' _ "$host" "$port" >/dev/null 2>&1
+    else
+        bash -c 'cat </dev/null >/dev/tcp/"$1"/"$2"' _ "$host" "$port" >/dev/null 2>&1
+    fi
+}
+
+network_test_https() {
+    local label="$1"
+    local url="$2"
+    local output rc status
+    if ! command_exists curl; then
+        network_test_row "$label" "curl не найден" "skip"
+        (( NETTEST_WARN += 1 ))
+        return 0
+    fi
+
+    if output="$(curl -4 -sS -o /dev/null \
+        -w 'http=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s ip=%{remote_ip}' \
+        --connect-timeout 4 -m 10 "$url" 2>&1)"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    output="$(network_test_short "$output")"
+    if (( rc == 0 )); then
+        status="ok"
+    else
+        status="fail"
+        (( NETTEST_HTTPS_BAD += 1 ))
+        output="rc=${rc} ${output}"
+    fi
+    network_test_row "$label" "$output" "$status"
+}
+
+network_test_raw_ip() {
+    local ip="$1"
+    local output rc status tcp_status
+    if network_test_tcp "$ip" 443 4; then
+        tcp_status="tcp=ok"
+    else
+        tcp_status="tcp=fail"
+    fi
+
+    if ! command_exists curl; then
+        network_test_row "raw ${ip}" "${tcp_status}; curl не найден" "skip"
+        (( NETTEST_WARN += 1 ))
+        return 0
+    fi
+
+    if output="$(curl -4 -sS -o /dev/null \
+        -w 'http=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s' \
+        --resolve "raw.githubusercontent.com:443:${ip}" \
+        --connect-timeout 4 -m 10 https://raw.githubusercontent.com/ 2>&1)"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    output="$(network_test_short "$output")"
+    if (( rc == 0 )); then
+        status="ok"
+        (( NETTEST_RAW_OK += 1 ))
+    else
+        status="fail"
+        (( NETTEST_RAW_BAD += 1 ))
+        output="rc=${rc} ${output}"
+    fi
+    network_test_row "raw ${ip}" "${tcp_status}; ${output}" "$status"
+}
+
+network_test_ping() {
+    local target="$1"
+    local label="${2:-$1}"
+    local tmp loss rtt status
+    if ! command_exists ping; then
+        network_test_row "ping ${label}" "ping не найден" "skip"
+        (( NETTEST_WARN += 1 ))
+        return 0
+    fi
+
+    tmp="$(mktemp)"
+    if ping -c 4 -W 2 "$target" > "$tmp" 2>&1; then
+        status="ok"
+    else
+        status="warn"
+        (( NETTEST_PING_BAD += 1 ))
+    fi
+    loss="$(awk -F',' '/packet loss/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3); print $3; exit}' "$tmp" 2>/dev/null || true)"
+    rtt="$(awk -F'/' '/^(rtt|round-trip)/ {print $5 " ms"; exit}' "$tmp" 2>/dev/null || true)"
+    rm -f "$tmp"
+    network_test_row "ping ${label}" "loss=${loss:-?}${rtt:+ avg=${rtt}}" "$status"
+}
+
+network_test_mtr() {
+    local target="$1"
+    local label="${2:-$1}"
+    local out
+    if ! command_exists mtr; then
+        network_test_row "mtr ${label}" "mtr не установлен" "skip"
+        return 0
+    fi
+    out="$(mtr -4 -T -P 443 -c 5 -r "$target" 2>/dev/null | tail -n 4 | sed 's/^[[:space:]]*//' | paste -sd ' | ' - || true)"
+    network_test_row "mtr ${label}" "$(network_test_short "${out:-нет вывода}")"
+}
+
+network_test_extra_target() {
+    local target="$1"
+    [[ -n "$target" ]] || return 0
+    echo
+    echo -e "${BOLD}${PURPLE}[ TARGET: ${target} ]${NC}"
+
+    if [[ "$target" =~ ^https?:// ]]; then
+        network_test_https "$target" "$target"
+        return 0
+    fi
+
+    if [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if network_test_tcp "$target" 443 4; then
+            network_test_row "tcp ${target}:443" "порт открыт" "ok"
+        else
+            network_test_row "tcp ${target}:443" "нет соединения" "fail"
+            (( NETTEST_HTTPS_BAD += 1 ))
+        fi
+        network_test_ping "$target" "$target"
+        return 0
+    fi
+
+    network_test_resolve "$target"
+    network_test_https "https ${target}" "https://${target}/"
+    network_test_mtr "$target" "$target"
+}
+
+network_test() {
+    header
+    local iface route_line default_route src_ip mtu dns_line host gateway ip target
+    local -a raw_ips default_hosts extra_targets
+    extra_targets=("$@")
+    raw_ips=(185.199.108.133 185.199.109.133 185.199.110.133 185.199.111.133)
+    default_hosts=(raw.githubusercontent.com github.com api.github.com)
+
+    NETTEST_DNS_BAD=0
+    NETTEST_HTTPS_BAD=0
+    NETTEST_RAW_OK=0
+    NETTEST_RAW_BAD=0
+    NETTEST_PING_BAD=0
+    NETTEST_WARN=0
+
+    echo -e "${BOLD}${PURPLE}[ СЕТЬ ]${NC}"
+    route_line="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
+    iface="$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$route_line")"
+    src_ip="$(awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' <<< "$route_line")"
+    gateway="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}' || true)"
+    default_route="$(ip -4 route show default 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$iface" ]]; then
+        mtu="$(ip -o link show dev "$iface" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="mtu") {print $(i+1); exit}}' || true)"
+    else
+        mtu=""
+    fi
+    network_test_row "interface" "${iface:--}${src_ip:+ src=${src_ip}}${mtu:+ mtu=${mtu}}"
+    network_test_row "default route" "${default_route:--}"
+
+    if command_exists resolvectl; then
+        dns_line="$(resolvectl dns 2>/dev/null | sed -E 's/^[[:space:]]+//' | paste -sd '; ' - || true)"
+    else
+        dns_line="$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ' ' - || true)"
+    fi
+    network_test_row "dns servers" "${dns_line:--}"
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ DNS ]${NC}"
+    for host in "${default_hosts[@]}"; do
+        network_test_resolve "$host"
+    done
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ HTTPS ]${NC}"
+    network_test_https "raw" "https://raw.githubusercontent.com/"
+    network_test_https "github" "https://github.com/"
+    network_test_https "api.github" "https://api.github.com/"
+    network_test_https "cloudflare" "https://1.1.1.1/cdn-cgi/trace"
+    network_test_https "google dns" "https://8.8.8.8/"
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ RAW GITHUB IP ]${NC}"
+    for ip in "${raw_ips[@]}"; do
+        network_test_raw_ip "$ip"
+    done
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ LOSS ]${NC}"
+    [[ -n "$gateway" ]] && network_test_ping "$gateway" "gateway"
+    network_test_ping "1.1.1.1" "1.1.1.1"
+    network_test_ping "8.8.8.8" "8.8.8.8"
+    network_test_mtr "raw.githubusercontent.com" "raw"
+
+    for target in "${extra_targets[@]}"; do
+        network_test_extra_target "$target"
+    done
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ИТОГ ]${NC}"
+    if (( NETTEST_DNS_BAD > 0 )); then
+        network_test_row "DNS" "есть проблемы резолва (${NETTEST_DNS_BAD})" "fail"
+    else
+        network_test_row "DNS" "резолвится" "ok"
+    fi
+
+    if (( NETTEST_RAW_BAD > 0 && NETTEST_RAW_OK > 0 )); then
+        network_test_row "raw GitHub" "часть IP живая, часть тупит: похоже на маршрут/Fastly" "warn"
+    elif (( NETTEST_RAW_BAD > 0 )); then
+        network_test_row "raw GitHub" "все raw IP плохие" "fail"
+    else
+        network_test_row "raw GitHub" "все raw IP отвечают" "ok"
+    fi
+
+    if (( NETTEST_HTTPS_BAD > 0 )); then
+        network_test_row "HTTPS" "есть таймауты/ошибки (${NETTEST_HTTPS_BAD})" "fail"
+    else
+        network_test_row "HTTPS" "базовые цели открываются" "ok"
+    fi
+
+    if (( NETTEST_PING_BAD > 0 )); then
+        network_test_row "ICMP" "есть потери/таймауты, но ICMP у провайдера может резаться" "warn"
+    else
+        network_test_row "ICMP" "без явных потерь" "ok"
+    fi
+
+    if (( NETTEST_DNS_BAD > 0 || NETTEST_HTTPS_BAD > 0 || NETTEST_RAW_BAD > 0 )); then
+        echo
+        warn "Если github/api живые, а raw IP выборочно таймаутятся - это обычно маршрут провайдера до Fastly/GitHub, а не Ubuntu."
+        warn "Для временного костыля можно прибить raw.githubusercontent.com к рабочему IP из блока RAW GITHUB IP."
+        return 1
+    fi
+
+    echo
+    ok "Сеть выглядит нормально по базовым проверкам."
+}
+
 ipcheck_place() {
     header
     stage "Проверяю IP.Check.Place"
@@ -5014,6 +5308,8 @@ menu() {
 
     labels+=("Панель состояния")
     actions+=("status")
+    labels+=("Тест сети")
+    actions+=("network-test")
     if [[ "$MACHINE_MODE" == "panel" ]]; then
         labels+=("Коллектор статистики")
         actions+=("stats-collector")
@@ -5074,6 +5370,7 @@ menu() {
         selfsteal) install_selfsteal ;;
         warp) install_warp_native ;;
         status) show_status ;;
+        network-test) network_test ;;
         stats-collector) install_stats_collector ;;
         stats-collector-status) stats_collector_status ;;
         stats-push-delete) stats_push_delete_all ;;
@@ -5111,6 +5408,7 @@ main() {
         selfsteal) install_selfsteal ;;
         warp) install_warp_native ;;
         status) show_status ;;
+        network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" ;;
         speedtest) install_speedtest "${2:-}" ;;
         speedtest-ru|speedtestru|bench-ru|benchru) speedtest_ru "${2:-}" ;;
         ipcheck-place) ipcheck_place ;;
