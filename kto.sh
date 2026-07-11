@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v235"
+SCRIPT_BUILD="v236"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 83.228.242.53 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
@@ -3972,10 +3972,33 @@ extract_haproxy_allowed_sni() {
     ' /etc/haproxy/haproxy.cfg 2>/dev/null || true
 }
 
+recommended_haproxy_maxconn() {
+    local override="${KTO_HAPROXY_MAXCONN:-}"
+    local total_mb maxconn
+
+    if [[ "$override" =~ ^[0-9]+$ ]]; then
+        maxconn=$(( 10#$override ))
+        if (( maxconn >= 1000 && maxconn <= 500000 )); then
+            echo "$maxconn"
+            return 0
+        fi
+    fi
+
+    total_mb="$(memory_total_mb)"
+    [[ "$total_mb" =~ ^[0-9]+$ ]] || total_mb=0
+    (( total_mb > 0 )) || total_mb=2048
+
+    # Two proxy-side sockets and HAProxy buffers make RAM the real connection limit.
+    maxconn=$(( total_mb * 16 ))
+    (( maxconn < 10000 )) && maxconn=10000
+    (( maxconn > 500000 )) && maxconn=500000
+    echo "$maxconn"
+}
+
 apply_haproxy_config() {
     local backend_target="$1"
     local allowed_sni="$2"
-    local haproxy_threads
+    local haproxy_threads haproxy_maxconn
 
     backend_target="$(normalize_haproxy_target "$backend_target")" || {
         fail "Некорректный HAProxy target. Пример: 1.2.3.4 или 1.2.3.4:8443"
@@ -3983,17 +4006,16 @@ apply_haproxy_config() {
     }
 
     haproxy_threads="$(cpu_count)"
-    (( haproxy_threads > 32 )) && haproxy_threads=32
+    (( haproxy_threads > 64 )) && haproxy_threads=64
+    haproxy_maxconn="$(recommended_haproxy_maxconn)"
 
     stage "Настраиваю HAProxy"
     write_root_file /etc/haproxy/haproxy.cfg <<EOF
 global
-    maxconn 200000
+    maxconn ${haproxy_maxconn}
     nbthread ${haproxy_threads}
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
     tune.ssl.default-dh-param 2048
-    tune.maxaccept 10000
-    tune.bufsize 65536
 
 defaults
     log global
@@ -4048,6 +4070,13 @@ backend vless_pool
     server xray1 ${backend_target} check weight 10
 EOF
 
+    cmd "${SUDO[@]}" mkdir -p /etc/systemd/system/haproxy.service.d
+    write_root_file /etc/systemd/system/haproxy.service.d/99-kto-capacity.conf <<'EOF'
+[Service]
+LimitNOFILE=1048576
+EOF
+    cmd "${SUDO[@]}" systemctl daemon-reload
+
     if ! "${SUDO[@]}" haproxy -c -f /etc/haproxy/haproxy.cfg >> "$LOG_FILE" 2>&1; then
         fail "Проверка HAProxy config"
         tail -n 25 "$LOG_FILE" >&2 || true
@@ -4059,6 +4088,7 @@ EOF
 
     ok "HAProxy установлен: 443 -> ${backend_target}"
     ok "Разрешенный SNI: ${allowed_sni}"
+    ok "HAProxy capacity: maxconn=${haproxy_maxconn}, threads=${haproxy_threads}"
 }
 
 ensure_haproxy_package() {
