@@ -20,11 +20,13 @@ else
     exit 1
 fi
 
-"${PYTHON_CMD[@]}" - <<'PY'
+PYTHONDONTWRITEBYTECODE=1 "${PYTHON_CMD[@]}" - <<'PY'
 from pathlib import Path
 
 path = Path("scripts/kto-stats-collector.py")
 compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
+
+PYTHONDONTWRITEBYTECODE=1 "${PYTHON_CMD[@]}" -m unittest discover -s tests -p 'test_*.py'
 
 echo "checks ok"

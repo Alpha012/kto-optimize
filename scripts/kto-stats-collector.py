@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import html
 import hashlib
+import hmac
 import json
 import os
+import queue
 import re
 import shlex
 import socket
@@ -15,10 +17,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v230"
+COLLECTOR_BUILD = "v231"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -33,7 +36,13 @@ def load_config(path):
                 key, value = line.split("=", 1)
                 value = value.strip()
                 if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
-                    value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+                    value = (
+                        value[1:-1]
+                        .replace('\\"', '"')
+                        .replace("\\$", "$")
+                        .replace("\\`", "`")
+                        .replace("\\\\", "\\")
+                    )
                 data[key.strip()] = value
     except FileNotFoundError:
         pass
@@ -42,6 +51,7 @@ def load_config(path):
 
 cfg = load_config(CONFIG)
 RAW_BASE = cfg.get("KTO_RAW_BASE", "https://raw.githubusercontent.com/Alpha012/kto-optimize/main").rstrip("/")
+ALLOW_INSECURE_UPDATE_URL = str(cfg.get("KTO_ALLOW_INSECURE_UPDATE_URL", "0")).lower() in ("1", "yes", "true", "on", "enabled")
 LISTEN_HOST = cfg.get("KTO_COLLECTOR_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(cfg.get("KTO_COLLECTOR_LISTEN_PORT", "1337"))
 SECRET = cfg.get("KTO_COLLECTOR_SECRET", "")
@@ -52,6 +62,16 @@ STATE_DIR = cfg.get("KTO_COLLECTOR_STATE_DIR", "/var/lib/kto-stats-collector")
 RICH_STATS_ENABLED = str(cfg.get("KTO_COLLECTOR_RICH_STATS_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 STALE_SEC = int(cfg.get("KTO_COLLECTOR_STALE_SEC", "60"))
 CHECK_INTERVAL = int(cfg.get("KTO_COLLECTOR_CHECK_INTERVAL", "30"))
+try:
+    AUTH_MAX_SKEW_SEC = int(cfg.get("KTO_COLLECTOR_AUTH_MAX_SKEW_SEC", "300") or "300")
+except Exception:
+    AUTH_MAX_SKEW_SEC = 300
+AUTH_MAX_SKEW_SEC = max(30, min(AUTH_MAX_SKEW_SEC, 3600))
+try:
+    NODES_FLUSH_SEC = float(cfg.get("KTO_COLLECTOR_NODES_FLUSH_SEC", "5") or "5")
+except Exception:
+    NODES_FLUSH_SEC = 5.0
+NODES_FLUSH_SEC = max(1.0, min(NODES_FLUSH_SEC, 60.0))
 try:
     BL_STALE_SEC = int(cfg.get("KTO_COLLECTOR_BL_STALE_SEC", "15") or "15")
 except Exception:
@@ -174,6 +194,7 @@ if IP_LIMIT_ALERT_TOP < 1:
 if IP_LIMIT_ALERT_TOP > 100:
     IP_LIMIT_ALERT_TOP = 100
 IP_LIMIT_ENFORCE_ENABLED = str(cfg.get("KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED", "0")).lower() in ("1", "yes", "true", "on", "enabled")
+IP_LIMIT_DROP_ENABLED = str(cfg.get("KTO_COLLECTOR_IP_LIMIT_DROP_ENABLED", "0")).lower() in ("1", "yes", "true", "on", "enabled")
 try:
     IP_LIMIT_PENALTY_SEC = int(cfg.get("KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC", "60") or "60")
 except Exception:
@@ -182,6 +203,7 @@ if IP_LIMIT_PENALTY_SEC < 10:
     IP_LIMIT_PENALTY_SEC = 10
 REMNA_API_URL = str(cfg.get("KTO_COLLECTOR_REMNA_API_URL", "") or "").strip().rstrip("/")
 REMNA_API_TOKEN = str(cfg.get("KTO_COLLECTOR_REMNA_API_TOKEN", "") or "").strip()
+REMNA_API_INSECURE = str(cfg.get("KTO_COLLECTOR_REMNA_API_INSECURE", "0")).lower() in ("1", "yes", "true", "on", "enabled")
 try:
     REMNA_API_CACHE_SEC = int(cfg.get("KTO_COLLECTOR_REMNA_API_CACHE_SEC", "300") or "300")
 except Exception:
@@ -290,6 +312,10 @@ REMNA_NODE_STATE = {"nodes": {}}
 UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
 IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
+EVENT_QUEUE = queue.Queue(maxsize=10000)
+NODES_DIRTY = False
+AUTH_NONCES = {}
+AUTH_NONCE_LAST_PURGE = 0
 ALERT_SEPARATOR = "➖" * 9
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
 LOST_EMOJI = '<tg-emoji emoji-id="5447183459602669338">🚨</tg-emoji>'
@@ -334,28 +360,98 @@ def now_ts():
     return int(time.time())
 
 
-def atomic_write(path, content):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path))
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(content)
-    os.replace(tmp, path)
+def enqueue_event(callback, *args, **kwargs):
+    try:
+        EVENT_QUEUE.put_nowait((callback, args, kwargs))
+        return True
+    except queue.Full:
+        log(f"event queue full, dropped={getattr(callback, '__name__', 'unknown')}")
+        return False
+
+
+def event_worker_loop():
+    while True:
+        callback, args, kwargs = EVENT_QUEUE.get()
+        try:
+            callback(*args, **kwargs)
+        except Exception as exc:
+            log(f"event worker failed callback={getattr(callback, '__name__', 'unknown')}: {exc}")
+        finally:
+            EVENT_QUEUE.task_done()
+
+
+def atomic_write(path, content, keep_backup=False):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    if keep_backup and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as current:
+                previous = current.read()
+            if not isinstance(json.loads(previous), dict):
+                raise ValueError("state is not an object")
+            atomic_write(f"{path}.bak", previous)
+        except Exception as exc:
+            log(f"state backup failed path={path}: {exc}")
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def load_nodes():
     global NODES
     os.makedirs(STATE_DIR, exist_ok=True)
-    try:
-        with open(NODES_FILE, "r", encoding="utf-8") as fh:
-            loaded = json.load(fh)
+    for candidate in (NODES_FILE, f"{NODES_FILE}.bak"):
+        try:
+            with open(candidate, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
             if isinstance(loaded, dict):
                 NODES = loaded
-    except Exception:
-        NODES = {}
+                if candidate != NODES_FILE:
+                    log(f"nodes state recovered from backup: {candidate}")
+                return
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            log(f"nodes state load failed path={candidate}: {exc}")
+    NODES = {}
 
 
 def save_nodes():
-    atomic_write(NODES_FILE, json.dumps(NODES, ensure_ascii=False, indent=2, sort_keys=True))
+    global NODES_DIRTY
+    atomic_write(NODES_FILE, json.dumps(NODES, ensure_ascii=False, indent=2, sort_keys=True), keep_backup=True)
+    NODES_DIRTY = False
+
+
+def schedule_nodes_save():
+    global NODES_DIRTY
+    NODES_DIRTY = True
+
+
+def nodes_flush_loop():
+    while True:
+        try:
+            time.sleep(NODES_FLUSH_SEC)
+            with LOCK:
+                if NODES_DIRTY:
+                    save_nodes()
+        except Exception as exc:
+            log(f"nodes flush failed: {exc}")
+            time.sleep(1)
 
 
 def load_falls():
@@ -1038,7 +1134,7 @@ def queue_update_task(requested_by, action="push_update", scope="all", targets=N
     with LOCK:
         selected_targets = targets if isinstance(targets, dict) else current_update_targets(scope)
         job = {
-            "id": f"{ts}-{os.getpid()}",
+            "id": uuid.uuid4().hex,
             "created_at": ts,
             "requested_by": str(requested_by or "").strip()[:80],
             "raw_base": RAW_BASE,
@@ -1062,6 +1158,19 @@ def queue_update_task(requested_by, action="push_update", scope="all", targets=N
     return dict(job)
 
 
+def update_target_key_for_node(node, targets):
+    if not isinstance(targets, dict) or not targets:
+        return node_record_key(node) or node_canonical_key(node)
+    node_key = node_record_key(node) or node_canonical_key(node)
+    if node_key in targets:
+        return node_key
+    aliases = node_alias_keys(node)
+    for target_key, target_name in targets.items():
+        if canonical_node_key(target_key) in aliases or canonical_node_key(target_name) in aliases:
+            return str(target_key)
+    return ""
+
+
 def update_task_for_node(node):
     node_key = node_record_key(node) or node_canonical_key(node)
     if not node_key:
@@ -1072,9 +1181,11 @@ def update_task_for_node(node):
         if not job_id:
             return None
         targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
-        if targets and node_key not in targets:
+        target_key = update_target_key_for_node(node, targets)
+        if targets and not target_key:
             return None
-        result = UPDATE_STATE.setdefault("results", {}).get(node_key)
+        state_key = target_key or node_key
+        result = UPDATE_STATE.setdefault("results", {}).get(state_key)
         action = str(current.get("action") or "push_update")
         if action == "push_delete":
             result_message = clean_display_text((result or {}).get("message") or "") if isinstance(result, dict) else ""
@@ -1089,7 +1200,7 @@ def update_task_for_node(node):
                 if isinstance(result, dict) and result.get("id") == task_id and result.get("status") == "error":
                     task_id = f"{task_id}:{now_ts() // 60}"
             if task_action == "push_delete":
-                UPDATE_STATE.setdefault("results", {})[node_key] = {
+                UPDATE_STATE.setdefault("results", {})[state_key] = {
                     "id": job_id,
                     "status": "ok",
                     "build": COLLECTOR_BUILD,
@@ -1127,14 +1238,28 @@ def process_update_result(raw, node, ts):
     should_check_done = False
     with LOCK:
         current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
-        targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
-        if targets and node_key not in targets:
+        current_id = str(current.get("id") or "")
+        result_id = str(result.get("id") or "")
+        action = str(current.get("action") or "")
+        valid_result = result_id == current_id
+        if action == "push_delete" and result_id.startswith(f"{current_id}:bootstrap"):
+            valid_result = True
+        if not current_id or not valid_result:
+            log(f"ignored stale update result node={node_key} result={result_id} current={current_id or '-'}")
             return
-        UPDATE_STATE.setdefault("results", {})[node_key] = result
+        targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
+        target_key = update_target_key_for_node(node, targets)
+        if targets and not target_key:
+            return
+        state_key = target_key or node_key
+        existing = UPDATE_STATE.setdefault("results", {}).get(state_key)
+        if isinstance(existing, dict) and existing == result:
+            return
+        UPDATE_STATE["results"][state_key] = result
         save_update_state()
         should_check_done = True
     if should_check_done:
-        maybe_send_update_done_notification()
+        enqueue_event(maybe_send_update_done_notification)
 
 
 def set_local_update_result(job_id, status, message=""):
@@ -1153,6 +1278,9 @@ def set_local_update_result(job_id, status, message=""):
 def local_collector_update(job):
     job_id = str(job.get("id") or "")
     raw_base = str(job.get("raw_base") or RAW_BASE).rstrip("/")
+    if not raw_base.startswith("https://") and not ALLOW_INSECURE_UPDATE_URL:
+        set_local_update_result(job_id, "error", "insecure update URL rejected")
+        return
     set_local_update_result(job_id, "running", "collector update started")
     script = f"""
 set -eu
@@ -1160,7 +1288,12 @@ tmp="$(mktemp)"
 cleanup() {{ rm -f "$tmp"; }}
 trap cleanup EXIT
 curl -fsSL {shlex.quote(raw_base)}/scripts/kto-stats-collector.py -o "$tmp"
-python3 -m py_compile "$tmp"
+[ "$(wc -c < "$tmp")" -ge 10000 ]
+[ "$(wc -c < "$tmp")" -le 2097152 ]
+[ "$(head -n 1 "$tmp")" = '#!/usr/bin/env python3' ]
+grep -Eq '^COLLECTOR_BUILD = "v[0-9]+"$' "$tmp"
+python3 -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); compile(p.read_text(encoding="utf-8"), str(p), "exec")' "$tmp"
+[ ! -f /usr/local/bin/kto-stats-collector ] || cp -f /usr/local/bin/kto-stats-collector /usr/local/bin/kto-stats-collector.prev
 install -m 0755 "$tmp" /usr/local/bin/kto-stats-collector
 (sleep 1; systemctl restart kto-stats-collector.service) >/dev/null 2>&1 &
 """
@@ -1869,6 +2002,13 @@ def canonical_node_key(value):
     return "".join(parts)
 
 
+def normalize_node_uuid(value):
+    try:
+        return str(uuid.UUID(str(value or "").strip()))
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
 def node_canonical_key(node):
     return canonical_node_key(node.get("name") or node.get("id") or "")
 
@@ -1909,6 +2049,9 @@ def human_name_record_key(node):
 def node_record_key(node):
     if not isinstance(node, dict):
         return canonical_node_key(node)
+    node_uuid = normalize_node_uuid(node.get("node_uuid"))
+    if node_uuid:
+        return f"uuid_{node_uuid}"
     for field in ("name", "id", "hostname"):
         key = exact_bypass_record_key(node.get(field))
         if key:
@@ -2053,7 +2196,7 @@ def remna_api_call(path, method="GET", payload=None):
     if not remna_api_enabled():
         return None
     url = f"{REMNA_API_URL}{path}"
-    context = ssl._create_unverified_context() if url.lower().startswith("https://") else None
+    context = ssl._create_unverified_context() if REMNA_API_INSECURE and url.lower().startswith("https://") else None
     body = None
     headers = {
         "Authorization": f"Bearer {REMNA_API_TOKEN}",
@@ -3014,6 +3157,12 @@ def status_summary(nodes, ts, expected_total=None, filtered=False):
 
 
 def node_is_wl(node):
+    if isinstance(node, dict):
+        node_kind = str(node.get("node_kind") or "").strip().lower()
+        if node_kind in ("wl", "whitelist", "bypass"):
+            return True
+        if node_kind in ("bl", "other", "node"):
+            return False
     values = [
         node.get("name") if isinstance(node, dict) else "",
         node.get("id") if isinstance(node, dict) else "",
@@ -3572,7 +3721,10 @@ def node_base_aliases(node):
         record_key = canonical_node_key(node_record_key(node))
         if record_key:
             aliases.add(record_key)
-        for key in ("id", "name", "hostname", "ip"):
+        fields = ("node_uuid", "id", "name", "hostname")
+        if not normalize_node_uuid(node.get("node_uuid")):
+            fields += ("ip",)
+        for key in fields:
             alias = canonical_node_key(node.get(key))
             if alias:
                 aliases.add(alias)
@@ -4144,7 +4296,6 @@ def handle_pending_rename(chat_id, from_id, text):
         pop_pending_rename(chat_id, from_id)
         send_message("<b>Машина больше не найдена.</b>")
         return True
-    old_aliases = node_base_aliases(node)
     existing_matches = find_nodes(new_name)
     target_key = node_record_key(node) or node_canonical_key(node)
     busy = [item for item in existing_matches if (node_record_key(item) or node_canonical_key(item)) != target_key]
@@ -4447,15 +4598,14 @@ def node_identity_keys(node):
     if not isinstance(node, dict):
         key = canonical_node_key(node)
         return {key} if key else set()
+    node_uuid = normalize_node_uuid(node.get("node_uuid"))
+    if node_uuid:
+        return {f"uuid_{node_uuid}"}
     record_key = canonical_node_key(node_record_key(node) or "")
     if record_key:
         keys.add(record_key)
-    ip = canonical_node_key(node.get("ip"))
-    if ip and ip not in ("unknown", "localhost", "none", "null"):
-        keys.add(f"ip_{ip}")
     node_id = canonical_node_key(node.get("id"))
-    node_name = canonical_node_key(node.get("name"))
-    if node_id and node_id != node_name and node_id not in ("unknown", "localhost", "none", "null"):
+    if node_id and node_id not in ("unknown", "localhost", "none", "null"):
         keys.add(f"id_{node_id}")
     return keys
 
@@ -4466,6 +4616,22 @@ def node_same_identity(left, right):
     if not left_keys or not right_keys:
         return False
     return bool(left_keys.intersection(right_keys))
+
+
+def node_migrates_legacy_identity(existing, incoming):
+    if not isinstance(existing, dict) or not isinstance(incoming, dict):
+        return False
+    if normalize_node_uuid(existing.get("node_uuid")) or not normalize_node_uuid(incoming.get("node_uuid")):
+        return False
+    existing_id = canonical_node_key(existing.get("id"))
+    incoming_id = canonical_node_key(incoming.get("id"))
+    if existing_id and incoming_id and existing_id == incoming_id:
+        return True
+    existing_name = canonical_node_key(existing.get("name"))
+    incoming_name = canonical_node_key(incoming.get("name"))
+    existing_ip = str(existing.get("ip") or "").strip()
+    incoming_ip = str(incoming.get("ip") or "").strip()
+    return bool(existing_name and existing_name == incoming_name and existing_ip and existing_ip == incoming_ip)
 
 
 def node_stats_disabled(node):
@@ -4984,14 +5150,27 @@ def ip_limit_enforcement_enabled_for_entries(entries):
 
 
 def schedule_ip_limit_blocks(user, entries, info, expires_at):
+    if not IP_LIMIT_DROP_ENABLED:
+        return 0
     user_key = ip_limit_primary_key(user, info)
     if not user_key:
         user_key = str(user or "").strip()
+    user_aliases = [str(value) for value in ip_limit_user_keys(user, info) if str(value).strip()]
+    if user_key not in user_aliases:
+        user_aliases.append(user_key)
     scheduled = 0
     with LOCK:
         for item in entries:
             ip = str(item.get("ip") or "").strip()
             if not valid_ipv4(ip):
+                continue
+            placeholders = ",".join("?" for _ in user_aliases)
+            shared = ip_limit_db().execute(
+                f"SELECT 1 FROM ip_limit_events WHERE ip = ? AND last_seen >= ? AND user NOT IN ({placeholders}) LIMIT 1",
+                (normalize_ip(ip), now_ts() - IP_LIMIT_WINDOW_SEC, *user_aliases),
+            ).fetchone()
+            if shared:
+                log(f"ip drop skipped shared_ip={ip} user={user_key}")
                 continue
             node_names = [str(node or "").strip() for node in item.get("nodes") or [] if str(node or "").strip()]
             for node_name in node_names:
@@ -5512,6 +5691,25 @@ def ip_limit_penalty_loop():
                         save_ip_limit_state()
                     continue
                 try:
+                    with LOCK:
+                        REMNA_USER_CACHE.pop(uuid_value, None)
+                        REMNA_USER_CACHE.pop(key, None)
+                    info = remna_user_lookup(uuid_value)
+                    if not isinstance(info, dict):
+                        raise RuntimeError("user state unavailable")
+                    status = str(info.get("status") or "").strip().upper()
+                    if status == "ACTIVE":
+                        with LOCK:
+                            ip_limit_db().execute("DELETE FROM ip_limit_penalties WHERE user = ?", (key,))
+                            save_ip_limit_state()
+                        log(f"ip limit penalty already lifted: user={key} uuid={uuid_value}")
+                        continue
+                    if status != "DISABLED":
+                        with LOCK:
+                            ip_limit_db().execute("DELETE FROM ip_limit_penalties WHERE user = ?", (key,))
+                            save_ip_limit_state()
+                        log(f"ip limit penalty not lifted due to status={status or '-'}: user={key} uuid={uuid_value}")
+                        continue
                     remna_user_action(uuid_value, "enable")
                     with LOCK:
                         ip_limit_db().execute("DELETE FROM ip_limit_penalties WHERE user = ?", (key,))
@@ -5579,6 +5777,34 @@ def process_ip_limit_events(events, fallback_node, ts):
         alert_ip_limit_exceeded(user, entries, info)
 
 
+def process_remna_ip_limit_enforcement(ts):
+    grouped = ip_limit_group_rows(ip_limit_snapshot(ts))
+    for user, raw_entries in grouped:
+        if len(raw_entries) <= 1:
+            continue
+        info = remna_user_info(user)
+        entries = active_ip_limit_entries_for_user(user, info, ts)
+        limit, _ = ip_limit_effective_limit(user, info)
+        if limit <= 0 or len(entries) <= limit:
+            continue
+        if not ip_limit_enforcement_enabled_for_entries(entries):
+            continue
+        alert_key = ip_limit_primary_key(user, info)
+        with LOCK:
+            row = ip_limit_db().execute("SELECT last_alert FROM ip_limit_alerts WHERE user = ?", (alert_key,)).fetchone()
+            last_alert = int(row["last_alert"] or 0) if row else 0
+            if ts - last_alert < IP_LIMIT_ALERT_COOLDOWN:
+                continue
+            ip_limit_db().execute(
+                "INSERT INTO ip_limit_alerts(user, last_alert) VALUES(?, ?) "
+                "ON CONFLICT(user) DO UPDATE SET last_alert = excluded.last_alert",
+                (alert_key, ts),
+            )
+            save_ip_limit_state()
+        log(f"remna ip limit enforce: user={user} active_ips={len(entries)} limit={limit}")
+        alert_ip_limit_exceeded(user, entries, info)
+
+
 def remna_ip_limit_poll_once():
     ts = now_ts()
     enabled_node_keys = ip_limit_enabled_node_keys()
@@ -5590,6 +5816,7 @@ def remna_ip_limit_poll_once():
         purge_ip_limit_state(ts)
         store_ip_limit_events(rows, "", ts, max_events=len(rows))
         save_ip_limit_state()
+    process_remna_ip_limit_enforcement(ts)
     maybe_alert_remna_ip_limit_top(rows, snapshot, ts)
     return {"ok": True, "rows": len(rows), "nodes": snapshot.get("nodes_polled", 0)}
 
@@ -5658,11 +5885,15 @@ def remna_node_loop():
 
 
 def update_node(payload, remote_ip=""):
-    raw_id = clean_display_text(payload.get("id") or "")
-    hostname_value = clean_display_text(payload.get("hostname") or "")
+    raw_id = clean_display_text(payload.get("id") or "")[:160]
+    hostname_value = clean_display_text(payload.get("hostname") or "")[:255]
     remote_ip_value = str(remote_ip or payload.get("ip") or "")
-    node_name = clean_display_text(payload.get("name") or raw_id or hostname_value or "")
+    node_name = clean_display_text(payload.get("name") or raw_id or hostname_value or "")[:160]
     node_id = raw_id or hostname_value or node_name
+    node_uuid = normalize_node_uuid(payload.get("node_uuid"))
+    node_kind = str(payload.get("node_kind") or "").strip().lower()
+    if node_kind not in ("wl", "bl"):
+        node_kind = ""
     override_name = node_name_override_for_node({"id": raw_id, "name": node_name, "hostname": hostname_value, "ip": remote_ip_value})
     if override_name:
         node_name = override_name
@@ -5678,10 +5909,12 @@ def update_node(payload, remote_ip=""):
     record = {
         "id": node_id,
         "name": node_name or node_id,
+        "node_uuid": node_uuid,
+        "node_kind": node_kind,
         "push_build": clean_display_text(payload.get("push_build") or payload.get("build") or ""),
         "ip": remote_ip_value,
         "uptime_sec": int(payload.get("uptime_sec") or 0),
-        "iface": str(payload.get("iface") or ""),
+        "iface": str(payload.get("iface") or "")[:80],
         "hostname": hostname_value,
         "day_total": int(payload.get("day_total") or 0),
         "day_rx": int(payload.get("day_rx") or 0),
@@ -5705,7 +5938,7 @@ def update_node(payload, remote_ip=""):
         "scan_wrong_sni_top": normalize_scan_top(payload.get("scan_wrong_sni_top")),
         "scan_wrong_sni_names": normalize_scan_sni_top(payload.get("scan_wrong_sni_names")),
         "remna": normalize_remna_info(payload.get("remna")),
-        "error": str(payload.get("error") or ""),
+        "error": clean_display_text(payload.get("error") or "")[:1000],
         "updated_at": int(payload.get("updated_at") or current),
         "last_seen": current,
         "offline_alerted": False,
@@ -5719,17 +5952,18 @@ def update_node(payload, remote_ip=""):
                 if existing_id != record_key and (
                     (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key
                     or node_same_identity(existing_node, record)
+                    or node_migrates_legacy_identity(existing_node, record)
                 ):
                     old = existing_node
                     break
         removed = []
         if suppress_runtime_stats:
             for existing_id, existing_node in list(NODES.items()):
-                if existing_id == record_key or (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key or node_same_identity(existing_node, record):
+                if existing_id == record_key or (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key or node_same_identity(existing_node, record) or node_migrates_legacy_identity(existing_node, record):
                     del NODES[existing_id]
                     removed.append(existing_id)
             if removed:
-                save_nodes()
+                schedule_nodes_save()
             was_offline = False
         else:
             was_offline = bool(old.get("offline_alerted")) and bool(old.get("offline_confirmed", True))
@@ -5755,22 +5989,24 @@ def update_node(payload, remote_ip=""):
                 if existing_id != record_key and (
                     (node_record_key(existing_node) or node_canonical_key(existing_node)) == record_key
                     or node_same_identity(existing_node, record)
+                    or node_migrates_legacy_identity(existing_node, record)
                 ):
                     del NODES[existing_id]
                     removed.append(existing_id)
             NODES[record_key] = record
-            save_nodes()
+            schedule_nodes_save()
     if removed:
         log(f"removed duplicate node records for {record_key}: {', '.join(removed)}")
     if was_offline:
         log(f"node online: {record_key}")
-        alert_online(record_key, record)
+        enqueue_event(alert_online, record_key, dict(record))
     if scan_alert_node:
         log(f"scan spike: {record_key} delta={scan_alert_delta}")
-        alert_scan_spike(scan_alert_node, scan_alert_delta)
+        enqueue_event(alert_scan_spike, dict(scan_alert_node), scan_alert_delta)
     process_update_result(payload.get("update_result"), record, current)
-    if not suppress_runtime_stats:
-        process_ip_limit_events(payload.get("ip_limit_events"), record.get("name") or node_id, current)
+    ip_events = payload.get("ip_limit_events")
+    if not suppress_runtime_stats and isinstance(ip_events, list) and ip_events:
+        enqueue_event(process_ip_limit_events, ip_events, record.get("name") or node_id, current)
     return record
 
 
@@ -5778,18 +6014,80 @@ def authorized(headers):
     if not SECRET:
         return False
     value = headers.get("Authorization", "")
-    return value == f"Bearer {SECRET}" or value == SECRET
+    return hmac.compare_digest(value, f"Bearer {SECRET}") or hmac.compare_digest(value, SECRET)
+
+
+def hmac_sha256_hex(secret, value):
+    return hmac.new(str(secret).encode("utf-8"), value, hashlib.sha256).hexdigest()
+
+
+def request_signature_payload(timestamp, nonce, body):
+    digest = hashlib.sha256(body).hexdigest()
+    return f"kto-v2\n{timestamp}\n{nonce}\n{digest}".encode("utf-8")
+
+
+def response_signature_payload(nonce, body):
+    digest = hashlib.sha256(body).hexdigest()
+    return f"kto-v2\n{nonce}\n{digest}".encode("utf-8")
+
+
+def authenticate_push(headers, body, current=None):
+    global AUTH_NONCE_LAST_PURGE
+    if not SECRET:
+        return None
+    signature = str(headers.get("X-KTO-Signature", "") or "").strip().lower()
+    timestamp_text = str(headers.get("X-KTO-Timestamp", "") or "").strip()
+    nonce = str(headers.get("X-KTO-Nonce", "") or "").strip().lower()
+    if signature or timestamp_text or nonce:
+        if not re.fullmatch(r"[0-9a-f]{64}", signature):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{16,64}", nonce):
+            return None
+        try:
+            timestamp = int(timestamp_text)
+        except (TypeError, ValueError):
+            return None
+        current = int(current or now_ts())
+        if abs(current - timestamp) > AUTH_MAX_SKEW_SEC:
+            return None
+        expected = hmac_sha256_hex(SECRET, request_signature_payload(timestamp, nonce, body))
+        if not hmac.compare_digest(signature, expected):
+            return None
+        with LOCK:
+            if current - AUTH_NONCE_LAST_PURGE >= min(60, AUTH_MAX_SKEW_SEC):
+                cutoff = current - AUTH_MAX_SKEW_SEC
+                for old_nonce, seen_at in list(AUTH_NONCES.items()):
+                    if seen_at < cutoff:
+                        del AUTH_NONCES[old_nonce]
+                AUTH_NONCE_LAST_PURGE = current
+            if nonce in AUTH_NONCES:
+                return None
+            AUTH_NONCES[nonce] = current
+        return {"mode": "hmac-sha256", "nonce": nonce, "timestamp": timestamp}
+    if authorized(headers):
+        return {"mode": "legacy", "nonce": "", "timestamp": 0}
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(20)
+
     def log_message(self, fmt, *args):
         log(fmt % args)
 
-    def send_json(self, code, data):
+    def send_json(self, code, data, auth_context=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if isinstance(auth_context, dict) and auth_context.get("mode") == "hmac-sha256":
+            nonce = str(auth_context.get("nonce") or "")
+            signature = hmac_sha256_hex(SECRET, response_signature_payload(nonce, body))
+            self.send_header("X-KTO-Auth", "hmac-sha256")
+            self.send_header("X-KTO-Nonce", nonce)
+            self.send_header("X-KTO-Response-Signature", signature)
         self.end_headers()
         self.wfile.write(body)
 
@@ -5803,7 +6101,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
             with LOCK:
-                self.send_json(200, {"ok": True, "nodes": NODES})
+                nodes = {key: dict(value) for key, value in NODES.items()}
+            self.send_json(200, {"ok": True, "nodes": nodes})
             return
         self.send_json(404, {"ok": False, "error": "not found"})
 
@@ -5812,14 +6111,17 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/push":
             self.send_json(404, {"ok": False, "error": "not found"})
             return
-        if not authorized(self.headers):
-            self.send_json(401, {"ok": False, "error": "unauthorized"})
-            return
+        auth_context = None
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 5242880:
+            if length <= 0 or length > 1048576:
                 raise ValueError("bad content length")
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = self.rfile.read(length)
+            auth_context = authenticate_push(self.headers, body)
+            if auth_context is None:
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            payload = json.loads(body.decode("utf-8"))
             remote_ip = self.client_address[0] if self.client_address else ""
             node = update_node(payload, remote_ip)
             response = {
@@ -5847,9 +6149,9 @@ class Handler(BaseHTTPRequestHandler):
             update_task = update_task_for_node(node)
             if update_task:
                 response["update_task"] = update_task
-            self.send_json(200, response)
+            self.send_json(200, response, auth_context=auth_context)
         except Exception as exc:
-            self.send_json(400, {"ok": False, "error": str(exc)})
+            self.send_json(400, {"ok": False, "error": str(exc)}, auth_context=auth_context)
 
 
 def offline_loop():
@@ -5934,6 +6236,12 @@ def offline_loop():
         except Exception as exc:
             log(f"offline loop failed: {exc}")
             time.sleep(5)
+
+
+class CollectorHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
 
 
 def load_offset():
@@ -6375,7 +6683,7 @@ def friendly_update_message(message, status=""):
     if lower == "error":
         return "ошибка"
     if lower == "node update started":
-        return "docker compose pull/down/up"
+        return "docker compose pull/up"
     if lower == "node updated":
         return "готово"
     if lower == "push update started":
@@ -6752,7 +7060,7 @@ def start_update_job(action, scope, requested_by, local_required=True, targets=N
     elif action == "node_update":
         lines += [
             "",
-            "<i>Ноды выполнят docker compose pull/down/up при ближайшем push.</i>",
+            "<i>Ноды выполнят docker compose pull/up при ближайшем push.</i>",
             f"<i>Статус: <code>{update_status_command(action)}</code></i>",
         ]
     elif action == "optimize":
@@ -7969,6 +8277,8 @@ def main():
     load_remna_node_state()
     load_update_state()
     load_ip_limit_state()
+    threading.Thread(target=event_worker_loop, daemon=True).start()
+    threading.Thread(target=nodes_flush_loop, daemon=True).start()
     threading.Thread(target=offline_loop, daemon=True).start()
     threading.Thread(target=ip_limit_penalty_loop, daemon=True).start()
     threading.Thread(target=remna_node_loop, daemon=True).start()
@@ -7976,7 +8286,7 @@ def main():
     threading.Thread(target=bot_loop, daemon=True).start()
     if DAILY_REPORT_TIME:
         threading.Thread(target=daily_report_loop, daemon=True).start()
-    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    server = CollectorHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     log(f"listening http://{LISTEN_HOST}:{LISTEN_PORT}")
     server.serve_forever()
 

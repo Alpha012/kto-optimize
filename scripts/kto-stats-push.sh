@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v230"
+PUSH_BUILD="v231"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -40,12 +40,27 @@ KTO_PUSH_INTERVAL="${KTO_PUSH_INTERVAL:-15}"
 KTO_REMNA_LOG_ENABLED="${KTO_REMNA_LOG_ENABLED:-1}"
 KTO_REMNA_DOCKER_CONTAINER="${KTO_REMNA_DOCKER_CONTAINER:-${KTO_IP_LIMIT_DOCKER_CONTAINER:-remnanode}}"
 KTO_REMNA_LOG_SCAN_SEC="${KTO_REMNA_LOG_SCAN_SEC:-300}"
+KTO_REMNA_DIAG_CACHE_SEC="${KTO_REMNA_DIAG_CACHE_SEC:-15}"
+KTO_REMNA_DIAG_CACHE="${KTO_REMNA_DIAG_CACHE:-/run/kto-stats-push-remna.json}"
 KTO_PUSH_UPDATE_STATE="${KTO_PUSH_UPDATE_STATE:-/var/lib/kto-stats-push/update_state.json}"
 KTO_UPDATE_RAW_BASE="${KTO_UPDATE_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
+KTO_PUSH_NODE_UUID="${KTO_PUSH_NODE_UUID:-}"
+KTO_PUSH_NODE_KIND="${KTO_PUSH_NODE_KIND:-}"
+KTO_PUSH_REQUIRE_SIGNED_RESPONSE="${KTO_PUSH_REQUIRE_SIGNED_RESPONSE:-0}"
+KTO_ALLOW_INSECURE_UPDATE_URL="${KTO_ALLOW_INSECURE_UPDATE_URL:-0}"
+KTO_PUSH_CPU_STATE="${KTO_PUSH_CPU_STATE:-/run/kto-stats-push-cpu.state}"
 KTO_TUNING_SYSCTL_CONF="${KTO_TUNING_SYSCTL_CONF:-/etc/sysctl.d/99-kto-tuning.conf}"
 KTO_LIMITS_CONF="${KTO_LIMITS_CONF:-/etc/security/limits.d/99-kto-limits.conf}"
 KTO_SYSTEMD_LIMITS_CONF="${KTO_SYSTEMD_LIMITS_CONF:-/etc/systemd/system.conf.d/99-kto-limits.conf}"
 KTO_USER_LIMITS_CONF="${KTO_USER_LIMITS_CONF:-/etc/systemd/user.conf.d/99-kto-limits.conf}"
+
+if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/kto-stats-push.lock
+    if ! flock -n 9; then
+        echo "push ${PUSH_BUILD}: previous run is still active"
+        exit 0
+    fi
+fi
 
 collector_url="${KTO_PUSH_COLLECTOR_URL%/}/push"
 hostname_value="$(hostname 2>/dev/null || echo unknown)"
@@ -124,12 +139,23 @@ read_cpu_totals() {
 }
 
 cpu_usage_percent() {
-    local total1 idle1 total2 idle2 total_delta idle_delta
-    read -r total1 idle1 < <(read_cpu_totals)
-    sleep 0.8
-    read -r total2 idle2 < <(read_cpu_totals)
-    total_delta=$(( ${total2:-0} - ${total1:-0} ))
-    idle_delta=$(( ${idle2:-0} - ${idle1:-0} ))
+    local previous_total=0 previous_idle=0 current_total=0 current_idle=0 total_delta idle_delta tmp
+    read -r current_total current_idle < <(read_cpu_totals)
+    if [[ -r "$KTO_PUSH_CPU_STATE" ]]; then
+        read -r previous_total previous_idle < "$KTO_PUSH_CPU_STATE" || true
+    fi
+    [[ "$previous_total" =~ ^[0-9]+$ ]] || previous_total=0
+    [[ "$previous_idle" =~ ^[0-9]+$ ]] || previous_idle=0
+    [[ "$current_total" =~ ^[0-9]+$ ]] || current_total=0
+    [[ "$current_idle" =~ ^[0-9]+$ ]] || current_idle=0
+    tmp="${KTO_PUSH_CPU_STATE}.$$"
+    if printf '%s %s\n' "$current_total" "$current_idle" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$KTO_PUSH_CPU_STATE" 2>/dev/null || rm -f "$tmp"
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+    total_delta=$(( ${current_total:-0} - ${previous_total:-0} ))
+    idle_delta=$(( ${current_idle:-0} - ${previous_idle:-0} ))
     if (( total_delta <= 0 )); then
         echo 0
     else
@@ -337,7 +363,7 @@ detect_remna_compose_dir() {
 }
 
 read_remna_diagnostics() {
-    local container logs scan_sec
+    local container logs scan_sec cache_sec cache_mtime cache_age tmp
 
     remna_status=''
     remna_restarts=0
@@ -347,6 +373,20 @@ read_remna_diagnostics() {
 
     config_enabled_value "$KTO_REMNA_LOG_ENABLED" || return 0
     command -v docker >/dev/null 2>&1 || return 0
+    cache_sec="$(int_or_zero "$KTO_REMNA_DIAG_CACHE_SEC")"
+    if (( cache_sec > 0 )) && [[ -r "$KTO_REMNA_DIAG_CACHE" ]]; then
+        cache_mtime="$(stat -c %Y "$KTO_REMNA_DIAG_CACHE" 2>/dev/null || echo 0)"
+        cache_age=$(( $(date +%s) - ${cache_mtime:-0} ))
+        if (( cache_age >= 0 && cache_age < cache_sec )); then
+            if IFS=$'\t' read -r remna_status remna_restarts remna_error_count remna_last_error remna_compose_dir \
+                < <(jq -r '[.status // "", .restarts // 0, .error_count // 0, .last_error // "", .compose_dir // ""] | @tsv' "$KTO_REMNA_DIAG_CACHE" 2>/dev/null); then
+                remna_restarts="$(int_or_zero "$remna_restarts")"
+                remna_error_count="$(int_or_zero "$remna_error_count")"
+                return 0
+            fi
+            rm -f "$KTO_REMNA_DIAG_CACHE" 2>/dev/null || true
+        fi
+    fi
 
     container="$(remna_container_name)"
     [[ -n "$container" ]] || return 0
@@ -371,6 +411,18 @@ read_remna_diagnostics() {
     if [[ -n "$logs" ]]; then
         remna_error_count="$(printf '%s\n' "$logs" | awk 'NF {count++} END {print count + 0}')"
         remna_last_error="$(printf '%s\n' "$logs" | tail -n 1 | tr -d '\r' | cut -c1-500)"
+    fi
+    tmp="${KTO_REMNA_DIAG_CACHE}.$$"
+    if jq -n \
+        --arg status "$remna_status" \
+        --argjson restarts "$remna_restarts" \
+        --argjson error_count "$remna_error_count" \
+        --arg last_error "$remna_last_error" \
+        --arg compose_dir "$remna_compose_dir" \
+        '{status: $status, restarts: $restarts, error_count: $error_count, last_error: $last_error, compose_dir: $compose_dir}' > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$KTO_REMNA_DIAG_CACHE" 2>/dev/null || rm -f "$tmp"
+    else
+        rm -f "$tmp" 2>/dev/null || true
     fi
 }
 
@@ -539,24 +591,36 @@ read_update_result() {
     }' "$KTO_PUSH_UPDATE_STATE" 2>/dev/null || echo '{}')"
 }
 
+escape_double_quoted_config_value() {
+    local value="${1:-}"
+    value="${value//$'\r'/}"
+    value="${value//$'\n'/}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//\$/\\\$}"
+    value="${value//\`/\\\`}"
+    printf '%s' "$value"
+}
+
 set_push_config_value() {
-    local key="$1" value="$2" tmp
+    local key="$1" value="$2" escaped tmp line found=0
     [[ -n "$key" && -w "$CONFIG" ]] || return 1
     tmp="$(mktemp)" || return 1
-    if awk -v key="$key" -v value="$value" '
-        BEGIN { done = 0 }
-        $0 ~ "^" key "=" {
-            print key "=\"" value "\""
-            done = 1
-            next
-        }
-        { print }
-        END {
-            if (!done) {
-                print key "=\"" value "\""
-            }
-        }
-    ' "$CONFIG" >"$tmp"; then
+    escaped="$(escape_double_quoted_config_value "$value")"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "${key}="* ]]; then
+            if (( found == 0 )); then
+                printf '%s="%s"\n' "$key" "$escaped" >> "$tmp"
+                found=1
+            fi
+        else
+            printf '%s\n' "$line" >> "$tmp"
+        fi
+    done < "$CONFIG"
+    if (( found == 0 )); then
+        printf '%s="%s"\n' "$key" "$escaped" >> "$tmp"
+    fi
+    if [[ -s "$tmp" ]]; then
         install -m 0600 "$tmp" "$CONFIG"
         rm -f "$tmp"
         return 0
@@ -564,6 +628,71 @@ set_push_config_value() {
     rm -f "$tmp"
     return 1
 }
+
+generate_node_uuid() {
+    local value=""
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        read -r value < /proc/sys/kernel/random/uuid || true
+    elif command -v uuidgen >/dev/null 2>&1; then
+        value="$(uuidgen 2>/dev/null || true)"
+    fi
+    printf '%s' "${value,,}"
+}
+
+ensure_node_identity() {
+    local inferred_kind lowered_name machine_mode=""
+    KTO_PUSH_NODE_UUID="${KTO_PUSH_NODE_UUID,,}"
+    if [[ ! "$KTO_PUSH_NODE_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+        KTO_PUSH_NODE_UUID="$(generate_node_uuid)"
+        if [[ ! "$KTO_PUSH_NODE_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+            echo "push ${PUSH_BUILD}: failed to generate node UUID" >&2
+            exit 1
+        fi
+        if ! set_push_config_value KTO_PUSH_NODE_UUID "$KTO_PUSH_NODE_UUID"; then
+            echo "push ${PUSH_BUILD}: failed to persist node UUID" >&2
+            exit 1
+        fi
+    fi
+    if [[ "$KTO_PUSH_NODE_KIND" != "wl" && "$KTO_PUSH_NODE_KIND" != "bl" ]]; then
+        lowered_name="${KTO_PUSH_NODE_NAME,,}"
+        inferred_kind="bl"
+        if [[ -r /etc/kto-cfg.conf ]]; then
+            machine_mode="$(awk -F= '$1 == "MACHINE_MODE" {gsub(/^"|"$/, "", $2); print tolower($2); exit}' /etc/kto-cfg.conf 2>/dev/null || true)"
+        fi
+        if [[ "$machine_mode" == "whitelist" ]] || [[ -r /etc/haproxy/haproxy.cfg ]]; then
+            inferred_kind="wl"
+        elif [[ "$machine_mode" != "node" ]]; then
+            case "$lowered_name" in
+                *"обход"*|*whitelist*|*haproxy*) inferred_kind="wl" ;;
+            esac
+        fi
+        KTO_PUSH_NODE_KIND="$inferred_kind"
+        set_push_config_value KTO_PUSH_NODE_KIND "$KTO_PUSH_NODE_KIND" || true
+    fi
+}
+
+sha256_text() {
+    sha256sum | awk '{print tolower($1)}'
+}
+
+hmac_sha256_text() {
+    local secret="$1"
+    openssl dgst -sha256 -hmac "$secret" 2>/dev/null | awk '{print tolower($NF)}'
+}
+
+response_header_value() {
+    local file="$1" key="$2"
+    awk -F':' -v wanted="$key" '
+        tolower($1) == tolower(wanted) {
+            sub(/^[^:]*:[[:space:]]*/, "", $0)
+            sub(/\r$/, "", $0)
+            value = $0
+        }
+        END { print value }
+    ' "$file" 2>/dev/null
+}
+
+ensure_node_identity
 
 write_push_timer_interval() {
     local interval="$1" tmp
@@ -1234,14 +1363,13 @@ apply_optimize_task() {
 
 apply_collector_update_task() {
     local response="$1"
-    local job_id action raw_base tmp err_file message new_build
+    local job_id action raw_base tmp err_file message new_build script_size backup
 
     command -v jq >/dev/null 2>&1 || return 0
     printf '%s' "$response" | jq -e 'has("update_task") and (.update_task | type == "object")' >/dev/null 2>&1 || return 0
 
     job_id="$(printf '%s' "$response" | jq -r '.update_task.id // empty' 2>/dev/null || true)"
     action="$(printf '%s' "$response" | jq -r '.update_task.action // empty' 2>/dev/null || true)"
-    raw_base="$(printf '%s' "$response" | jq -r '.update_task.raw_base // empty' 2>/dev/null || true)"
     [[ -n "$job_id" ]] || return 0
     if update_task_already_finished "$job_id"; then
         return 0
@@ -1270,8 +1398,14 @@ apply_collector_update_task() {
     [[ "$action" == "push_update" ]] || return 0
     command -v curl >/dev/null 2>&1 || return 0
     command -v bash >/dev/null 2>&1 || return 0
-    raw_base="${raw_base:-$KTO_UPDATE_RAW_BASE}"
+    # The collector may request an action, but the node chooses its trusted update source.
+    raw_base="$KTO_UPDATE_RAW_BASE"
     raw_base="${raw_base%/}"
+    if [[ ! "$raw_base" =~ ^https:// ]] && [[ "$KTO_ALLOW_INSECURE_UPDATE_URL" != "1" ]]; then
+        write_update_result "$job_id" "error" "insecure update URL rejected"
+        echo "push ${PUSH_BUILD}: insecure update URL rejected: ${raw_base}" >&2
+        return 0
+    fi
 
     write_update_result "$job_id" "running" "push update started"
     tmp="$(mktemp)"
@@ -1285,6 +1419,19 @@ apply_collector_update_task() {
     fi
     rm -f "$err_file"
 
+    script_size="$(wc -c < "$tmp" 2>/dev/null || echo 0)"
+    if [[ ! "$script_size" =~ ^[0-9]+$ ]] || (( script_size < 10000 || script_size > 1048576 )); then
+        rm -f "$tmp"
+        write_update_result "$job_id" "error" "downloaded push script has invalid size"
+        echo "push ${PUSH_BUILD}: update failed: invalid script size ${script_size}" >&2
+        return 0
+    fi
+    if [[ "$(head -n 1 "$tmp" 2>/dev/null || true)" != "#!/usr/bin/env bash" ]]; then
+        rm -f "$tmp"
+        write_update_result "$job_id" "error" "downloaded push script has invalid header"
+        echo "push ${PUSH_BUILD}: update failed: invalid script header" >&2
+        return 0
+    fi
     if ! bash -n "$tmp" >/dev/null 2>&1; then
         rm -f "$tmp"
         write_update_result "$job_id" "error" "downloaded push script failed bash -n"
@@ -1292,7 +1439,16 @@ apply_collector_update_task() {
         return 0
     fi
     new_build="$(awk -F= '$1 == "PUSH_BUILD" { gsub(/"/, "", $2); print $2; exit }' "$tmp" 2>/dev/null || true)"
-    new_build="${new_build:-$PUSH_BUILD}"
+    if [[ ! "$new_build" =~ ^v[0-9]+$ ]]; then
+        rm -f "$tmp"
+        write_update_result "$job_id" "error" "downloaded push script has invalid build"
+        echo "push ${PUSH_BUILD}: update failed: invalid build marker" >&2
+        return 0
+    fi
+    backup="/usr/local/bin/kto-stats-push.prev"
+    if [[ -f /usr/local/bin/kto-stats-push ]]; then
+        cp -f /usr/local/bin/kto-stats-push "$backup" 2>/dev/null || true
+    fi
     if install -m 0755 "$tmp" /usr/local/bin/kto-stats-push 2>/dev/null; then
         rm -f "$tmp"
         write_update_result "$job_id" "ok" "push script updated" "$new_build"
@@ -1344,8 +1500,8 @@ apply_node_update_task() {
     if (
         cd "$compose_dir" &&
         docker compose pull &&
-        docker compose down &&
-        docker compose up -d
+        docker compose up -d --remove-orphans &&
+        docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null | grep -qx true
     ) >"$err_file" 2>&1; then
         rm -f "$err_file"
         write_update_result "$job_id" "ok" "node updated"
@@ -1393,7 +1549,7 @@ ip_limit_kill_conntrack() {
 
 apply_ip_limit_blocks() {
     local response="$1"
-    local now state_dir desired_file merged_file active_file previous_file ip expires user chain applied=0 removed=0
+    local now state_dir desired_file merged_file active_file previous_file ip _expires _user chain applied=0 removed=0
 
     command -v jq >/dev/null 2>&1 || return 0
     command -v iptables >/dev/null 2>&1 || return 0
@@ -1434,7 +1590,7 @@ apply_ip_limit_blocks() {
         }
     ' "$merged_file" | sort -t $'\t' -k1,1 > "$active_file"
 
-    while IFS=$'\t' read -r ip expires user; do
+    while IFS=$'\t' read -r ip _expires _user; do
         [[ -n "$ip" ]] || continue
         validate_ipv4 "$ip" || continue
         while read -r chain; do
@@ -1447,7 +1603,7 @@ apply_ip_limit_blocks() {
         ip_limit_kill_conntrack "$ip"
     done < "$active_file"
 
-    while IFS=$'\t' read -r ip expires user; do
+    while IFS=$'\t' read -r ip _expires _user; do
         [[ -n "$ip" ]] || continue
         validate_ipv4 "$ip" || continue
         if ! awk -F '\t' -v ip="$ip" '$1 == ip {found=1} END {exit found ? 0 : 1}' "$active_file"; then
@@ -1476,47 +1632,6 @@ config_bool_value() {
         1|yes|true|on|enabled) echo 1 ;;
         *) echo 0 ;;
     esac
-}
-
-config_escape_value() {
-    local value="${1:-}"
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-    value="${value//\$/\\$}"
-    value="${value//\`/\\\`}"
-    printf '%s' "$value"
-}
-
-set_push_config_value() {
-    local key="$1" value="$2" tmp escaped
-    [[ -n "$key" ]] || return 0
-    escaped="$(config_escape_value "$value")"
-    tmp="$(mktemp)"
-    if [[ -r "$CONFIG" ]]; then
-        awk -v key="$key" -v line="${key}=\"${escaped}\"" '
-            BEGIN { done = 0 }
-            $0 ~ "^" key "=" {
-                if (!done) {
-                    print line
-                    done = 1
-                }
-                next
-            }
-            { print }
-            END {
-                if (!done) print line
-            }
-        ' "$CONFIG" > "$tmp"
-    else
-        printf '%s="%s"\n' "$key" "$escaped" > "$tmp"
-    fi
-    if cp "$tmp" "$CONFIG" 2>/dev/null; then
-        chmod 600 "$CONFIG" 2>/dev/null || true
-        rm -f "$tmp"
-        return 0
-    fi
-    rm -f "$tmp"
-    return 1
 }
 
 normalize_node_name_from_collector() {
@@ -1894,6 +2009,8 @@ month_total=$(( month_rx + month_tx ))
 if ! payload="$(jq -n \
     --arg id "$KTO_PUSH_NODE_ID" \
     --arg name "$KTO_PUSH_NODE_NAME" \
+    --arg node_uuid "$KTO_PUSH_NODE_UUID" \
+    --arg node_kind "$KTO_PUSH_NODE_KIND" \
     --arg push_build "$PUSH_BUILD" \
     --arg iface "$KTO_PUSH_IFACE" \
     --arg hostname "$hostname_value" \
@@ -1931,6 +2048,8 @@ if ! payload="$(jq -n \
     '{
         id: $id,
         name: $name,
+        node_uuid: $node_uuid,
+        node_kind: $node_kind,
         push_build: $push_build,
         iface: $iface,
         hostname: $hostname,
@@ -1973,19 +2092,73 @@ if ! payload="$(jq -n \
 fi
 
 curl_errors="$(mktemp)"
-if response="$(curl -4 -fsS --connect-timeout 8 --max-time 20 --retry 2 --retry-delay 2 \
+response_headers="$(mktemp)"
+request_timestamp="$(date +%s)"
+request_nonce=""
+request_signature=""
+request_signed=0
+curl_headers=(-H "Content-Type: application/json")
+if command -v openssl >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then
+    request_nonce="$(tr -d '-' < /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+    if [[ "$request_nonce" =~ ^[0-9a-fA-F]{16,64}$ ]]; then
+        payload_hash="$(printf '%s' "$payload" | sha256_text)"
+        request_signature="$(printf 'kto-v2\n%s\n%s\n%s' "$request_timestamp" "$request_nonce" "$payload_hash" | hmac_sha256_text "$KTO_PUSH_SECRET" || true)"
+        if [[ "$request_signature" =~ ^[0-9a-f]{64}$ ]]; then
+            request_signed=1
+            curl_headers+=(
+                -H "X-KTO-Timestamp: ${request_timestamp}"
+                -H "X-KTO-Nonce: ${request_nonce}"
+                -H "X-KTO-Signature: ${request_signature}"
+            )
+        fi
+    fi
+fi
+if (( request_signed == 0 )) && [[ "$KTO_PUSH_REQUIRE_SIGNED_RESPONSE" == "1" ]]; then
+    echo "push ${PUSH_BUILD}: signed transport unavailable" >&2
+    rm -f "$curl_errors" "$response_headers"
+    exit 1
+fi
+if [[ "$KTO_PUSH_REQUIRE_SIGNED_RESPONSE" != "1" ]]; then
+    curl_headers+=(-H "Authorization: Bearer ${KTO_PUSH_SECRET}")
+fi
+
+if response="$(curl -4 -fsS --connect-timeout 8 --max-time 20 \
     -X POST "$collector_url" \
-    -H "Authorization: Bearer ${KTO_PUSH_SECRET}" \
-    -H "Content-Type: application/json" \
-    --data "$payload" 2>"$curl_errors")"; then
+    -D "$response_headers" \
+    "${curl_headers[@]}" \
+    --data-binary "$payload" 2>"$curl_errors")"; then
     :
 else
     rc=$?
     echo "push ${PUSH_BUILD}: curl failed rc=${rc}: $(tr '\n' ' ' < "$curl_errors")" >&2
-    rm -f "$curl_errors"
+    rm -f "$curl_errors" "$response_headers"
     exit "$rc"
 fi
 rm -f "$curl_errors"
+
+response_signature="$(response_header_value "$response_headers" X-KTO-Response-Signature)"
+response_nonce="$(response_header_value "$response_headers" X-KTO-Nonce)"
+if [[ -n "$response_signature" ]]; then
+    response_hash="$(printf '%s' "$response" | sha256_text)"
+    expected_response_signature="$(printf 'kto-v2\n%s\n%s' "$request_nonce" "$response_hash" | hmac_sha256_text "$KTO_PUSH_SECRET" || true)"
+    if (( request_signed == 0 )) || [[ "$response_nonce" != "$request_nonce" ]] || [[ ! "$response_signature" =~ ^[0-9a-fA-F]{64}$ ]] || [[ "${response_signature,,}" != "$expected_response_signature" ]]; then
+        echo "push ${PUSH_BUILD}: collector response signature is invalid" >&2
+        rm -f "$response_headers"
+        exit 1
+    fi
+    if [[ "$KTO_PUSH_REQUIRE_SIGNED_RESPONSE" != "1" ]]; then
+        if set_push_config_value KTO_PUSH_REQUIRE_SIGNED_RESPONSE 1; then
+            KTO_PUSH_REQUIRE_SIGNED_RESPONSE=1
+        else
+            echo "push ${PUSH_BUILD}: signed response verified, but pinning failed" >&2
+        fi
+    fi
+elif [[ "$KTO_PUSH_REQUIRE_SIGNED_RESPONSE" == "1" ]]; then
+    echo "push ${PUSH_BUILD}: collector returned an unsigned response" >&2
+    rm -f "$response_headers"
+    exit 1
+fi
+rm -f "$response_headers"
 
 if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
     ip_limit_extra=""

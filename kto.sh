@@ -7,10 +7,9 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v230"
+SCRIPT_BUILD="v231"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
-PANEL_DOMAIN="${KTO_PANEL_DOMAIN:-admin.ktoygaday.xyz}"
 WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 83.228.242.53 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
 WHITELIST_SSH_ALLOWED_IPS="${KTO_WHITELIST_SSH_ALLOWED_IPS:-$WHITELIST_SSH_ALLOWED_IPS_DEFAULT}"
 WHITELIST_SSH_KEEP_CURRENT="${KTO_WHITELIST_SSH_KEEP_CURRENT:-1}"
@@ -18,7 +17,6 @@ REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
 CONFIG_FILE="/etc/kto-cfg.conf"
-CONFIG_SOURCE_FILE=""
 MACHINE_MODE="${KTO_MACHINE_MODE:-}"
 NODE_PROFILE="${KTO_NODE_PROFILE:-}"
 REMNA_API_URL="${KTO_REMNA_API_URL:-https://admin.ktoygaday.xyz}"
@@ -82,8 +80,10 @@ IP_LIMIT_SCAN_SEC_DEFAULT="${KTO_IP_LIMIT_SCAN_SEC_DEFAULT:-120}"
 IP_LIMIT_TAIL_LINES_DEFAULT="${KTO_IP_LIMIT_TAIL_LINES_DEFAULT:-5000}"
 IP_LIMIT_XRAY_LOGS_DEFAULT="${KTO_IP_LIMIT_XRAY_LOGS_DEFAULT:-1}"
 IP_LIMIT_ENFORCE_ENABLED_DEFAULT="${KTO_IP_LIMIT_ENFORCE_ENABLED_DEFAULT:-0}"
+IP_LIMIT_DROP_ENABLED_DEFAULT="${KTO_IP_LIMIT_DROP_ENABLED_DEFAULT:-0}"
 IP_LIMIT_PENALTY_SEC_DEFAULT="${KTO_IP_LIMIT_PENALTY_SEC_DEFAULT:-60}"
 REMNA_API_CACHE_SEC_DEFAULT="${KTO_COLLECTOR_REMNA_API_CACHE_SEC_DEFAULT:-300}"
+REMNA_API_INSECURE_DEFAULT="${KTO_COLLECTOR_REMNA_API_INSECURE_DEFAULT:-0}"
 REMNA_NODE_ALERT_ENABLED_DEFAULT="${KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED_DEFAULT:-1}"
 REMNA_NODE_POLL_SEC_DEFAULT="${KTO_COLLECTOR_REMNA_NODE_POLL_SEC_DEFAULT:-15}"
 REMNA_OFFLINE_GUARD_ENABLED_DEFAULT="${KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED_DEFAULT:-1}"
@@ -449,6 +449,11 @@ install_asset_file() {
     local raw_url="${KTO_RAW_BASE%/}/${relative_path}"
     local tmp
 
+    if [[ ! "$raw_url" =~ ^https:// ]] && [[ "${KTO_ALLOW_INSECURE_UPDATE_URL:-0}" != "1" ]]; then
+        fail "Небезопасный URL asset: ${raw_url}"
+        return 1
+    fi
+
     if [[ -f "$local_path" ]]; then
         if ! "${SUDO[@]}" install -m "$mode" "$local_path" "$target_path" >> "$LOG_FILE" 2>&1; then
             fail "Не смог установить asset: ${relative_path}"
@@ -591,6 +596,8 @@ config_get() {
             gsub(/^"/, "", value)
             gsub(/"$/, "", value)
             gsub(/\\"/, "\"", value)
+            gsub(/\\\$/, "$", value)
+            gsub(/\\`/, "`", value)
             gsub(/\\\\/, "\\", value)
             print value
             exit
@@ -602,7 +609,19 @@ escape_config_value() {
     local value="$1"
     value="${value//\\/\\\\}"
     value="${value//\"/\\\"}"
+    value="${value//\$/\\\$}"
+    value="${value//\`/\\\`}"
     printf '%s\n' "$value"
+}
+
+generate_node_uuid() {
+    local value=""
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        read -r value < /proc/sys/kernel/random/uuid || true
+    elif command_exists uuidgen; then
+        value="$(uuidgen 2>/dev/null || true)"
+    fi
+    printf '%s\n' "${value,,}"
 }
 
 text_has_replacement_char() {
@@ -622,7 +641,6 @@ text_has_bad_utf8() {
 
 load_machine_mode() {
     local saved_mode="" saved_profile="" saved_api_url="" saved_api_token="" source_file="$CONFIG_FILE"
-    CONFIG_SOURCE_FILE=""
 
     if [[ -n "$MACHINE_MODE" ]]; then
         if ! valid_machine_mode "$MACHINE_MODE"; then
@@ -637,8 +655,6 @@ load_machine_mode() {
             NODE_PROFILE=""
         fi
     fi
-
-    CONFIG_SOURCE_FILE="$source_file"
 
     saved_mode="$("${SUDO[@]}" awk -F= '$1=="MACHINE_MODE"{gsub(/"/,"",$2); print $2; exit}' "$source_file" 2>/dev/null || true)"
     if [[ -z "$MACHINE_MODE" ]] && valid_machine_mode "$saved_mode"; then
@@ -1470,18 +1486,22 @@ remna_api() {
     local path="$2"
     local payload_file="${3:-}"
     local tmp code url
+    local curl_tls=()
     tmp="$(mktemp)"
     url="${REMNA_API_URL%/}${path}"
+    if [[ "${KTO_REMNA_API_INSECURE:-0}" == "1" ]]; then
+        curl_tls=(-k)
+    fi
 
     if [[ -n "$payload_file" ]]; then
-        code="$(curl -k -sS -L -X "$method" \
+        code="$(curl "${curl_tls[@]}" -sS -L -X "$method" \
             -H "Authorization: Bearer ${REMNA_API_TOKEN}" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             --data-binary "@${payload_file}" \
             -o "$tmp" -w '%{http_code}' "$url" 2>> "$LOG_FILE" || true)"
     else
-        code="$(curl -k -sS -L -X "$method" \
+        code="$(curl "${curl_tls[@]}" -sS -L -X "$method" \
             -H "Authorization: Bearer ${REMNA_API_TOKEN}" \
             -H "Accept: application/json" \
             -o "$tmp" -w '%{http_code}' "$url" 2>> "$LOG_FILE" || true)"
@@ -1638,16 +1658,18 @@ opt_prepare_system() {
     cmd "${SUDO[@]}" dpkg --configure -a || true
     cmd "${SUDO[@]}" apt-get clean || true
     cmd "${SUDO[@]}" apt-get autoclean || true
-    cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || true
+    if [[ "${KTO_DESTRUCTIVE_CLEANUP:-0}" == "1" ]]; then
+        cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || true
+    fi
     if command_exists journalctl; then
         cmd "${SUDO[@]}" journalctl --vacuum-size=256M --vacuum-time=7d || true
     fi
     cmd "${SUDO[@]}" rm -f /etc/apt/sources.list.d/ookla_speedtest-cli.list || true
-    if package_installed snapd; then
+    if package_installed snapd && [[ "${KTO_PURGE_SNAPD:-0}" == "1" ]]; then
         cmd "${SUDO[@]}" systemctl disable --now snapd.socket snapd.service || true
         cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd || true
-    else
-        echo "snapd purge skipped: not installed" >> "$LOG_FILE"
+    elif package_installed snapd; then
+        echo "snapd purge skipped: set KTO_PURGE_SNAPD=1 to remove it" >> "$LOG_FILE"
     fi
 }
 
@@ -1704,6 +1726,11 @@ EOF
 
 opt_dns_guard() {
     ensure_hostname_hosts_entry
+
+    if dns_resolution_ok && [[ "${KTO_FORCE_DNS_GUARD:-0}" != "1" ]]; then
+        echo "DNS guard skipped: current resolver works" >> "$LOG_FILE"
+        return 0
+    fi
 
     if systemd_resolved_available; then
         cmd "${SUDO[@]}" mkdir -p /etc/systemd/resolved.conf.d
@@ -1797,13 +1824,16 @@ EOF
     cmd "${SUDO[@]}" install -m 0644 "$tmp" "$DOCKER_DAEMON_JSON"
     rm -f "$tmp"
 
-    cmd "${SUDO[@]}" find /var/lib/docker/containers -type f -name '*-json.log' -size +100M -exec truncate -s 0 {} + || true
-    cmd "${SUDO[@]}" docker image prune -af || true
-    cmd "${SUDO[@]}" docker builder prune -af || true
+    if [[ "${KTO_DESTRUCTIVE_CLEANUP:-0}" == "1" ]]; then
+        cmd "${SUDO[@]}" find /var/lib/docker/containers -type f -name '*-json.log' -size +100M -exec truncate -s 0 {} + || true
+        cmd "${SUDO[@]}" docker image prune -af || true
+        cmd "${SUDO[@]}" docker builder prune -af || true
+    fi
     cmd "${SUDO[@]}" systemctl reload docker || true
 }
 
 truncate_large_var_logs() {
+    [[ "${KTO_DESTRUCTIVE_CLEANUP:-0}" == "1" ]] || return 0
     cmd "${SUDO[@]}" find /var/log -xdev -type f -size +256M \
         ! -path '/var/log/journal/*' \
         -printf 'truncate large log: %s %p\n' || true
@@ -1850,7 +1880,9 @@ cleanup_superseded_kto_files() {
 opt_storage_guard() {
     cmd "${SUDO[@]}" apt-get clean || true
     cmd "${SUDO[@]}" apt-get autoclean || true
-    cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || true
+    if [[ "${KTO_DESTRUCTIVE_CLEANUP:-0}" == "1" ]]; then
+        cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || true
+    fi
 
     cmd "${SUDO[@]}" mkdir -p /etc/systemd/journald.conf.d /etc/logrotate.d
     cleanup_superseded_kto_files
@@ -1882,12 +1914,14 @@ EOF
         cmd "${SUDO[@]}" logrotate "$KTO_LOGROTATE_CONF" || true
     fi
 
-    cmd "${SUDO[@]}" find /tmp -xdev -mindepth 1 -mtime +2 -exec rm -rf -- {} + || true
-    cmd "${SUDO[@]}" find /var/tmp -xdev -mindepth 1 -mtime +7 -exec rm -rf -- {} + || true
-    cmd "${SUDO[@]}" find /var/crash -type f -delete || true
-    cmd "${SUDO[@]}" find /var/lib/systemd/coredump -type f -mtime +1 -delete || true
-    cmd "${SUDO[@]}" find /var/log -xdev -type f \( -name '*.gz' -o -name '*.old' -o -name '*.1' \) -mtime +14 -delete || true
-    truncate_large_var_logs
+    if [[ "${KTO_DESTRUCTIVE_CLEANUP:-0}" == "1" ]]; then
+        cmd "${SUDO[@]}" find /tmp -xdev -mindepth 1 -mtime +2 -exec rm -rf -- {} + || true
+        cmd "${SUDO[@]}" find /var/tmp -xdev -mindepth 1 -mtime +7 -exec rm -rf -- {} + || true
+        cmd "${SUDO[@]}" find /var/crash -type f -delete || true
+        cmd "${SUDO[@]}" find /var/lib/systemd/coredump -type f -mtime +1 -delete || true
+        cmd "${SUDO[@]}" find /var/log -xdev -type f \( -name '*.gz' -o -name '*.old' -o -name '*.1' \) -mtime +14 -delete || true
+        truncate_large_var_logs
+    fi
 
     configure_docker_log_rotation
 }
@@ -1930,7 +1964,7 @@ clean_disk_now() {
     local used
 
     stage "Очищаю диск"
-    opt_storage_guard
+    KTO_DESTRUCTIVE_CLEANUP=1 opt_storage_guard
 
     used="$(root_disk_used_percent)"
     ok "Очистка диска завершена"
@@ -2107,10 +2141,12 @@ opt_firewall() {
     local anti_rules
     anti_rules="$(antiscanner_rules_count)"
 
-    if [[ "$anti_rules" =~ ^[0-9]+$ && "$anti_rules" -gt 0 ]]; then
-        echo "ufw reset skipped: AntiScanner rules already present ($anti_rules)" >> "$LOG_FILE"
-    else
+    if [[ "${KTO_UFW_RESET:-0}" == "1" ]]; then
         cmd "${SUDO[@]}" ufw --force reset
+    elif [[ "$anti_rules" =~ ^[0-9]+$ && "$anti_rules" -gt 0 ]]; then
+        echo "ufw reset skipped: preserving AntiScanner rules ($anti_rules)" >> "$LOG_FILE"
+    else
+        echo "ufw reset skipped: preserving existing rules" >> "$LOG_FILE"
     fi
     cmd "${SUDO[@]}" ufw default deny incoming
     cmd "${SUDO[@]}" ufw default allow outgoing
@@ -2528,7 +2564,7 @@ whitelist_ssh_rules_configured() {
 system_check_prepare_state() {
     local issues=() dpkg_audit
 
-    if package_installed snapd; then
+    if package_installed snapd && [[ "${KTO_PURGE_SNAPD:-0}" == "1" ]]; then
         issues+=("snapd установлен")
     fi
     if "${SUDO[@]}" test -e /etc/apt/sources.list.d/ookla_speedtest-cli.list 2>/dev/null; then
@@ -2716,9 +2752,11 @@ system_check_network_limits() {
         else
             system_check_row ok "dns guard" "настроен"
         fi
+    elif dns_resolution_ok; then
+        system_check_row ok "dns guard" "системный DNS работает, сохраняю"
     else
         SYSTEM_CHECK_NEEDS_NETWORK=1
-        system_check_row miss "dns guard" "принудительный DNS не настроен"
+        system_check_row miss "dns guard" "DNS не работает, нужен fallback"
     fi
 
     if dns_resolution_ok; then
@@ -2911,10 +2949,9 @@ system_check_apply_missing() {
 }
 
 system_check_pause() {
-    local answer
     echo
     echo -ne "${PURPLE}>${NC} ${BOLD}Нажмите Enter, чтобы вернуться:${NC} "
-    read -r answer
+    read -r
 }
 
 system_check() {
@@ -4120,11 +4157,11 @@ install_stats_collector() {
     need_root
 
     local listen_host listen_port secret bot_token chat_id allowed_user stale_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec scan_alert_delta expected_nodes daily_report_time existing_config=0
-    local ip_limit_enabled ip_limit_source ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_penalty_sec
-    local remna_api_url remna_api_token remna_api_cache_sec remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
+    local ip_limit_enabled ip_limit_source ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_drop_enabled ip_limit_penalty_sec
+    local remna_api_url remna_api_token remna_api_cache_sec remna_api_insecure remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
     local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_bl_stale safe_bl_offline_confirm safe_bl_stale_fallback safe_bl_push_interval safe_scan_alert_delta safe_expected safe_tz safe_daily
-    local safe_ip_limit_enabled safe_ip_limit_source safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_scan_sec safe_ip_limit_alert_threshold safe_ip_limit_alert_top safe_ip_limit_enforce_enabled safe_ip_limit_penalty_sec
-    local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_remna_node_alert_enabled safe_remna_node_poll_sec safe_remna_offline_guard_enabled safe_remna_offline_state_max_age_sec safe_remna_offline_log_grace_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
+    local safe_ip_limit_enabled safe_ip_limit_source safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_scan_sec safe_ip_limit_alert_threshold safe_ip_limit_alert_top safe_ip_limit_enforce_enabled safe_ip_limit_drop_enabled safe_ip_limit_penalty_sec
+    local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_remna_api_insecure safe_remna_node_alert_enabled safe_remna_node_poll_sec safe_remna_offline_guard_enabled safe_remna_offline_state_max_age_sec safe_remna_offline_log_grace_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
 
     if "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
         listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -4154,10 +4191,12 @@ install_stats_collector() {
         ip_limit_alert_threshold="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_THRESHOLD "$STATS_COLLECTOR_CONFIG")"
         ip_limit_alert_top="$(config_get KTO_COLLECTOR_IP_LIMIT_ALERT_TOP "$STATS_COLLECTOR_CONFIG")"
         ip_limit_enforce_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED "$STATS_COLLECTOR_CONFIG")"
+        ip_limit_drop_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_DROP_ENABLED "$STATS_COLLECTOR_CONFIG")"
         ip_limit_penalty_sec="$(config_get KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC "$STATS_COLLECTOR_CONFIG")"
         remna_api_url="$(config_get KTO_COLLECTOR_REMNA_API_URL "$STATS_COLLECTOR_CONFIG")"
         remna_api_token="$(config_get KTO_COLLECTOR_REMNA_API_TOKEN "$STATS_COLLECTOR_CONFIG")"
         remna_api_cache_sec="$(config_get KTO_COLLECTOR_REMNA_API_CACHE_SEC "$STATS_COLLECTOR_CONFIG")"
+        remna_api_insecure="$(config_get KTO_COLLECTOR_REMNA_API_INSECURE "$STATS_COLLECTOR_CONFIG")"
         remna_node_alert_enabled="$(config_get KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED "$STATS_COLLECTOR_CONFIG")"
         remna_node_poll_sec="$(config_get KTO_COLLECTOR_REMNA_NODE_POLL_SEC "$STATS_COLLECTOR_CONFIG")"
         remna_offline_guard_enabled="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED "$STATS_COLLECTOR_CONFIG")"
@@ -4203,10 +4242,12 @@ install_stats_collector() {
         ip_limit_alert_threshold="${ip_limit_alert_threshold:-$IP_LIMIT_ALERT_THRESHOLD_DEFAULT}"
         ip_limit_alert_top="${ip_limit_alert_top:-$IP_LIMIT_ALERT_TOP_DEFAULT}"
         ip_limit_enforce_enabled="${ip_limit_enforce_enabled:-$IP_LIMIT_ENFORCE_ENABLED_DEFAULT}"
+        ip_limit_drop_enabled="${ip_limit_drop_enabled:-$IP_LIMIT_DROP_ENABLED_DEFAULT}"
         ip_limit_penalty_sec="${ip_limit_penalty_sec:-$IP_LIMIT_PENALTY_SEC_DEFAULT}"
         remna_api_url="${remna_api_url:-$REMNA_API_URL}"
         remna_api_token="${remna_api_token:-$REMNA_API_TOKEN}"
         remna_api_cache_sec="${remna_api_cache_sec:-$REMNA_API_CACHE_SEC_DEFAULT}"
+        remna_api_insecure="${remna_api_insecure:-$REMNA_API_INSECURE_DEFAULT}"
         remna_node_alert_enabled="${remna_node_alert_enabled:-$REMNA_NODE_ALERT_ENABLED_DEFAULT}"
         remna_node_poll_sec="${remna_node_poll_sec:-$REMNA_NODE_POLL_SEC_DEFAULT}"
         remna_offline_guard_enabled="${remna_offline_guard_enabled:-$REMNA_OFFLINE_GUARD_ENABLED_DEFAULT}"
@@ -4243,10 +4284,12 @@ install_stats_collector() {
         ip_limit_alert_threshold="$IP_LIMIT_ALERT_THRESHOLD_DEFAULT"
         ip_limit_alert_top="$IP_LIMIT_ALERT_TOP_DEFAULT"
         ip_limit_enforce_enabled="$IP_LIMIT_ENFORCE_ENABLED_DEFAULT"
+        ip_limit_drop_enabled="$IP_LIMIT_DROP_ENABLED_DEFAULT"
         ip_limit_penalty_sec="$IP_LIMIT_PENALTY_SEC_DEFAULT"
         remna_api_url="$REMNA_API_URL"
         remna_api_token="$REMNA_API_TOKEN"
         remna_api_cache_sec="$REMNA_API_CACHE_SEC_DEFAULT"
+        remna_api_insecure="$REMNA_API_INSECURE_DEFAULT"
         remna_node_alert_enabled="$REMNA_NODE_ALERT_ENABLED_DEFAULT"
         remna_node_poll_sec="$REMNA_NODE_POLL_SEC_DEFAULT"
         remna_offline_guard_enabled="$REMNA_OFFLINE_GUARD_ENABLED_DEFAULT"
@@ -4264,6 +4307,9 @@ install_stats_collector() {
     fi
     if [[ -n "${KTO_COLLECTOR_REMNA_API_CACHE_SEC:-}" ]]; then
         remna_api_cache_sec="$KTO_COLLECTOR_REMNA_API_CACHE_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_REMNA_API_INSECURE:-}" ]]; then
+        remna_api_insecure="$KTO_COLLECTOR_REMNA_API_INSECURE"
     fi
     if [[ -n "${KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED:-}" ]]; then
         remna_node_alert_enabled="$KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED"
@@ -4331,6 +4377,9 @@ install_stats_collector() {
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED:-}" ]]; then
         ip_limit_enforce_enabled="$KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED"
     fi
+    if [[ -n "${KTO_COLLECTOR_IP_LIMIT_DROP_ENABLED:-}" ]]; then
+        ip_limit_drop_enabled="$KTO_COLLECTOR_IP_LIMIT_DROP_ENABLED"
+    fi
     if [[ -n "${KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC:-}" ]]; then
         ip_limit_penalty_sec="$KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC"
     fi
@@ -4372,10 +4421,12 @@ install_stats_collector() {
     safe_ip_limit_alert_threshold="$(escape_config_value "$ip_limit_alert_threshold")"
     safe_ip_limit_alert_top="$(escape_config_value "$ip_limit_alert_top")"
     safe_ip_limit_enforce_enabled="$(escape_config_value "$ip_limit_enforce_enabled")"
+    safe_ip_limit_drop_enabled="$(escape_config_value "$ip_limit_drop_enabled")"
     safe_ip_limit_penalty_sec="$(escape_config_value "$ip_limit_penalty_sec")"
     safe_remna_api_url="$(escape_config_value "$remna_api_url")"
     safe_remna_api_token="$(escape_config_value "$remna_api_token")"
     safe_remna_api_cache_sec="$(escape_config_value "$remna_api_cache_sec")"
+    safe_remna_api_insecure="$(escape_config_value "$remna_api_insecure")"
     safe_remna_node_alert_enabled="$(escape_config_value "$remna_node_alert_enabled")"
     safe_remna_node_poll_sec="$(escape_config_value "$remna_node_poll_sec")"
     safe_remna_offline_guard_enabled="$(escape_config_value "$remna_offline_guard_enabled")"
@@ -4422,10 +4473,12 @@ KTO_COLLECTOR_IP_LIMIT_SCAN_SEC="$safe_ip_limit_scan_sec"
 KTO_COLLECTOR_IP_LIMIT_ALERT_THRESHOLD="$safe_ip_limit_alert_threshold"
 KTO_COLLECTOR_IP_LIMIT_ALERT_TOP="$safe_ip_limit_alert_top"
 KTO_COLLECTOR_IP_LIMIT_ENFORCE_ENABLED="$safe_ip_limit_enforce_enabled"
+KTO_COLLECTOR_IP_LIMIT_DROP_ENABLED="$safe_ip_limit_drop_enabled"
 KTO_COLLECTOR_IP_LIMIT_PENALTY_SEC="$safe_ip_limit_penalty_sec"
 KTO_COLLECTOR_REMNA_API_URL="$safe_remna_api_url"
 KTO_COLLECTOR_REMNA_API_TOKEN="$safe_remna_api_token"
 KTO_COLLECTOR_REMNA_API_CACHE_SEC="$safe_remna_api_cache_sec"
+KTO_COLLECTOR_REMNA_API_INSECURE="$safe_remna_api_insecure"
 KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED="$safe_remna_node_alert_enabled"
 KTO_COLLECTOR_REMNA_NODE_POLL_SEC="$safe_remna_node_poll_sec"
 KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED="$safe_remna_offline_guard_enabled"
@@ -4681,10 +4734,13 @@ install_stats_push_client() {
     require_push_mode
     need_root
 
-    local default_iface default_name node_name node_id iface collector_url secret interval existing_config=0
+    local default_iface default_name node_name node_id node_uuid node_kind require_signed_response iface collector_url secret interval existing_config=0
     local ip_limit_enabled ip_limit_log_file ip_limit_docker_container ip_limit_user_regex ip_limit_ip_regex ip_limit_scan_sec ip_limit_tail_lines ip_limit_max_events ip_limit_xray_logs
-    local safe_name safe_id safe_iface safe_url safe_secret safe_interval
+    local safe_name safe_id safe_uuid safe_kind safe_require_signed_response safe_iface safe_url safe_secret safe_interval
     local safe_ip_limit_enabled safe_ip_limit_log_file safe_ip_limit_docker safe_ip_limit_user_regex safe_ip_limit_ip_regex safe_ip_limit_scan_sec safe_ip_limit_tail_lines safe_ip_limit_max_events safe_ip_limit_xray_logs
+    node_uuid=""
+    node_kind=""
+    require_signed_response=""
 
     default_iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
     default_iface="${default_iface:-$(default_network_interface)}"
@@ -4698,6 +4754,9 @@ install_stats_push_client() {
     if "${SUDO[@]}" test -s "$STATS_PUSH_CONFIG" 2>/dev/null; then
         node_id="$(config_get KTO_PUSH_NODE_ID "$STATS_PUSH_CONFIG")"
         node_name="$(config_get KTO_PUSH_NODE_NAME "$STATS_PUSH_CONFIG")"
+        node_uuid="$(config_get KTO_PUSH_NODE_UUID "$STATS_PUSH_CONFIG")"
+        node_kind="$(config_get KTO_PUSH_NODE_KIND "$STATS_PUSH_CONFIG")"
+        require_signed_response="$(config_get KTO_PUSH_REQUIRE_SIGNED_RESPONSE "$STATS_PUSH_CONFIG")"
         iface="$(config_get KTO_PUSH_IFACE "$STATS_PUSH_CONFIG")"
         collector_url="$(config_get KTO_PUSH_COLLECTOR_URL "$STATS_PUSH_CONFIG")"
         secret="$(config_get KTO_PUSH_SECRET "$STATS_PUSH_CONFIG")"
@@ -4738,6 +4797,7 @@ install_stats_push_client() {
         fi
         ip_limit_max_events="${ip_limit_max_events:-$IP_LIMIT_MAX_EVENTS_DEFAULT}"
         ip_limit_xray_logs="${ip_limit_xray_logs:-$IP_LIMIT_XRAY_LOGS_DEFAULT}"
+        require_signed_response="${require_signed_response:-0}"
         if ! network_interface_exists "$iface"; then
             fail "Интерфейс ${iface} из конфига не найден. Проверь: ip -br link"
             return 1
@@ -4774,10 +4834,31 @@ install_stats_push_client() {
         ip_limit_tail_lines="$IP_LIMIT_TAIL_LINES_DEFAULT"
         ip_limit_max_events="$IP_LIMIT_MAX_EVENTS_DEFAULT"
         ip_limit_xray_logs="$IP_LIMIT_XRAY_LOGS_DEFAULT"
+        require_signed_response=0
+    fi
+
+    node_uuid="${node_uuid,,}"
+    if [[ ! "$node_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+        node_uuid="$(generate_node_uuid)"
+    fi
+    if [[ ! "$node_uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+        fail "Не удалось создать UUID машины."
+        return 1
+    fi
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        node_kind="wl"
+    else
+        node_kind="bl"
+    fi
+    if [[ "$require_signed_response" != "1" ]]; then
+        require_signed_response=0
     fi
 
     safe_name="$(escape_config_value "$node_name")"
     safe_id="$(escape_config_value "$node_id")"
+    safe_uuid="$(escape_config_value "$node_uuid")"
+    safe_kind="$(escape_config_value "$node_kind")"
+    safe_require_signed_response="$(escape_config_value "$require_signed_response")"
     safe_iface="$(escape_config_value "$iface")"
     safe_url="$(escape_config_value "$collector_url")"
     safe_secret="$(escape_config_value "$secret")"
@@ -4797,7 +4878,7 @@ install_stats_push_client() {
     else
         stage "Устанавливаю push статистики"
     fi
-    must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat iptables conntrack socat
+    must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat iptables conntrack socat openssl
     if ! "${SUDO[@]}" vnstat --json -i "$iface" >/dev/null 2>&1; then
         cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
     fi
@@ -4818,9 +4899,12 @@ install_stats_push_client() {
     write_root_file_mode 0600 "$STATS_PUSH_CONFIG" <<EOF
 KTO_PUSH_NODE_ID="$safe_id"
 KTO_PUSH_NODE_NAME="$safe_name"
+KTO_PUSH_NODE_UUID="$safe_uuid"
+KTO_PUSH_NODE_KIND="$safe_kind"
 KTO_PUSH_IFACE="$safe_iface"
 KTO_PUSH_COLLECTOR_URL="$safe_url"
 KTO_PUSH_SECRET="$safe_secret"
+KTO_PUSH_REQUIRE_SIGNED_RESPONSE="$safe_require_signed_response"
 KTO_PUSH_INTERVAL="$safe_interval"
 KTO_IP_LIMIT_ENABLED="$safe_ip_limit_enabled"
 KTO_IP_LIMIT_LOG_FILE="$safe_ip_limit_log_file"
