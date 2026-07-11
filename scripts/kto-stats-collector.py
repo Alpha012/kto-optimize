@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v234"
+COLLECTOR_BUILD = "v235"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -821,18 +821,15 @@ def load_alerts_off_state():
                 continue
             if isinstance(item, dict):
                 name = clean_display_text(item.get("name") or node_key)[:120] or node_key
-                raw_aliases = item.get("aliases") if isinstance(item.get("aliases"), list) else []
+                record_key = canonical_node_key(item.get("record_key") or node_key)
                 updated_at = int(item.get("updated_at") or 0)
             else:
                 name = clean_display_text(item or node_key)[:120] or node_key
-                raw_aliases = []
+                record_key = node_key
                 updated_at = 0
-            aliases = {node_key, canonical_node_key(name)}
-            aliases.update(canonical_node_key(alias) for alias in raw_aliases)
-            aliases.discard("")
             clean_nodes[node_key] = {
                 "name": name,
-                "aliases": sorted(aliases, key=natural_sort_key),
+                "record_key": record_key or node_key,
                 "updated_at": updated_at,
             }
         ALERTS_OFF_STATE = {"nodes": clean_nodes}
@@ -4701,12 +4698,27 @@ def node_in_alias_state(node, state):
     return False
 
 
+def node_in_record_state(node, state):
+    record_key = canonical_node_key(node_record_key(node) or node_canonical_key(node))
+    if not record_key:
+        return False
+    with LOCK:
+        for key, item in state.setdefault("nodes", {}).items():
+            item_keys = {canonical_node_key(key)}
+            if isinstance(item, dict):
+                item_keys.add(canonical_node_key(item.get("record_key")))
+            item_keys.discard("")
+            if record_key in item_keys:
+                return True
+    return False
+
+
 def node_stats_disabled(node):
     return node_in_alias_state(node, STATS_OFF_STATE)
 
 
 def node_connection_alerts_disabled(node):
-    return node_in_alias_state(node, ALERTS_OFF_STATE)
+    return node_in_record_state(node, ALERTS_OFF_STATE)
 
 
 def current_bl_nodes():
@@ -7445,20 +7457,19 @@ def handle_push_notifications(text, enabled):
                 continue
             node = matches[0]
             node_key = node_record_key(node) or node_canonical_key(node)
+            exact_key = canonical_node_key(node_key)
             node_name = node_display_name(node, node_key)
-            aliases = node_alias_keys(node)
-            if not node_key:
+            if not node_key or not exact_key:
                 missing.append(query)
                 continue
             if enabled:
                 removed = False
                 for key, item in list(nodes_state.items()):
-                    item_aliases = {canonical_node_key(key)}
+                    item_keys = {canonical_node_key(key)}
                     if isinstance(item, dict):
-                        item_aliases.update(canonical_node_key(value) for value in item.get("aliases") or [])
-                        item_aliases.add(canonical_node_key(item.get("name")))
-                    item_aliases.discard("")
-                    if aliases.intersection(item_aliases):
+                        item_keys.add(canonical_node_key(item.get("record_key")))
+                    item_keys.discard("")
+                    if exact_key in item_keys:
                         nodes_state.pop(key, None)
                         removed = True
                 if removed:
@@ -7471,7 +7482,7 @@ def handle_push_notifications(text, enabled):
                     continue
                 nodes_state[node_key] = {
                     "name": node_name[:120],
-                    "aliases": sorted({alias for alias in aliases if alias}, key=natural_sort_key),
+                    "record_key": exact_key,
                     "updated_at": ts,
                 }
                 changed.append(node_name)

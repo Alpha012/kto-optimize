@@ -358,6 +358,27 @@ class CollectorRegressionTests(unittest.TestCase):
         finally:
             collector.send_message = original_send
 
+    def test_disable_push_uses_exact_uuid_not_shared_aliases(self):
+        first_payload = self.payload("Обход №1 (Private)", str(uuid.uuid4()), "wl")
+        second_payload = self.payload("Обход №1 (resell)", str(uuid.uuid4()), "wl")
+        first_payload["hostname"] = "shared.example"
+        second_payload["hostname"] = "shared.example"
+        first = collector.update_node(first_payload, "203.0.113.91")
+        second = collector.update_node(second_payload, "203.0.113.92")
+        original_send = collector.send_message
+        collector.send_message = lambda *_args, **_kwargs: None
+        try:
+            collector.handle_push_notifications("/disable_push Обход #1 (Private)", enabled=False)
+            self.assertTrue(collector.node_connection_alerts_disabled(first))
+            first_state = next(iter(collector.ALERTS_OFF_STATE["nodes"].values()))
+            first_state["aliases"] = ["sharedexample", collector.canonical_node_key(second["name"])]
+            self.assertFalse(collector.node_connection_alerts_disabled(second))
+            collector.handle_push_notifications("/disable_push Обход #1 (resell)", enabled=False)
+            self.assertTrue(collector.node_connection_alerts_disabled(second))
+            self.assertEqual(2, len(collector.ALERTS_OFF_STATE["nodes"]))
+        finally:
+            collector.send_message = original_send
+
 
 if __name__ == "__main__":
     unittest.main()
