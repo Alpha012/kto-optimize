@@ -180,6 +180,9 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertNotEqual(signature, changed)
 
     def test_signed_http_push_returns_verifiable_response(self):
+        with collector.LOCK:
+            collector.ip_limit_meta_set("total_limit", "5")
+            collector.save_ip_limit_state()
         body = json.dumps(
             self.payload("HTTP нода", str(uuid.uuid4()), "bl"),
             ensure_ascii=False,
@@ -218,6 +221,7 @@ class CollectorRegressionTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual([], payload["ip_limit_blocks"])
             self.assertTrue(payload["ip_limit_clear_blocks"])
+            self.assertTrue(payload["ip_limit_enabled"])
         finally:
             server.shutdown()
             server.server_close()
@@ -247,6 +251,28 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertFalse(collector.ip_limit_telegram_alert_allowed(0))
         self.assertTrue(collector.ip_limit_telegram_alert_allowed(20))
         self.assertFalse(collector.ip_limit_telegram_alert_allowed(21))
+        self.assertTrue(collector.ip_limit_telegram_alert_allowed(25, "total"))
+
+    def test_total_ip_limit_overrides_personal_and_hwid_immediately(self):
+        info = {"id": 3, "uuid": str(uuid.uuid4()), "hwidDeviceLimit": 1}
+        collector.set_ip_limit_override("3", info, 2)
+        self.assertEqual((2, "personal"), collector.ip_limit_effective_limit("3", info))
+        messages = []
+        original_send = collector.send_message
+        collector.send_message = lambda text, **_kwargs: messages.append(text)
+        try:
+            collector.handle_ip_limit_total("/limit_ip_total 5")
+            self.assertEqual((5, "total"), collector.ip_limit_effective_limit("3", info))
+            self.assertTrue(collector.ip_limit_processing_enabled_for_node("Любая нода"))
+            self.assertIn("5 IP для каждого", messages[-1])
+            collector.handle_ip_limit_total("/limit_ip_total 0")
+            self.assertEqual((0, "total"), collector.ip_limit_effective_limit("3", info))
+            self.assertFalse(collector.ip_limit_processing_enabled_for_node("Любая нода"))
+            collector.handle_ip_limit_total("/limit_ip_total auto")
+            self.assertIsNone(collector.ip_limit_total_limit())
+            self.assertEqual((2, "personal"), collector.ip_limit_effective_limit("3", info))
+        finally:
+            collector.send_message = original_send
 
     def test_ip_limit_is_alert_only_and_recovers_old_actions(self):
         now = int(time.time())

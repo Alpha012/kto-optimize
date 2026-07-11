@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v233"
+COLLECTOR_BUILD = "v234"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4545,7 +4545,24 @@ def ip_limit_primary_key(user, info=None):
     return keys[0] if keys else str(user or "").strip()
 
 
+def ip_limit_total_limit():
+    with LOCK:
+        raw = ip_limit_meta_get("total_limit")
+    if raw == "":
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value < 0 or value > 10000:
+        return None
+    return value
+
+
 def ip_limit_effective_limit(user, info=None):
+    total_limit = ip_limit_total_limit()
+    if total_limit is not None:
+        return total_limit, "total"
     with LOCK:
         for key in ip_limit_user_keys(user, info):
             row = ip_limit_db().execute("SELECT limit_value FROM ip_limit_limits WHERE user = ?", (str(key),)).fetchone()
@@ -5117,6 +5134,9 @@ def ip_limit_remna_monitor_enabled():
         return False
     if not remna_api_enabled():
         return False
+    total_limit = ip_limit_total_limit()
+    if total_limit is not None:
+        return total_limit > 0
     if IP_LIMIT_ENABLED:
         return True
     return bool(ip_limit_enabled_node_keys())
@@ -5125,12 +5145,13 @@ def ip_limit_remna_monitor_enabled():
 def remna_ip_limit_allowed_rows(rows, enabled_node_keys):
     allowed = []
     active_after = now_ts() - REMNA_TOP_IP_ACTIVE_SEC
+    total_limit = ip_limit_total_limit()
     for row in rows or []:
         last_seen = remna_epoch_sec(row.get("last_seen"), 0)
         if last_seen > 0 and last_seen < active_after:
             continue
         node_keys = node_alias_keys(row.get("node"))
-        if not IP_LIMIT_ENABLED and enabled_node_keys and not node_keys.intersection(enabled_node_keys):
+        if total_limit is None and not IP_LIMIT_ENABLED and enabled_node_keys and not node_keys.intersection(enabled_node_keys):
             continue
         allowed.append({
             "user": row.get("user"),
@@ -5166,6 +5187,9 @@ def set_ip_limit_node_policy(node, enabled=True, enforce=False):
 
 
 def ip_limit_processing_enabled_for_node(node_name):
+    total_limit = ip_limit_total_limit()
+    if total_limit is not None:
+        return total_limit > 0
     if IP_LIMIT_ENABLED:
         return True
     policy = ip_limit_node_policy(node_name)
@@ -5303,12 +5327,15 @@ def ip_limit_report(query=""):
 
     grouped = ip_limit_group_rows(rows)
     total_ips = len({row["ip"] for row in rows})
+    total_limit = ip_limit_total_limit()
+    report_limit = total_limit if total_limit is not None else IP_LIMIT_MAX_IPS
+    report_limit_text = f"{report_limit} IP" if report_limit > 0 else "без лимита"
     header = [
         "<b>IP лимит</b>",
         ALERT_SEPARATOR,
         detail_line("Машина", query),
         detail_line("Окно", format_duration_ru(IP_LIMIT_WINDOW_SEC)),
-        detail_line("Лимит", f"{IP_LIMIT_MAX_IPS} IP"),
+        detail_line("Лимит", report_limit_text),
         detail_line("IP", total_ips),
     ]
 
@@ -5398,7 +5425,7 @@ def remna_ip_limit_alert_rows(rows, ts):
             continue
         info = row.get("user_info") if isinstance(row.get("user_info"), dict) and row.get("user_info") else remna_user_info(user)
         limit, source = ip_limit_effective_limit(user, info)
-        if not ip_limit_telegram_alert_allowed(limit) or active_ips <= limit:
+        if not ip_limit_telegram_alert_allowed(limit, source) or active_ips <= limit:
             continue
         item = dict(row)
         if isinstance(info, dict) and info:
@@ -5410,8 +5437,11 @@ def remna_ip_limit_alert_rows(rows, ts):
     return result
 
 
-def ip_limit_telegram_alert_allowed(limit):
-    return 0 < int(limit or 0) <= IP_LIMIT_ALERT_THRESHOLD
+def ip_limit_telegram_alert_allowed(limit, source=""):
+    value = int(limit or 0)
+    if source == "total":
+        return value > 0
+    return 0 < value <= IP_LIMIT_ALERT_THRESHOLD
 
 
 def remna_ip_limit_top_message(top_rows, snapshot):
@@ -5421,7 +5451,7 @@ def remna_ip_limit_top_message(top_rows, snapshot):
         f"{LOST_EMOJI} #ipLimitTop",
         "<b>Много активных IP</b>",
         ALERT_SEPARATOR,
-        detail_line("Порог", f">{IP_LIMIT_ALERT_THRESHOLD} IP и выше личного лимита"),
+        detail_line("Порог", f">{IP_LIMIT_ALERT_THRESHOLD} IP и выше действующего лимита"),
         detail_line("Максимум", f"{max_ips} IP"),
         detail_line("Окно", format_duration_ru(REMNA_TOP_IP_ACTIVE_SEC)),
         detail_line("Ноды", f"{snapshot.get('nodes_polled', 0)}/{snapshot.get('nodes_total', 0)}"),
@@ -5469,6 +5499,7 @@ def ip_limit_limit_text(limit, source):
     if limit <= 0:
         return "без лимита"
     suffix_map = {
+        "total": "общий для всех",
         "personal": "персональный",
         "hwid": "HWID",
         "global": "глобальный",
@@ -5516,6 +5547,8 @@ def ip_limit_user_card(query):
         detail_line("Окно", format_duration_ru(IP_LIMIT_WINDOW_SEC)),
         detail_line("Активных IP", active_text),
     ])
+    if source == "total":
+        lines.append("<i>Персональные и HWID-лимиты сейчас игнорируются.</i>")
     with LOCK:
         penalty = ip_limit_db().execute("SELECT enable_at FROM ip_limit_penalties WHERE user = ?", (key,)).fetchone()
         if penalty and int(penalty["enable_at"] or 0) > ts:
@@ -5529,15 +5562,14 @@ def ip_limit_user_card(query):
         lines.append("<blockquote>" + "\n".join(ip_lines) + "</blockquote>")
     else:
         lines.append("<blockquote>Активных IP сейчас нет.</blockquote>")
-    markup = {
-        "inline_keyboard": [
-            [
-                {"text": "Убрать лимит", "callback_data": f"ipl:off:{key}"},
-                {"text": "Повысить лимит", "callback_data": f"ipl:raise:{key}"},
-            ],
-            [{"text": "Обновить", "callback_data": f"ipl:show:{key}"}],
-        ]
-    }
+    markup_rows = []
+    if source != "total":
+        markup_rows.append([
+            {"text": "Убрать лимит", "callback_data": f"ipl:off:{key}"},
+            {"text": "Повысить лимит", "callback_data": f"ipl:raise:{key}"},
+        ])
+    markup_rows.append([{"text": "Обновить", "callback_data": f"ipl:show:{key}"}])
+    markup = {"inline_keyboard": markup_rows}
     return "\n".join(lines), markup
 
 
@@ -5560,7 +5592,7 @@ def alert_ip_limit_exceeded(user, entries, info=None):
 
     if not isinstance(info, dict):
         info = remna_user_info(user)
-    limit, _ = ip_limit_effective_limit(user, info)
+    limit, source = ip_limit_effective_limit(user, info)
     lines = [
         f"{LOST_EMOJI} #ipLimitExceeded",
         "<b>IP лимит превышен</b>",
@@ -5569,6 +5601,7 @@ def alert_ip_limit_exceeded(user, entries, info=None):
     ]
     lines.extend(remna_detail_lines(user, info, include_hwid=True))
     lines.extend([
+        detail_line("Лимит", ip_limit_limit_text(limit, source)),
         detail_line("Активных IP", f"{len(entries)}/{limit if limit > 0 else 'без лимита'}"),
         detail_line("Окно", format_duration_ru(IP_LIMIT_WINDOW_SEC)),
         f"<blockquote>{chr(10).join(ip_lines)}</blockquote>",
@@ -5665,8 +5698,8 @@ def process_ip_limit_events(events, fallback_node, ts):
         with LOCK:
             purge_ip_limit_state(ts)
             entries = active_ip_limit_entries_for_user(user, info, ts)
-            limit, _ = ip_limit_effective_limit(user, info)
-            if not ip_limit_telegram_alert_allowed(limit) or len(entries) <= limit:
+            limit, source = ip_limit_effective_limit(user, info)
+            if not ip_limit_telegram_alert_allowed(limit, source) or len(entries) <= limit:
                 continue
             alert_key = ip_limit_primary_key(user, info)
             row = ip_limit_db().execute("SELECT last_alert FROM ip_limit_alerts WHERE user = ?", (alert_key,)).fetchone()
@@ -5690,10 +5723,10 @@ def process_remna_ip_limit_alerts(ts):
             continue
         info = remna_user_info(user)
         entries = active_ip_limit_entries_for_user(user, info, ts)
-        limit, _ = ip_limit_effective_limit(user, info)
+        limit, source = ip_limit_effective_limit(user, info)
         if limit <= 0 or len(entries) <= limit:
             continue
-        if not ip_limit_telegram_alert_allowed(limit):
+        if not ip_limit_telegram_alert_allowed(limit, source):
             continue
         alert_key = ip_limit_primary_key(user, info)
         with LOCK:
@@ -5713,8 +5746,9 @@ def process_remna_ip_limit_alerts(ts):
 
 def remna_ip_limit_poll_once():
     ts = now_ts()
+    total_limit = ip_limit_total_limit()
     enabled_node_keys = ip_limit_enabled_node_keys()
-    if not IP_LIMIT_ENABLED and not enabled_node_keys:
+    if total_limit == 0 or (total_limit is None and not IP_LIMIT_ENABLED and not enabled_node_keys):
         return {"ok": True, "disabled": True}
     snapshot = remna_fetch_active_user_ips()
     rows = remna_ip_limit_allowed_rows(snapshot.get("rows") or [], enabled_node_keys)
@@ -6041,9 +6075,14 @@ class Handler(BaseHTTPRequestHandler):
                 "ip_limit_blocks": [],
                 "ip_limit_clear_blocks": True,
             }
+            total_limit = ip_limit_total_limit()
             ip_policy = ip_limit_node_policy(node)
-            if ip_policy is not None:
+            if total_limit is not None:
+                response["ip_limit_enabled"] = total_limit > 0
+            elif ip_policy is not None:
                 response["ip_limit_enabled"] = bool(ip_policy.get("enabled"))
+            else:
+                response["ip_limit_enabled"] = bool(IP_LIMIT_ENABLED)
             sni_override = sni_override_for_node(node)
             if sni_override is not None:
                 response["allowed_sni"] = sni_override
@@ -7903,6 +7942,63 @@ def handle_ip_limit(text):
     send_message(body, reply_markup=markup)
 
 
+def handle_ip_limit_total(text):
+    parts = text.split(maxsplit=1)
+    value_text = parts[1].strip().lower() if len(parts) > 1 else ""
+    current = ip_limit_total_limit()
+    if not value_text:
+        current_text = "auto: персональный → HWID → fallback" if current is None else ip_limit_limit_text(current, "total")
+        send_message(
+            "<b>Общий IP лимит</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Сейчас', current_text)}\n\n"
+            "<b>Установить:</b> <code>/limit_ip_total 5</code>\n"
+            "<b>Выключить IP-алерты:</b> <code>/limit_ip_total 0</code>\n"
+            "<b>Вернуть HWID-логику:</b> <code>/limit_ip_total auto</code>"
+        )
+        return
+    if value_text in ("auto", "reset", "default"):
+        with LOCK:
+            ip_limit_db().execute("DELETE FROM ip_limit_meta WHERE key = 'total_limit'")
+            save_ip_limit_state()
+        send_message(
+            "<b>Общий IP лимит сброшен</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Логика', 'персональный → HWID → fallback')}\n"
+            "<i>Применилось сразу, рестарт не нужен.</i>"
+        )
+        return
+    if not re.fullmatch(r"\d{1,5}", value_text):
+        send_message("<b>Нужно число от 0 до 10000.</b>\n\nПример: <code>/limit_ip_total 5</code>")
+        return
+    limit = int(value_text)
+    if limit > 10000:
+        send_message("<b>Лимит должен быть от 0 до 10000.</b>")
+        return
+    with LOCK:
+        ip_limit_meta_set("total_limit", str(limit))
+        ip_limit_db().execute("DELETE FROM ip_limit_pending")
+        save_ip_limit_state()
+    if limit == 0:
+        send_message(
+            "<b>IP-limit алерты выключены</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Общий лимит', 'без лимита')}\n"
+            "<i>Статистика и остальные алерты продолжают работать. Рестарт не нужен.</i>"
+        )
+        return
+    send_message(
+        "<b>Общий IP лимит установлен</b>\n"
+        f"{ALERT_SEPARATOR}\n"
+        f"{detail_line('Лимит', f'{limit} IP для каждого')}\n"
+        f"{detail_line('Приоритет', 'выше персонального и HWID')}\n"
+        f"{detail_line('Режим', 'только алерты, без ограничений')}\n"
+        "<i>Применилось сразу, рестарт не нужен.</i>"
+    )
+    if ip_limit_remna_monitor_enabled():
+        enqueue_event(remna_ip_limit_poll_once)
+
+
 def handle_ip_enable(text, force=False):
     parts = text.split(maxsplit=1)
     command = "/ip_enable_force" if force else "/ip_enable"
@@ -7979,6 +8075,10 @@ def handle_pending_ip_limit(chat_id, from_id, text):
     pending = peek_pending_ip_limit(chat_id, from_id)
     if not pending or pending.get("action") != "set_ip_limit":
         return False
+    if ip_limit_total_limit() is not None:
+        pop_pending_ip_limit(chat_id, from_id)
+        send_message("<b>Действует общий IP лимит.</b>\n\nПерсональные лимиты сейчас не применяются.")
+        return True
     value = str(text or "").strip()
     if not re.fullmatch(r"\d{1,3}", value):
         send_message("<b>Нужна цифра.</b>\n\nНапример: <code>5</code>\nОтмена: <code>/cancel</code>")
@@ -8013,6 +8113,12 @@ def handle_ip_limit_callback(callback):
     action, user_key = parts[1], parts[2].strip()
     if not user_key:
         answer_callback(callback_id, "пустой юзер")
+        return
+    if action in ("off", "raise") and ip_limit_total_limit() is not None:
+        answer_callback(callback_id, "действует общий лимит")
+        body, markup = ip_limit_user_card(user_key)
+        if not edit_message_text(chat_id, message_id, body, reply_markup=markup):
+            send_message(body, reply_markup=markup)
         return
     info = remna_user_lookup(user_key)
     if action == "off":
@@ -8235,6 +8341,8 @@ def bot_loop():
                     handle_push_debug(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command in ("/ip_limit", "/limit_ip"):
                     handle_ip_limit(text)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/limit_ip_total":
+                    handle_ip_limit_total(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_enable":
                     handle_ip_enable(text, force=False)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip_enable_force":
