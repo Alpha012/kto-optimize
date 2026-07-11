@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v231"
+COLLECTOR_BUILD = "v232"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -5432,7 +5432,7 @@ def remna_ip_limit_alert_rows(rows, ts):
             continue
         info = row.get("user_info") if isinstance(row.get("user_info"), dict) and row.get("user_info") else remna_user_info(user)
         limit, source = ip_limit_effective_limit(user, info)
-        if limit <= 0 or limit > IP_LIMIT_ALERT_THRESHOLD or active_ips <= limit:
+        if not ip_limit_telegram_alert_allowed(limit) or active_ips <= limit:
             continue
         item = dict(row)
         if isinstance(info, dict) and info:
@@ -5442,6 +5442,10 @@ def remna_ip_limit_alert_rows(rows, ts):
         item["limit_source"] = source
         result.append(item)
     return result
+
+
+def ip_limit_telegram_alert_allowed(limit):
+    return 0 < int(limit or 0) <= IP_LIMIT_ALERT_THRESHOLD
 
 
 def remna_ip_limit_top_message(top_rows, snapshot):
@@ -5802,7 +5806,11 @@ def process_remna_ip_limit_enforcement(ts):
             )
             save_ip_limit_state()
         log(f"remna ip limit enforce: user={user} active_ips={len(entries)} limit={limit}")
-        alert_ip_limit_exceeded(user, entries, info)
+        if ip_limit_telegram_alert_allowed(limit):
+            alert_ip_limit_exceeded(user, entries, info)
+        else:
+            action = enforce_ip_limit(user, entries, limit, info, enforce_enabled=True)
+            log(f"remna ip limit enforced without alert: user={user} action={action or '-'}")
 
 
 def remna_ip_limit_poll_once():

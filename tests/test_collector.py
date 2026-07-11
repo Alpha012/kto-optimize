@@ -241,6 +241,9 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertEqual([], collector.remna_ip_limit_alert_rows(rows("1", unlimited), now))
         self.assertEqual([], collector.remna_ip_limit_alert_rows(rows("2", high_limit), now))
         self.assertEqual(1, len(collector.remna_ip_limit_alert_rows(rows("3", limited), now)))
+        self.assertFalse(collector.ip_limit_telegram_alert_allowed(0))
+        self.assertTrue(collector.ip_limit_telegram_alert_allowed(20))
+        self.assertFalse(collector.ip_limit_telegram_alert_allowed(21))
 
     def test_shared_ip_is_never_scheduled_for_source_drop(self):
         collector.IP_LIMIT_DROP_ENABLED = True
