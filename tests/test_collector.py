@@ -29,6 +29,7 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.STATE_DIR = self.state.name
         collector.NODES_FILE = os.path.join(self.state.name, "nodes.json")
         collector.UPDATE_STATE_FILE = os.path.join(self.state.name, "update_state.json")
+        collector.ALERTS_OFF_FILE = os.path.join(self.state.name, "connection_alerts_off.json")
         collector.IP_LIMIT_DB_FILE = os.path.join(self.state.name, "ip_limit.sqlite")
         if collector.IP_LIMIT_DB is not None:
             collector.IP_LIMIT_DB.close()
@@ -37,17 +38,16 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.FALLS = {}
         collector.NODE_NAME_STATE = {"nodes": {}, "pending": {}}
         collector.STATS_OFF_STATE = {"nodes": {}}
+        collector.ALERTS_OFF_STATE = {"nodes": {}}
         collector.UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
         collector.AUTH_NONCES = {}
         collector.NODES_DIRTY = False
         collector.init_ip_limit_db()
         self.original_enqueue = collector.enqueue_event
-        self.original_drop_enabled = collector.IP_LIMIT_DROP_ENABLED
         collector.enqueue_event = lambda *_args, **_kwargs: True
 
     def tearDown(self):
         collector.enqueue_event = self.original_enqueue
-        collector.IP_LIMIT_DROP_ENABLED = self.original_drop_enabled
         if collector.IP_LIMIT_DB is not None:
             collector.IP_LIMIT_DB.close()
         collector.IP_LIMIT_DB = None
@@ -214,7 +214,10 @@ class CollectorRegressionTests(unittest.TestCase):
                 collector.response_signature_payload(nonce, response_body),
             )
             self.assertEqual(expected, response_signature)
-            self.assertTrue(json.loads(response_body)["ok"])
+            payload = json.loads(response_body)
+            self.assertTrue(payload["ok"])
+            self.assertEqual([], payload["ip_limit_blocks"])
+            self.assertTrue(payload["ip_limit_clear_blocks"])
         finally:
             server.shutdown()
             server.server_close()
@@ -245,26 +248,89 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertTrue(collector.ip_limit_telegram_alert_allowed(20))
         self.assertFalse(collector.ip_limit_telegram_alert_allowed(21))
 
-    def test_shared_ip_is_never_scheduled_for_source_drop(self):
-        collector.IP_LIMIT_DROP_ENABLED = True
+    def test_ip_limit_is_alert_only_and_recovers_old_actions(self):
         now = int(time.time())
         db = collector.ip_limit_db()
         db.execute(
-            "INSERT INTO ip_limit_events(user, ip, node, node_key, last_seen) VALUES(?, ?, ?, ?, ?)",
-            ("1", "198.51.100.77", "Нидерланды", "нидерланды", now),
+            "INSERT INTO ip_limit_nodes(node_key, node, enabled, enforce, updated_at) VALUES(?, ?, 1, 1, ?)",
+            ("нидерланды", "Нидерланды", now),
         )
         db.execute(
-            "INSERT INTO ip_limit_events(user, ip, node, node_key, last_seen) VALUES(?, ?, ?, ?, ?)",
-            ("2", "198.51.100.77", "Нидерланды", "нидерланды", now),
+            "INSERT INTO ip_limit_blocks(node_key, ip, user, node, expires_at) VALUES(?, ?, ?, ?, ?)",
+            ("нидерланды", "198.51.100.10", "3", "Нидерланды", now + 60),
+        )
+        db.execute(
+            "INSERT INTO ip_limit_penalties(user, uuid, disabled_at, enable_at, reason, last_error) VALUES(?, ?, ?, ?, ?, '')",
+            ("3", str(uuid.uuid4()), now, now + 60, "ip_limit"),
         )
         db.commit()
-        scheduled = collector.schedule_ip_limit_blocks(
-            "1",
-            [{"ip": "198.51.100.77", "nodes": ["Нидерланды"]}],
-            {"id": 1, "uuid": str(uuid.uuid4())},
-            now + 60,
+        collector.disable_ip_limit_actions_runtime()
+        self.assertEqual(0, db.execute("SELECT COUNT(*) FROM ip_limit_blocks").fetchone()[0])
+        self.assertEqual(0, db.execute("SELECT enforce FROM ip_limit_nodes").fetchone()[0])
+        penalty = db.execute("SELECT enable_at, reason FROM ip_limit_penalties").fetchone()
+        self.assertEqual(0, penalty["enable_at"])
+        self.assertEqual("ip_limit_recovery", penalty["reason"])
+
+    def test_remna_ip_limit_sends_alert_without_actions(self):
+        now = int(time.time())
+        db = collector.ip_limit_db()
+        for index in range(1, 3):
+            db.execute(
+                "INSERT INTO ip_limit_events(user, ip, node, node_key, last_seen) VALUES(?, ?, ?, ?, ?)",
+                ("3", f"198.51.100.{index}", "Нидерланды", "нидерланды", now),
+            )
+        db.commit()
+        messages = []
+        user_info = {"id": 3, "uuid": str(uuid.uuid4()), "hwidDeviceLimit": 1, "status": "ACTIVE"}
+        original_info = collector.remna_user_info
+        original_send = collector.send_message
+        original_asn = collector.asn_info_text
+        original_action = collector.remna_user_action
+        collector.remna_user_info = lambda _user: user_info
+        collector.send_message = lambda text, **_kwargs: messages.append(text)
+        collector.asn_info_text = lambda _ip: ""
+        collector.remna_user_action = lambda *_args, **_kwargs: self.fail("IP limit attempted a Remnawave action")
+        try:
+            collector.process_remna_ip_limit_alerts(now)
+        finally:
+            collector.remna_user_info = original_info
+            collector.send_message = original_send
+            collector.asn_info_text = original_asn
+            collector.remna_user_action = original_action
+        self.assertEqual(1, len(messages))
+        self.assertIn("#ipLimitExceeded", messages[0])
+        self.assertNotIn("Действие", messages[0])
+        self.assertEqual(0, db.execute("SELECT COUNT(*) FROM ip_limit_blocks").fetchone()[0])
+        self.assertEqual(0, db.execute("SELECT COUNT(*) FROM ip_limit_penalties").fetchone()[0])
+
+    def test_disable_push_mutes_only_connection_alerts(self):
+        node = collector.update_node(
+            self.payload("Германия", str(uuid.uuid4()), "bl"),
+            "203.0.113.90",
         )
-        self.assertEqual(0, scheduled)
+        messages = []
+        original_send = collector.send_message
+        collector.send_message = lambda text, **_kwargs: messages.append(text)
+        try:
+            collector.handle_push_notifications("/disable_push Германия", enabled=False)
+            self.assertTrue(collector.node_connection_alerts_disabled(node))
+            self.assertFalse(collector.node_stats_disabled(node))
+            self.assertIn("Push, статистика, SLA и downtime продолжают работать", messages[-1])
+            node_key = collector.node_record_key(node)
+            collector.NODES[node_key]["offline_alerted"] = True
+            collector.NODES[node_key]["offline_confirmed"] = True
+            collector.NODES[node_key]["offline_since"] = int(time.time()) - 30
+            queued = []
+            collector.enqueue_event = lambda callback, *_args, **_kwargs: queued.append(callback.__name__)
+            collector.update_node(
+                self.payload("Германия", node["node_uuid"], "bl"),
+                "203.0.113.90",
+            )
+            self.assertNotIn("alert_online", queued)
+            collector.handle_push_notifications("/enable_push Германия", enabled=True)
+            self.assertFalse(collector.node_connection_alerts_disabled(node))
+        finally:
+            collector.send_message = original_send
 
 
 if __name__ == "__main__":
