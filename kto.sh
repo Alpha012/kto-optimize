@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v236"
+SCRIPT_BUILD="v237"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 83.228.242.53 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
@@ -3444,28 +3444,13 @@ install_speedtest() {
     fi
 }
 
-ensure_speedtest_ru_tools() {
-    apt_install_with_update_if_missing wget ca-certificates perl iperf3
-    if [[ -x /usr/bin/iperf3 ]] && timeout --foreground 5s /usr/bin/iperf3 --version >> "$LOG_FILE" 2>&1; then
-        export PATH="/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin:${PATH}"
-        return 0
-    fi
-    if command_exists iperf3 && timeout --foreground 5s iperf3 --version >> "$LOG_FILE" 2>&1; then
-        return 0
-    fi
-    fail "iperf3 не установлен или не запускается"
-    return 1
-}
-
 speedtest_ru() {
     header
     need_root
-    local bench_script bench_mode
-    local -a bench_args=()
-    bench_mode="${1:-${KTO_SPEEDTEST_RU_MODE:-single}}"
+    local bench_script
 
     stage "Запускаю Speedtest (RU)"
-    ensure_speedtest_ru_tools
+    apt_install_with_update_if_missing wget ca-certificates
 
     bench_script="$(mktemp)"
     cleanup_speedtest_ru() {
@@ -3474,35 +3459,16 @@ speedtest_ru() {
     }
     trap cleanup_speedtest_ru RETURN
 
-    must "Скачивание bench.gig.ovh" wget -qO "$bench_script" bench.gig.ovh
-    if ! grep -q "run_iperf3_test" "$bench_script" || ! grep -q "Server unreachable" "$bench_script"; then
-        fail "bench.gig.ovh вернул неожиданный скрипт"
+    must "Скачивание bench.tlab.pw" wget -qO "$bench_script" https://bench.tlab.pw
+    if ! head -n 1 "$bench_script" | grep -Eq '^#!.*bash' \
+        || ! grep -q '^speed_test()' "$bench_script" \
+        || ! bash -n "$bench_script"; then
+        fail "bench.tlab.pw вернул неожиданный скрипт"
         return 1
     fi
 
-    perl -0pi -e '
-        s/# Check if command exists\n_exists\(\) \{\n    command -v "\$1" >\/dev\/null 2>&1\n\}/# Check if command exists\n_exists() {\n    command -v "\$1" >\/dev\/null 2>\&1\n}\n\nkto_reachable() {\n    local server="\$1"\n    local port="\$2"\n    ping -c 1 -W 2 "\$server" >\/dev\/null 2>\&1 \&\& return 0\n    timeout 3 bash -c "cat < \/dev\/null > \/dev\/tcp\/\$server\/\$port" >\/dev\/null 2>\&1\n}/;
-        s/if ! ping -c 1 -W 2 "\$server" >\/dev\/null 2>&1; then/if ! kto_reachable "\$server" "\$port"; then/;
-    ' "$bench_script"
-
-    case "$bench_mode" in
-        ""|single|--single|-s)
-            bench_args=(--single)
-            ;;
-        multi|--multi|-m)
-            bench_args=(--multi)
-            ;;
-        all|--all|-a)
-            bench_args=(--all)
-            ;;
-        *)
-            warn "Неизвестный режим speedtest-ru '${bench_mode}', использую single."
-            bench_args=(--single)
-            ;;
-    esac
-
-    echo "running: wget -qO- bench.gig.ovh | bash -s -- ${bench_args[*]} (patched: ping or tcp iperf port, prefer system iperf3)" >> "$LOG_FILE"
-    env PATH="/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin:${PATH}" bash "$bench_script" "${bench_args[@]}"
+    echo "running: wget -qO- https://bench.tlab.pw | bash" >> "$LOG_FILE"
+    bash "$bench_script"
 }
 
 NETTEST_DNS_BAD=0
