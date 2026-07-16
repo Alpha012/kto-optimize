@@ -1,4 +1,6 @@
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -7,6 +9,18 @@ ROOT = Path(__file__).resolve().parents[1]
 KTO = (ROOT / "kto.sh").read_text(encoding="utf-8")
 PUSH = (ROOT / "scripts" / "kto-stats-push.sh").read_text(encoding="utf-8")
 COLLECTOR = (ROOT / "scripts" / "kto-stats-collector.py").read_text(encoding="utf-8")
+
+
+def bash_executable():
+    candidates = [
+        shutil.which("bash"),
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    return None
 
 
 def function_body(source, name):
@@ -22,9 +36,9 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v239"', KTO)
-        self.assertIn('PUSH_BUILD="v239"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v239"', COLLECTOR)
+        self.assertIn('SCRIPT_BUILD="v240"', KTO)
+        self.assertIn('PUSH_BUILD="v240"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v240"', COLLECTOR)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -96,6 +110,80 @@ class CombinedNodeProfileTests(unittest.TestCase):
         self.assertIn("/etc/wireguard/warp.conf", install)
         self.assertIn("/usr/local/bin/vps-warp", install)
         self.assertIn("systemctl is-active --quiet wg-quick@warp", install)
+
+    def test_haproxy_multiport_menu_keeps_legacy_443_names(self):
+        render = function_body(KTO, "render_haproxy_routes_config")
+        haproxy_menu = function_body(KTO, "haproxy_menu")
+        main_menu = function_body(KTO, "menu")
+
+        self.assertIn('if (( port == 443 ))', render)
+        self.assertIn('frontend_name="vless_in"', render)
+        self.assertIn('backend_name="vless_pool"', render)
+        self.assertIn('server_name="xray1"', render)
+        self.assertIn('frontend_name="vless_in_${port}"', render)
+        self.assertIn('backend_name="vless_pool_${port}"', render)
+        self.assertIn('2) Добавить порт', haproxy_menu)
+        self.assertIn('3) Удалить дополнительный порт', haproxy_menu)
+        self.assertIn('4) Обновить HAProxy, сохранив маршруты', haproxy_menu)
+        self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
+
+    def test_haproxy_updates_are_transactional_and_preserve_routes(self):
+        apply_routes = function_body(KTO, "apply_haproxy_routes_config")
+        update = function_body(KTO, "update_haproxy_existing_config")
+
+        self.assertIn('haproxy -c -f "$tmp_config"', apply_routes)
+        self.assertIn('${config}.kto.bak', apply_routes)
+        self.assertIn('возвращаю предыдущий', apply_routes)
+        self.assertIn('install -m 0644 "$backup" "$config"', apply_routes)
+        self.assertIn('extract_haproxy_routes > "$routes_file"', update)
+        self.assertIn('маршруты сохранены', update)
+
+    def test_haproxy_firewall_and_wrong_sni_cover_extra_ports(self):
+        firewall = function_body(KTO, "harden_whitelist_haproxy_firewall")
+        optimize_firewall = function_body(KTO, "opt_firewall")
+        check_firewall = function_body(KTO, "system_check_firewall")
+        scan = function_body(PUSH, "read_haproxy_scan_stats")
+
+        self.assertIn('ufw allow "${port}/tcp"', firewall)
+        self.assertIn('ufw --force delete allow "${port}/tcp"', firewall)
+        self.assertIn('extract_haproxy_routes > "$routes_file"', optimize_firewall)
+        self.assertIn('ufw allow "${port}/tcp"', optimize_firewall)
+        self.assertIn('extract_haproxy_routes > "$routes_file"', check_firewall)
+        self.assertIn('ufw_rule_allowed "${port}/tcp"', check_firewall)
+        self.assertIn('/^vless_in_[0-9]+$/', scan)
+        self.assertIn("count[$1] += $2", scan)
+        self.assertIn("show table %s", scan)
+
+    def test_haproxy_multiport_config_round_trip(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+routes=$(mktemp)
+config=$(mktemp)
+trap 'rm -f "$routes" "$config"' EXIT
+printf '443\t89.144.8.3:443\tbase.example.com\n8443\t5.34.179.144:443\textra.example.com other.example.com\n' > "$routes"
+render_haproxy_routes_config "$routes" "$config"
+grep -q '^frontend vless_in$' "$config"
+grep -q '^frontend vless_in_8443$' "$config"
+grep -q '^    server xray1 89.144.8.3:443 check weight 10$' "$config"
+grep -q '^    server xray_8443 5.34.179.144:443 check weight 10$' "$config"
+actual=$(extract_haproxy_routes "$config")
+expected=$'443\t89.144.8.3:443\tbase.example.com\n8443\t5.34.179.144:443\textra.example.com other.example.com'
+[[ "$actual" == "$expected" ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

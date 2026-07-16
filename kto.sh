@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v239"
+SCRIPT_BUILD="v240"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -872,7 +872,7 @@ settings_menu() {
         echo -e "2) Проверка системы"
         echo -e "3) Очистка диска"
         if [[ "$MACHINE_MODE" == "whitelist" ]]; then
-            echo -e "4) Обновить HAProxy IP/SNI"
+            echo -e "4) HAProxy"
         fi
         echo -e "0) Выйти"
         echo -e "${PURPLE}==========================================${NC}"
@@ -892,7 +892,7 @@ settings_menu() {
                 ;;
             4)
                 if [[ "$MACHINE_MODE" == "whitelist" ]]; then
-                    configure_haproxy_backend
+                    haproxy_menu
                 else
                     fail "Этот пункт доступен только для режима whitelist."
                     sleep 1
@@ -1271,6 +1271,33 @@ normalize_haproxy_target() {
     printf '%s:%d\n' "$ip" "$port"
 }
 
+normalize_haproxy_sni_list() {
+    local raw="${1:-}" token base existing
+    local -a tokens=() normalized=()
+
+    raw="${raw//,/ }"
+    raw="${raw//;/ }"
+    IFS=' ' read -r -a tokens <<< "$raw"
+    for token in "${tokens[@]}"; do
+        token="${token,,}"
+        token="${token%.}"
+        [[ -n "$token" ]] || continue
+        base="$token"
+        if [[ "$base" == \*.* ]]; then
+            base="${base#*.}"
+        fi
+        validate_domain "$base" || return 1
+        for existing in "${normalized[@]:-}"; do
+            [[ "$existing" == "$token" ]] && continue 2
+        done
+        normalized+=("$token")
+    done
+
+    (( ${#normalized[@]} > 0 )) || return 1
+    local IFS=' '
+    printf '%s\n' "${normalized[*]}"
+}
+
 current_ssh_client_ip() {
     local ip="${SSH_CLIENT:-}"
     ip="${ip%% *}"
@@ -1331,6 +1358,30 @@ ask_haproxy_target() {
             return 0
         fi
         fail "Некорректный target. Пример: 1.2.3.4 или 1.2.3.4:8443"
+    done
+}
+
+ask_haproxy_target_default() {
+    local prompt="$1" default="${2:-}" value target
+    while true; do
+        value="$(ask_text "$prompt" "$default")"
+        if target="$(normalize_haproxy_target "$value")"; then
+            echo "$target"
+            return 0
+        fi
+        fail "Некорректный target. Пример: 1.2.3.4 или 1.2.3.4:8443"
+    done
+}
+
+ask_haproxy_sni_list() {
+    local prompt="$1" default="${2:-}" value normalized
+    while true; do
+        value="$(ask_text "$prompt" "$default")"
+        if normalized="$(normalize_haproxy_sni_list "$value")"; then
+            echo "$normalized"
+            return 0
+        fi
+        fail "Некорректный SNI. Можно указать несколько доменов через пробел."
     done
 }
 
@@ -2153,7 +2204,7 @@ EOF
 
 opt_firewall() {
     local ssh_port="$1"
-    local anti_rules
+    local anti_rules routes_file="" port target sni
     anti_rules="$(antiscanner_rules_count)"
 
     if [[ "${KTO_UFW_RESET:-0}" == "1" ]]; then
@@ -2170,15 +2221,31 @@ opt_firewall() {
     else
         cmd "${SUDO[@]}" ufw allow "${ssh_port}/tcp"
     fi
-    cmd "${SUDO[@]}" ufw allow 443/tcp
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        routes_file="$(mktemp)"
+        extract_haproxy_routes > "$routes_file"
+        if [[ -s "$routes_file" ]]; then
+            while IFS=$'\t' read -r port target sni; do
+                [[ "$port" =~ ^[0-9]+$ ]] || continue
+                cmd "${SUDO[@]}" ufw allow "${port}/tcp"
+            done < "$routes_file"
+        else
+            cmd "${SUDO[@]}" ufw allow 443/tcp
+        fi
+    else
+        cmd "${SUDO[@]}" ufw allow 443/tcp
+    fi
     if [[ "$MACHINE_MODE" == "node" ]]; then
         cmd "${SUDO[@]}" ufw allow 443/udp
         cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
     else
         cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
-        cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+        if [[ -z "$routes_file" ]] || ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
+            cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+        fi
     fi
     cmd "${SUDO[@]}" ufw --force enable
+    [[ -z "$routes_file" ]] || rm -f "$routes_file"
 }
 
 opt_antiscanner() {
@@ -2848,7 +2915,7 @@ system_check_network_limits() {
 
 system_check_firewall() {
     local ssh_port="$1"
-    local missing=() extra=()
+    local missing=() extra=() routes_file="" port target sni
 
     if ! command_exists ufw; then
         SYSTEM_CHECK_NEEDS_FIREWALL=1
@@ -2868,13 +2935,28 @@ system_check_firewall() {
     else
         ufw_rule_allowed "${ssh_port}/tcp" || missing+=("${ssh_port}/tcp")
     fi
-    ufw_rule_allowed "443/tcp" || missing+=("443/tcp")
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        routes_file="$(mktemp)"
+        extract_haproxy_routes > "$routes_file"
+        if [[ -s "$routes_file" ]]; then
+            while IFS=$'\t' read -r port target sni; do
+                [[ "$port" =~ ^[0-9]+$ ]] || continue
+                ufw_rule_allowed "${port}/tcp" || missing+=("${port}/tcp")
+            done < "$routes_file"
+        else
+            ufw_rule_allowed "443/tcp" || missing+=("443/tcp")
+        fi
+    else
+        ufw_rule_allowed "443/tcp" || missing+=("443/tcp")
+    fi
     if [[ "$MACHINE_MODE" == "node" ]]; then
         ufw_rule_allowed "443/udp" || missing+=("443/udp")
         ufw_rule_allowed "${NODE_PORT}/tcp" || missing+=("${NODE_PORT}/tcp")
     else
         ufw_rule_allowed "443/udp" && extra+=("443/udp")
-        ufw_rule_allowed "${NODE_PORT}/tcp" && extra+=("${NODE_PORT}/tcp")
+        if [[ -z "$routes_file" ]] || ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
+            ufw_rule_allowed "${NODE_PORT}/tcp" && extra+=("${NODE_PORT}/tcp")
+        fi
     fi
 
     if (( ${#missing[@]} == 0 && ${#extra[@]} == 0 )); then
@@ -2889,6 +2971,7 @@ system_check_firewall() {
             system_check_row miss "ufw rules" "лишние: $(system_check_join "${extra[@]}")"
         fi
     fi
+    [[ -z "$routes_file" ]] || rm -f "$routes_file"
 }
 
 system_check_antiscanner() {
@@ -3951,44 +4034,111 @@ reload_haproxy_gracefully() {
         warn "HAProxy reload не прошёл, делаю restart."
     fi
 
-    must "Запуск HAProxy" "${SUDO[@]}" systemctl restart haproxy
+    if "${SUDO[@]}" systemctl restart haproxy >> "$LOG_FILE" 2>&1; then
+        ok "HAProxy применён через restart"
+        return 0
+    fi
+    fail "Не удалось запустить HAProxy"
+    return 1
 }
 
-extract_haproxy_backend_target() {
-    local target
-    target="$("${SUDO[@]}" awk '
-        $1 == "server" && $2 == "xray1" {
-            print $3
-            exit
+extract_haproxy_routes() {
+    local config="${1:-/etc/haproxy/haproxy.cfg}"
+    local raw port target sni normalized_target normalized_sni
+
+    "${SUDO[@]}" test -s "$config" 2>/dev/null || return 0
+    raw="$("${SUDO[@]}" awk '
+        $1 == "frontend" {
+            section = "frontend"
+            name = $2
+            if (!(name in frontend_seen)) {
+                frontend_order[++frontend_count] = name
+                frontend_seen[name] = 1
+            }
+            next
         }
-    ' /etc/haproxy/haproxy.cfg 2>/dev/null || true)"
-    normalize_haproxy_target "$target" 2>/dev/null || true
-}
-
-extract_haproxy_backend_ip() {
-    "${SUDO[@]}" awk '
-        $1 == "server" && $2 == "xray1" {
-            split($3, address, ":")
-            print address[1]
-            exit
+        $1 == "backend" {
+            section = "backend"
+            name = $2
+            next
         }
-    ' /etc/haproxy/haproxy.cfg 2>/dev/null || true
-}
-
-extract_haproxy_allowed_sni() {
-    "${SUDO[@]}" awk '
-        $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+        $1 == "global" || $1 == "defaults" || $1 == "listen" {
+            section = $1
+            name = $2
+            next
+        }
+        section == "frontend" && $1 == "bind" && !(name in frontend_port) {
+            address = $2
+            split(address, addresses, ",")
+            address = addresses[1]
+            sub(/^.*:/, "", address)
+            sub(/[^0-9].*$/, "", address)
+            frontend_port[name] = address
+            next
+        }
+        section == "frontend" && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+            value = ""
             for (i = 1; i <= NF; i++) {
                 if ($i == "-i") {
                     for (j = i + 1; j <= NF; j++) {
-                        printf "%s%s", (j == i + 1 ? "" : " "), $j
+                        if ($j ~ /^#/) break
+                        value = value (value == "" ? "" : " ") $j
                     }
-                    printf "\n"
-                    exit
+                    break
+                }
+            }
+            frontend_sni[name] = value
+            next
+        }
+        section == "frontend" && $1 == "default_backend" {
+            frontend_backend[name] = $2
+            next
+        }
+        section == "backend" && $1 == "server" && !(name in backend_target) {
+            backend_target[name] = $3
+            next
+        }
+        END {
+            for (i = 1; i <= frontend_count; i++) {
+                frontend = frontend_order[i]
+                backend = frontend_backend[frontend]
+                if (frontend_port[frontend] != "" && frontend_sni[frontend] != "" && backend_target[backend] != "") {
+                    printf "%s\t%s\t%s\n", frontend_port[frontend], backend_target[backend], frontend_sni[frontend]
                 }
             }
         }
-    ' /etc/haproxy/haproxy.cfg 2>/dev/null || true
+    ' "$config" 2>/dev/null || true)"
+
+    while IFS=$'\t' read -r port target sni; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        port=$((10#$port))
+        (( port >= 1 && port <= 65535 )) || continue
+        normalized_target="$(normalize_haproxy_target "$target" 2>/dev/null || true)"
+        normalized_sni="$(normalize_haproxy_sni_list "$sni" 2>/dev/null || true)"
+        [[ -n "$normalized_target" && -n "$normalized_sni" ]] || continue
+        printf '%d\t%s\t%s\n' "$port" "$normalized_target" "$normalized_sni"
+    done <<< "$raw" | sort -t $'\t' -k1,1n
+}
+
+extract_haproxy_backend_target() {
+    extract_haproxy_routes | awk -F '\t' 'NR == 1 { print $2; exit }'
+}
+
+extract_haproxy_backend_ip() {
+    extract_haproxy_backend_target | awk -F : 'NR == 1 { print $1; exit }'
+}
+
+extract_haproxy_allowed_sni() {
+    extract_haproxy_routes | awk -F '\t' 'NR == 1 { print $3; exit }'
+}
+
+haproxy_route_file_has_port() {
+    local routes_file="$1" wanted="$2"
+    awk -F '\t' -v wanted="$wanted" '$1 == wanted { found = 1 } END { exit found ? 0 : 1 }' "$routes_file"
+}
+
+haproxy_route_count() {
+    awk -F '\t' 'NF >= 3 { count++ } END { print count + 0 }' "$1"
 }
 
 recommended_haproxy_maxconn() {
@@ -4014,13 +4164,37 @@ recommended_haproxy_maxconn() {
     echo "$maxconn"
 }
 
-apply_haproxy_config() {
-    local backend_target="$1"
-    local allowed_sni="$2"
-    local haproxy_threads haproxy_maxconn
+render_haproxy_routes_config() {
+    local routes_file="$1" output_file="$2"
+    local port backend_target allowed_sni normalized_target normalized_sni
+    local frontend_name backend_name server_name haproxy_threads haproxy_maxconn route_count=0
+    local -A seen_ports=()
 
-    backend_target="$(normalize_haproxy_target "$backend_target")" || {
-        fail "Некорректный HAProxy target. Пример: 1.2.3.4 или 1.2.3.4:8443"
+    while IFS=$'\t' read -r port backend_target allowed_sni; do
+        [[ "$port" =~ ^[0-9]+$ ]] || {
+            fail "Некорректный входной HAProxy порт: ${port:-пусто}"
+            return 1
+        }
+        port=$((10#$port))
+        (( port >= 1 && port <= 65535 )) || {
+            fail "HAProxy порт вне диапазона: $port"
+            return 1
+        }
+        [[ -z "${seen_ports[$port]+x}" ]] || {
+            fail "HAProxy порт $port указан дважды"
+            return 1
+        }
+        normalized_target="$(normalize_haproxy_target "$backend_target" 2>/dev/null || true)"
+        normalized_sni="$(normalize_haproxy_sni_list "$allowed_sni" 2>/dev/null || true)"
+        [[ -n "$normalized_target" && -n "$normalized_sni" ]] || {
+            fail "Некорректный HAProxy маршрут на порту $port"
+            return 1
+        }
+        seen_ports[$port]=1
+        route_count=$(( route_count + 1 ))
+    done < "$routes_file"
+    (( route_count > 0 )) || {
+        fail "Список HAProxy маршрутов пуст"
         return 1
     }
 
@@ -4028,8 +4202,8 @@ apply_haproxy_config() {
     (( haproxy_threads > 64 )) && haproxy_threads=64
     haproxy_maxconn="$(recommended_haproxy_maxconn)"
 
-    stage "Настраиваю HAProxy"
-    write_root_file /etc/haproxy/haproxy.cfg <<EOF
+    cat > "$output_file" <<EOF
+# Managed by kto. Edit routes through the HAProxy menu.
 global
     maxconn ${haproxy_maxconn}
     nbthread ${haproxy_threads}
@@ -4059,12 +4233,31 @@ defaults
 
     default-server inter 30s fall 8 rise 3
 
+backend wrong_sni_names
+    stick-table type string len 160 size 100k expire 30m store gpc0
+EOF
+
+    while IFS=$'\t' read -r port backend_target allowed_sni; do
+        port=$((10#$port))
+        backend_target="$(normalize_haproxy_target "$backend_target")"
+        allowed_sni="$(normalize_haproxy_sni_list "$allowed_sni")"
+        if (( port == 443 )); then
+            frontend_name="vless_in"
+            backend_name="vless_pool"
+            server_name="xray1"
+        else
+            frontend_name="vless_in_${port}"
+            backend_name="vless_pool_${port}"
+            server_name="xray_${port}"
+        fi
+
+        cat >> "$output_file" <<EOF
 
 # -------------------------
-# FRONTEND : 443
+# FRONTEND : ${port}
 # -------------------------
-frontend vless_in
-    bind *:443 backlog 65535
+frontend ${frontend_name}
+    bind *:${port} backlog 65535
     stick-table type ip size 100k expire 30m store gpc0,conn_rate(10s)
     tcp-request inspect-delay 5s
     acl clienthello req.ssl_hello_type 1
@@ -4077,17 +4270,46 @@ frontend vless_in
     tcp-request content accept if clienthello allowed_sni
     tcp-request content reject if clienthello !allowed_sni
     tcp-request content reject if WAIT_END
-    default_backend vless_pool
+    default_backend ${backend_name}
 
-backend wrong_sni_names
-    stick-table type string len 160 size 100k expire 30m store gpc0
-
-backend vless_pool
+backend ${backend_name}
     mode tcp
     balance leastconn
 
-    server xray1 ${backend_target} check weight 10
+    server ${server_name} ${backend_target} check weight 10
 EOF
+    done < "$routes_file"
+}
+
+apply_haproxy_routes_config() {
+    local routes_file="$1"
+    local config=/etc/haproxy/haproxy.cfg
+    local tmp_config backup had_config=0 haproxy_threads haproxy_maxconn route_count
+
+    ensure_haproxy_package
+    tmp_config="$(mktemp)"
+    backup="$(mktemp)"
+    if ! render_haproxy_routes_config "$routes_file" "$tmp_config"; then
+        rm -f "$tmp_config" "$backup"
+        return 1
+    fi
+
+    stage "Проверяю HAProxy config"
+    if ! "${SUDO[@]}" haproxy -c -f "$tmp_config" >> "$LOG_FILE" 2>&1; then
+        rm -f "$tmp_config" "$backup"
+        fail "Проверка HAProxy config"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        return 1
+    fi
+
+    if "${SUDO[@]}" test -s "$config" 2>/dev/null; then
+        had_config=1
+        "${SUDO[@]}" cat "$config" > "$backup"
+        "${SUDO[@]}" cp -a "$config" "${config}.kto.bak" >> "$LOG_FILE" 2>&1 || true
+    fi
+
+    stage "Применяю HAProxy config"
+    "${SUDO[@]}" install -m 0644 "$tmp_config" "$config" >> "$LOG_FILE" 2>&1
 
     cmd "${SUDO[@]}" mkdir -p /etc/systemd/system/haproxy.service.d
     write_root_file /etc/systemd/system/haproxy.service.d/99-kto-capacity.conf <<'EOF'
@@ -4095,19 +4317,41 @@ EOF
 LimitNOFILE=1048576
 EOF
     cmd "${SUDO[@]}" systemctl daemon-reload
+    cmd "${SUDO[@]}" systemctl enable haproxy || true
 
-    if ! "${SUDO[@]}" haproxy -c -f /etc/haproxy/haproxy.cfg >> "$LOG_FILE" 2>&1; then
-        fail "Проверка HAProxy config"
+    if ! reload_haproxy_gracefully; then
+        warn "Новый конфиг не запустился, возвращаю предыдущий."
+        if (( had_config == 1 )); then
+            "${SUDO[@]}" install -m 0644 "$backup" "$config" >> "$LOG_FILE" 2>&1
+            "${SUDO[@]}" systemctl restart haproxy >> "$LOG_FILE" 2>&1 || true
+        else
+            "${SUDO[@]}" rm -f "$config" >> "$LOG_FILE" 2>&1 || true
+            "${SUDO[@]}" systemctl stop haproxy >> "$LOG_FILE" 2>&1 || true
+        fi
+        rm -f "$tmp_config" "$backup"
         tail -n 25 "$LOG_FILE" >&2 || true
         return 1
     fi
 
-    cmd "${SUDO[@]}" systemctl enable haproxy || true
-    reload_haproxy_gracefully
-
-    ok "HAProxy установлен: 443 -> ${backend_target}"
-    ok "Разрешенный SNI: ${allowed_sni}"
+    rm -f "$tmp_config" "$backup"
+    haproxy_threads="$(cpu_count)"
+    (( haproxy_threads > 64 )) && haproxy_threads=64
+    haproxy_maxconn="$(recommended_haproxy_maxconn)"
+    route_count="$(haproxy_route_count "$routes_file")"
+    ok "HAProxy маршрутов: ${route_count}"
     ok "HAProxy capacity: maxconn=${haproxy_maxconn}, threads=${haproxy_threads}"
+}
+
+apply_haproxy_config() {
+    local backend_target="$1" allowed_sni="$2" routes_file
+    routes_file="$(mktemp)"
+    printf '443\t%s\t%s\n' "$backend_target" "$allowed_sni" > "$routes_file"
+    if apply_haproxy_routes_config "$routes_file"; then
+        rm -f "$routes_file"
+        return 0
+    fi
+    rm -f "$routes_file"
+    return 1
 }
 
 ensure_haproxy_package() {
@@ -4120,62 +4364,295 @@ ensure_haproxy_package() {
 }
 
 harden_whitelist_haproxy_firewall() {
-    local ssh_port
+    local routes_file="${1:-}" previous_routes_file="${2:-}"
+    local ssh_port port target sni generated_routes=""
     command_exists ufw || return 0
     ufw_active || return 0
+
+    if [[ -z "$routes_file" || ! -s "$routes_file" ]]; then
+        generated_routes="$(mktemp)"
+        extract_haproxy_routes > "$generated_routes"
+        routes_file="$generated_routes"
+    fi
     ssh_port="$(detect_ssh_port)"
 
     apply_whitelist_ssh_rules "$ssh_port"
-    cmd "${SUDO[@]}" ufw allow 443/tcp || true
+    while IFS=$'\t' read -r port target sni; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        if ! cmd "${SUDO[@]}" ufw allow "${port}/tcp" comment 'kto-haproxy'; then
+            cmd "${SUDO[@]}" ufw allow "${port}/tcp" || true
+        fi
+    done < "$routes_file"
+
+    if [[ -n "$previous_routes_file" && -s "$previous_routes_file" ]]; then
+        while IFS=$'\t' read -r port target sni; do
+            [[ "$port" =~ ^[0-9]+$ ]] || continue
+            if ! haproxy_route_file_has_port "$routes_file" "$port"; then
+                cmd "${SUDO[@]}" ufw --force delete allow "${port}/tcp" || true
+            fi
+        done < "$previous_routes_file"
+    fi
+
     cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
-    cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+    if ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
+        cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+    fi
+    [[ -z "$generated_routes" ]] || rm -f "$generated_routes"
 }
 
 configure_haproxy_backend() {
     header
     require_whitelist_mode
     need_root
-    local backend_target allowed_sni
+    local backend_target allowed_sni routes_file previous_routes_file
     backend_target="$(ask_haproxy_target "Введите выходной IP или IP:порт")"
-    allowed_sni="$(ask_domain "Введите разрешенный SNI")"
+    allowed_sni="$(ask_haproxy_sni_list "Введите разрешенный SNI")"
 
-    ensure_haproxy_package
-    apply_haproxy_config "$backend_target" "$allowed_sni"
-    harden_whitelist_haproxy_firewall
+    routes_file="$(mktemp)"
+    previous_routes_file="$(mktemp)"
+    extract_haproxy_routes > "$previous_routes_file"
+    printf '443\t%s\t%s\n' "$backend_target" "$allowed_sni" > "$routes_file"
+
+    if apply_haproxy_routes_config "$routes_file"; then
+        harden_whitelist_haproxy_firewall "$routes_file" "$previous_routes_file"
+        ok "HAProxy установлен: 443 -> ${backend_target}"
+        ok "Разрешенный SNI: ${allowed_sni}"
+    else
+        rm -f "$routes_file" "$previous_routes_file"
+        return 1
+    fi
+    rm -f "$routes_file" "$previous_routes_file"
 }
 
-install_haproxy() {
-    configure_haproxy_backend
+print_haproxy_routes() {
+    local routes_file="$1" port target sni
+    echo -e "${BOLD}${PURPLE}[ МАРШРУТЫ ]${NC}"
+    while IFS=$'\t' read -r port target sni; do
+        [[ -n "$port" ]] || continue
+        printf ' %5s/tcp -> %-21s SNI: %s\n' "$port" "$target" "$sni"
+    done < "$routes_file"
+}
+
+select_haproxy_route() {
+    local routes_file="$1" mode="${2:-all}" choice index=0 port target sni
+    local -a ports=()
+
+    printf '%s\n' "Выберите HAProxy-порт:" >&2
+    while IFS=$'\t' read -r port target sni; do
+        [[ -n "$port" ]] || continue
+        if [[ "$mode" == "extra" && "$port" == "443" ]]; then
+            continue
+        fi
+        ports+=("$port")
+        index=$(( index + 1 ))
+        printf ' %d) %s/tcp -> %s | %s\n' "$index" "$port" "$target" "$sni" >&2
+    done < "$routes_file"
+
+    if (( ${#ports[@]} == 0 )); then
+        fail "Дополнительных HAProxy-портов нет"
+        return 1
+    fi
+
+    while true; do
+        printf '> ' >&2
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ports[@]} )); then
+            echo "${ports[$((choice - 1))]}"
+            return 0
+        fi
+        fail "Неверный выбор"
+    done
+}
+
+default_haproxy_extra_port() {
+    local routes_file="$1" port=8443
+    while (( port <= 65535 )); do
+        if ! haproxy_route_file_has_port "$routes_file" "$port"; then
+            echo "$port"
+            return 0
+        fi
+        port=$(( port + 1 ))
+    done
+    return 1
+}
+
+haproxy_tcp_port_listening() {
+    local wanted="$1"
+    command_exists ss || return 1
+    ss -H -ltn 2>/dev/null | awk -v wanted="$wanted" '
+        {
+            address = $4
+            sub(/^.*:/, "", address)
+            if (address == wanted) found = 1
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+add_haproxy_route() {
+    local routes_file="$1" default_port port backend_target allowed_sni next_file
+    default_port="$(default_haproxy_extra_port "$routes_file")" || {
+        fail "Нет свободного HAProxy-порта"
+        return 1
+    }
+
+    while true; do
+        port="$(ask_int "Входной HAProxy порт" "$default_port" 1 65535)"
+        if haproxy_route_file_has_port "$routes_file" "$port"; then
+            fail "HAProxy порт $port уже настроен"
+            continue
+        fi
+        if haproxy_tcp_port_listening "$port"; then
+            fail "TCP-порт $port уже занят другим процессом"
+            continue
+        fi
+        break
+    done
+
+    backend_target="$(ask_haproxy_target_default "Выходной IP или IP:порт")"
+    allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
+    next_file="$(mktemp)"
+    cp "$routes_file" "$next_file"
+    printf '%s\t%s\t%s\n' "$port" "$backend_target" "$allowed_sni" >> "$next_file"
+
+    if apply_haproxy_routes_config "$next_file"; then
+        harden_whitelist_haproxy_firewall "$next_file" "$routes_file"
+        mv "$next_file" "$routes_file"
+        ok "Добавлен порт ${port}: ${backend_target}"
+        return 0
+    fi
+    rm -f "$next_file"
+    return 1
+}
+
+edit_haproxy_route() {
+    local routes_file="$1" port current_line current_target current_sni backend_target allowed_sni next_file
+    port="$(select_haproxy_route "$routes_file")" || return 1
+    current_line="$(awk -F '\t' -v port="$port" '$1 == port { print; exit }' "$routes_file")"
+    IFS=$'\t' read -r _ current_target current_sni <<< "$current_line"
+
+    backend_target="$(ask_haproxy_target_default "Выходной IP или IP:порт" "$current_target")"
+    allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI" "$current_sni")"
+    next_file="$(mktemp)"
+    awk -F '\t' -v OFS='\t' -v port="$port" -v target="$backend_target" -v sni="$allowed_sni" '
+        $1 == port { print port, target, sni; next }
+        { print }
+    ' "$routes_file" > "$next_file"
+
+    if apply_haproxy_routes_config "$next_file"; then
+        harden_whitelist_haproxy_firewall "$next_file" "$routes_file"
+        mv "$next_file" "$routes_file"
+        ok "Маршрут ${port}/tcp обновлён"
+        return 0
+    fi
+    rm -f "$next_file"
+    return 1
+}
+
+delete_haproxy_route() {
+    local routes_file="$1" port next_file
+    port="$(select_haproxy_route "$routes_file" extra)" || return 1
+    next_file="$(mktemp)"
+    awk -F '\t' -v port="$port" '$1 != port { print }' "$routes_file" > "$next_file"
+
+    if apply_haproxy_routes_config "$next_file"; then
+        harden_whitelist_haproxy_firewall "$next_file" "$routes_file"
+        mv "$next_file" "$routes_file"
+        ok "HAProxy порт ${port}/tcp удалён"
+        return 0
+    fi
+    rm -f "$next_file"
+    return 1
 }
 
 update_haproxy_existing_config() {
     header
     require_whitelist_mode
     need_root
-    local backend_target allowed_sni
+    local routes_file
 
     if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
-        fail "HAProxy config не найден. Сначала запусти обычный haproxy."
+        warn "HAProxy config не найден, создаю базовый порт 443."
+        configure_haproxy_backend
+        return
+    fi
+
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+    if [[ ! -s "$routes_file" ]]; then
+        rm -f "$routes_file"
+        fail "Не смог распознать маршруты в текущем HAProxy config. Конфиг не изменён."
         return 1
     fi
 
-    backend_target="$(extract_haproxy_backend_target)"
-    allowed_sni="$(extract_haproxy_allowed_sni)"
+    if apply_haproxy_routes_config "$routes_file"; then
+        harden_whitelist_haproxy_firewall "$routes_file" "$routes_file"
+        ok "HAProxy обновлён без повторного ввода, маршруты сохранены"
+        rm -f "$routes_file"
+        return 0
+    fi
+    rm -f "$routes_file"
+    return 1
+}
 
-    if [[ -z "$backend_target" ]]; then
-        fail "Не смог найти выходной IP:порт в текущем HAProxy config."
+haproxy_menu() {
+    header
+    require_whitelist_mode
+    need_root
+    local routes_file choice
+    routes_file="$(mktemp)"
+
+    if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
+        warn "HAProxy ещё не настроен. Сначала создаю базовый порт 443."
+        if ! configure_haproxy_backend; then
+            rm -f "$routes_file"
+            return 1
+        fi
+    fi
+
+    extract_haproxy_routes > "$routes_file"
+    if [[ ! -s "$routes_file" ]]; then
+        rm -f "$routes_file"
+        fail "Текущий HAProxy config не распознан. Автоматически перезаписывать его не буду."
         return 1
     fi
-    if [[ -z "$allowed_sni" ]]; then
-        fail "Не смог найти разрешенный SNI в текущем HAProxy config."
-        return 1
-    fi
 
-    ensure_haproxy_package
-    apply_haproxy_config "$backend_target" "$allowed_sni"
-    harden_whitelist_haproxy_firewall
+    while true; do
+        header
+        print_haproxy_routes "$routes_file"
+        echo
+        echo -e "1) Изменить маршрут"
+        echo -e "2) Добавить порт"
+        echo -e "3) Удалить дополнительный порт"
+        echo -e "4) Обновить HAProxy, сохранив маршруты"
+        echo -e "0) Назад"
+        echo -e "${PURPLE}==========================================${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+        read -r choice
+        case "$choice" in
+            1) edit_haproxy_route "$routes_file" || true ;;
+            2) add_haproxy_route "$routes_file" || true ;;
+            3) delete_haproxy_route "$routes_file" || true ;;
+            4)
+                if apply_haproxy_routes_config "$routes_file"; then
+                    harden_whitelist_haproxy_firewall "$routes_file" "$routes_file"
+                    ok "HAProxy обновлён, все маршруты сохранены"
+                fi
+                ;;
+            0)
+                rm -f "$routes_file"
+                return 0
+                ;;
+            *) fail "Неверный выбор" ;;
+        esac
+        echo
+        echo -ne "${PURPLE}>${NC} Нажмите Enter, чтобы продолжить..."
+        read -r _
+    done
+}
 
-    ok "HAProxy обновлён без повторного ввода"
+install_haproxy() {
+    haproxy_menu
 }
 
 write_stats_collector_script() {
@@ -5466,8 +5943,6 @@ menu() {
     elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
         labels+=("HAProxy")
         actions+=("haproxy")
-        labels+=("Обновить HAProxy")
-        actions+=("haproxy-update")
         labels+=("Push статистики")
         actions+=("stats-push-menu")
     fi

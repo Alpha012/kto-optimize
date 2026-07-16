@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v239"
+PUSH_BUILD="v240"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -279,7 +279,9 @@ read_haproxy_allowed_sni() {
     [[ -r /etc/haproxy/haproxy.cfg ]] || return 0
 
     values="$(awk '
-        $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+        $1 == "frontend" { base_frontend = ($2 == "vless_in"); next }
+        $1 == "backend" { base_frontend = 0; next }
+        base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
             for (i = 1; i <= NF; i++) {
                 if ($i == "-i") {
                     for (j = i + 1; j <= NF; j++) print $j
@@ -490,14 +492,18 @@ apply_collector_haproxy_config() {
             has_sni=1
             desired_sni_line="    acl allowed_sni req.ssl_sni -i $(paste -sd ' ' "$desired_file")"
             current_sni_line="$(awk '
-                $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+                $1 == "frontend" { base_frontend = ($2 == "vless_in"); next }
+                $1 == "backend" { base_frontend = 0; next }
+                base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
                     print
                     exit
                 }
             ' "$tmp_cfg" 2>/dev/null || true)"
             if [[ "$current_sni_line" != "$desired_sni_line" ]]; then
                 if awk -v replacement="$desired_sni_line" '
-                    $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" && replaced == 0 {
+                    $1 == "frontend" { base_frontend = ($2 == "vless_in") }
+                    $1 == "backend" { base_frontend = 0 }
+                    base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" && replaced == 0 {
                         print replacement
                         replaced = 1
                         next
@@ -1672,7 +1678,7 @@ apply_collector_ip_limit_config() {
 
 read_haproxy_scan_stats() {
     local socket="/run/haproxy/admin.sock"
-    local raw entries sni_raw sni_entries
+    local raw raw_entries entries sni_raw sni_entries tables table table_raw
 
     scan_wrong_sni_total=0
     scan_wrong_sni_sources=0
@@ -1683,10 +1689,21 @@ read_haproxy_scan_stats() {
     command -v jq >/dev/null 2>&1 || return 0
     [[ -S "$socket" ]] || return 0
 
-    raw="$(printf 'show table vless_in\n' | socat -t 2 - UNIX-CONNECT:"$socket" 2>/dev/null || true)"
+    tables="$(awk '
+        $1 == "frontend" && ($2 == "vless_in" || $2 ~ /^vless_in_[0-9]+$/) { print $2 }
+    ' /etc/haproxy/haproxy.cfg 2>/dev/null | awk '!seen[$0]++' || true)"
+    [[ -n "$tables" ]] || tables="vless_in"
+
+    raw=""
+    while read -r table; do
+        [[ -n "$table" ]] || continue
+        table_raw="$(printf 'show table %s\n' "$table" | socat -t 2 - UNIX-CONNECT:"$socket" 2>/dev/null || true)"
+        [[ -n "$table_raw" ]] || continue
+        raw+="${raw:+$'\n'}${table_raw}"
+    done <<< "$tables"
     [[ -n "$raw" ]] || return 0
 
-    entries="$(awk '
+    raw_entries="$(awk '
         /key=/ {
             ip = ""
             gpc = 0
@@ -1708,6 +1725,15 @@ read_haproxy_scan_stats() {
             }
         }
     ' <<< "$raw" || true)"
+    entries="$(awk '
+        NF >= 3 {
+            count[$1] += $2
+            if ($3 > rate[$1]) rate[$1] = $3
+        }
+        END {
+            for (ip in count) print ip, count[ip], rate[ip] + 0
+        }
+    ' <<< "$raw_entries" || true)"
     [[ -n "$entries" ]] || return 0
 
     scan_wrong_sni_total="$(awk '{sum += $2} END {print sum + 0}' <<< "$entries")"
