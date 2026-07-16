@@ -22,9 +22,9 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v238"', KTO)
-        self.assertIn('PUSH_BUILD="v238"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v238"', COLLECTOR)
+        self.assertIn('SCRIPT_BUILD="v239"', KTO)
+        self.assertIn('PUSH_BUILD="v239"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v239"', COLLECTOR)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -85,6 +85,17 @@ class CombinedNodeProfileTests(unittest.TestCase):
         self.assertIn('reality_hysteria2) profile_label="Reality + Hysteria2"', status)
         self.assertIn('section="SSL"', status)
         self.assertIn('cert_dir="/opt/remnawave"', status)
+
+    def test_vps_warp_installer_is_unattended_and_verified(self):
+        install = function_body(KTO, "do_install_warp_native")
+
+        self.assertIn("tagashi666/vps-warp/main/warp_install.sh", KTO)
+        self.assertIn('bash -n "$script"', install)
+        self.assertIn("printf '2\\n\\n'", install)
+        self.assertIn("setsid --wait", install)
+        self.assertIn("/etc/wireguard/warp.conf", install)
+        self.assertIn("/usr/local/bin/vps-warp", install)
+        self.assertIn("systemctl is-active --quiet wg-quick@warp", install)
 
 
 if __name__ == "__main__":

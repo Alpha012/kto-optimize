@@ -7,9 +7,10 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v238"
+SCRIPT_BUILD="v239"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
+WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
 WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 83.228.242.53 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
 WHITELIST_SSH_ALLOWED_IPS="${KTO_WHITELIST_SSH_ALLOWED_IPS:-$WHITELIST_SSH_ALLOWED_IPS_DEFAULT}"
 WHITELIST_SSH_KEEP_CURRENT="${KTO_WHITELIST_SSH_KEEP_CURRENT:-1}"
@@ -3204,19 +3205,51 @@ install_selfsteal() {
 }
 
 do_install_warp_native() {
-    stage "Устанавливаю WARP Native"
+    stage "Устанавливаю VPS-WARP"
     local script
     script="$(mktemp)"
-    must "Скачивание WARP" curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh -o "$script"
-    if ! printf '2\n1\n' | "${SUDO[@]}" bash "$script" >> "$LOG_FILE" 2>&1; then
+    must "Скачивание VPS-WARP" curl -fsSL "$WARP_INSTALL_URL" -o "$script"
+
+    if ! bash -n "$script" >> "$LOG_FILE" 2>&1; then
         rm -f "$script"
-        fail "WARP не установился"
+        fail "Скачанный установщик VPS-WARP повреждён"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        exit 1
+    fi
+
+    if ! command_exists setsid; then
+        apt_update_quiet
+        apt_install_quiet util-linux
+    fi
+    if ! command_exists setsid; then
+        rm -f "$script"
+        fail "Не найден setsid для автоматической установки VPS-WARP"
+        exit 1
+    fi
+
+    # Upstream intentionally reads /dev/tty. A detached session makes the
+    # supplied language choice and empty WARP+ key fully non-interactive.
+    if ! printf '2\n\n' | "${SUDO[@]}" env \
+        HOME=/root TERM="${TERM:-xterm}" DEBIAN_FRONTEND=noninteractive \
+        setsid --wait bash "$script" >> "$LOG_FILE" 2>&1; then
+        rm -f "$script"
+        fail "VPS-WARP не установился"
         tail -n 25 "$LOG_FILE" >&2 || true
         exit 1
     fi
     rm -f "$script"
+
+    if ! "${SUDO[@]}" test -s /etc/wireguard/warp.conf \
+        || ! "${SUDO[@]}" test -x /usr/local/bin/vps-warp \
+        || ! "${SUDO[@]}" systemctl is-active --quiet wg-quick@warp; then
+        "${SUDO[@]}" systemctl status wg-quick@warp --no-pager >> "$LOG_FILE" 2>&1 || true
+        fail "VPS-WARP завершил установку, но туннель не поднялся"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        exit 1
+    fi
+
     echo
-    ok "WARP установлен"
+    ok "VPS-WARP установлен и активен"
 }
 
 install_warp_native() {
@@ -5399,7 +5432,7 @@ menu() {
             labels+=("Установка SelfSteal")
             actions+=("selfsteal")
         fi
-        labels+=("Установка WARP Native")
+        labels+=("Установка VPS-WARP")
         actions+=("warp")
         labels+=("Push статистики")
         actions+=("stats-push-menu")
