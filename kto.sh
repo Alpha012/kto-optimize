@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v237"
+SCRIPT_BUILD="v238"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 83.228.242.53 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
@@ -567,15 +567,24 @@ valid_machine_mode() {
 }
 
 valid_node_profile() {
-    [[ "$1" == "reality" || "$1" == "hysteria2" ]]
+    [[ "$1" == "reality" || "$1" == "hysteria2" || "$1" == "reality_hysteria2" ]]
 }
 
 node_profile_label() {
     case "${NODE_PROFILE:-}" in
         reality) echo "Reality" ;;
         hysteria2) echo "Hysteria2" ;;
+        reality_hysteria2) echo "Reality + Hysteria2" ;;
         *) echo "-" ;;
     esac
+}
+
+node_profile_includes_reality() {
+    [[ "${NODE_PROFILE:-}" == "reality" || "${NODE_PROFILE:-}" == "reality_hysteria2" ]]
+}
+
+node_profile_includes_hysteria2() {
+    [[ "${NODE_PROFILE:-}" == "hysteria2" || "${NODE_PROFILE:-}" == "reality_hysteria2" ]]
 }
 
 config_label() {
@@ -651,7 +660,7 @@ load_machine_mode() {
 
     if [[ -n "$NODE_PROFILE" ]]; then
         if ! valid_node_profile "$NODE_PROFILE"; then
-            warn "KTO_NODE_PROFILE должен быть reality или hysteria2. Игнорирую."
+            warn "KTO_NODE_PROFILE должен быть reality, hysteria2 или reality_hysteria2. Игнорирую."
             NODE_PROFILE=""
         fi
     fi
@@ -759,8 +768,9 @@ select_node_profile() {
         echo -e "${BOLD}${PURPLE}[ ПРОФИЛЬ НОДЫ ]${NC}"
         echo -e "1) Reality"
         echo -e "2) Hysteria2"
+        echo -e "3) Reality + Hysteria2"
         echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите профиль (1-2):${NC} "
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите профиль (1-3):${NC} "
         read -r choice
         case "$choice" in
             1|reality|Reality)
@@ -769,6 +779,10 @@ select_node_profile() {
                 ;;
             2|hysteria2|Hysteria2|hysteria|Hysteria)
                 NODE_PROFILE="hysteria2"
+                break
+                ;;
+            3|reality_hysteria2|reality+hysteria2|Reality+Hysteria2|combo|hybrid)
+                NODE_PROFILE="reality_hysteria2"
                 break
                 ;;
             *)
@@ -914,16 +928,16 @@ require_node_mode() {
 
 require_hysteria2_profile() {
     require_node_mode
-    if [[ "$NODE_PROFILE" != "hysteria2" ]]; then
-        fail "SSL доступен только для профиля Hysteria2."
+    if ! node_profile_includes_hysteria2; then
+        fail "SSL доступен только для профилей Hysteria2 и Reality + Hysteria2."
         exit 1
     fi
 }
 
 require_reality_profile() {
     require_node_mode
-    if [[ "$NODE_PROFILE" != "reality" ]]; then
-        fail "SelfSteal доступен только для профиля Reality."
+    if ! node_profile_includes_reality; then
+        fail "SelfSteal доступен только для профилей Reality и Reality + Hysteria2."
         exit 1
     fi
 }
@@ -3091,7 +3105,7 @@ do_install_remnawave_node() {
 
     stage "Готовлю Remnawave Node ($(node_profile_label))"
     cmd "${SUDO[@]}" mkdir -p "$REMNA_DIR"
-    if [[ "$NODE_PROFILE" == "hysteria2" ]]; then
+    if node_profile_includes_hysteria2; then
         write_root_file "$REMNA_DIR/docker-compose.yml" <<EOF
 services:
   remnanode:
@@ -3877,6 +3891,12 @@ install_common_stack() {
         stage "Общее поднятие Hysteria2"
         do_issue_ssl_certificate "$domain"
         do_install_remnawave_node "$secret"
+        do_install_warp_native
+    elif [[ "$NODE_PROFILE" == "reality_hysteria2" ]]; then
+        stage "Общее поднятие Reality + Hysteria2"
+        do_issue_ssl_certificate "$domain"
+        do_install_remnawave_node "$secret"
+        do_install_selfsteal "$domain"
         do_install_warp_native
     else
         fail "Неизвестный профиль node"
@@ -5341,7 +5361,7 @@ show_status() {
         print_row "remnanode" "not found" 0
     fi
 
-    if [[ "$NODE_PROFILE" == "hysteria2" ]]; then
+    if node_profile_includes_hysteria2; then
         echo
         echo -e "${BOLD}${PURPLE}[ SSL ]${NC}"
         print_row "privkey.key" "$CERT_DIR/privkey.key" "$(file_ok "$CERT_DIR/privkey.key")"
@@ -5375,7 +5395,7 @@ menu() {
         actions+=("common")
         labels+=("Установка ноды Remnawave")
         actions+=("node")
-        if [[ "$NODE_PROFILE" == "reality" ]]; then
+        if node_profile_includes_reality; then
             labels+=("Установка SelfSteal")
             actions+=("selfsteal")
         fi
@@ -5407,7 +5427,7 @@ menu() {
         actions+=("ipcheck-region")
     fi
 
-    if [[ "$MACHINE_MODE" == "node" && "$NODE_PROFILE" == "hysteria2" ]]; then
+    if [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_hysteria2; then
         labels+=("Сгенерировать SSL-сертификат")
         actions+=("ssl")
     elif [[ "$MACHINE_MODE" == "whitelist" ]]; then

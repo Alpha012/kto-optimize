@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v237"
+PUSH_BUILD="v238"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -1009,21 +1009,27 @@ antiscanner_rules_count_panel() {
 }
 
 status_panel_rows_json() {
-    local rows_file section cc qdisc mode profile ram_used_b ram_total_b ram_percent available_b swap_b zram_summary kernel cpus
-    local docker_status container node_status antiscanner_count
+    local rows_file section cc qdisc mode profile profile_label ram_used_b ram_total_b ram_percent available_b swap_b zram_summary kernel cpus
+    local docker_status container node_status antiscanner_count cert_dir cert_expiry cert_status
     rows_file="$(mktemp)"
 
     mode="$(kto_cfg_get MACHINE_MODE)"
     mode="${mode:-node}"
     profile="$(kto_cfg_get NODE_PROFILE)"
     profile="${profile:-reality}"
+    case "$profile" in
+        reality) profile_label="Reality" ;;
+        hysteria2) profile_label="Hysteria2" ;;
+        reality_hysteria2) profile_label="Reality + Hysteria2" ;;
+        *) profile_label="$profile" ;;
+    esac
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
 
     section="СЕТЬ"
     append_status_panel_row "$rows_file" "$section" "mode" "$mode" "info"
     if [[ "$mode" == "node" ]]; then
-        append_status_panel_row "$rows_file" "$section" "profile" "$profile" "info"
+        append_status_panel_row "$rows_file" "$section" "profile" "$profile_label" "info"
     fi
     append_status_panel_row "$rows_file" "$section" "BBR + FQ" "${cc} + ${qdisc}" "$([[ "$cc" == "bbr" && "$qdisc" == "fq" ]] && echo ok || echo fail)"
     append_status_panel_row "$rows_file" "$section" "ports" "$(ufw_allowed_ports_panel)" "info"
@@ -1072,6 +1078,22 @@ status_panel_rows_json() {
     else
         append_status_panel_row "$rows_file" "$section" "docker" "not installed" "fail"
         append_status_panel_row "$rows_file" "$section" "remnanode" "not found" "fail"
+    fi
+
+    if [[ "$mode" == "node" && ( "$profile" == "hysteria2" || "$profile" == "reality_hysteria2" ) ]]; then
+        section="SSL"
+        cert_dir="/opt/remnawave"
+        append_status_panel_row "$rows_file" "$section" "privkey.key" "$cert_dir/privkey.key" "$([[ -s "$cert_dir/privkey.key" ]] && echo ok || echo fail)"
+        append_status_panel_row "$rows_file" "$section" "fullchain.pem" "$cert_dir/fullchain.pem" "$([[ -s "$cert_dir/fullchain.pem" ]] && echo ok || echo fail)"
+        if [[ -s "$cert_dir/fullchain.pem" ]] && command -v openssl >/dev/null 2>&1; then
+            cert_expiry="$(openssl x509 -enddate -noout -in "$cert_dir/fullchain.pem" 2>/dev/null | sed 's/notAfter=//' || true)"
+            if openssl x509 -checkend 1209600 -noout -in "$cert_dir/fullchain.pem" >/dev/null 2>&1; then
+                cert_status="ok"
+            else
+                cert_status="fail"
+            fi
+            append_status_panel_row "$rows_file" "$section" "expires" "${cert_expiry:-unknown}" "$cert_status"
+        fi
     fi
 
     section="ЯДРО"
