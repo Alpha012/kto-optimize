@@ -36,9 +36,9 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v242"', KTO)
-        self.assertIn('PUSH_BUILD="v242"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v242"', COLLECTOR)
+        self.assertIn('SCRIPT_BUILD="v243"', KTO)
+        self.assertIn('PUSH_BUILD="v243"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v243"', COLLECTOR)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -247,6 +247,38 @@ actual=$(cat "$routes")
         self.assertIn('systemctl stop "$STATS_COLLECTOR_SERVICE"', alerts_menu)
         self.assertIn('systemctl start "$STATS_COLLECTOR_SERVICE"', alerts_menu)
         self.assertIn('Статистика, SLA и downtime продолжат работать', alerts_menu)
+        self.assertIn('query="$(trim_whitespace "$query")"', alerts_menu)
+        self.assertNotIn('query="$(trim "$query")"', alerts_menu)
+
+    def test_collector_alert_menu_trims_zero_and_machine_names(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+STATS_COLLECTOR_CONFIG=$(mktemp)
+LOG_FILE=$(mktemp)
+trap 'rm -f "$STATS_COLLECTOR_CONFIG" "$LOG_FILE"' EXIT
+printf 'configured\n' > "$STATS_COLLECTOR_CONFIG"
+STATS_COLLECTOR_SCRIPT=/bin/true
+header() { :; }
+require_panel_mode() { :; }
+need_root() { :; }
+write_stats_collector_script() { :; }
+[[ "$(trim_whitespace '  Обход №1 (Private)  ')" == 'Обход №1 (Private)' ]]
+stats_collector_alerts_menu <<< '  0  ' >/dev/null
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

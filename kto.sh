@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v242"
+SCRIPT_BUILD="v243"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -204,6 +204,13 @@ format_duration() {
     else
         printf '%ds' "$seconds"
     fi
+}
+
+trim_whitespace() {
+    local value="${1:-}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s\n' "$value"
 }
 
 need_root() {
@@ -5312,7 +5319,7 @@ stats_collector_alerts_menu() {
         echo -e "${DIM}Ввод обычной машины отключает уведомления, повторный ввод включает обратно.${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Название машины [0 - назад]:${NC} "
         read -r query
-        query="$(trim "$query")"
+        query="$(trim_whitespace "$query")"
         if [[ -z "$query" || "$query" == "0" ]]; then
             return 0
         fi
