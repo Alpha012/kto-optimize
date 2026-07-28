@@ -7,6 +7,7 @@ cd "$ROOT_DIR"
 bash -n tune.sh
 bash -n kto.sh
 bash -n scripts/kto-stats-push.sh
+bash -n scripts/kto-mobile443.sh
 
 PYTHON_CMD=()
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then

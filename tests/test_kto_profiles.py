@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 KTO = (ROOT / "kto.sh").read_text(encoding="utf-8")
 PUSH = (ROOT / "scripts" / "kto-stats-push.sh").read_text(encoding="utf-8")
 COLLECTOR = (ROOT / "scripts" / "kto-stats-collector.py").read_text(encoding="utf-8")
+MOBILE443 = (ROOT / "scripts" / "kto-mobile443.sh").read_text(encoding="utf-8")
 
 
 def bash_executable():
@@ -36,9 +37,10 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v243"', KTO)
-        self.assertIn('PUSH_BUILD="v243"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v243"', COLLECTOR)
+        self.assertIn('SCRIPT_BUILD="v244"', KTO)
+        self.assertIn('PUSH_BUILD="v244"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v244"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v244"', MOBILE443)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -269,6 +271,64 @@ need_root() { :; }
 write_stats_collector_script() { :; }
 [[ "$(trim_whitespace '  Обход №1 (Private)  ')" == 'Обход №1 (Private)' ]]
 stats_collector_alerts_menu <<< '  0  ' >/dev/null
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_whitelist_mobile443_mode_is_minimal_pinned_and_fail_open(self):
+        main_menu = function_body(KTO, "menu")
+        enable = function_body(KTO, "enable_mobile443_lte")
+        disable = function_body(KTO, "disable_mobile443_lte")
+        config = function_body(MOBILE443, "write_config")
+        download = function_body(MOBILE443, "download_upstream")
+        fail_open = function_body(MOBILE443, "fail_open")
+        manager_enable = function_body(MOBILE443, "enable_lte")
+
+        self.assertIn('labels+=("Включение режима \\"Только LTE\\"")', main_menu)
+        self.assertIn('actions+=("mobile443-lte")', main_menu)
+        self.assertIn('extract_haproxy_routes > "$routes_file"', enable)
+        self.assertIn('whitelist_ipv6_disabled', enable)
+        self.assertIn('opt_ipv6_mode_guard', enable)
+        self.assertIn('"$MOBILE443_MANAGER" enable "$ports"', enable)
+        self.assertIn('ensure_mobile443_manager', disable)
+        self.assertIn('bash "$script" update full', manager_enable)
+        self.assertIn('fail_open "$ports"', manager_enable)
+        self.assertIn('ENABLE_TRAF_GUARD="false"', config)
+        self.assertIn('ENABLE_MOBILE_ALLOW="${enabled}"', config)
+        self.assertIn('ENABLE_TELEGRAM="false"', config)
+        self.assertIn('sha256sum "$destination"', download)
+        self.assertIn('remove_jumps', fail_open)
+        self.assertIn('MOBILE443_REF="${KTO_MOBILE443_REF:-43d0065e983d1d518421b781298f8130125738b4}"', MOBILE443)
+        self.assertIn('MOBILE443_ASN_SHA256="${KTO_MOBILE443_ASN_SHA256:-505184e6e859871d64a379a05954ccba648bae97ba672f2e6c7575ba969befaf}"', MOBILE443)
+
+    def test_mobile443_uses_all_unique_haproxy_ports(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+trap 'rm -f "$routes"' EXIT
+printf '8443\ttarget-a:443\ta.example\n443\ttarget-b:443\tb.example\n8443\ttarget-c:443\tc.example\n' > "$routes"
+[[ "$(mobile443_lte_ports_from_routes "$routes")" == '443 8443' ]]
+source <(sed '/^require_root$/,$d' scripts/kto-mobile443.sh)
+[[ "$(normalize_ports '08443,443 8443')" == '443 8443' ]]
+events=$(mktemp)
+systemctl() { return 0; }
+remove_jumps() { printf 'jumps-removed\n' >> "$events"; }
+write_config() { printf 'config:%s:%s\n' "$1" "$2" >> "$events"; }
+fail_open '443 8443'
+grep -qx 'jumps-removed' "$events"
+grep -qx 'config:443 8443:false' "$events"
+rm -f "$events"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

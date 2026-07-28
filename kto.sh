@@ -7,13 +7,16 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v243"
+SCRIPT_BUILD="v244"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
 WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 94.247.129.92 83.228.242.53 167.254.243.181 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
 WHITELIST_SSH_ALLOWED_IPS="${KTO_WHITELIST_SSH_ALLOWED_IPS:-$WHITELIST_SSH_ALLOWED_IPS_DEFAULT}"
 WHITELIST_SSH_KEEP_CURRENT="${KTO_WHITELIST_SSH_KEEP_CURRENT:-1}"
+MOBILE443_DIR="/opt/mobile443"
+MOBILE443_CONFIG="${MOBILE443_DIR}/config.conf"
+MOBILE443_MANAGER="/usr/local/sbin/kto-mobile443"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
@@ -4715,6 +4718,119 @@ install_haproxy() {
     haproxy_menu
 }
 
+mobile443_lte_ports_from_routes() {
+    local routes_file="$1"
+    awk -F '\t' '$1 ~ /^[0-9]+$/ && $1 >= 1 && $1 <= 65535 { print $1 }' "$routes_file" 2>/dev/null |
+        sort -n -u | paste -sd ' ' -
+}
+
+mobile443_lte_configured() {
+    "${SUDO[@]}" test -s "$MOBILE443_CONFIG" 2>/dev/null &&
+        "${SUDO[@]}" grep -Eq '^ENABLE_MOBILE_ALLOW=(true|"true")$' "$MOBILE443_CONFIG" 2>/dev/null
+}
+
+mobile443_lte_ports_include() {
+    local ports="$1" wanted="$2"
+    [[ " $ports " == *" $wanted "* ]]
+}
+
+install_mobile443_manager() {
+    install_asset_file scripts/kto-mobile443.sh "$MOBILE443_MANAGER" 0755
+}
+
+ensure_mobile443_manager() {
+    if "${SUDO[@]}" test -x "$MOBILE443_MANAGER" 2>/dev/null; then
+        return 0
+    fi
+    install_mobile443_manager
+}
+
+enable_mobile443_lte() {
+    header
+    require_whitelist_mode
+    need_root
+    local routes_file ports ssh_port
+
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+    ports="$(mobile443_lte_ports_from_routes "$routes_file" 2>/dev/null || true)"
+    rm -f "$routes_file"
+    if [[ -z "$ports" ]]; then
+        fail "Сначала настрой хотя бы один HAProxy-порт"
+        return 1
+    fi
+
+    ssh_port="$(detect_ssh_port)"
+    if mobile443_lte_ports_include "$ports" "$ssh_port"; then
+        fail "Порт ${ssh_port} занят SSH. LTE-фильтр не включён, чтобы не потерять доступ к серверу."
+        return 1
+    fi
+
+    if ! whitelist_ipv6_disabled; then
+        stage "Отключаю IPv6 для whitelist-режима"
+        opt_ipv6_mode_guard
+        if ! whitelist_ipv6_disabled; then
+            fail "Не удалось отключить IPv6. LTE-фильтр не включён."
+            return 1
+        fi
+    fi
+
+    if ! install_mobile443_manager; then
+        return 1
+    fi
+    if ! "${SUDO[@]}" env KTO_MOBILE443_LOG_FILE="$LOG_FILE" "$MOBILE443_MANAGER" enable "$ports"; then
+        return 1
+    fi
+}
+
+disable_mobile443_lte() {
+    header
+    require_whitelist_mode
+    need_root
+    ensure_mobile443_manager || return 1
+    "${SUDO[@]}" env KTO_MOBILE443_LOG_FILE="$LOG_FILE" "$MOBILE443_MANAGER" disable
+}
+
+print_mobile443_lte_status() {
+    ensure_mobile443_manager || return 1
+    "${SUDO[@]}" env KTO_MOBILE443_LOG_FILE="$LOG_FILE" "$MOBILE443_MANAGER" status
+}
+
+mobile443_lte_menu() {
+    require_whitelist_mode
+    need_root
+    local choice
+    if ! mobile443_lte_configured; then
+        enable_mobile443_lte
+        return
+    fi
+
+    while true; do
+        header
+        print_mobile443_lte_status
+        echo
+        echo -e "1) Обновить списки и синхронизировать HAProxy-порты"
+        echo -e "2) Выключить режим \"Только LTE\""
+        echo -e "0) Назад"
+        echo -e "${PURPLE}==========================================${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+        read -r choice
+        case "$choice" in
+            1) enable_mobile443_lte; return ;;
+            2)
+                echo -ne "${YELLOW}Отключить LTE-фильтр? [y/N]:${NC} "
+                read -r choice
+                if [[ "${choice,,}" == "y" || "${choice,,}" == "yes" ]]; then
+                    disable_mobile443_lte
+                    return
+                fi
+                ;;
+            0) return 0 ;;
+            *) fail "Неверный выбор" ;;
+        esac
+    done
+}
+
 write_stats_collector_script() {
     install_asset_file scripts/kto-stats-collector.py "$STATS_COLLECTOR_SCRIPT" 0755
 }
@@ -6094,6 +6210,12 @@ menu() {
     elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
         labels+=("HAProxy")
         actions+=("haproxy")
+        if mobile443_lte_configured; then
+            labels+=("Режим \"Только LTE\" (включён)")
+        else
+            labels+=("Включение режима \"Только LTE\"")
+        fi
+        actions+=("mobile443-lte")
         labels+=("Push статистики")
         actions+=("stats-push-menu")
     fi
@@ -6140,6 +6262,7 @@ menu() {
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
         haproxy-update) update_haproxy_existing_config ;;
+        mobile443-lte) mobile443_lte_menu ;;
         stats-push-menu) stats_push_menu ;;
         settings) settings_menu ;;
         *) fail "Неверный выбор" ;;
@@ -6175,6 +6298,10 @@ main() {
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
         haproxy-update|update-haproxy|haproxy-refresh) update_haproxy_existing_config ;;
+        mobile443-lte|lte-only) mobile443_lte_menu ;;
+        mobile443-lte-enable|lte-only-enable) enable_mobile443_lte ;;
+        mobile443-lte-disable|lte-only-disable) disable_mobile443_lte ;;
+        mobile443-lte-status|lte-only-status) header; require_whitelist_mode; need_root; print_mobile443_lte_status ;;
         collector|collector-install|collector-update|stats-collector|stats-collector-update) install_stats_collector ;;
         collector-status|stats-collector-status) stats_collector_status ;;
         collector-alerts|stats-collector-alerts|push-alerts) stats_collector_alerts_menu ;;
