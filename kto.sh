@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v244"
+SCRIPT_BUILD="v245"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4778,7 +4778,7 @@ enable_mobile443_lte() {
     if ! install_mobile443_manager; then
         return 1
     fi
-    if ! "${SUDO[@]}" env KTO_MOBILE443_LOG_FILE="$LOG_FILE" "$MOBILE443_MANAGER" enable "$ports"; then
+    if ! "${SUDO[@]}" "$MOBILE443_MANAGER" enable "$ports"; then
         return 1
     fi
 }
@@ -4788,12 +4788,12 @@ disable_mobile443_lte() {
     require_whitelist_mode
     need_root
     ensure_mobile443_manager || return 1
-    "${SUDO[@]}" env KTO_MOBILE443_LOG_FILE="$LOG_FILE" "$MOBILE443_MANAGER" disable
+    "${SUDO[@]}" "$MOBILE443_MANAGER" disable
 }
 
 print_mobile443_lte_status() {
     ensure_mobile443_manager || return 1
-    "${SUDO[@]}" env KTO_MOBILE443_LOG_FILE="$LOG_FILE" "$MOBILE443_MANAGER" status
+    "${SUDO[@]}" "$MOBILE443_MANAGER" status
 }
 
 mobile443_lte_menu() {
@@ -4801,13 +4801,16 @@ mobile443_lte_menu() {
     need_root
     local choice
     if ! mobile443_lte_configured; then
-        enable_mobile443_lte
-        return
+        enable_mobile443_lte || true
+        return 0
     fi
 
     while true; do
         header
-        print_mobile443_lte_status
+        if ! print_mobile443_lte_status; then
+            fail "Не удалось прочитать состояние LTE-фильтра"
+            return 0
+        fi
         echo
         echo -e "1) Обновить списки и синхронизировать HAProxy-порты"
         echo -e "2) Выключить режим \"Только LTE\""
@@ -4816,13 +4819,13 @@ mobile443_lte_menu() {
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
         read -r choice
         case "$choice" in
-            1) enable_mobile443_lte; return ;;
+            1) enable_mobile443_lte || true; return 0 ;;
             2)
                 echo -ne "${YELLOW}Отключить LTE-фильтр? [y/N]:${NC} "
                 read -r choice
                 if [[ "${choice,,}" == "y" || "${choice,,}" == "yes" ]]; then
-                    disable_mobile443_lte
-                    return
+                    disable_mobile443_lte || true
+                    return 0
                 fi
                 ;;
             0) return 0 ;;

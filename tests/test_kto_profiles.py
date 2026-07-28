@@ -37,10 +37,10 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v244"', KTO)
-        self.assertIn('PUSH_BUILD="v244"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v244"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v244"', MOBILE443)
+        self.assertIn('SCRIPT_BUILD="v245"', KTO)
+        self.assertIn('PUSH_BUILD="v245"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v245"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v245"', MOBILE443)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -284,8 +284,10 @@ stats_collector_alerts_menu <<< '  0  ' >/dev/null
 
     def test_whitelist_mobile443_mode_is_minimal_pinned_and_fail_open(self):
         main_menu = function_body(KTO, "menu")
+        lte_menu = function_body(KTO, "mobile443_lte_menu")
         enable = function_body(KTO, "enable_mobile443_lte")
         disable = function_body(KTO, "disable_mobile443_lte")
+        status = function_body(KTO, "print_mobile443_lte_status")
         config = function_body(MOBILE443, "write_config")
         download = function_body(MOBILE443, "download_upstream")
         fail_open = function_body(MOBILE443, "fail_open")
@@ -293,11 +295,13 @@ stats_collector_alerts_menu <<< '  0  ' >/dev/null
 
         self.assertIn('labels+=("Включение режима \\"Только LTE\\"")', main_menu)
         self.assertIn('actions+=("mobile443-lte")', main_menu)
+        self.assertIn('enable_mobile443_lte || true', lte_menu)
         self.assertIn('extract_haproxy_routes > "$routes_file"', enable)
         self.assertIn('whitelist_ipv6_disabled', enable)
         self.assertIn('opt_ipv6_mode_guard', enable)
         self.assertIn('"$MOBILE443_MANAGER" enable "$ports"', enable)
         self.assertIn('ensure_mobile443_manager', disable)
+        self.assertNotIn('KTO_MOBILE443_LOG_FILE', enable + disable + status)
         self.assertIn('bash "$script" update full', manager_enable)
         self.assertIn('fail_open "$ports"', manager_enable)
         self.assertIn('ENABLE_TRAF_GUARD="false"', config)
@@ -319,7 +323,14 @@ routes=$(mktemp)
 trap 'rm -f "$routes"' EXIT
 printf '8443\ttarget-a:443\ta.example\n443\ttarget-b:443\tb.example\n8443\ttarget-c:443\tc.example\n' > "$routes"
 [[ "$(mobile443_lte_ports_from_routes "$routes")" == '443 8443' ]]
+require_whitelist_mode() { :; }
+need_root() { :; }
+mobile443_lte_configured() { return 1; }
+enable_mobile443_lte() { return 1; }
+mobile443_lte_menu
+KTO_MOBILE443_LOG_FILE=/tmp/must-not-be-used
 source <(sed '/^require_root$/,$d' scripts/kto-mobile443.sh)
+[[ "$LOG_FILE" == '/var/log/kto-mobile443.log' ]]
 [[ "$(normalize_ports '08443,443 8443')" == '443 8443' ]]
 events=$(mktemp)
 systemctl() { return 0; }

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-MOBILE443_BUILD="v244"
+MOBILE443_BUILD="v245"
 MOBILE443_DIR="/opt/mobile443"
 MOBILE443_CONFIG="${MOBILE443_DIR}/config.conf"
 MOBILE443_CHAIN="FILTER_MOBILE_443"
@@ -11,7 +11,7 @@ MOBILE443_IPSET="allowed_mobile_443"
 MOBILE443_REF="${KTO_MOBILE443_REF:-43d0065e983d1d518421b781298f8130125738b4}"
 MOBILE443_ASN_URL="${KTO_MOBILE443_ASN_URL:-https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/${MOBILE443_REF}/asn.sh}"
 MOBILE443_ASN_SHA256="${KTO_MOBILE443_ASN_SHA256:-505184e6e859871d64a379a05954ccba648bae97ba672f2e6c7575ba969befaf}"
-LOG_FILE="${KTO_MOBILE443_LOG_FILE:-/var/log/kto-mobile443.log}"
+LOG_FILE="/var/log/kto-mobile443.log"
 
 print_ok() {
     printf '[OK] %s\n' "$*"
@@ -26,8 +26,17 @@ require_root() {
         print_error "Запусти менеджер mobile443 от root"
         exit 1
     fi
-    mkdir -p "$(dirname "$LOG_FILE")"
-    touch "$LOG_FILE"
+    if ! mkdir -p "$(dirname "$LOG_FILE")" ||
+        ! touch "$LOG_FILE" ||
+        ! chown root:root "$LOG_FILE" ||
+        ! chmod 0600 "$LOG_FILE"; then
+        print_error "Не удалось подготовить лог: ${LOG_FILE}"
+        exit 1
+    fi
+    if ! printf '===== kto-mobile443 %s %s =====\n' "$MOBILE443_BUILD" "$(date -Is)" >> "$LOG_FILE"; then
+        print_error "Не удалось открыть лог: ${LOG_FILE}"
+        exit 1
+    fi
 }
 
 normalize_ports() {
