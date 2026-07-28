@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v240"
+COLLECTOR_BUILD = "v241"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -4105,7 +4105,7 @@ def handle_pending_sni(chat_id, from_id, text):
             "<b>Сейчас разрешены:</b>\n"
             f"{sni_list_text(current)}\n\n"
             "Теперь напиши SNI для allow-list.\n"
-            "Пример: <code>example.com</code>"
+            "Пример: <code>example.com</code> или <code>*.example.com</code>"
         )
         return True
     try:

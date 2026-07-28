@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v240"
+PUSH_BUILD="v241"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -282,10 +282,19 @@ read_haproxy_allowed_sni() {
         $1 == "frontend" { base_frontend = ($2 == "vless_in"); next }
         $1 == "backend" { base_frontend = 0; next }
         base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+            suffix_match = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i == "-m" && $(i + 1) == "end") suffix_match = 1
+            }
             for (i = 1; i <= NF; i++) {
                 if ($i == "-i") {
-                    for (j = i + 1; j <= NF; j++) print $j
-                    exit
+                    for (j = i + 1; j <= NF; j++) {
+                        if ($j ~ /^#/) break
+                        value = $j
+                        if (suffix_match && value ~ /^\./) value = "*" value
+                        print value
+                    }
+                    break
                 }
             }
         }
@@ -296,6 +305,28 @@ read_haproxy_allowed_sni() {
         [[ -n "$value" ]] || continue
         normalize_sni_value "$value" || true
     done <<< "$values" | awk '!seen[$0]++' | jq -R -s '[split("\n")[] | select(length > 0)]' 2>/dev/null || echo '[]')"
+}
+
+render_haproxy_sni_acl_block() {
+    local values_file="$1" value
+    local -a exact_values=() wildcard_suffixes=()
+
+    while IFS= read -r value; do
+        [[ -n "$value" ]] || continue
+        if [[ "$value" == \*.* ]]; then
+            wildcard_suffixes+=(".${value#*.}")
+        else
+            exact_values+=("$value")
+        fi
+    done < "$values_file"
+
+    local IFS=' '
+    if (( ${#exact_values[@]} > 0 )); then
+        printf '    acl allowed_sni req.ssl_sni -i %s\n' "${exact_values[*]}"
+    fi
+    if (( ${#wildcard_suffixes[@]} > 0 )); then
+        printf '    acl allowed_sni req.ssl_sni -m end -i %s\n' "${wildcard_suffixes[*]}"
+    fi
 }
 
 read_haproxy_backend_target() {
@@ -430,7 +461,7 @@ read_remna_diagnostics() {
 
 apply_collector_haproxy_config() {
     local response="$1"
-    local desired_file tmp_cfg next_cfg desired_sni_line current_sni_line
+    local desired_file tmp_cfg next_cfg desired_sni_block current_sni_block
     local desired_target current_target current_target_raw applied=0 changed=0 has_sni=0 has_target=0
 
     command -v jq >/dev/null 2>&1 || return 0
@@ -490,22 +521,23 @@ apply_collector_haproxy_config() {
 
         if [[ -s "$desired_file" ]]; then
             has_sni=1
-            desired_sni_line="    acl allowed_sni req.ssl_sni -i $(paste -sd ' ' "$desired_file")"
-            current_sni_line="$(awk '
+            desired_sni_block="$(render_haproxy_sni_acl_block "$desired_file")"
+            current_sni_block="$(awk '
                 $1 == "frontend" { base_frontend = ($2 == "vless_in"); next }
                 $1 == "backend" { base_frontend = 0; next }
                 base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
                     print
-                    exit
                 }
             ' "$tmp_cfg" 2>/dev/null || true)"
-            if [[ "$current_sni_line" != "$desired_sni_line" ]]; then
-                if awk -v replacement="$desired_sni_line" '
+            if [[ "$current_sni_block" != "$desired_sni_block" ]]; then
+                if awk -v replacement="$desired_sni_block" '
                     $1 == "frontend" { base_frontend = ($2 == "vless_in") }
                     $1 == "backend" { base_frontend = 0 }
-                    base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" && replaced == 0 {
-                        print replacement
-                        replaced = 1
+                    base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+                        if (replaced == 0) {
+                            print replacement
+                            replaced = 1
+                        }
                         next
                     }
                     { print }

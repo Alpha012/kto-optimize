@@ -36,9 +36,9 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v240"', KTO)
-        self.assertIn('PUSH_BUILD="v240"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v240"', COLLECTOR)
+        self.assertIn('SCRIPT_BUILD="v241"', KTO)
+        self.assertIn('PUSH_BUILD="v241"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v241"', COLLECTOR)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -124,8 +124,28 @@ class CombinedNodeProfileTests(unittest.TestCase):
         self.assertIn('backend_name="vless_pool_${port}"', render)
         self.assertIn('2) Добавить порт', haproxy_menu)
         self.assertIn('3) Удалить дополнительный порт', haproxy_menu)
-        self.assertIn('4) Обновить HAProxy, сохранив маршруты', haproxy_menu)
+        self.assertIn('4) Заменить SNI у всех маршрутов', haproxy_menu)
+        self.assertIn('5) Обновить HAProxy, сохранив маршруты', haproxy_menu)
+        self.assertIn('replace_all_haproxy_sni "$routes_file"', haproxy_menu)
         self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
+
+    def test_haproxy_wildcard_sni_and_ssh_defaults_are_managed(self):
+        render_sni = function_body(KTO, "render_haproxy_sni_acl_lines")
+        extract = function_body(KTO, "extract_haproxy_routes")
+        read_sni = function_body(PUSH, "read_haproxy_allowed_sni")
+        apply_haproxy = function_body(PUSH, "apply_collector_haproxy_config")
+
+        self.assertIn('req.ssl_sni -m end -i %s', render_sni)
+        self.assertIn('value = "*" value', extract)
+        self.assertIn('value = "*" value', read_sni)
+        self.assertIn('current_sni_block', apply_haproxy)
+        self.assertIn('if (replaced == 0)', apply_haproxy)
+        self.assertIn(
+            'WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 '
+            '85.93.9.35 185.31.243.221 94.247.129.92 83.228.242.53 167.254.243.181 '
+            '5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"',
+            KTO,
+        )
 
     def test_haproxy_updates_are_transactional_and_preserve_routes(self):
         apply_routes = function_body(KTO, "apply_haproxy_routes_config")
@@ -165,14 +185,45 @@ SUDO=()
 routes=$(mktemp)
 config=$(mktemp)
 trap 'rm -f "$routes" "$config"' EXIT
-printf '443\t89.144.8.3:443\tbase.example.com\n8443\t5.34.179.144:443\textra.example.com other.example.com\n' > "$routes"
+printf '443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\n8443\t5.34.179.144:443\textra.example.com *.other.example.com\n' > "$routes"
 render_haproxy_routes_config "$routes" "$config"
 grep -q '^frontend vless_in$' "$config"
 grep -q '^frontend vless_in_8443$' "$config"
 grep -q '^    server xray1 89.144.8.3:443 check weight 10$' "$config"
 grep -q '^    server xray_8443 5.34.179.144:443 check weight 10$' "$config"
+grep -q '^    acl allowed_sni req.ssl_sni -i base.example.com$' "$config"
+grep -q '^    acl allowed_sni req.ssl_sni -m end -i \.rog-self.co.uk$' "$config"
 actual=$(extract_haproxy_routes "$config")
-expected=$'443\t89.144.8.3:443\tbase.example.com\n8443\t5.34.179.144:443\textra.example.com other.example.com'
+expected=$'443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\n8443\t5.34.179.144:443\textra.example.com *.other.example.com'
+[[ "$actual" == "$expected" ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_bulk_sni_replace_preserves_ports_and_targets(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+routes=$(mktemp)
+trap 'rm -f "$routes"' EXIT
+printf '443\t89.144.8.3:443\told.example.com\n8443\t5.34.179.144:443\tother.example.com\n' > "$routes"
+ask_haproxy_sni_list() { printf '%s\n' '*.rog-self.co.uk'; }
+apply_haproxy_routes_config() { return 0; }
+harden_whitelist_haproxy_firewall() { return 0; }
+replace_all_haproxy_sni "$routes"
+expected=$'443\t89.144.8.3:443\t*.rog-self.co.uk\n8443\t5.34.179.144:443\t*.rog-self.co.uk'
+actual=$(cat "$routes")
 [[ "$actual" == "$expected" ]]
 '''
         result = subprocess.run(

@@ -7,11 +7,11 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v240"
+SCRIPT_BUILD="v241"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
-WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 83.228.242.53 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
+WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 94.247.129.92 83.228.242.53 167.254.243.181 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
 WHITELIST_SSH_ALLOWED_IPS="${KTO_WHITELIST_SSH_ALLOWED_IPS:-$WHITELIST_SSH_ALLOWED_IPS_DEFAULT}"
 WHITELIST_SSH_KEEP_CURRENT="${KTO_WHITELIST_SSH_KEEP_CURRENT:-1}"
 REMNA_DIR="/opt/remnawave"
@@ -1298,6 +1298,29 @@ normalize_haproxy_sni_list() {
     printf '%s\n' "${normalized[*]}"
 }
 
+render_haproxy_sni_acl_lines() {
+    local raw="${1:-}" normalized token
+    local -a values=() exact_values=() wildcard_suffixes=()
+
+    normalized="$(normalize_haproxy_sni_list "$raw")" || return 1
+    IFS=' ' read -r -a values <<< "$normalized"
+    for token in "${values[@]}"; do
+        if [[ "$token" == \*.* ]]; then
+            wildcard_suffixes+=(".${token#*.}")
+        else
+            exact_values+=("$token")
+        fi
+    done
+
+    local IFS=' '
+    if (( ${#exact_values[@]} > 0 )); then
+        printf '    acl allowed_sni req.ssl_sni -i %s\n' "${exact_values[*]}"
+    fi
+    if (( ${#wildcard_suffixes[@]} > 0 )); then
+        printf '    acl allowed_sni req.ssl_sni -m end -i %s\n' "${wildcard_suffixes[*]}"
+    fi
+}
+
 current_ssh_client_ip() {
     local ip="${SSH_CLIENT:-}"
     ip="${ip%% *}"
@@ -1381,7 +1404,7 @@ ask_haproxy_sni_list() {
             echo "$normalized"
             return 0
         fi
-        fail "Некорректный SNI. Можно указать несколько доменов через пробел."
+        fail "Некорректный SNI. Примеры: example.com, *.example.com; несколько значений — через пробел."
     done
 }
 
@@ -4077,17 +4100,21 @@ extract_haproxy_routes() {
             next
         }
         section == "frontend" && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
-            value = ""
+            suffix_match = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i == "-m" && $(i + 1) == "end") suffix_match = 1
+            }
             for (i = 1; i <= NF; i++) {
                 if ($i == "-i") {
                     for (j = i + 1; j <= NF; j++) {
                         if ($j ~ /^#/) break
-                        value = value (value == "" ? "" : " ") $j
+                        value = $j
+                        if (suffix_match && value ~ /^\./) value = "*" value
+                        frontend_sni[name] = frontend_sni[name] (frontend_sni[name] == "" ? "" : " ") value
                     }
                     break
                 }
             }
-            frontend_sni[name] = value
             next
         }
         section == "frontend" && $1 == "default_backend" {
@@ -4262,7 +4289,9 @@ frontend ${frontend_name}
     tcp-request inspect-delay 5s
     acl clienthello req.ssl_hello_type 1
     acl has_sni req.ssl_sni -m found
-    acl allowed_sni req.ssl_sni -i ${allowed_sni}
+EOF
+        render_haproxy_sni_acl_lines "$allowed_sni" >> "$output_file"
+        cat >> "$output_file" <<EOF
     tcp-request content track-sc0 src if clienthello !allowed_sni
     tcp-request content sc-inc-gpc0(0) if clienthello !allowed_sni
     tcp-request content track-sc1 req.ssl_sni,lower table wrong_sni_names if clienthello has_sni !allowed_sni
@@ -4549,6 +4578,28 @@ edit_haproxy_route() {
     return 1
 }
 
+replace_all_haproxy_sni() {
+    local routes_file="$1" current_sni allowed_sni next_file route_count
+    current_sni="$(awk -F '\t' 'NF >= 3 { print $3; exit }' "$routes_file")"
+    allowed_sni="$(ask_haproxy_sni_list "Новый SNI для всех HAProxy-портов" "$current_sni")"
+    next_file="$(mktemp)"
+    awk -F '\t' -v OFS='\t' -v sni="$allowed_sni" '
+        NF >= 3 { print $1, $2, sni; next }
+        { print }
+    ' "$routes_file" > "$next_file"
+
+    if apply_haproxy_routes_config "$next_file"; then
+        harden_whitelist_haproxy_firewall "$next_file" "$routes_file"
+        mv "$next_file" "$routes_file"
+        route_count="$(haproxy_route_count "$routes_file")"
+        ok "SNI заменён на всех HAProxy-маршрутах: ${route_count}"
+        ok "Разрешенный SNI: ${allowed_sni}"
+        return 0
+    fi
+    rm -f "$next_file"
+    return 1
+}
+
 delete_haproxy_route() {
     local routes_file="$1" port next_file
     port="$(select_haproxy_route "$routes_file" extra)" || return 1
@@ -4624,7 +4675,8 @@ haproxy_menu() {
         echo -e "1) Изменить маршрут"
         echo -e "2) Добавить порт"
         echo -e "3) Удалить дополнительный порт"
-        echo -e "4) Обновить HAProxy, сохранив маршруты"
+        echo -e "4) Заменить SNI у всех маршрутов"
+        echo -e "5) Обновить HAProxy, сохранив маршруты"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -4633,7 +4685,8 @@ haproxy_menu() {
             1) edit_haproxy_route "$routes_file" || true ;;
             2) add_haproxy_route "$routes_file" || true ;;
             3) delete_haproxy_route "$routes_file" || true ;;
-            4)
+            4) replace_all_haproxy_sni "$routes_file" || true ;;
+            5)
                 if apply_haproxy_routes_config "$routes_file"; then
                     harden_whitelist_haproxy_firewall "$routes_file" "$routes_file"
                     ok "HAProxy обновлён, все маршруты сохранены"
