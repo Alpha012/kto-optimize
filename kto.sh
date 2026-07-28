@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v245"
+SCRIPT_BUILD="v246"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4739,7 +4739,8 @@ install_mobile443_manager() {
 }
 
 ensure_mobile443_manager() {
-    if "${SUDO[@]}" test -x "$MOBILE443_MANAGER" 2>/dev/null; then
+    if "${SUDO[@]}" test -x "$MOBILE443_MANAGER" 2>/dev/null &&
+        "${SUDO[@]}" grep -Fqx "MOBILE443_BUILD=\"${SCRIPT_BUILD}\"" "$MOBILE443_MANAGER" 2>/dev/null; then
         return 0
     fi
     install_mobile443_manager
@@ -4794,6 +4795,13 @@ disable_mobile443_lte() {
 print_mobile443_lte_status() {
     ensure_mobile443_manager || return 1
     "${SUDO[@]}" "$MOBILE443_MANAGER" status
+}
+
+show_mobile443_lte_status() {
+    header
+    require_whitelist_mode
+    need_root
+    print_mobile443_lte_status
 }
 
 mobile443_lte_menu() {
@@ -6219,6 +6227,8 @@ menu() {
             labels+=("Включение режима \"Только LTE\"")
         fi
         actions+=("mobile443-lte")
+        labels+=("Статус режима \"Только LTE\"")
+        actions+=("mobile443-lte-status")
         labels+=("Push статистики")
         actions+=("stats-push-menu")
     fi
@@ -6266,6 +6276,7 @@ menu() {
         haproxy) install_haproxy ;;
         haproxy-update) update_haproxy_existing_config ;;
         mobile443-lte) mobile443_lte_menu ;;
+        mobile443-lte-status) show_mobile443_lte_status ;;
         stats-push-menu) stats_push_menu ;;
         settings) settings_menu ;;
         *) fail "Неверный выбор" ;;
@@ -6304,7 +6315,7 @@ main() {
         mobile443-lte|lte-only) mobile443_lte_menu ;;
         mobile443-lte-enable|lte-only-enable) enable_mobile443_lte ;;
         mobile443-lte-disable|lte-only-disable) disable_mobile443_lte ;;
-        mobile443-lte-status|lte-only-status) header; require_whitelist_mode; need_root; print_mobile443_lte_status ;;
+        mobile443-lte-status|lte-only-status) show_mobile443_lte_status ;;
         collector|collector-install|collector-update|stats-collector|stats-collector-update) install_stats_collector ;;
         collector-status|stats-collector-status) stats_collector_status ;;
         collector-alerts|stats-collector-alerts|push-alerts) stats_collector_alerts_menu ;;

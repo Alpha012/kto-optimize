@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-MOBILE443_BUILD="v245"
+MOBILE443_BUILD="v246"
 MOBILE443_DIR="/opt/mobile443"
 MOBILE443_CONFIG="${MOBILE443_DIR}/config.conf"
 MOBILE443_CHAIN="FILTER_MOBILE_443"
@@ -186,6 +186,23 @@ prefix_count() {
         awk '/^Number of entries:/ { print $4; exit }'
 }
 
+systemd_value() {
+    local unit="$1" property="$2" value
+    value="$(systemctl show "$unit" --property "$property" --value 2>/dev/null || true)"
+    [[ -n "$value" ]] || value="-"
+    printf '%s\n' "$value"
+}
+
+rule_status() {
+    local proto="$1" port="$2"
+    if command -v iptables >/dev/null 2>&1 &&
+        iptables -C INPUT -p "$proto" --dport "$port" -j "$MOBILE443_CHAIN" >/dev/null 2>&1; then
+        printf 'OK\n'
+    else
+        printf 'НЕТ\n'
+    fi
+}
+
 healthy() {
     local ports="$1" count port
     local -a port_list=()
@@ -220,8 +237,14 @@ enable_lte() {
         return 1
     fi
 
-    ensure_download_tools
-    script="$(mktemp)"
+    if ! ensure_download_tools; then
+        print_error "Не удалось подготовить curl и sha256sum. Лог: ${LOG_FILE}"
+        return 1
+    fi
+    if ! script="$(mktemp)"; then
+        print_error "Не удалось создать временный файл для установщика"
+        return 1
+    fi
     if ! download_upstream "$script"; then
         rm -f "$script"
         return 1
@@ -245,6 +268,7 @@ enable_lte() {
     fi
     rm -f "$script"
 
+    printf '[..] Списки загружены. Проверяю ipset, iptables и systemd.\n'
     systemctl disable --now mobile443-monitor.service >> "$LOG_FILE" 2>&1 || true
     if ! healthy "$ports"; then
         fail_open "$ports"
@@ -252,11 +276,18 @@ enable_lte() {
         return 1
     fi
 
-    count="$(prefix_count)"
+    count="$(prefix_count || true)"
+    if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+        fail_open "$ports"
+        print_error "Не удалось прочитать размер мобильного allowlist. Правила сняты, трафик оставлен открытым."
+        return 1
+    fi
     print_ok "Режим \"Только LTE\" включён"
     print_ok "Порты TCP/UDP: ${ports}"
     print_ok "Мобильных IPv4-сетей: ${count}"
     print_ok "Telegram и traffic-guard отключены"
+    echo
+    show_status
 }
 
 disable_lte() {
@@ -272,28 +303,80 @@ disable_lte() {
 }
 
 show_status() {
-    local ports count filter_status timer_status
+    local ports count config_status filter_status chain_status ipset_status
+    local timer_status timer_enabled next_update last_update update_result update_rc
+    local port tcp_status udp_status
+    local -a port_list=()
     ports="$(config_ports 2>/dev/null || echo 443)"
     count="$(prefix_count || true)"
     [[ "$count" =~ ^[0-9]+$ ]] || count=0
     if config_enabled; then
-        if healthy "$ports"; then
-            filter_status="активен"
+        config_status="включён"
+        timer_status="$(systemctl is-active mobile443-update.timer 2>/dev/null || true)"
+        timer_enabled="$(systemctl is-enabled mobile443-update.timer 2>/dev/null || true)"
+        if healthy "$ports" && [[ "$timer_status" == "active" && "$timer_enabled" == "enabled" ]]; then
+            filter_status="РАБОТАЕТ"
         else
-            filter_status="ошибка"
+            filter_status="ОШИБКА"
         fi
     else
-        filter_status="выключен"
+        config_status="выключен"
+        filter_status="ВЫКЛЮЧЕН"
+        timer_status="$(systemctl is-active mobile443-update.timer 2>/dev/null || true)"
+        timer_enabled="$(systemctl is-enabled mobile443-update.timer 2>/dev/null || true)"
     fi
-    timer_status="$(systemctl is-active mobile443-update.timer 2>/dev/null || true)"
     [[ -n "$timer_status" ]] || timer_status="inactive"
+    [[ -n "$timer_enabled" ]] || timer_enabled="disabled"
+
+    if command -v iptables >/dev/null 2>&1 && iptables -nL "$MOBILE443_CHAIN" >/dev/null 2>&1; then
+        chain_status="OK"
+    else
+        chain_status="НЕТ"
+    fi
+    if command -v ipset >/dev/null 2>&1 && ipset list "$MOBILE443_IPSET" >/dev/null 2>&1; then
+        ipset_status="OK"
+    else
+        ipset_status="НЕТ"
+    fi
+
+    next_update="$(systemd_value mobile443-update.timer NextElapseUSecRealtime)"
+    last_update="$(systemd_value mobile443-update.service ExecMainExitTimestamp)"
+    if [[ "$last_update" == "-" ]]; then
+        last_update="$(systemd_value mobile443-update.service ActiveEnterTimestamp)"
+    fi
+    update_result="$(systemd_value mobile443-update.service Result)"
+    update_rc="$(systemd_value mobile443-update.service ExecMainStatus)"
 
     printf '[ ТОЛЬКО LTE ]\n'
-    printf 'Фильтр: %s\n' "$filter_status"
+    printf 'Build: %s\n' "$MOBILE443_BUILD"
+    printf 'Итог: %s\n' "$filter_status"
+    printf 'Конфиг: %s\n' "$config_status"
     printf 'Порты TCP/UDP: %s\n' "$ports"
-    printf 'Мобильных IPv4-сетей: %s\n' "$count"
-    printf 'Автообновление: %s\n' "$timer_status"
+    printf 'Цепочка iptables: %s\n' "$chain_status"
+    printf 'Allowlist ipset: %s, IPv4-сетей: %s\n' "$ipset_status" "$count"
+    echo
+    printf 'Правила INPUT:\n'
+    local IFS=' '
+    read -r -a port_list <<< "$ports"
+    for port in "${port_list[@]}"; do
+        tcp_status="$(rule_status tcp "$port")"
+        udp_status="$(rule_status udp "$port")"
+        printf '%s/tcp: %s | %s/udp: %s\n' "$port" "$tcp_status" "$port" "$udp_status"
+    done
+    echo
+    printf 'Автообновление: %s / %s\n' "$timer_status" "$timer_enabled"
+    printf 'Последнее обновление: %s\n' "$last_update"
+    printf 'Результат обновления: %s, rc=%s\n' "$update_result" "$update_rc"
+    printf 'Следующее обновление: %s\n' "$next_update"
+    printf 'Лог: %s\n' "$LOG_FILE"
     printf 'Фильтрация идёт по мобильным ASN РФ, а не по типу радиосети телефона.\n'
+
+    if [[ "$filter_status" == "ОШИБКА" ]]; then
+        echo
+        printf 'Последние строки лога:\n'
+        tail -n 15 "$LOG_FILE" 2>/dev/null || true
+    fi
+    return 0
 }
 
 require_root

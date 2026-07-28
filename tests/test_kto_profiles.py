@@ -37,10 +37,10 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v245"', KTO)
-        self.assertIn('PUSH_BUILD="v245"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v245"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v245"', MOBILE443)
+        self.assertIn('SCRIPT_BUILD="v246"', KTO)
+        self.assertIn('PUSH_BUILD="v246"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v246"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v246"', MOBILE443)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -292,9 +292,12 @@ stats_collector_alerts_menu <<< '  0  ' >/dev/null
         download = function_body(MOBILE443, "download_upstream")
         fail_open = function_body(MOBILE443, "fail_open")
         manager_enable = function_body(MOBILE443, "enable_lte")
+        manager_status = function_body(MOBILE443, "show_status")
 
         self.assertIn('labels+=("Включение режима \\"Только LTE\\"")', main_menu)
         self.assertIn('actions+=("mobile443-lte")', main_menu)
+        self.assertIn('labels+=("Статус режима \\"Только LTE\\"")', main_menu)
+        self.assertIn('actions+=("mobile443-lte-status")', main_menu)
         self.assertIn('enable_mobile443_lte || true', lte_menu)
         self.assertIn('extract_haproxy_routes > "$routes_file"', enable)
         self.assertIn('whitelist_ipv6_disabled', enable)
@@ -304,6 +307,13 @@ stats_collector_alerts_menu <<< '  0  ' >/dev/null
         self.assertNotIn('KTO_MOBILE443_LOG_FILE', enable + disable + status)
         self.assertIn('bash "$script" update full', manager_enable)
         self.assertIn('fail_open "$ports"', manager_enable)
+        self.assertIn('show_status', manager_enable)
+        self.assertIn('Списки загружены. Проверяю ipset, iptables и systemd.', manager_enable)
+        self.assertIn('Итог: %s', manager_status)
+        self.assertIn('Правила INPUT:', manager_status)
+        self.assertIn('NextElapseUSecRealtime', manager_status)
+        self.assertIn('ExecMainStatus', manager_status)
+        self.assertIn('tail -n 15 "$LOG_FILE"', manager_status)
         self.assertIn('ENABLE_TRAF_GUARD="false"', config)
         self.assertIn('ENABLE_MOBILE_ALLOW="${enabled}"', config)
         self.assertIn('ENABLE_TELEGRAM="false"', config)
@@ -340,6 +350,56 @@ fail_open '443 8443'
 grep -qx 'jumps-removed' "$events"
 grep -qx 'config:443 8443:false' "$events"
 rm -f "$events"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_mobile443_status_reports_real_rules_and_timer(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^require_root$/,$d' scripts/kto-mobile443.sh)
+config_ports() { printf '443 8443\n'; }
+config_enabled() { return 0; }
+prefix_count() { printf '2500\n'; }
+healthy() { return 0; }
+iptables() {
+    if [[ "$1" == "-nL" || "$1" == "-C" ]]; then
+        return 0
+    fi
+    return 1
+}
+ipset() { return 0; }
+systemctl() {
+    if [[ "$1" == "is-active" ]]; then
+        printf 'active\n'
+    elif [[ "$1" == "is-enabled" ]]; then
+        printf 'enabled\n'
+    elif [[ "$1" == "show" ]]; then
+        case "$4" in
+            NextElapseUSecRealtime) printf 'Tue 2026-07-29 00:00:00 UTC\n' ;;
+            ExecMainExitTimestamp) printf 'Mon 2026-07-28 00:01:00 UTC\n' ;;
+            Result) printf 'success\n' ;;
+            ExecMainStatus) printf '0\n' ;;
+            *) printf '\n' ;;
+        esac
+    fi
+}
+output="$(show_status)"
+grep -q '^Итог: РАБОТАЕТ$' <<< "$output"
+grep -q '^443/tcp: OK | 443/udp: OK$' <<< "$output"
+grep -q '^8443/tcp: OK | 8443/udp: OK$' <<< "$output"
+grep -q '^Allowlist ipset: OK, IPv4-сетей: 2500$' <<< "$output"
+grep -q '^Автообновление: active / enabled$' <<< "$output"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
