@@ -36,9 +36,9 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v241"', KTO)
-        self.assertIn('PUSH_BUILD="v241"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v241"', COLLECTOR)
+        self.assertIn('SCRIPT_BUILD="v242"', KTO)
+        self.assertIn('PUSH_BUILD="v242"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v242"', COLLECTOR)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -235,6 +235,18 @@ actual=$(cat "$routes")
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_panel_menu_manages_connection_alert_mutes(self):
+        panel_menu = function_body(KTO, "menu")
+        alerts_menu = function_body(KTO, "stats_collector_alerts_menu")
+
+        self.assertIn('labels+=("Не получать push-уведомления")', panel_menu)
+        self.assertIn('stats-collector-alerts) stats_collector_alerts_menu', panel_menu)
+        self.assertIn('--connection-alerts-list', alerts_menu)
+        self.assertIn('--connection-alerts-toggle "$query"', alerts_menu)
+        self.assertIn('systemctl stop "$STATS_COLLECTOR_SERVICE"', alerts_menu)
+        self.assertIn('systemctl start "$STATS_COLLECTOR_SERVICE"', alerts_menu)
+        self.assertIn('Статистика, SLA и downtime продолжат работать', alerts_menu)
 
 
 if __name__ == "__main__":

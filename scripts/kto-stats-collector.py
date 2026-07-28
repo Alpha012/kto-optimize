@@ -11,6 +11,7 @@ import socket
 import ssl
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,7 +22,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v241"
+COLLECTOR_BUILD = "v242"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -7434,12 +7435,7 @@ def handle_stats_monitoring(text, enabled):
     send_message("\n".join(lines))
 
 
-def handle_push_notifications(text, enabled):
-    queries = stats_toggle_queries(text)
-    command = "/enable_push" if enabled else "/disable_push"
-    if not queries:
-        send_message(f"<b>Пример:</b> <code>{command} Германия</code>")
-        return
+def set_connection_alert_notifications(queries, enabled):
     changed = []
     already = []
     missing = []
@@ -7488,6 +7484,25 @@ def handle_push_notifications(text, enabled):
                 changed.append(node_name)
         if changed:
             save_alerts_off_state()
+    return {
+        "changed": changed,
+        "already": already,
+        "missing": missing,
+        "ambiguous": ambiguous,
+    }
+
+
+def handle_push_notifications(text, enabled):
+    queries = stats_toggle_queries(text)
+    command = "/enable_push" if enabled else "/disable_push"
+    if not queries:
+        send_message(f"<b>Пример:</b> <code>{command} Германия</code>")
+        return
+    result = set_connection_alert_notifications(queries, enabled)
+    changed = result["changed"]
+    already = result["already"]
+    missing = result["missing"]
+    ambiguous = result["ambiguous"]
     title = "Уведомления включены" if enabled else "Уведомления отключены"
     lines = [f"<b>{title}</b>", ALERT_SEPARATOR]
     if changed:
@@ -7503,6 +7518,88 @@ def handle_push_notifications(text, enabled):
     else:
         lines += ["", "<i>Lost/restored уведомления снова будут приходить.</i>"]
     send_message("\n".join(lines))
+
+
+def connection_alerts_off_names():
+    with LOCK:
+        names = []
+        for key, item in ALERTS_OFF_STATE.setdefault("nodes", {}).items():
+            if isinstance(item, dict):
+                name = clean_display_text(item.get("name") or key)
+            else:
+                name = clean_display_text(item or key)
+            if name:
+                names.append(name[:120])
+    return sorted(set(names), key=natural_sort_key)
+
+
+def connection_alert_state_matches(query):
+    query_key = canonical_node_key(query)
+    if not query_key:
+        return []
+    matches = []
+    with LOCK:
+        for key, item in ALERTS_OFF_STATE.setdefault("nodes", {}).items():
+            item_keys = {canonical_node_key(key)}
+            if isinstance(item, dict):
+                item_keys.add(canonical_node_key(item.get("record_key")))
+                item_keys.add(canonical_node_key(item.get("name")))
+                name = clean_display_text(item.get("name") or key)[:120]
+            else:
+                item_keys.add(canonical_node_key(item))
+                name = clean_display_text(item or key)[:120]
+            item_keys.discard("")
+            if query_key in item_keys:
+                matches.append((key, name or clean_display_text(key)[:120]))
+    return matches
+
+
+def connection_alerts_cli(argv):
+    if not argv or argv[0] not in ("--connection-alerts-list", "--connection-alerts-toggle"):
+        return None
+    if argv[0] == "--connection-alerts-list":
+        load_alerts_off_state()
+        for name in connection_alerts_off_names():
+            print(name)
+        return 0
+
+    query = clean_display_text(" ".join(argv[1:]))
+    if not query:
+        print("error\tНазвание машины не указано")
+        return 2
+    load_alerts_off_state()
+    muted_matches = connection_alert_state_matches(query)
+    if len(muted_matches) == 1:
+        key, name = muted_matches[0]
+        with LOCK:
+            ALERTS_OFF_STATE.setdefault("nodes", {}).pop(key, None)
+            save_alerts_off_state()
+        print(f"enabled\t{name}")
+        return 0
+    if len(muted_matches) > 1:
+        names = ", ".join(name for _, name in muted_matches[:10])
+        print(f"error\tНесколько отключённых машин совпали: {names}")
+        return 4
+
+    load_nodes()
+    matches = find_nodes(query)
+    if not matches:
+        print(f"error\tМашина не найдена: {query}")
+        return 3
+    if len(matches) > 1:
+        names = ", ".join(node_display_name(node) for node in matches[:10])
+        print(f"error\tНесколько совпадений: {names}")
+        return 4
+
+    node = matches[0]
+    enable = node_connection_alerts_disabled(node)
+    result = set_connection_alert_notifications([query], enable)
+    if result["missing"] or result["ambiguous"] or not (result["changed"] or result["already"]):
+        print(f"error\tНе удалось изменить уведомления: {query}")
+        return 5
+    action = "enabled" if enable else "disabled"
+    print(f"{action}\t{node_display_name(node)}")
+    return 0
 
 
 def set_pending_bl_group(chat_id, from_id, action, group_id=""):
@@ -8402,4 +8499,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    cli_status = connection_alerts_cli(sys.argv[1:])
+    if cli_status is None:
+        main()
+    else:
+        raise SystemExit(cli_status)

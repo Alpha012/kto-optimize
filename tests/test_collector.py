@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -378,6 +380,40 @@ class CollectorRegressionTests(unittest.TestCase):
             self.assertEqual(2, len(collector.ALERTS_OFF_STATE["nodes"]))
         finally:
             collector.send_message = original_send
+
+    def test_console_toggle_uses_same_connection_alert_state(self):
+        node = collector.update_node(
+            self.payload("Обход №3 (Private)", str(uuid.uuid4()), "wl"),
+            "203.0.113.93",
+        )
+        collector.save_nodes()
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = collector.connection_alerts_cli(
+                ["--connection-alerts-toggle", "Обход #3 (Private)"]
+            )
+        self.assertEqual(0, status)
+        self.assertIn("disabled\tОбход №3 (Private)", output.getvalue())
+        self.assertTrue(collector.node_connection_alerts_disabled(node))
+        self.assertFalse(collector.node_stats_disabled(node))
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = collector.connection_alerts_cli(["--connection-alerts-list"])
+        self.assertEqual(0, status)
+        self.assertEqual("Обход №3 (Private)", output.getvalue().strip())
+
+        collector.NODES = {}
+        collector.save_nodes()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = collector.connection_alerts_cli(
+                ["--connection-alerts-toggle", "Обход №3 (Private)"]
+            )
+        self.assertEqual(0, status)
+        self.assertIn("enabled\tОбход №3 (Private)", output.getvalue())
+        self.assertFalse(collector.node_connection_alerts_disabled(node))
 
 
 if __name__ == "__main__":

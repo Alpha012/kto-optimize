@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v241"
+SCRIPT_BUILD="v242"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5274,6 +5274,95 @@ PY
     fi
 }
 
+stats_collector_alerts_menu() {
+    header
+    require_panel_mode
+    need_root
+    local list_file result_file query result_line result_action result_name rc was_active
+
+    if ! "${SUDO[@]}" test -s "$STATS_COLLECTOR_CONFIG" 2>/dev/null; then
+        fail "Коллектор ещё не настроен. Сначала установи его через пункт «Коллектор статистики»."
+        return 1
+    fi
+
+    write_stats_collector_script
+    while true; do
+        header
+        echo -e "${BOLD}${PURPLE}[ УВЕДОМЛЕНИЯ КОЛЛЕКТОРА ]${NC}"
+        echo -e "${BOLD}Не получать push-уведомления:${NC}"
+        list_file="$(mktemp)"
+        if "${SUDO[@]}" env KTO_STATS_COLLECTOR_CONFIG="$STATS_COLLECTOR_CONFIG" \
+            "$STATS_COLLECTOR_SCRIPT" --connection-alerts-list > "$list_file" 2>> "$LOG_FILE"; then
+            if [[ -s "$list_file" ]]; then
+                while IFS= read -r result_name; do
+                    [[ -n "$result_name" ]] && printf '  - %s\n' "$result_name"
+                done < "$list_file"
+            else
+                echo -e "  ${DIM}нет${NC}"
+            fi
+        else
+            rm -f "$list_file"
+            fail "Не удалось прочитать список отключённых уведомлений"
+            return 1
+        fi
+        rm -f "$list_file"
+
+        echo
+        echo -e "${DIM}Статистика, SLA и downtime продолжат работать. Меняются только lost/restored уведомления.${NC}"
+        echo -e "${DIM}Ввод обычной машины отключает уведомления, повторный ввод включает обратно.${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Название машины [0 - назад]:${NC} "
+        read -r query
+        query="$(trim "$query")"
+        if [[ -z "$query" || "$query" == "0" ]]; then
+            return 0
+        fi
+
+        was_active=0
+        if "${SUDO[@]}" systemctl is-active --quiet "$STATS_COLLECTOR_SERVICE" 2>/dev/null; then
+            was_active=1
+            if ! "${SUDO[@]}" systemctl stop "$STATS_COLLECTOR_SERVICE" >> "$LOG_FILE" 2>&1; then
+                fail "Не удалось временно остановить коллектор"
+                return 1
+            fi
+        fi
+
+        result_file="$(mktemp)"
+        if "${SUDO[@]}" env KTO_STATS_COLLECTOR_CONFIG="$STATS_COLLECTOR_CONFIG" \
+            "$STATS_COLLECTOR_SCRIPT" --connection-alerts-toggle "$query" > "$result_file" 2>&1; then
+            rc=0
+        else
+            rc=$?
+        fi
+
+        if (( was_active == 1 )); then
+            if ! "${SUDO[@]}" systemctl start "$STATS_COLLECTOR_SERVICE" >> "$LOG_FILE" 2>&1; then
+                cat "$result_file" >> "$LOG_FILE" 2>/dev/null || true
+                rm -f "$result_file"
+                fail "Состояние сохранено, но коллектор не запустился обратно"
+                return 1
+            fi
+        fi
+
+        result_line="$(tail -n 1 "$result_file" 2>/dev/null | tr -d '\r')"
+        cat "$result_file" >> "$LOG_FILE" 2>/dev/null || true
+        rm -f "$result_file"
+        IFS=$'\t' read -r result_action result_name <<< "$result_line"
+        if (( rc != 0 )); then
+            fail "${result_name:-Не удалось изменить уведомления}"
+        elif [[ "$result_action" == "disabled" ]]; then
+            ok "Lost/restored уведомления отключены: ${result_name}"
+        elif [[ "$result_action" == "enabled" ]]; then
+            ok "Lost/restored уведомления включены: ${result_name}"
+        else
+            fail "Коллектор вернул непонятный ответ"
+        fi
+
+        echo
+        echo -ne "${PURPLE}>${NC} Нажмите Enter, чтобы продолжить..."
+        read -r _
+    done
+}
+
 write_stats_push_script() {
     install_asset_file scripts/kto-stats-push.sh "$STATS_PUSH_SCRIPT" 0755
 }
@@ -5977,6 +6066,8 @@ menu() {
         actions+=("stats-collector")
         labels+=("Статус коллектора")
         actions+=("stats-collector-status")
+        labels+=("Не получать push-уведомления")
+        actions+=("stats-collector-alerts")
         labels+=("Очистить список статистики")
         actions+=("stats-push-delete")
     else
@@ -6033,6 +6124,7 @@ menu() {
         network-test) network_test ;;
         stats-collector) install_stats_collector ;;
         stats-collector-status) stats_collector_status ;;
+        stats-collector-alerts) stats_collector_alerts_menu ;;
         stats-push-delete) stats_push_delete_all ;;
         speedtest) install_speedtest ;;
         speedtest-ru) speedtest_ru ;;
@@ -6078,6 +6170,7 @@ main() {
         haproxy-update|update-haproxy|haproxy-refresh) update_haproxy_existing_config ;;
         collector|collector-install|collector-update|stats-collector|stats-collector-update) install_stats_collector ;;
         collector-status|stats-collector-status) stats_collector_status ;;
+        collector-alerts|stats-collector-alerts|push-alerts) stats_collector_alerts_menu ;;
         push-menu|stats-push-menu) stats_push_menu ;;
         stats-push|stats-push-install|stats-push-update) install_stats_push_client ;;
         stats-push-send) send_stats_push_once ;;
