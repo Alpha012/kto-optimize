@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v247"
+SCRIPT_BUILD="v248"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -98,6 +98,12 @@ ASN_CACHE_SEC_DEFAULT="${KTO_COLLECTOR_ASN_CACHE_SEC_DEFAULT:-604800}"
 ASN_TIMEOUT_SEC_DEFAULT="${KTO_COLLECTOR_ASN_TIMEOUT_SEC_DEFAULT:-2}"
 SPEEDTEST_TIMEOUT="${KTO_SPEEDTEST_TIMEOUT:-240}"
 SPEEDTEST_DOWNLOAD_TIMEOUT="${KTO_SPEEDTEST_DOWNLOAD_TIMEOUT:-180}"
+SPEEDTEST_STATIC_VERSION="1.2.0"
+SPEEDTEST_PACKAGE_VERSION="1.2.0.84-1.ea6b6773cf"
+SPEEDTEST_X86_64_ARCHIVE_SHA256="5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7"
+SPEEDTEST_AARCH64_ARCHIVE_SHA256="3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3"
+SPEEDTEST_AMD64_DEB_SHA256="35e084567a6388631fb10cf01e5e0d6b57a67d34ede2b72ba111b3d9164c8b94"
+SPEEDTEST_ARM64_DEB_SHA256="98e7de9db3bf181d08bc67e647bcfc71349c8014e387289c08e54e5c55d82f37"
 APT_UPDATED=0
 
 GREEN='\033[0;32m'
@@ -3494,10 +3500,180 @@ print_speedtest_result() {
     speedtest_row "Result" "$url"
 }
 
+speedtest_binary_works() {
+    local binary="$1" version_output
+    [[ -x "$binary" ]] || return 1
+    if command_exists timeout; then
+        version_output="$(timeout --foreground 10s "$binary" --version 2>&1 || true)"
+    else
+        version_output="$("$binary" --version 2>&1 || true)"
+    fi
+    grep -qi 'Speedtest by Ookla' <<< "$version_output"
+}
+
+speedtest_find_binary() {
+    local binary
+    for binary in /usr/local/bin/speedtest /usr/bin/speedtest; do
+        if speedtest_binary_works "$binary"; then
+            printf '%s\n' "$binary"
+            return 0
+        fi
+    done
+    return 1
+}
+
+speedtest_platform_profile() {
+    local arch="${1:-}"
+    case "$arch" in
+        x86_64|amd64)
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+                "https://install.speedtest.net/app/cli/ookla-speedtest-${SPEEDTEST_STATIC_VERSION}-linux-x86_64.tgz" \
+                "$SPEEDTEST_X86_64_ARCHIVE_SHA256" \
+                "https://packagecloud.io/ookla/speedtest-cli/packages/debian/bullseye/speedtest_${SPEEDTEST_PACKAGE_VERSION}_amd64.deb/download.deb" \
+                "$SPEEDTEST_AMD64_DEB_SHA256" \
+                "amd64"
+            ;;
+        aarch64|arm64)
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+                "https://install.speedtest.net/app/cli/ookla-speedtest-${SPEEDTEST_STATIC_VERSION}-linux-aarch64.tgz" \
+                "$SPEEDTEST_AARCH64_ARCHIVE_SHA256" \
+                "https://packagecloud.io/ookla/speedtest-cli/packages/debian/bullseye/speedtest_${SPEEDTEST_PACKAGE_VERSION}_arm64.deb/download.deb" \
+                "$SPEEDTEST_ARM64_DEB_SHA256" \
+                "arm64"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+speedtest_fetch_url() {
+    local label="$1" url="$2" destination="$3" output_file="$4"
+    rm -f "$destination"
+    if command_exists curl; then
+        stage "${label}: скачиваю через curl"
+        if run_live_capture_timeout "$SPEEDTEST_DOWNLOAD_TIMEOUT" "$output_file" \
+            curl -fL --progress-bar --connect-timeout 10 --retry 2 --retry-delay 2 \
+            --max-time "$SPEEDTEST_DOWNLOAD_TIMEOUT" -o "$destination" "$url" && [[ -s "$destination" ]]; then
+            ok "${label}: curl"
+            return 0
+        fi
+        warn "${label}: обычный curl не сработал, пробую IPv4."
+        rm -f "$destination"
+
+        stage "${label}: повтор через curl IPv4"
+        if run_live_capture_timeout "$SPEEDTEST_DOWNLOAD_TIMEOUT" "$output_file" \
+            curl -4 -fL --progress-bar --connect-timeout 10 --retry 3 --retry-delay 2 \
+            --max-time "$SPEEDTEST_DOWNLOAD_TIMEOUT" -o "$destination" "$url" && [[ -s "$destination" ]]; then
+            ok "${label}: curl IPv4"
+            return 0
+        fi
+        warn "${label}: curl IPv4 не сработал, пробую wget IPv4."
+        rm -f "$destination"
+    fi
+
+    if command_exists wget; then
+        stage "${label}: резерв через wget IPv4"
+        if run_live_capture_timeout "$SPEEDTEST_DOWNLOAD_TIMEOUT" "$output_file" \
+            wget -4 --timeout=20 --tries=3 -O "$destination" "$url" && [[ -s "$destination" ]]; then
+            ok "${label}: wget IPv4"
+            return 0
+        fi
+        rm -f "$destination"
+    fi
+    return 1
+}
+
+speedtest_verify_sha256() {
+    local file="$1" expected="$2" actual
+    [[ -s "$file" ]] || return 1
+    actual="$(sha256sum "$file" 2>/dev/null | awk '{ print tolower($1) }')"
+    if [[ -z "$actual" || "$actual" != "${expected,,}" ]]; then
+        printf 'Speedtest checksum mismatch: file=%s expected=%s actual=%s\n' \
+            "$file" "$expected" "${actual:--}" >> "$LOG_FILE"
+        return 1
+    fi
+}
+
+speedtest_install_static_archive() {
+    local archive_url="$1" archive_hash="$2"
+    local archive output_file extract_dir
+    archive="$(mktemp)"
+    output_file="$(mktemp)"
+    extract_dir="$(mktemp -d)"
+
+    if ! speedtest_fetch_url "Ookla CLI" "$archive_url" "$archive" "$output_file"; then
+        rm -f "$archive" "$output_file"
+        rm -rf "$extract_dir"
+        return 1
+    fi
+    rm -f "$output_file"
+    if ! speedtest_verify_sha256 "$archive" "$archive_hash"; then
+        warn "Ookla CLI: контрольная сумма архива не совпала."
+        rm -f "$archive"
+        rm -rf "$extract_dir"
+        return 1
+    fi
+    if ! tar -tzf "$archive" 2>> "$LOG_FILE" | grep -qx 'speedtest' ||
+        ! tar xzf "$archive" -C "$extract_dir" speedtest >> "$LOG_FILE" 2>&1 ||
+        ! "${SUDO[@]}" install -m 0755 "$extract_dir/speedtest" /usr/local/bin/speedtest >> "$LOG_FILE" 2>&1; then
+        warn "Ookla CLI: архив не удалось безопасно распаковать."
+        rm -f "$archive"
+        rm -rf "$extract_dir"
+        return 1
+    fi
+    rm -f "$archive"
+    rm -rf "$extract_dir"
+    if ! speedtest_binary_works /usr/local/bin/speedtest; then
+        warn "Ookla CLI: установленный статический бинарник не запускается."
+        "${SUDO[@]}" rm -f /usr/local/bin/speedtest >> "$LOG_FILE" 2>&1 || true
+        return 1
+    fi
+    ok "Официальный Ookla CLI установлен в /usr/local/bin"
+}
+
+speedtest_install_packagecloud_deb() {
+    local deb_url="$1" deb_hash="$2" expected_arch="$3"
+    local package_dir package_file output_file package_name package_arch
+    package_dir="$(mktemp -d)"
+    package_file="${package_dir}/speedtest.deb"
+    output_file="$(mktemp)"
+
+    if ! speedtest_fetch_url "Ookla Packagecloud" "$deb_url" "$package_file" "$output_file"; then
+        rm -f "$output_file"
+        rm -rf "$package_dir"
+        return 1
+    fi
+    rm -f "$output_file"
+    if ! speedtest_verify_sha256 "$package_file" "$deb_hash"; then
+        warn "Ookla Packagecloud: контрольная сумма пакета не совпала."
+        rm -rf "$package_dir"
+        return 1
+    fi
+    package_name="$(dpkg-deb -f "$package_file" Package 2>/dev/null || true)"
+    package_arch="$(dpkg-deb -f "$package_file" Architecture 2>/dev/null || true)"
+    if [[ "$package_name" != "speedtest" || "$package_arch" != "$expected_arch" ]]; then
+        warn "Ookla Packagecloud: пакет имеет неожиданные метаданные."
+        rm -rf "$package_dir"
+        return 1
+    fi
+    if ! "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive \
+        apt-get -o DPkg::Lock::Timeout=600 install -y "$package_file" >> "$LOG_FILE" 2>&1; then
+        warn "Ookla Packagecloud: apt не смог установить проверенный пакет."
+        rm -rf "$package_dir"
+        return 1
+    fi
+    rm -rf "$package_dir"
+    if ! speedtest_binary_works /usr/bin/speedtest; then
+        warn "Ookla Packagecloud: установленный пакет не запускается."
+        return 1
+    fi
+    ok "Официальный Ookla CLI установлен через Packagecloud"
+}
+
 install_speedtest() {
     header
     need_root
-    local output filtered output_file archive arch url rc server_id
+    local output filtered output_file arch rc server_id binary profile
+    local archive_url archive_hash deb_url deb_hash deb_arch
     local -a speedtest_args speedtest_retry_args
 
     server_id="${1:-${KTO_SPEEDTEST_SERVER_ID:-}}"
@@ -3507,48 +3683,55 @@ install_speedtest() {
     fi
 
     stage "Готовлю Speedtest"
-    if [[ -x /usr/local/bin/speedtest ]] && command_exists timeout; then
-        if ! timeout --foreground 10s /usr/local/bin/speedtest --version >> "$LOG_FILE" 2>&1; then
-            warn "Speedtest binary не отвечает, переустановлю."
+    binary="$(speedtest_find_binary 2>/dev/null || true)"
+    if [[ -z "$binary" ]]; then
+        if [[ -e /usr/local/bin/speedtest ]]; then
+            warn "Старый Speedtest в /usr/local/bin не отвечает, удаляю."
             cmd "${SUDO[@]}" rm -f /usr/local/bin/speedtest || true
         fi
-    fi
-    if ! [[ -x /usr/local/bin/speedtest ]]; then
         cmd "${SUDO[@]}" apt-get remove -y speedtest-cli || true
+        if package_installed speedtest && ! speedtest_binary_works /usr/bin/speedtest; then
+            cmd "${SUDO[@]}" apt-get remove -y speedtest || true
+        fi
         cmd "${SUDO[@]}" rm -f /usr/bin/speedtest /usr/local/bin/speedtest || true
-        arch="$(uname -m)"
-        if [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
-            url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz"
-        else
-            url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz"
+
+        if ! apt_install_with_update_if_missing ca-certificates curl wget tar coreutils; then
+            warn "Не все утилиты скачивания поставились через apt, использую уже доступные."
         fi
-        archive="$(mktemp)"
-        output_file="$(mktemp)"
-        stage "Скачиваю Ookla CLI"
-        if run_live_capture_timeout "$SPEEDTEST_DOWNLOAD_TIMEOUT" "$output_file" \
-            curl -fL --progress-bar --connect-timeout 10 --retry 2 --retry-delay 2 --max-time "$SPEEDTEST_DOWNLOAD_TIMEOUT" \
-            -o "$archive" "$url"; then
-            rc=0
-        else
-            rc=$?
-        fi
-        if (( rc != 0 )); then
-            rm -f "$archive" "$output_file"
-            fail "Скачивание Speedtest"
-            if (( rc == 124 )); then
-                warn "Скачивание зависло дольше ${SPEEDTEST_DOWNLOAD_TIMEOUT}s."
-            fi
+        if ! command_exists tar || ! command_exists sha256sum ||
+            { ! command_exists curl && ! command_exists wget; }; then
+            fail "Для установки Speedtest нужны tar, sha256sum и curl либо wget"
             return 1
         fi
-        rm -f "$output_file"
-        must "Распаковка Speedtest" "${SUDO[@]}" tar xzf "$archive" -C /usr/local/bin speedtest
-        rm -f "$archive"
+
+        arch="$(uname -m)"
+        if ! profile="$(speedtest_platform_profile "$arch")"; then
+            fail "Архитектура ${arch} не поддерживается официальным Ookla CLI"
+            return 1
+        fi
+        IFS=$'\t' read -r archive_url archive_hash deb_url deb_hash deb_arch <<< "$profile"
+
+        if ! speedtest_install_static_archive "$archive_url" "$archive_hash"; then
+            warn "Статический Ookla CLI не установился, перехожу на официальный Packagecloud."
+            if ! speedtest_install_packagecloud_deb "$deb_url" "$deb_hash" "$deb_arch"; then
+                fail "Speedtest не установился ни одним способом"
+                warn "Проверены curl, curl IPv4, wget IPv4 и официальный Packagecloud."
+                return 1
+            fi
+        fi
+
+        binary="$(speedtest_find_binary 2>/dev/null || true)"
+        if [[ -z "$binary" ]]; then
+            fail "Speedtest установлен, но рабочий бинарник не найден"
+            return 1
+        fi
     else
-        echo "Speedtest binary skipped: already installed" >> "$LOG_FILE"
+        echo "Speedtest binary skipped: already installed at $binary" >> "$LOG_FILE"
+        ok "Ookla CLI уже установлен: ${binary}"
     fi
 
-    speedtest_args=(/usr/local/bin/speedtest --accept-license --accept-gdpr --progress=yes)
-    speedtest_retry_args=(/usr/local/bin/speedtest --accept-license --accept-gdpr --progress=no)
+    speedtest_args=("$binary" --accept-license --accept-gdpr --progress=yes)
+    speedtest_retry_args=("$binary" --accept-license --accept-gdpr --progress=no)
     if [[ -n "$server_id" ]]; then
         speedtest_args+=(--server-id="$server_id")
         speedtest_retry_args+=(--server-id="$server_id")

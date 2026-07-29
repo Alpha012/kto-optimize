@@ -37,10 +37,10 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v247"', KTO)
-        self.assertIn('PUSH_BUILD="v247"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v247"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v247"', MOBILE443)
+        self.assertIn('SCRIPT_BUILD="v248"', KTO)
+        self.assertIn('PUSH_BUILD="v248"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v248"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v248"', MOBILE443)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -112,6 +112,71 @@ class CombinedNodeProfileTests(unittest.TestCase):
         self.assertIn("/etc/wireguard/warp.conf", install)
         self.assertIn("/usr/local/bin/vps-warp", install)
         self.assertIn("systemctl is-active --quiet wg-quick@warp", install)
+
+    def test_speedtest_installer_uses_verified_non_snap_fallbacks(self):
+        fetch = function_body(KTO, "speedtest_fetch_url")
+        archive = function_body(KTO, "speedtest_install_static_archive")
+        package = function_body(KTO, "speedtest_install_packagecloud_deb")
+        install = function_body(KTO, "install_speedtest")
+
+        self.assertNotIn("snap install speedtest", KTO)
+        self.assertIn("curl -fL", fetch)
+        self.assertIn("curl -4 -fL", fetch)
+        self.assertIn("wget -4", fetch)
+        self.assertIn("speedtest_verify_sha256", archive)
+        self.assertIn("speedtest_verify_sha256", package)
+        self.assertIn('dpkg-deb -f "$package_file" Package', package)
+        self.assertIn('apt-get -o DPkg::Lock::Timeout=600 install -y "$package_file"', package)
+        self.assertIn("speedtest_install_static_archive", install)
+        self.assertIn("speedtest_install_packagecloud_deb", install)
+        self.assertIn("Проверены curl, curl IPv4, wget IPv4 и официальный Packagecloud", install)
+
+    def test_speedtest_download_retries_with_ipv4_and_wget(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+target=$(mktemp)
+output=$(mktemp)
+trap 'rm -f "$target" "$output"' EXIT
+RUN_CALLS=()
+stage() { :; }
+warn() { :; }
+ok() { :; }
+command_exists() { [[ "$1" == "curl" || "$1" == "wget" || "$1" == "timeout" ]]; }
+run_live_capture_timeout() {
+    RUN_CALLS+=("$3:${4:-}")
+    if (( ${#RUN_CALLS[@]} == 3 )); then
+        printf 'downloaded\n' > "$target"
+        return 0
+    fi
+    return 1
+}
+speedtest_fetch_url test https://example.invalid/speedtest "$target" "$output"
+[[ "${#RUN_CALLS[@]}" == 3 ]]
+[[ "${RUN_CALLS[0]}" == "curl:-fL" ]]
+[[ "${RUN_CALLS[1]}" == "curl:-4" ]]
+[[ "${RUN_CALLS[2]}" == "wget:-4" ]]
+[[ -s "$target" ]]
+profile=$(speedtest_platform_profile x86_64)
+IFS=$'\t' read -r archive_url archive_hash deb_url deb_hash deb_arch <<< "$profile"
+[[ "$archive_url" == *install.speedtest.net* ]]
+[[ "$deb_url" == *packagecloud.io* ]]
+[[ "$archive_hash" == "$SPEEDTEST_X86_64_ARCHIVE_SHA256" ]]
+[[ "$deb_hash" == "$SPEEDTEST_AMD64_DEB_SHA256" ]]
+[[ "$deb_arch" == amd64 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_haproxy_multiport_menu_keeps_legacy_443_names(self):
         render = function_body(KTO, "render_haproxy_routes_config")
