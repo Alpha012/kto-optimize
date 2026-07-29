@@ -37,10 +37,10 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v248"', KTO)
-        self.assertIn('PUSH_BUILD="v248"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v248"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v248"', MOBILE443)
+        self.assertIn('SCRIPT_BUILD="v249"', KTO)
+        self.assertIn('PUSH_BUILD="v249"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v249"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v249"', MOBILE443)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -129,7 +129,11 @@ class CombinedNodeProfileTests(unittest.TestCase):
         self.assertIn('apt-get -o DPkg::Lock::Timeout=600 install -y "$package_file"', package)
         self.assertIn("speedtest_install_static_archive", install)
         self.assertIn("speedtest_install_packagecloud_deb", install)
-        self.assertIn("Проверены curl, curl IPv4, wget IPv4 и официальный Packagecloud", install)
+        self.assertLess(
+            install.index("speedtest_install_packagecloud_deb"),
+            install.index("speedtest_install_static_archive"),
+        )
+        self.assertIn("Проверены официальный Packagecloud и статический архив", install)
 
     def test_speedtest_download_retries_with_ipv4_and_wget(self):
         bash = bash_executable()

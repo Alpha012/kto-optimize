@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v248"
+SCRIPT_BUILD="v249"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -3711,11 +3711,11 @@ install_speedtest() {
         fi
         IFS=$'\t' read -r archive_url archive_hash deb_url deb_hash deb_arch <<< "$profile"
 
-        if ! speedtest_install_static_archive "$archive_url" "$archive_hash"; then
-            warn "Статический Ookla CLI не установился, перехожу на официальный Packagecloud."
-            if ! speedtest_install_packagecloud_deb "$deb_url" "$deb_hash" "$deb_arch"; then
+        if ! speedtest_install_packagecloud_deb "$deb_url" "$deb_hash" "$deb_arch"; then
+            warn "Ookla Packagecloud не сработал, пробую резервный статический архив."
+            if ! speedtest_install_static_archive "$archive_url" "$archive_hash"; then
                 fail "Speedtest не установился ни одним способом"
-                warn "Проверены curl, curl IPv4, wget IPv4 и официальный Packagecloud."
+                warn "Проверены официальный Packagecloud и статический архив через curl, curl IPv4 и wget IPv4."
                 return 1
             fi
         fi
