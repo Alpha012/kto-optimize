@@ -99,6 +99,53 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertFalse(collector.node_is_wl(self.payload("Обход №1", str(uuid.uuid4()), "bl")))
         self.assertTrue(collector.node_is_wl(self.payload("Обычная машина", str(uuid.uuid4()), "wl")))
 
+    def test_wl_other_nodes_sort_resell_then_private_then_the_rest(self):
+        names = [
+            "Обход №3 (Private)",
+            "Обход №3 (resell)",
+            "Обход, но не обход (DNS)",
+            "Обход №1 (Private)",
+            "Обход №2 (resell)",
+            "Обход №1 (resell)",
+        ]
+        nodes = [{"name": name} for name in names]
+        ordered = [node["name"] for node in sorted(nodes, key=collector.wl_other_node_sort_key)]
+        self.assertEqual(
+            [
+                "Обход №1 (resell)",
+                "Обход №2 (resell)",
+                "Обход №3 (resell)",
+                "Обход №1 (Private)",
+                "Обход №3 (Private)",
+                "Обход, но не обход (DNS)",
+            ],
+            ordered,
+        )
+
+    def test_wl_rich_and_plain_reports_use_variant_order(self):
+        names = [
+            "Обход №3 (Private)",
+            "Обход №2 (resell)",
+            "Обход №1 (Private)",
+            "Обход №1 (resell)",
+        ]
+        for index, name in enumerate(names, start=1):
+            collector.update_node(
+                self.payload(name, str(uuid.uuid4()), "wl"),
+                f"203.0.113.{index}",
+            )
+        expected = [
+            "Обход №1 (resell)",
+            "Обход №2 (resell)",
+            "Обход №1 (Private)",
+            "Обход №3 (Private)",
+        ]
+        plain = collector.aggregate_message("wl")
+        rich = collector.aggregate_wl_rich_message()
+        self.assertEqual(sorted(plain.index(name) for name in expected), [plain.index(name) for name in expected])
+        rich_names = [name.replace("№", "#") for name in expected]
+        self.assertEqual(sorted(rich.index(name) for name in rich_names), [rich.index(name) for name in rich_names])
+
     def test_update_job_ids_are_unique(self):
         first = collector.queue_update_task("test", local_required=False)
         second = collector.queue_update_task("test", local_required=False)

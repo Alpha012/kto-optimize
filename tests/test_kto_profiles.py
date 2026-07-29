@@ -37,10 +37,10 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v246"', KTO)
-        self.assertIn('PUSH_BUILD="v246"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v246"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v246"', MOBILE443)
+        self.assertIn('SCRIPT_BUILD="v247"', KTO)
+        self.assertIn('PUSH_BUILD="v247"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v247"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v247"', MOBILE443)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")

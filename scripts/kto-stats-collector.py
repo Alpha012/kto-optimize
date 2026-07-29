@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v246"
+COLLECTOR_BUILD = "v247"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3429,6 +3429,20 @@ def node_natural_sort_key(node):
     return natural_sort_key(node_sort_text(node))
 
 
+def wl_other_node_sort_key(node):
+    text = node_sort_text(node)
+    folded = text.casefold()
+    if re.search(r"(?<!\w)(?:resell|reseller|реселл|ресейл)(?!\w)", folded):
+        variant_order = 0
+    elif re.search(r"(?<!\w)(?:private|приват)(?!\w)", folded):
+        variant_order = 1
+    else:
+        variant_order = 2
+    bypass_match = re.search(r"обход\s*(?:[№#]\s*)?(\d+)", folded)
+    bypass_number = int(bypass_match.group(1)) if bypass_match else 2**63 - 1
+    return (variant_order, bypass_number, natural_sort_key(text))
+
+
 def bl_node_sort_key(node):
     text = node_sort_text(node)
     canonical = canonical_node_key(text)
@@ -3469,7 +3483,7 @@ def aggregate_message(scope="all"):
         nodes.sort(key=bl_node_sort_key)
     else:
         nodes.sort(key=node_natural_sort_key)
-    other_nodes.sort(key=node_natural_sort_key)
+    other_nodes.sort(key=wl_other_node_sort_key)
     parts = [f"<b>{title}</b>"]
     for node in nodes:
         age = ts - int(node.get("last_seen", 0) or 0)
@@ -3621,7 +3635,7 @@ def aggregate_wl_rich_message():
     if not nodes and not other_nodes:
         return "<h3>Статистика обходов</h3><p>Нет данных от машин.</p>"
     nodes.sort(key=node_natural_sort_key)
-    other_nodes.sort(key=node_natural_sort_key)
+    other_nodes.sort(key=wl_other_node_sort_key)
     headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "SNI", "Статус"]
     parts = [
         "<h3>Статистика обходов</h3>",
