@@ -10,6 +10,7 @@ KTO = (ROOT / "kto.sh").read_text(encoding="utf-8")
 PUSH = (ROOT / "scripts" / "kto-stats-push.sh").read_text(encoding="utf-8")
 COLLECTOR = (ROOT / "scripts" / "kto-stats-collector.py").read_text(encoding="utf-8")
 MOBILE443 = (ROOT / "scripts" / "kto-mobile443.sh").read_text(encoding="utf-8")
+ADDITIONAL_IPS = (ROOT / "scripts" / "kto-additional-ips.sh").read_text(encoding="utf-8")
 
 
 def bash_executable():
@@ -37,10 +38,11 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v249"', KTO)
-        self.assertIn('PUSH_BUILD="v249"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v249"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v249"', MOBILE443)
+        self.assertIn('SCRIPT_BUILD="v250"', KTO)
+        self.assertIn('PUSH_BUILD="v250"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v250"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v250"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v250"', ADDITIONAL_IPS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -171,6 +173,142 @@ IFS=$'\t' read -r archive_url archive_hash deb_url deb_hash deb_arch <<< "$profi
 [[ "$archive_hash" == "$SPEEDTEST_X86_64_ARCHIVE_SHA256" ]]
 [[ "$deb_hash" == "$SPEEDTEST_AMD64_DEB_SHA256" ]]
 [[ "$deb_arch" == amd64 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_additional_ip_menu_uses_openstack_ports_and_source_routing(self):
+        menu = function_body(KTO, "menu")
+        wrapper = function_body(KTO, "setup_additional_ips")
+        setup = function_body(ADDITIONAL_IPS, "setup_additional_ips")
+        apply_netplan = function_body(ADDITIONAL_IPS, "apply_managed_netplan")
+        render = function_body(ADDITIONAL_IPS, "render_netplan")
+
+        self.assertIn('labels+=("Проверить и завести дополнительные IP")', menu)
+        self.assertIn('actions+=("additional-ips")', menu)
+        self.assertIn('ensure_additional_ip_manager', wrapper)
+        self.assertIn('fetch_openstack_metadata "$metadata_file"', setup)
+        self.assertIn('openstack_ipv4_port_macs "$metadata_file"', setup)
+        self.assertIn('wait_for_dhcp "${names[@]}"', setup)
+        self.assertIn('remove_duplicate_primary_addresses', setup)
+        self.assertIn('write_multiwan_sysctl', setup)
+        self.assertIn('main_route_healthy', apply_netplan)
+        self.assertIn('restore_managed_netplan', apply_netplan)
+        self.assertIn('routing-policy:', render)
+        self.assertIn('on-link: true', render)
+        self.assertIn('table: ${table}', render)
+
+    def test_additional_ip_metadata_parser_and_netplan_renderer(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' scripts/kto-additional-ips.sh)
+python3() { python "$@"; }
+metadata=$(mktemp)
+state=$(mktemp)
+netplan=$(mktemp)
+trap 'rm -f "$metadata" "$state" "$netplan"' EXIT
+cat > "$metadata" <<'JSON'
+{
+  "links": [
+    {"id":"primary","ethernet_mac_address":"fa:16:3e:00:00:01"},
+    {"id":"extra-a","ethernet_mac_address":"FA:16:3E:00:00:02"},
+    {"id":"extra-b","ethernet_mac_address":"fa:16:3e:00:00:03"}
+  ],
+  "networks": [
+    {"type":"ipv4_dhcp","link":"primary"},
+    {"type":"ipv4_dhcp","link":"extra-a"},
+    {"type":"ipv6_dhcpv6-stateful","link":"extra-a"},
+    {"type":"ipv4_dhcp","link":"extra-a"},
+    {"type":"ipv4_dhcp","link":"extra-b"}
+  ]
+}
+JSON
+actual=$(openstack_ipv4_port_macs "$metadata" | tr -d '\r')
+expected=$'fa:16:3e:00:00:01\nfa:16:3e:00:00:02\nfa:16:3e:00:00:03'
+[[ "$actual" == "$expected" ]]
+printf 'wan2|fa:16:3e:00:00:02|500|185.141.227.93/26|185.141.227.65|185.141.227.64/26|102|10200\n' > "$state"
+render_netplan "$state" "$netplan"
+grep -q '^    wan2:$' "$netplan"
+grep -q '^        macaddress: "fa:16:3e:00:00:02"$' "$netplan"
+grep -q '^        - to: 185.141.227.64/26$' "$netplan"
+grep -q '^          via: 185.141.227.65$' "$netplan"
+grep -q '^        - from: 185.141.227.93/32$' "$netplan"
+grep -q '^          table: 102$' "$netplan"
+grep -q '^          priority: 10200$' "$netplan"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_additional_ip_setup_is_idempotent_two_phase_configuration(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' scripts/kto-additional-ips.sh)
+require_root() { :; }
+require_commands() { :; }
+init_log() { LOG_FILE=$(mktemp); }
+primary_interface() { printf 'ens3\n'; }
+primary_ipv4() { printf '78.159.250.112\n'; }
+primary_route_metric() { printf '100\n'; }
+interface_mac() { printf 'fa:16:3e:00:00:01\n'; }
+fetch_openstack_metadata() { printf '{}\n' > "$1"; }
+openstack_ipv4_port_macs() {
+    printf '%s\n' fa:16:3e:00:00:01 fa:16:3e:00:00:02 fa:16:3e:00:00:03
+}
+rescan_network_links() { :; }
+interface_for_mac() { return 1; }
+apply_count=0
+first=$(mktemp)
+second=$(mktemp)
+trap 'rm -f "$first" "$second" "${LOG_FILE:-}"' EXIT
+apply_managed_netplan() {
+    apply_count=$((apply_count + 1))
+    if (( apply_count == 1 )); then cp "$1" "$first"; else cp "$1" "$second"; fi
+}
+renew_interfaces() { :; }
+wait_for_dhcp() { :; }
+interface_ipv4_cidr() {
+    if [[ "$1" == wan2 ]]; then printf '185.141.227.93/26\n'; else printf '217.19.122.48/24\n'; fi
+}
+interface_gateway() {
+    if [[ "$1" == wan2 ]]; then printf '185.141.227.65\n'; else printf '217.19.122.1\n'; fi
+}
+network_for_cidr() {
+    if [[ "$1" == 185.* ]]; then printf '185.141.227.64/26\n'; else printf '217.19.122.0/24\n'; fi
+}
+disable_legacy_alias_file() { :; }
+remove_duplicate_primary_addresses() { :; }
+write_multiwan_sysctl() { :; }
+sleep() { :; }
+print_result_table() { :; }
+setup_additional_ips
+[[ "$apply_count" == 2 ]]
+grep -q '^    wan2:$' "$first"
+! grep -q 'routing-policy:' "$first"
+grep -q '^    wan2:$' "$second"
+grep -q '^    wan3:$' "$second"
+grep -q 'routing-policy:' "$second"
+grep -q 'table: 102' "$second"
+grep -q 'table: 103' "$second"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

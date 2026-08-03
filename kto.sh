@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v249"
+SCRIPT_BUILD="v250"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -17,6 +17,7 @@ WHITELIST_SSH_KEEP_CURRENT="${KTO_WHITELIST_SSH_KEEP_CURRENT:-1}"
 MOBILE443_DIR="/opt/mobile443"
 MOBILE443_CONFIG="${MOBILE443_DIR}/config.conf"
 MOBILE443_MANAGER="/usr/local/sbin/kto-mobile443"
+ADDITIONAL_IP_MANAGER="/usr/local/sbin/kto-additional-ips"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
@@ -4111,6 +4112,27 @@ network_test() {
     ok "Сеть выглядит нормально по базовым проверкам."
 }
 
+install_additional_ip_manager() {
+    install_asset_file scripts/kto-additional-ips.sh "$ADDITIONAL_IP_MANAGER" 0755
+}
+
+ensure_additional_ip_manager() {
+    if "${SUDO[@]}" test -x "$ADDITIONAL_IP_MANAGER" 2>/dev/null &&
+        "${SUDO[@]}" grep -Fqx "ADDITIONAL_IP_BUILD=\"${SCRIPT_BUILD}\"" "$ADDITIONAL_IP_MANAGER" 2>/dev/null; then
+        return 0
+    fi
+    install_additional_ip_manager
+}
+
+setup_additional_ips() {
+    header
+    need_root
+    stage "Проверяю OpenStack-порты и дополнительные IP"
+    must "Установка сетевых зависимостей" apt_install_with_update_if_missing curl python3 iproute2 netplan.io procps
+    ensure_additional_ip_manager
+    "${SUDO[@]}" "$ADDITIONAL_IP_MANAGER" setup
+}
+
 ipcheck_place() {
     header
     stage "Проверяю IP.Check.Place"
@@ -6378,6 +6400,10 @@ menu() {
     actions+=("status")
     labels+=("Тест сети")
     actions+=("network-test")
+    if [[ "$MACHINE_MODE" != "panel" ]]; then
+        labels+=("Проверить и завести дополнительные IP")
+        actions+=("additional-ips")
+    fi
     if [[ "$MACHINE_MODE" == "panel" ]]; then
         labels+=("Коллектор статистики")
         actions+=("stats-collector")
@@ -6447,6 +6473,7 @@ menu() {
         warp) install_warp_native ;;
         status) show_status ;;
         network-test) network_test ;;
+        additional-ips) setup_additional_ips || true ;;
         stats-collector) install_stats_collector ;;
         stats-collector-status) stats_collector_status ;;
         stats-collector-alerts) stats_collector_alerts_menu ;;
@@ -6488,6 +6515,7 @@ main() {
         warp) install_warp_native ;;
         status) show_status ;;
         network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" ;;
+        additional-ips|extra-ips|multi-ip|multiwan) setup_additional_ips ;;
         speedtest) install_speedtest "${2:-}" ;;
         speedtest-ru|speedtestru|bench-ru|benchru) speedtest_ru "${2:-}" ;;
         ipcheck-place) ipcheck_place ;;
