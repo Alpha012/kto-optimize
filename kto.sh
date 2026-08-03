@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v254"
+SCRIPT_BUILD="v255"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4241,7 +4241,7 @@ ensure_additional_ip_manager() {
 setup_additional_ips() {
     header
     need_root
-    stage "Проверяю OpenStack-порты и дополнительные IP"
+    stage "Проверяю дополнительные IP и source routes"
     must "Установка сетевых зависимостей" apt_install_with_update_if_missing curl python3 iproute2 netplan.io procps
     ensure_additional_ip_manager
     "${SUDO[@]}" "$ADDITIONAL_IP_MANAGER" setup

@@ -4,10 +4,14 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-ADDITIONAL_IP_BUILD="v254"
+ADDITIONAL_IP_BUILD="v255"
 MANAGED_NETPLAN_FILE="${KTO_ADDITIONAL_IP_NETPLAN_FILE:-/etc/netplan/90-kto-extra-nics.yaml}"
 LEGACY_ALIAS_NETPLAN_FILE="${KTO_ADDITIONAL_IP_LEGACY_NETPLAN_FILE:-/etc/netplan/90-kto-extra-ips.yaml}"
 MANAGED_SYSCTL_FILE="${KTO_ADDITIONAL_IP_SYSCTL_FILE:-/etc/sysctl.d/99-z-kto-multiwan.conf}"
+MANAGED_ROUTE_STATE_FILE="${KTO_ADDITIONAL_IP_ROUTE_STATE_FILE:-/etc/kto-additional-ip-routes.conf}"
+MANAGED_ROUTE_SCRIPT="${KTO_ADDITIONAL_IP_ROUTE_SCRIPT:-/usr/local/sbin/kto-additional-ip-routes}"
+MANAGED_ROUTE_UNIT_FILE="${KTO_ADDITIONAL_IP_ROUTE_UNIT_FILE:-/etc/systemd/system/kto-additional-ip-routes.service}"
+MANAGED_ROUTE_SERVICE="${KTO_ADDITIONAL_IP_ROUTE_SERVICE:-kto-additional-ip-routes.service}"
 METADATA_URL="${KTO_OPENSTACK_METADATA_URL:-http://169.254.169.254/openstack/latest/network_data.json}"
 LOG_FILE="${KTO_ADDITIONAL_IP_LOG_FILE:-/var/log/kto-additional-ips.log}"
 DHCP_WAIT_SEC="${KTO_ADDITIONAL_IP_DHCP_WAIT_SEC:-45}"
@@ -261,14 +265,289 @@ interface_ipv4_cidr() {
 }
 
 interface_gateway() {
-    local interface="$1"
-    ip -4 route show default dev "$interface" 2>/dev/null |
-        awk 'NR == 1 {print $3}' || true
+    local interface="$1" gateway="" ifindex lease_file
+    gateway="$(ip -4 route show table all default dev "$interface" 2>/dev/null |
+        awk 'NR == 1 {for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}' || true)"
+    if [[ -n "$gateway" ]]; then
+        printf '%s\n' "$gateway"
+        return 0
+    fi
+
+    ifindex="$(cat "/sys/class/net/${interface}/ifindex" 2>/dev/null || true)"
+    lease_file="/run/systemd/netif/leases/${ifindex}"
+    if [[ -n "$ifindex" && -r "$lease_file" ]]; then
+        gateway="$(awk -F= '$1 == "ROUTER" {split($2, value, " "); print value[1]; exit}' "$lease_file")"
+    fi
+    if [[ -n "$gateway" ]]; then
+        printf '%s\n' "$gateway"
+        return 0
+    fi
+
+    if command -v nmcli >/dev/null 2>&1; then
+        gateway="$(nmcli -g IP4.GATEWAY device show "$interface" 2>/dev/null | awk 'NF {print; exit}' || true)"
+        [[ -n "$gateway" ]] && printf '%s\n' "$gateway"
+    fi
+    return 0
 }
 
 network_for_cidr() {
     local cidr="$1"
     python3 -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]).network)' "$cidr"
+}
+
+is_candidate_interface() {
+    local interface="${1%%@*}"
+    case "$interface" in
+        lo|docker*|veth*|br-*|virbr*|podman*|cni*|flannel*|tailscale*|wg*|tun*|tap*|zt*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+discover_existing_extra_state() {
+    local primary_interface_name="$1" primary_ip="$2" output_file="$3"
+    local interface ip_cidr ip gateway network_cidr mac metric table priority
+    local index=0
+    local candidates
+
+    DISCOVERED_EXTRA_COUNT=0
+    DISCOVERED_SKIPPED_COUNT=0
+    : > "$output_file"
+    candidates="$(mktemp)"
+    ip -4 -o address show scope global 2>/dev/null |
+        awk '{print $2 "|" $4}' | sort -uV > "$candidates"
+
+    while IFS='|' read -r interface ip_cidr; do
+        interface="${interface%%@*}"
+        ip="${ip_cidr%%/*}"
+        [[ -n "$interface" && -n "$ip_cidr" && -n "$ip" ]] || continue
+        [[ "$ip" == "$primary_ip" ]] && continue
+        is_candidate_interface "$interface" || continue
+
+        gateway="$(interface_gateway "$interface")"
+        if [[ -z "$gateway" && "$interface" == "$primary_interface_name" ]]; then
+            gateway="$(interface_gateway "$primary_interface_name")"
+        fi
+        network_cidr="$(network_for_cidr "$ip_cidr" 2>> "$LOG_FILE" || true)"
+        if [[ -z "$gateway" || -z "$network_cidr" ]]; then
+            DISCOVERED_SKIPPED_COUNT=$(( DISCOVERED_SKIPPED_COUNT + 1 ))
+            warn "${interface} ${ip_cidr}: не найден шлюз или сеть; адрес пропущен без изменений"
+            continue
+        fi
+
+        index=$(( index + 1 ))
+        mac="$(interface_mac "$interface")"
+        metric=$(( 500 + index ))
+        table=$(( 5200 + index ))
+        priority=$(( 15200 + index ))
+        printf '%s|%s|%d|%s|%s|%s|%d|%d\n' \
+            "$interface" "$mac" "$metric" "$ip_cidr" "$gateway" "$network_cidr" "$table" "$priority" >> "$output_file"
+    done < "$candidates"
+    rm -f "$candidates"
+
+    DISCOVERED_EXTRA_COUNT="$index"
+    (( index > 0 ))
+}
+
+remove_source_routes_from_state() {
+    local state_file="$1" name mac metric ip_cidr gateway network_cidr table priority ip
+    [[ -r "$state_file" ]] || return 0
+    while IFS='|' read -r name mac metric ip_cidr gateway network_cidr table priority; do
+        [[ -n "$ip_cidr" && "$table" =~ ^[0-9]+$ && "$priority" =~ ^[0-9]+$ ]] || continue
+        ip="${ip_cidr%%/*}"
+        ip -4 rule del from "${ip}/32" table "$table" priority "$priority" >> "$LOG_FILE" 2>&1 || true
+        ip -4 route del default via "$gateway" dev "$name" table "$table" >> "$LOG_FILE" 2>&1 || true
+        ip -4 route del "$network_cidr" dev "$name" table "$table" >> "$LOG_FILE" 2>&1 || true
+    done < "$state_file"
+    ip -4 route flush cache >> "$LOG_FILE" 2>&1 || true
+}
+
+render_source_route_script() {
+    local output_file="$1"
+    {
+        cat <<'EOF'
+#!/usr/bin/env bash
+# Managed by kto-additional-ips. Re-run the kto menu to refresh it.
+set -u
+EOF
+        printf 'STATE_FILE=%q\n' "$MANAGED_ROUTE_STATE_FILE"
+        cat <<'EOF'
+
+[[ -r "$STATE_FILE" ]] || exit 0
+failed=0
+for _ in $(seq 1 30); do
+    pending=0
+    while IFS='|' read -r interface mac metric ip_cidr gateway network_cidr table priority; do
+        [[ -n "$interface" && -n "$ip_cidr" ]] || continue
+        ip="${ip_cidr%%/*}"
+        if ! ip -4 -o address show dev "$interface" scope global 2>/dev/null |
+            awk '{split($4, value, "/"); print value[1]}' | grep -Fqx "$ip"; then
+            pending=1
+        fi
+    done < "$STATE_FILE"
+    (( pending == 0 )) && break
+    sleep 1
+done
+
+while IFS='|' read -r interface mac metric ip_cidr gateway network_cidr table priority; do
+    [[ -n "$interface" && -n "$ip_cidr" && -n "$gateway" && -n "$network_cidr" ]] || continue
+    ip="${ip_cidr%%/*}"
+    if ! ip -4 -o address show dev "$interface" scope global 2>/dev/null |
+        awk '{split($4, value, "/"); print value[1]}' | grep -Fqx "$ip"; then
+        printf '[kto-additional-ips] %s: адрес %s не появился на %s\n' "$(date -Is)" "$ip" "$interface" >&2
+        failed=1
+        continue
+    fi
+
+    ip -4 route replace "$network_cidr" dev "$interface" src "$ip" scope link table "$table" || failed=1
+    ip -4 route replace default via "$gateway" dev "$interface" onlink table "$table" || failed=1
+    ip -4 rule del from "${ip}/32" table "$table" priority "$priority" 2>/dev/null || true
+    ip -4 rule add from "${ip}/32" table "$table" priority "$priority" || failed=1
+done < "$STATE_FILE"
+ip -4 route flush cache 2>/dev/null || true
+exit "$failed"
+EOF
+    } > "$output_file"
+}
+
+render_source_route_unit() {
+    local output_file="$1"
+    cat > "$output_file" <<EOF
+[Unit]
+Description=KTO additional IP source routes
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${MANAGED_ROUTE_SCRIPT}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+restore_source_route_manager() {
+    local backup_directory="$1" had_state="$2" had_script="$3" had_unit="$4"
+    systemctl disable --now "$MANAGED_ROUTE_SERVICE" >> "$LOG_FILE" 2>&1 || true
+    remove_source_routes_from_state "$MANAGED_ROUTE_STATE_FILE"
+
+    if (( had_state == 1 )); then
+        install -m 0600 "$backup_directory/state" "$MANAGED_ROUTE_STATE_FILE"
+    else
+        rm -f "$MANAGED_ROUTE_STATE_FILE"
+    fi
+    if (( had_script == 1 )); then
+        install -m 0755 "$backup_directory/script" "$MANAGED_ROUTE_SCRIPT"
+    else
+        rm -f "$MANAGED_ROUTE_SCRIPT"
+    fi
+    if (( had_unit == 1 )); then
+        install -m 0644 "$backup_directory/unit" "$MANAGED_ROUTE_UNIT_FILE"
+    else
+        rm -f "$MANAGED_ROUTE_UNIT_FILE"
+    fi
+
+    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+    if (( had_state == 1 && had_script == 1 )); then
+        "$MANAGED_ROUTE_SCRIPT" >> "$LOG_FILE" 2>&1 || true
+    fi
+    if (( had_unit == 1 )); then
+        systemctl enable --now "$MANAGED_ROUTE_SERVICE" >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
+install_source_route_manager() {
+    local state_file="$1" expected_interface="$2" expected_ip="$3"
+    local backup_directory script_file unit_file
+    local had_state=0 had_script=0 had_unit=0
+
+    backup_directory="$(mktemp -d)"
+    script_file="$(mktemp)"
+    unit_file="$(mktemp)"
+    if [[ -f "$MANAGED_ROUTE_STATE_FILE" ]]; then
+        had_state=1
+        cp -a "$MANAGED_ROUTE_STATE_FILE" "$backup_directory/state"
+    fi
+    if [[ -f "$MANAGED_ROUTE_SCRIPT" ]]; then
+        had_script=1
+        cp -a "$MANAGED_ROUTE_SCRIPT" "$backup_directory/script"
+    fi
+    if [[ -f "$MANAGED_ROUTE_UNIT_FILE" ]]; then
+        had_unit=1
+        cp -a "$MANAGED_ROUTE_UNIT_FILE" "$backup_directory/unit"
+    fi
+
+    mkdir -p \
+        "$(dirname "$MANAGED_ROUTE_STATE_FILE")" \
+        "$(dirname "$MANAGED_ROUTE_SCRIPT")" \
+        "$(dirname "$MANAGED_ROUTE_UNIT_FILE")"
+    render_source_route_script "$script_file"
+    render_source_route_unit "$unit_file"
+    remove_source_routes_from_state "$MANAGED_ROUTE_STATE_FILE"
+    install -m 0600 "$state_file" "$MANAGED_ROUTE_STATE_FILE"
+    install -m 0755 "$script_file" "$MANAGED_ROUTE_SCRIPT"
+    install -m 0644 "$unit_file" "$MANAGED_ROUTE_UNIT_FILE"
+    rm -f "$script_file" "$unit_file"
+
+    if ! "$MANAGED_ROUTE_SCRIPT" >> "$LOG_FILE" 2>&1 ||
+        ! main_route_healthy "$expected_interface" "$expected_ip"; then
+        fail "Source routes не применились или изменили основной маршрут. Возвращаю предыдущую конфигурацию."
+        restore_source_route_manager "$backup_directory" "$had_state" "$had_script" "$had_unit"
+        rm -rf "$backup_directory"
+        return 1
+    fi
+    if ! systemctl daemon-reload >> "$LOG_FILE" 2>&1 ||
+        ! systemctl enable --now "$MANAGED_ROUTE_SERVICE" >> "$LOG_FILE" 2>&1; then
+        fail "Не удалось сохранить source routes в systemd. Возвращаю предыдущую конфигурацию."
+        restore_source_route_manager "$backup_directory" "$had_state" "$had_script" "$had_unit"
+        rm -rf "$backup_directory"
+        return 1
+    fi
+
+    rm -rf "$backup_directory"
+    return 0
+}
+
+print_non_openstack_diagnostics() {
+    fail "Metadata нет, и готовых дополнительных IPv4 со шлюзом система не показывает."
+    printf '\nЧто нужно сделать:\n'
+    printf '1. Привязать дополнительные IP/сетевые карты в панели провайдера.\n'
+    printf '2. Настроить для них IP/маску и шлюз по инструкции провайдера (или включить DHCP).\n'
+    printf '3. Повторно запустить этот пункт: готовые адреса будут найдены автоматически.\n'
+    printf '\nСейчас система видит:\n'
+    ip -br -4 address 2>/dev/null || true
+    printf '\nСетевые интерфейсы:\n'
+    ip -br link 2>/dev/null || true
+    printf '\nМаршруты:\n'
+    ip -4 route show table all 2>/dev/null || true
+    printf '\nДля ручной схемы нужны три значения на каждый адрес: IP/CIDR, шлюз и интерфейс.\n'
+}
+
+setup_existing_source_routes() {
+    local primary_interface_name="$1" primary_ip="$2" state_file="$3"
+
+    warn "OpenStack metadata недоступны; проверяю уже настроенные интерфейсы и IP."
+    if ! command -v systemctl >/dev/null 2>&1; then
+        fail "Для постоянных source routes нужен systemd (команда systemctl не найдена)."
+        return 1
+    fi
+    if ! discover_existing_extra_state "$primary_interface_name" "$primary_ip" "$state_file"; then
+        print_non_openstack_diagnostics
+        return 1
+    fi
+
+    ok "Найдено готовых дополнительных IPv4: ${DISCOVERED_EXTRA_COUNT}"
+    if (( DISCOVERED_SKIPPED_COUNT > 0 )); then
+        warn "Пропущено адресов без определяемого шлюза: ${DISCOVERED_SKIPPED_COUNT}"
+    fi
+    info "Создаю постоянный source-route, не изменяя сетевой конфиг провайдера"
+    write_multiwan_sysctl
+    if ! install_source_route_manager "$state_file" "$primary_interface_name" "$primary_ip"; then
+        return 1
+    fi
+    sleep 2
+    print_result_table "$primary_interface_name" "$primary_ip" "$state_file"
 }
 
 wait_for_dhcp() {
@@ -468,8 +747,9 @@ setup_additional_ips() {
 
     info "Читаю OpenStack network metadata"
     if ! fetch_openstack_metadata "$metadata_file"; then
-        fail "OpenStack metadata недоступны. Автоматическая настройка не поддерживается на этой машине."
-        return 1
+        local fallback_rc=0
+        setup_existing_source_routes "$primary_interface_name" "$primary_ip" "$final_state" || fallback_rc=$?
+        return "$fallback_rc"
     fi
     mapfile -t metadata_macs < <(openstack_ipv4_port_macs "$metadata_file")
     for mac in "${metadata_macs[@]}"; do
@@ -572,12 +852,18 @@ setup_additional_ips() {
 }
 
 show_status() {
-    local primary_interface_name primary_ip
+    local primary_interface_name primary_ip route_service_status="-"
     primary_interface_name="$(primary_interface)"
     primary_ip="$(primary_ipv4)"
+    if command -v systemctl >/dev/null 2>&1 && [[ -f "$MANAGED_ROUTE_UNIT_FILE" ]]; then
+        route_service_status="$(systemctl is-active "$MANAGED_ROUTE_SERVICE" 2>/dev/null || true)"
+        [[ -n "$route_service_status" ]] || route_service_status="inactive"
+    fi
     printf 'kto additional IP %s\n' "$ADDITIONAL_IP_BUILD"
     printf 'Основной: %s %s\n' "${primary_interface_name:--}" "${primary_ip:--}"
     printf 'Netplan: %s\n' "$([[ -f "$MANAGED_NETPLAN_FILE" ]] && echo OK || echo '-')"
+    printf 'Source-route state: %s\n' "$([[ -f "$MANAGED_ROUTE_STATE_FILE" ]] && echo OK || echo '-')"
+    printf 'Source-route service: %s\n' "$route_service_status"
     printf 'Sysctl: %s\n' "$([[ -f "$MANAGED_SYSCTL_FILE" ]] && echo OK || echo '-')"
     echo
     ip -br -4 address

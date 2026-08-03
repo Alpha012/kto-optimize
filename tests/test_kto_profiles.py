@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v254"', KTO)
-        self.assertIn('PUSH_BUILD="v254"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v254"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v254"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v254"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v254"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v255"', KTO)
+        self.assertIn('PUSH_BUILD="v255"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v255"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v255"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v255"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v255"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -197,6 +197,7 @@ IFS=$'\t' read -r archive_url archive_hash deb_url deb_hash deb_arch <<< "$profi
         self.assertIn('actions+=("additional-ips")', menu)
         self.assertIn('ensure_additional_ip_manager', wrapper)
         self.assertIn('fetch_openstack_metadata "$metadata_file"', setup)
+        self.assertIn('setup_existing_source_routes', setup)
         self.assertIn('openstack_ipv4_port_macs "$metadata_file"', setup)
         self.assertIn('wait_for_dhcp "${names[@]}"', setup)
         self.assertIn('remove_duplicate_primary_addresses', setup)
@@ -266,6 +267,66 @@ jq -n --slurpfile config "$fixed" '{response:{config:$config[0]}}' > "$profile"
 rewrite_profile_config "$profile" 0 default "$reset"
 jq -e '(.outbounds[0] | has("sendThrough") | not)' "$reset" >/dev/null
 jq -e '.outbounds[1].sendThrough == "10.0.0.2"' "$reset" >/dev/null
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_additional_ip_non_openstack_fallback_discovers_existing_interfaces(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' scripts/kto-additional-ips.sh)
+LOG_FILE=/dev/null
+ip() {
+    if [[ "${1:-}" == "-4" && "${2:-}" == "-o" && "${3:-}" == "address" && "${4:-}" == "show" ]]; then
+        printf '%s\n' \
+            '2: ens3 inet 78.159.250.112/24 brd 78.159.250.255 scope global ens3' \
+            '3: wan2 inet 185.141.227.93/26 brd 185.141.227.127 scope global wan2' \
+            '4: wan3 inet 217.19.122.48/24 brd 217.19.122.255 scope global wan3' \
+            '5: docker0 inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0'
+        return 0
+    fi
+    return 1
+}
+interface_gateway() {
+    case "$1" in
+        ens3) printf '78.159.250.1\n' ;;
+        wan2) printf '185.141.227.65\n' ;;
+        wan3) printf '217.19.122.1\n' ;;
+    esac
+}
+interface_mac() { printf 'fa:16:3e:00:00:02\n'; }
+network_for_cidr() {
+    case "$1" in
+        185.*) printf '185.141.227.64/26\n' ;;
+        217.*) printf '217.19.122.0/24\n' ;;
+    esac
+}
+state=$(mktemp)
+runner=$(mktemp)
+trap 'rm -f "$state" "$runner"' EXIT
+discover_existing_extra_state ens3 78.159.250.112 "$state"
+[[ "$DISCOVERED_EXTRA_COUNT" == 2 ]]
+[[ "$DISCOVERED_SKIPPED_COUNT" == 0 ]]
+grep -q '^wan2|.*|185.141.227.93/26|185.141.227.65|185.141.227.64/26|5201|15201$' "$state"
+grep -q '^wan3|.*|217.19.122.48/24|217.19.122.1|217.19.122.0/24|5202|15202$' "$state"
+! grep -q 'docker0' "$state"
+MANAGED_ROUTE_STATE_FILE=/etc/kto-additional-ip-routes.conf
+render_source_route_script "$runner"
+bash -n "$runner"
+grep -q 'route replace.*scope link table' "$runner"
+grep -q 'route replace default via.*onlink table' "$runner"
+grep -q 'rule add from.*table.*priority' "$runner"
+! grep -q 'route flush table' "$runner"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
