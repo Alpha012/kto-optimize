@@ -38,11 +38,11 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v251"', KTO)
-        self.assertIn('PUSH_BUILD="v251"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v251"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v251"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v251"', ADDITIONAL_IPS)
+        self.assertIn('SCRIPT_BUILD="v252"', KTO)
+        self.assertIn('PUSH_BUILD="v252"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v252"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v252"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v252"', ADDITIONAL_IPS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -309,6 +309,41 @@ grep -q '^    wan3:$' "$second"
 grep -q 'routing-policy:' "$second"
 grep -q 'table: 102' "$second"
 grep -q 'table: 103' "$second"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_additional_ip_check_bypasses_proxies_and_reports_nat_as_working(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        self.assertIn("curl -q -4 --noproxy '*' --interface", ADDITIONAL_IPS)
+        harness = r'''
+source <(sed '/^main /d' scripts/kto-additional-ips.sh)
+state=$(mktemp)
+trap 'rm -f "$state"' EXIT
+printf 'wan2|fa:16:3e:00:00:02|500|185.141.227.93/26|185.141.227.65|185.141.227.64/26|102|10200\n' > "$state"
+bound_public_ip() {
+    case "$1" in
+        78.159.250.112) printf '78.159.250.112\n' ;;
+        185.141.227.93) printf '46.243.235.141\n' ;;
+    esac
+}
+ip() {
+    printf '1.1.1.1 from 185.141.227.93 via 185.141.227.65 dev wan2 table 102\n'
+}
+output=$(print_result_table ens3 78.159.250.112 "$state" 2>&1)
+grep -q '185.141.227.93.*46.243.235.141.*NAT' <<< "$output"
+grep -q 'Дополнительные IP имеют доступ в интернет: 1/1' <<< "$output"
+grep -q 'через NAT/прокси: 1' <<< "$output"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

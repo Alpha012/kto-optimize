@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-ADDITIONAL_IP_BUILD="v251"
+ADDITIONAL_IP_BUILD="v252"
 MANAGED_NETPLAN_FILE="${KTO_ADDITIONAL_IP_NETPLAN_FILE:-/etc/netplan/90-kto-extra-nics.yaml}"
 LEGACY_ALIAS_NETPLAN_FILE="${KTO_ADDITIONAL_IP_LEGACY_NETPLAN_FILE:-/etc/netplan/90-kto-extra-ips.yaml}"
 MANAGED_SYSCTL_FILE="${KTO_ADDITIONAL_IP_SYSCTL_FILE:-/etc/sysctl.d/99-z-kto-multiwan.conf}"
@@ -368,7 +368,7 @@ bound_public_ip() {
         "https://icanhazip.com"
     )
     for url in "${urls[@]}"; do
-        output="$(curl -4 --interface "$source_ip" -fsS --connect-timeout 8 --max-time 12 "$url" 2>> "$LOG_FILE" || true)"
+        output="$(curl -q -4 --noproxy '*' --interface "$source_ip" -fsS --connect-timeout 8 --max-time 12 "$url" 2>> "$LOG_FILE" || true)"
         output="${output//$'\r'/}"
         output="${output//$'\n'/}"
         if [[ "$output" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -382,13 +382,18 @@ bound_public_ip() {
 print_result_table() {
     local primary_interface_name="$1" primary_ip="$2" state_file="$3"
     local name mac metric ip_cidr gateway network_cidr table priority ip route external status
-    local total=0 passed=0
+    local total=0 working=0 direct=0 nat=0
 
     printf '\n%-8s %-16s %-16s %-7s %-16s %s\n' "Интерф." "IP" "Шлюз" "Таблица" "Внешний IP" "Статус"
     printf '%-8s %-16s %-16s %-7s %-16s %s\n' "--------" "----------------" "----------------" "-------" "----------------" "------"
     external="$(bound_public_ip "$primary_ip" || true)"
-    status="OK"
-    [[ "$external" == "$primary_ip" ]] || status="FAIL"
+    if [[ "$external" == "$primary_ip" ]]; then
+        status="OK"
+    elif [[ -n "$external" ]]; then
+        status="NAT"
+    else
+        status="FAIL"
+    fi
     printf '%-8s %-16s %-16s %-7s %-16s %s\n' "$primary_interface_name" "$primary_ip" "main" "main" "${external:--}" "$status"
 
     while IFS='|' read -r name mac metric ip_cidr gateway network_cidr table priority; do
@@ -400,22 +405,32 @@ print_result_table() {
         fi
         route="$(ip -4 route get 1.1.1.1 from "$ip" 2>/dev/null || true)"
         external="$(bound_public_ip "$ip" || true)"
-        if [[ " $route " == *" dev ${name} "* && "$external" == "$ip" ]]; then
-            status="OK"
-            passed=$(( passed + 1 ))
-        else
+        if [[ " $route " != *" dev ${name} "* ]]; then
+            status="ROUTE"
+        elif [[ -z "$external" ]]; then
             status="FAIL"
+        elif [[ "$external" == "$ip" ]]; then
+            status="OK"
+            working=$(( working + 1 ))
+            direct=$(( direct + 1 ))
+        else
+            status="NAT"
+            working=$(( working + 1 ))
+            nat=$(( nat + 1 ))
         fi
         printf '%-8s %-16s %-16s %-7s %-16s %s\n' "$name" "$ip" "$gateway" "$table" "${external:--}" "$status"
     done < "$state_file"
 
     printf '\n'
-    if (( total > 0 && passed == total )); then
-        ok "Дополнительные IP работают: ${passed}/${total}"
+    if (( total > 0 && working == total )); then
+        ok "Дополнительные IP имеют доступ в интернет: ${working}/${total}"
+        if (( nat > 0 )); then
+            warn "Без подмены адреса: ${direct}; через NAT/прокси: ${nat}. Статус NAT показывает фактический внешний IP."
+        fi
         ok "Основной SSH-маршрут сохранён: ${primary_ip} через ${primary_interface_name}"
         return 0
     fi
-    fail "Прошли проверку не все дополнительные IP: ${passed}/${total}"
+    fail "Имеют доступ в интернет не все дополнительные IP: ${working}/${total}"
     return 1
 }
 
