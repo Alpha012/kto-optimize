@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v253"', KTO)
-        self.assertIn('PUSH_BUILD="v253"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v253"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v253"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v253"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v253"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v254"', KTO)
+        self.assertIn('PUSH_BUILD="v254"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v254"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v254"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v254"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v254"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")

@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v253"
+COLLECTOR_BUILD = "v254"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3652,8 +3652,8 @@ def send_stats_wl(use_rich=True):
     if use_rich or RICH_STATS_ENABLED:
         rich_html = aggregate_wl_rich_message()
         if send_rich_message(rich_html):
-            return
-    send_message(aggregate_message("wl"))
+            return True
+    return bool(send_message(aggregate_message("wl")))
 
 
 def remna_table_text(node):
@@ -3725,12 +3725,16 @@ def bl_group_stats_rich_message(group_id=None, ungrouped=False):
     group_name, group_nodes, group_found = bl_group_rich_context(group_id, ungrouped=ungrouped)
     if not group_found:
         return "<h3>Статистика других машин</h3><p>Группа не найдена.</p>"
+
+    return "<h3>Статистика других машин</h3>" + bl_nodes_rich_section(group_name, group_nodes)
+
+
+def bl_nodes_rich_section(group_name, group_nodes, ts=None):
     if not group_nodes:
-        return f"<h3>Статистика других машин</h3><h4>{rich_text(group_name)}</h4><p>Нет машин в группе.</p>"
-    ts = now_ts()
+        return f"<h4>{rich_text(group_name)}</h4><p>Нет машин в группе.</p>"
+    ts = now_ts() if ts is None else int(ts)
     headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "RAM", "CPU", "Remnawave", "Статус"]
     parts = [
-        "<h3>Статистика других машин</h3>",
         f"<h4>{rich_text(group_name)}</h4>",
         rich_table(headers, rich_bl_rows(group_nodes, ts)),
         rich_status_summary(group_nodes, ts, max(len(group_nodes), 1)),
@@ -5127,6 +5131,43 @@ def aggregate_grouped_bl_summary_message():
     return "\n".join(parts)
 
 
+def aggregate_grouped_bl_rich_message():
+    groups = bl_group_list()
+    nodes = current_bl_nodes()
+    ts = now_ts()
+    parts = ["<h3>Статистика других машин</h3>"]
+    rendered = 0
+
+    if not groups:
+        if not nodes:
+            return "<h3>Статистика других машин</h3><p>Нет данных от машин.</p>"
+        parts.append(bl_nodes_rich_section("Все машины", nodes, ts))
+        return "".join(parts)
+
+    for group in groups:
+        group_nodes = bl_group_nodes(group, nodes)
+        if not group_nodes:
+            continue
+        parts.append(bl_nodes_rich_section(group.get("name") or "Группа", group_nodes, ts))
+        rendered += 1
+
+    ungrouped = bl_ungrouped_nodes(nodes, groups)
+    if ungrouped:
+        parts.append(bl_nodes_rich_section("Без группы", ungrouped, ts))
+        rendered += 1
+
+    if not rendered:
+        return "<h3>Статистика других машин</h3><p>Нет данных от машин.</p>"
+    return "".join(parts)
+
+
+def send_grouped_bl_stats(use_rich=True):
+    if use_rich or RICH_STATS_ENABLED:
+        if send_rich_message(aggregate_grouped_bl_rich_message()):
+            return True
+    return bool(send_message(aggregate_grouped_bl_summary_message()))
+
+
 def ip_limit_node_policy(node):
     aliases = list(node_alias_keys(node))
     if not aliases:
@@ -6255,10 +6296,10 @@ def daily_report_loop():
             current = datetime.now()
             today = current.strftime("%Y-%m-%d")
             if current.strftime("%H:%M") == DAILY_REPORT_TIME and last_sent != today:
-                wl_sent = send_message(aggregate_message("wl"))
+                wl_sent = send_stats_wl(use_rich=True)
                 bl_sent = False
                 if wl_sent:
-                    bl_sent = send_message(aggregate_grouped_bl_summary_message())
+                    bl_sent = send_grouped_bl_stats(use_rich=True)
                 if wl_sent and bl_sent:
                     last_sent = today
                     save_daily_date(today)

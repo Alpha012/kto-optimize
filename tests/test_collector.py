@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -41,6 +42,7 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.NODE_NAME_STATE = {"nodes": {}, "pending": {}}
         collector.STATS_OFF_STATE = {"nodes": {}}
         collector.ALERTS_OFF_STATE = {"nodes": {}}
+        collector.BL_GROUP_STATE = {"groups": {}, "pending": {}}
         collector.UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
         collector.AUTH_NONCES = {}
         collector.NODES_DIRTY = False
@@ -145,6 +147,44 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertEqual(sorted(plain.index(name) for name in expected), [plain.index(name) for name in expected])
         rich_names = [name.replace("№", "#") for name in expected]
         self.assertEqual(sorted(rich.index(name) for name in rich_names), [rich.index(name) for name in rich_names])
+
+    def test_daily_report_uses_same_rich_table_senders_as_manual_stats(self):
+        loop_source = inspect.getsource(collector.daily_report_loop)
+        self.assertIn("send_stats_wl(use_rich=True)", loop_source)
+        self.assertIn("send_grouped_bl_stats(use_rich=True)", loop_source)
+        self.assertNotIn('send_message(aggregate_message("wl"))', loop_source)
+        self.assertNotIn("send_message(aggregate_grouped_bl_summary_message())", loop_source)
+
+    def test_grouped_daily_bl_report_contains_manual_rich_tables(self):
+        first_uuid = str(uuid.uuid4())
+        second_uuid = str(uuid.uuid4())
+        first = collector.update_node(self.payload("Германия", first_uuid, "bl"), "203.0.113.51")
+        second = collector.update_node(self.payload("Швейцария", second_uuid, "bl"), "203.0.113.52")
+        first_key = collector.node_group_key(first)
+        second_key = collector.node_group_key(second)
+        collector.BL_GROUP_STATE = {
+            "groups": {
+                "vpn": {
+                    "id": "vpn",
+                    "name": "kto VPN",
+                    "nodes": {first_key: "Германия", second_key: "Швейцария"},
+                    "created_at": 1,
+                    "updated_at": 1,
+                }
+            },
+            "pending": {},
+        }
+
+        daily = collector.aggregate_grouped_bl_rich_message()
+        manual = collector.bl_group_stats_rich_message("vpn")
+        manual_section = manual.removeprefix("<h3>Статистика других машин</h3>")
+
+        self.assertIn("<table bordered striped>", daily)
+        self.assertIn("<th align=\"center\">Машина</th>", daily)
+        self.assertIn("<h4>kto VPN</h4>", daily)
+        self.assertIn("Германия", daily)
+        self.assertIn("Швейцария", daily)
+        self.assertIn(manual_section, daily)
 
     def test_update_job_ids_are_unique(self):
         first = collector.queue_update_task("test", local_required=False)
