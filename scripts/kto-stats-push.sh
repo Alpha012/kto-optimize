@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v250"
+PUSH_BUILD="v251"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -490,7 +490,9 @@ apply_collector_haproxy_config() {
             if [[ -n "$current_target_raw" && "$current_target" != "$desired_target" ]]; then
                 if awk -v target="$desired_target" '
                     $1 == "server" && $2 == "xray1" && replaced == 0 {
-                        print "    server xray1 " target " check weight 10"
+                        line = "    server xray1 " target
+                        for (i = 4; i <= NF; i++) line = line " " $i
+                        print line
                         replaced = 1
                         next
                     }

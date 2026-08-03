@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v250"
+SCRIPT_BUILD="v251"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -1288,6 +1288,119 @@ normalize_haproxy_target() {
     printf '%s:%d\n' "$ip" "$port"
 }
 
+normalize_haproxy_source_ip() {
+    local raw="${1:-default}"
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    case "${raw,,}" in
+        ""|auto|default) printf 'default\n'; return 0 ;;
+    esac
+    validate_ipv4 "$raw" || return 1
+    printf '%s\n' "$raw"
+}
+
+haproxy_default_source_ip() {
+    ip -4 route get 1.1.1.1 2>/dev/null |
+        awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}' || true
+}
+
+haproxy_default_source_interface() {
+    ip -4 route get 1.1.1.1 2>/dev/null |
+        awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' || true
+}
+
+list_haproxy_additional_source_ips() {
+    local default_interface default_ip line interface cidr source_ip route route_interface
+    default_interface="$(haproxy_default_source_interface)"
+    default_ip="$(haproxy_default_source_ip)"
+    [[ -n "$default_interface" ]] || return 0
+    validate_ipv4 "$default_ip" || return 0
+
+    while read -r line; do
+        interface="$(awk '{print $2}' <<< "$line")"
+        interface="${interface%%@*}"
+        cidr="$(awk '{print $4}' <<< "$line")"
+        source_ip="${cidr%%/*}"
+        [[ -n "$interface" && "$interface" != lo && "$interface" != "$default_interface" ]] || continue
+        [[ "$source_ip" != "$default_ip" ]] || continue
+        validate_ipv4 "$source_ip" || continue
+        route="$(ip -4 route get 1.1.1.1 from "$source_ip" 2>/dev/null || true)"
+        route_interface="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<< "$route")"
+        [[ "$route_interface" == "$interface" ]] || continue
+        printf '%s\t%s\n' "$source_ip" "$interface"
+    done < <(ip -4 -o address show scope global 2>/dev/null || true) |
+        sort -t $'\t' -k2,2V -k1,1V |
+        awk -F '\t' '!seen[$1]++'
+}
+
+haproxy_additional_source_ip_available() {
+    local wanted="$1"
+    list_haproxy_additional_source_ips |
+        awk -F '\t' -v wanted="$wanted" '$1 == wanted { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+select_haproxy_additional_source_ip() {
+    local routes_file="${1:-}" choice source_ip interface index entry
+    local -a all_entries=() entries=()
+    mapfile -t all_entries < <(list_haproxy_additional_source_ips)
+    for entry in "${all_entries[@]}"; do
+        IFS=$'\t' read -r source_ip interface <<< "$entry"
+        if [[ -n "$routes_file" && -s "$routes_file" ]] &&
+            awk -F '\t' -v wanted="$source_ip" '$4 == wanted { found = 1 } END { exit found ? 0 : 1 }' "$routes_file"; then
+            continue
+        fi
+        entries+=("$entry")
+    done
+
+    if (( ${#entries[@]} == 0 )); then
+        if (( ${#all_entries[@]} > 0 )); then
+            fail "Все рабочие дополнительные IP уже используются HAProxy-маршрутами."
+        else
+            fail "Рабочих дополнительных IP не найдено. Сначала запусти «Проверить и завести дополнительные IP»."
+        fi
+        return 1
+    fi
+    if (( ${#entries[@]} == 1 )); then
+        IFS=$'\t' read -r source_ip interface <<< "${entries[0]}"
+        printf 'Доступен один дополнительный IP: %s (%s)\n' "$source_ip" "$interface" >&2
+        printf '%s\n' "$source_ip"
+        return 0
+    fi
+
+    printf 'Доступные дополнительные исходящие IP:\n' >&2
+    for index in "${!entries[@]}"; do
+        IFS=$'\t' read -r source_ip interface <<< "${entries[$index]}"
+        printf ' %d) %s (%s)\n' "$(( index + 1 ))" "$source_ip" "$interface" >&2
+    done
+    while true; do
+        printf '> ' >&2
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            choice=$(( 10#$choice ))
+            if (( choice >= 1 && choice <= ${#entries[@]} )); then
+                IFS=$'\t' read -r source_ip interface <<< "${entries[$(( choice - 1 ))]}"
+                printf '%s\n' "$source_ip"
+                return 0
+            fi
+        fi
+        fail "Неверный выбор"
+    done
+}
+
+haproxy_source_label() {
+    local source_ip="${1:-default}" default_ip
+    source_ip="$(normalize_haproxy_source_ip "$source_ip" 2>/dev/null || printf 'default')"
+    if [[ "$source_ip" != default ]]; then
+        printf '%s\n' "$source_ip"
+        return 0
+    fi
+    default_ip="$(haproxy_default_source_ip)"
+    if [[ -n "$default_ip" ]]; then
+        printf '%s (default)\n' "$default_ip"
+    else
+        printf 'системный default\n'
+    fi
+}
+
 normalize_haproxy_sni_list() {
     local raw="${1:-}" token base existing
     local -a tokens=() normalized=()
@@ -2244,7 +2357,7 @@ EOF
 
 opt_firewall() {
     local ssh_port="$1"
-    local anti_rules routes_file="" port target sni
+    local anti_rules routes_file="" port target sni source_ip
     anti_rules="$(antiscanner_rules_count)"
 
     if [[ "${KTO_UFW_RESET:-0}" == "1" ]]; then
@@ -2265,7 +2378,7 @@ opt_firewall() {
         routes_file="$(mktemp)"
         extract_haproxy_routes > "$routes_file"
         if [[ -s "$routes_file" ]]; then
-            while IFS=$'\t' read -r port target sni; do
+            while IFS=$'\t' read -r port target sni source_ip; do
                 [[ "$port" =~ ^[0-9]+$ ]] || continue
                 cmd "${SUDO[@]}" ufw allow "${port}/tcp"
             done < "$routes_file"
@@ -2955,7 +3068,7 @@ system_check_network_limits() {
 
 system_check_firewall() {
     local ssh_port="$1"
-    local missing=() extra=() routes_file="" port target sni
+    local missing=() extra=() routes_file="" port target sni source_ip
 
     if ! command_exists ufw; then
         SYSTEM_CHECK_NEEDS_FIREWALL=1
@@ -2979,7 +3092,7 @@ system_check_firewall() {
         routes_file="$(mktemp)"
         extract_haproxy_routes > "$routes_file"
         if [[ -s "$routes_file" ]]; then
-            while IFS=$'\t' read -r port target sni; do
+            while IFS=$'\t' read -r port target sni source_ip; do
                 [[ "$port" =~ ^[0-9]+$ ]] || continue
                 ufw_rule_allowed "${port}/tcp" || missing+=("${port}/tcp")
             done < "$routes_file"
@@ -4282,7 +4395,7 @@ reload_haproxy_gracefully() {
 
 extract_haproxy_routes() {
     local config="${1:-/etc/haproxy/haproxy.cfg}"
-    local raw port target sni normalized_target normalized_sni
+    local raw port target sni source_ip normalized_target normalized_sni normalized_source_ip
 
     "${SUDO[@]}" test -s "$config" 2>/dev/null || return 0
     raw="$("${SUDO[@]}" awk '
@@ -4338,6 +4451,12 @@ extract_haproxy_routes() {
         }
         section == "backend" && $1 == "server" && !(name in backend_target) {
             backend_target[name] = $3
+            for (i = 4; i <= NF; i++) {
+                if ($i == "source" && (i + 1) <= NF) {
+                    backend_source[name] = $(i + 1)
+                    break
+                }
+            }
             next
         }
         END {
@@ -4345,20 +4464,23 @@ extract_haproxy_routes() {
                 frontend = frontend_order[i]
                 backend = frontend_backend[frontend]
                 if (frontend_port[frontend] != "" && frontend_sni[frontend] != "" && backend_target[backend] != "") {
-                    printf "%s\t%s\t%s\n", frontend_port[frontend], backend_target[backend], frontend_sni[frontend]
+                    source = backend_source[backend]
+                    if (source == "") source = "default"
+                    printf "%s\t%s\t%s\t%s\n", frontend_port[frontend], backend_target[backend], frontend_sni[frontend], source
                 }
             }
         }
     ' "$config" 2>/dev/null || true)"
 
-    while IFS=$'\t' read -r port target sni; do
+    while IFS=$'\t' read -r port target sni source_ip; do
         [[ "$port" =~ ^[0-9]+$ ]] || continue
         port=$((10#$port))
         (( port >= 1 && port <= 65535 )) || continue
         normalized_target="$(normalize_haproxy_target "$target" 2>/dev/null || true)"
         normalized_sni="$(normalize_haproxy_sni_list "$sni" 2>/dev/null || true)"
-        [[ -n "$normalized_target" && -n "$normalized_sni" ]] || continue
-        printf '%d\t%s\t%s\n' "$port" "$normalized_target" "$normalized_sni"
+        normalized_source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}" 2>/dev/null || true)"
+        [[ -n "$normalized_target" && -n "$normalized_sni" && -n "$normalized_source_ip" ]] || continue
+        printf '%d\t%s\t%s\t%s\n' "$port" "$normalized_target" "$normalized_sni" "$normalized_source_ip"
     done <<< "$raw" | sort -t $'\t' -k1,1n
 }
 
@@ -4408,11 +4530,11 @@ recommended_haproxy_maxconn() {
 
 render_haproxy_routes_config() {
     local routes_file="$1" output_file="$2"
-    local port backend_target allowed_sni normalized_target normalized_sni
-    local frontend_name backend_name server_name haproxy_threads haproxy_maxconn route_count=0
+    local port backend_target allowed_sni source_ip normalized_target normalized_sni normalized_source_ip
+    local frontend_name backend_name server_name source_clause haproxy_threads haproxy_maxconn route_count=0
     local -A seen_ports=()
 
-    while IFS=$'\t' read -r port backend_target allowed_sni; do
+    while IFS=$'\t' read -r port backend_target allowed_sni source_ip; do
         [[ "$port" =~ ^[0-9]+$ ]] || {
             fail "Некорректный входной HAProxy порт: ${port:-пусто}"
             return 1
@@ -4428,7 +4550,8 @@ render_haproxy_routes_config() {
         }
         normalized_target="$(normalize_haproxy_target "$backend_target" 2>/dev/null || true)"
         normalized_sni="$(normalize_haproxy_sni_list "$allowed_sni" 2>/dev/null || true)"
-        [[ -n "$normalized_target" && -n "$normalized_sni" ]] || {
+        normalized_source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}" 2>/dev/null || true)"
+        [[ -n "$normalized_target" && -n "$normalized_sni" && -n "$normalized_source_ip" ]] || {
             fail "Некорректный HAProxy маршрут на порту $port"
             return 1
         }
@@ -4479,10 +4602,13 @@ backend wrong_sni_names
     stick-table type string len 160 size 100k expire 30m store gpc0
 EOF
 
-    while IFS=$'\t' read -r port backend_target allowed_sni; do
+    while IFS=$'\t' read -r port backend_target allowed_sni source_ip; do
         port=$((10#$port))
         backend_target="$(normalize_haproxy_target "$backend_target")"
         allowed_sni="$(normalize_haproxy_sni_list "$allowed_sni")"
+        source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}")"
+        source_clause=""
+        [[ "$source_ip" == default ]] || source_clause=" source ${source_ip}"
         if (( port == 443 )); then
             frontend_name="vless_in"
             backend_name="vless_pool"
@@ -4520,7 +4646,7 @@ backend ${backend_name}
     mode tcp
     balance leastconn
 
-    server ${server_name} ${backend_target} check weight 10
+    server ${server_name} ${backend_target} check weight 10${source_clause}
 EOF
     done < "$routes_file"
 }
@@ -4589,7 +4715,7 @@ EOF
 apply_haproxy_config() {
     local backend_target="$1" allowed_sni="$2" routes_file
     routes_file="$(mktemp)"
-    printf '443\t%s\t%s\n' "$backend_target" "$allowed_sni" > "$routes_file"
+    printf '443\t%s\t%s\tdefault\n' "$backend_target" "$allowed_sni" > "$routes_file"
     if apply_haproxy_routes_config "$routes_file"; then
         rm -f "$routes_file"
         return 0
@@ -4609,7 +4735,7 @@ ensure_haproxy_package() {
 
 harden_whitelist_haproxy_firewall() {
     local routes_file="${1:-}" previous_routes_file="${2:-}"
-    local ssh_port port target sni generated_routes=""
+    local ssh_port port target sni source_ip generated_routes=""
     command_exists ufw || return 0
     ufw_active || return 0
 
@@ -4621,7 +4747,7 @@ harden_whitelist_haproxy_firewall() {
     ssh_port="$(detect_ssh_port)"
 
     apply_whitelist_ssh_rules "$ssh_port"
-    while IFS=$'\t' read -r port target sni; do
+    while IFS=$'\t' read -r port target sni source_ip; do
         [[ "$port" =~ ^[0-9]+$ ]] || continue
         if ! cmd "${SUDO[@]}" ufw allow "${port}/tcp" comment 'kto-haproxy'; then
             cmd "${SUDO[@]}" ufw allow "${port}/tcp" || true
@@ -4629,7 +4755,7 @@ harden_whitelist_haproxy_firewall() {
     done < "$routes_file"
 
     if [[ -n "$previous_routes_file" && -s "$previous_routes_file" ]]; then
-        while IFS=$'\t' read -r port target sni; do
+        while IFS=$'\t' read -r port target sni source_ip; do
             [[ "$port" =~ ^[0-9]+$ ]] || continue
             if ! haproxy_route_file_has_port "$routes_file" "$port"; then
                 cmd "${SUDO[@]}" ufw --force delete allow "${port}/tcp" || true
@@ -4649,13 +4775,13 @@ configure_haproxy_backend() {
     require_whitelist_mode
     need_root
     local backend_target allowed_sni routes_file previous_routes_file
-    backend_target="$(ask_haproxy_target "Введите выходной IP или IP:порт")"
+    backend_target="$(ask_haproxy_target "Введите Backend IP или IP:порт")"
     allowed_sni="$(ask_haproxy_sni_list "Введите разрешенный SNI")"
 
     routes_file="$(mktemp)"
     previous_routes_file="$(mktemp)"
     extract_haproxy_routes > "$previous_routes_file"
-    printf '443\t%s\t%s\n' "$backend_target" "$allowed_sni" > "$routes_file"
+    printf '443\t%s\t%s\tdefault\n' "$backend_target" "$allowed_sni" > "$routes_file"
 
     if apply_haproxy_routes_config "$routes_file"; then
         harden_whitelist_haproxy_firewall "$routes_file" "$previous_routes_file"
@@ -4669,27 +4795,29 @@ configure_haproxy_backend() {
 }
 
 print_haproxy_routes() {
-    local routes_file="$1" port target sni
+    local routes_file="$1" port target sni source_ip source_label
     echo -e "${BOLD}${PURPLE}[ МАРШРУТЫ ]${NC}"
-    while IFS=$'\t' read -r port target sni; do
+    while IFS=$'\t' read -r port target sni source_ip; do
         [[ -n "$port" ]] || continue
-        printf ' %5s/tcp -> %-21s SNI: %s\n' "$port" "$target" "$sni"
+        source_label="$(haproxy_source_label "${source_ip:-default}")"
+        printf ' %5s/tcp -> %-21s Выход: %-24s SNI: %s\n' "$port" "$target" "$source_label" "$sni"
     done < "$routes_file"
 }
 
 select_haproxy_route() {
-    local routes_file="$1" mode="${2:-all}" choice index=0 port target sni
+    local routes_file="$1" mode="${2:-all}" choice index=0 port target sni source_ip source_label
     local -a ports=()
 
     printf '%s\n' "Выберите HAProxy-порт:" >&2
-    while IFS=$'\t' read -r port target sni; do
+    while IFS=$'\t' read -r port target sni source_ip; do
         [[ -n "$port" ]] || continue
         if [[ "$mode" == "extra" && "$port" == "443" ]]; then
             continue
         fi
         ports+=("$port")
         index=$(( index + 1 ))
-        printf ' %d) %s/tcp -> %s | %s\n' "$index" "$port" "$target" "$sni" >&2
+        source_label="$(haproxy_source_label "${source_ip:-default}")"
+        printf ' %d) %s/tcp -> %s | выход %s | %s\n' "$index" "$port" "$target" "$source_label" "$sni" >&2
     done < "$routes_file"
 
     if (( ${#ports[@]} == 0 )); then
@@ -4700,9 +4828,12 @@ select_haproxy_route() {
     while true; do
         printf '> ' >&2
         read -r choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ports[@]} )); then
-            echo "${ports[$((choice - 1))]}"
-            return 0
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            choice=$(( 10#$choice ))
+            if (( choice >= 1 && choice <= ${#ports[@]} )); then
+                echo "${ports[$((choice - 1))]}"
+                return 0
+            fi
         fi
         fail "Неверный выбор"
     done
@@ -4733,8 +4864,19 @@ haproxy_tcp_port_listening() {
     '
 }
 
-add_haproxy_route() {
-    local routes_file="$1" default_port port backend_target allowed_sni next_file
+add_haproxy_route_with_source() {
+    local routes_file="$1" source_ip="${2:-default}"
+    local default_port port backend_target allowed_sni next_file
+    source_ip="$(normalize_haproxy_source_ip "$source_ip" 2>/dev/null || true)"
+    if [[ -z "$source_ip" ]]; then
+        fail "Некорректный исходящий IP"
+        return 1
+    fi
+    if [[ "$source_ip" != default ]] && ! haproxy_additional_source_ip_available "$source_ip"; then
+        fail "Исходящий IP ${source_ip} больше не доступен через отдельный интерфейс"
+        return 1
+    fi
+
     default_port="$(default_haproxy_extra_port "$routes_file")" || {
         fail "Нет свободного HAProxy-порта"
         return 1
@@ -4753,33 +4895,47 @@ add_haproxy_route() {
         break
     done
 
-    backend_target="$(ask_haproxy_target_default "Выходной IP или IP:порт")"
+    backend_target="$(ask_haproxy_target_default "Backend IP или IP:порт")"
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
     next_file="$(mktemp)"
     cp "$routes_file" "$next_file"
-    printf '%s\t%s\t%s\n' "$port" "$backend_target" "$allowed_sni" >> "$next_file"
+    printf '%s\t%s\t%s\t%s\n' "$port" "$backend_target" "$allowed_sni" "$source_ip" >> "$next_file"
 
     if apply_haproxy_routes_config "$next_file"; then
         harden_whitelist_haproxy_firewall "$next_file" "$routes_file"
         mv "$next_file" "$routes_file"
-        ok "Добавлен порт ${port}: ${backend_target}"
+        ok "Добавлен HAProxy порт ${port}: ${backend_target}"
+        ok "Исходящий IP: $(haproxy_source_label "$source_ip")"
         return 0
     fi
     rm -f "$next_file"
     return 1
 }
 
+add_haproxy_route() {
+    add_haproxy_route_with_source "$1" default
+}
+
+add_haproxy_source_route() {
+    local routes_file="$1" source_ip
+    source_ip="$(select_haproxy_additional_source_ip "$routes_file")" || return 1
+    echo
+    stage "Новый HAProxy-маршрут будет выходить через ${source_ip}"
+    add_haproxy_route_with_source "$routes_file" "$source_ip"
+}
+
 edit_haproxy_route() {
-    local routes_file="$1" port current_line current_target current_sni backend_target allowed_sni next_file
+    local routes_file="$1" port current_line current_target current_sni current_source backend_target allowed_sni next_file
     port="$(select_haproxy_route "$routes_file")" || return 1
     current_line="$(awk -F '\t' -v port="$port" '$1 == port { print; exit }' "$routes_file")"
-    IFS=$'\t' read -r _ current_target current_sni <<< "$current_line"
+    IFS=$'\t' read -r _ current_target current_sni current_source <<< "$current_line"
+    current_source="$(normalize_haproxy_source_ip "${current_source:-default}")"
 
-    backend_target="$(ask_haproxy_target_default "Выходной IP или IP:порт" "$current_target")"
+    backend_target="$(ask_haproxy_target_default "Backend IP или IP:порт" "$current_target")"
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI" "$current_sni")"
     next_file="$(mktemp)"
-    awk -F '\t' -v OFS='\t' -v port="$port" -v target="$backend_target" -v sni="$allowed_sni" '
-        $1 == port { print port, target, sni; next }
+    awk -F '\t' -v OFS='\t' -v port="$port" -v target="$backend_target" -v sni="$allowed_sni" -v source_ip="$current_source" '
+        $1 == port { print port, target, sni, source_ip; next }
         { print }
     ' "$routes_file" > "$next_file"
 
@@ -4799,7 +4955,7 @@ replace_all_haproxy_sni() {
     allowed_sni="$(ask_haproxy_sni_list "Новый SNI для всех HAProxy-портов" "$current_sni")"
     next_file="$(mktemp)"
     awk -F '\t' -v OFS='\t' -v sni="$allowed_sni" '
-        NF >= 3 { print $1, $2, sni; next }
+        NF >= 3 { print $1, $2, sni, ($4 == "" ? "default" : $4); next }
         { print }
     ' "$routes_file" > "$next_file"
 
@@ -4888,10 +5044,11 @@ haproxy_menu() {
         print_haproxy_routes "$routes_file"
         echo
         echo -e "1) Изменить маршрут"
-        echo -e "2) Добавить порт"
-        echo -e "3) Удалить дополнительный порт"
-        echo -e "4) Заменить SNI у всех маршрутов"
-        echo -e "5) Обновить HAProxy, сохранив маршруты"
+        echo -e "2) Добавить порт через основной выходной IP"
+        echo -e "3) Добавить конфиг для другого выходного IP"
+        echo -e "4) Удалить дополнительный порт"
+        echo -e "5) Заменить SNI у всех маршрутов"
+        echo -e "6) Обновить HAProxy, сохранив маршруты"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -4899,9 +5056,10 @@ haproxy_menu() {
         case "$choice" in
             1) edit_haproxy_route "$routes_file" || true ;;
             2) add_haproxy_route "$routes_file" || true ;;
-            3) delete_haproxy_route "$routes_file" || true ;;
-            4) replace_all_haproxy_sni "$routes_file" || true ;;
-            5)
+            3) add_haproxy_source_route "$routes_file" || true ;;
+            4) delete_haproxy_route "$routes_file" || true ;;
+            5) replace_all_haproxy_sni "$routes_file" || true ;;
+            6)
                 if apply_haproxy_routes_config "$routes_file"; then
                     harden_whitelist_haproxy_firewall "$routes_file" "$routes_file"
                     ok "HAProxy обновлён, все маршруты сохранены"
