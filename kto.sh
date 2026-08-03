@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v252"
+SCRIPT_BUILD="v253"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -18,6 +18,7 @@ MOBILE443_DIR="/opt/mobile443"
 MOBILE443_CONFIG="${MOBILE443_DIR}/config.conf"
 MOBILE443_MANAGER="/usr/local/sbin/kto-mobile443"
 ADDITIONAL_IP_MANAGER="/usr/local/sbin/kto-additional-ips"
+REMNA_EGRESS_MANAGER="/usr/local/sbin/kto-remnawave-egress"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 CERT_DIR="/opt/remnawave"
@@ -4246,6 +4247,37 @@ setup_additional_ips() {
     "${SUDO[@]}" "$ADDITIONAL_IP_MANAGER" setup
 }
 
+install_remna_egress_manager() {
+    install_asset_file scripts/kto-remnawave-egress.sh "$REMNA_EGRESS_MANAGER" 0755
+}
+
+ensure_remna_egress_manager() {
+    if "${SUDO[@]}" test -x "$REMNA_EGRESS_MANAGER" 2>/dev/null &&
+        "${SUDO[@]}" grep -Fqx "REMNA_EGRESS_BUILD=\"${SCRIPT_BUILD}\"" "$REMNA_EGRESS_MANAGER" 2>/dev/null; then
+        return 0
+    fi
+    install_remna_egress_manager
+}
+
+configure_remnawave_egress() {
+    header
+    require_node_mode
+    if ! node_profile_includes_reality; then
+        fail "Выбор исходящего IP доступен для Reality и Reality + Hysteria2."
+        return 1
+    fi
+    need_root
+    must "Установка зависимостей Remnawave egress" apt_install_with_update_if_missing curl jq iproute2 libc-bin
+    ensure_remna_api_config
+    ensure_remna_egress_manager
+    "${SUDO[@]}" env \
+        KTO_REMNA_API_URL="$REMNA_API_URL" \
+        KTO_REMNA_API_TOKEN="$REMNA_API_TOKEN" \
+        KTO_REMNA_API_INSECURE="${KTO_REMNA_API_INSECURE:-0}" \
+        KTO_NODE_PROFILE="$NODE_PROFILE" \
+        "$REMNA_EGRESS_MANAGER" "${1:-menu}"
+}
+
 ipcheck_place() {
     header
     stage "Проверяю IP.Check.Place"
@@ -6562,6 +6594,10 @@ menu() {
         labels+=("Проверить и завести дополнительные IP")
         actions+=("additional-ips")
     fi
+    if [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_reality; then
+        labels+=("Исходящий IP Remnawave")
+        actions+=("remnawave-egress")
+    fi
     if [[ "$MACHINE_MODE" == "panel" ]]; then
         labels+=("Коллектор статистики")
         actions+=("stats-collector")
@@ -6632,6 +6668,7 @@ menu() {
         status) show_status ;;
         network-test) network_test ;;
         additional-ips) setup_additional_ips || true ;;
+        remnawave-egress) configure_remnawave_egress || true ;;
         stats-collector) install_stats_collector ;;
         stats-collector-status) stats_collector_status ;;
         stats-collector-alerts) stats_collector_alerts_menu ;;
@@ -6674,6 +6711,7 @@ main() {
         status) show_status ;;
         network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" ;;
         additional-ips|extra-ips|multi-ip|multiwan) setup_additional_ips ;;
+        remnawave-egress|remna-egress|reality-egress|xray-egress) shift; configure_remnawave_egress "${1:-menu}" ;;
         speedtest) install_speedtest "${2:-}" ;;
         speedtest-ru|speedtestru|bench-ru|benchru) speedtest_ru "${2:-}" ;;
         ipcheck-place) ipcheck_place ;;

@@ -11,6 +11,7 @@ PUSH = (ROOT / "scripts" / "kto-stats-push.sh").read_text(encoding="utf-8")
 COLLECTOR = (ROOT / "scripts" / "kto-stats-collector.py").read_text(encoding="utf-8")
 MOBILE443 = (ROOT / "scripts" / "kto-mobile443.sh").read_text(encoding="utf-8")
 ADDITIONAL_IPS = (ROOT / "scripts" / "kto-additional-ips.sh").read_text(encoding="utf-8")
+REMNA_EGRESS = (ROOT / "scripts" / "kto-remnawave-egress.sh").read_text(encoding="utf-8")
 
 
 def bash_executable():
@@ -38,11 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v252"', KTO)
-        self.assertIn('PUSH_BUILD="v252"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v252"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v252"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v252"', ADDITIONAL_IPS)
+        self.assertIn('SCRIPT_BUILD="v253"', KTO)
+        self.assertIn('PUSH_BUILD="v253"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v253"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v253"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v253"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v253"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -204,6 +206,120 @@ IFS=$'\t' read -r archive_url archive_hash deb_url deb_hash deb_arch <<< "$profi
         self.assertIn('routing-policy:', render)
         self.assertIn('on-link: true', render)
         self.assertIn('table: ${table}', render)
+
+    def test_reality_profiles_expose_remnawave_egress_manager(self):
+        menu = function_body(KTO, "menu")
+        wrapper = function_body(KTO, "configure_remnawave_egress")
+
+        self.assertIn('labels+=("Исходящий IP Remnawave")', menu)
+        self.assertIn('actions+=("remnawave-egress")', menu)
+        self.assertIn('node_profile_includes_reality', menu)
+        self.assertIn('node_profile_includes_reality', wrapper)
+        self.assertIn('ensure_remna_api_config', wrapper)
+        self.assertIn('ensure_remna_egress_manager', wrapper)
+        self.assertIn('KTO_NODE_PROFILE="$NODE_PROFILE"', wrapper)
+
+    def test_remnawave_egress_rewrites_only_selected_freedom_outbound(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+        jq_check = subprocess.run(
+            [bash, "-lc", "command -v jq"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if jq_check.returncode != 0:
+            self.skipTest("jq is unavailable in bash environment")
+
+        harness = r'''
+source <(sed '/^main "$@"$/d' scripts/kto-remnawave-egress.sh)
+profile=$(mktemp)
+origin=$(mktemp)
+fixed=$(mktemp)
+reset=$(mktemp)
+trap 'rm -f "$profile" "$origin" "$fixed" "$reset"' EXIT
+cat > "$profile" <<'JSON'
+{
+  "response": {
+    "config": {
+      "outbounds": [
+        {"protocol":"freedom","tag":"DIRECT"},
+        {"protocol":"freedom","tag":"OTHER","sendThrough":"10.0.0.2"},
+        {"protocol":"blackhole","tag":"BLOCK"}
+      ]
+    }
+  }
+}
+JSON
+rewrite_profile_config "$profile" 0 origin "$origin"
+jq -e '.outbounds[0].sendThrough == "origin"' "$origin" >/dev/null
+jq -e '.outbounds[1].sendThrough == "10.0.0.2"' "$origin" >/dev/null
+
+jq -n --slurpfile config "$origin" '{response:{config:$config[0]}}' > "$profile"
+rewrite_profile_config "$profile" 0 185.141.227.93 "$fixed"
+jq -e '.outbounds[0].sendThrough == "185.141.227.93"' "$fixed" >/dev/null
+
+jq -n --slurpfile config "$fixed" '{response:{config:$config[0]}}' > "$profile"
+rewrite_profile_config "$profile" 0 default "$reset"
+jq -e '(.outbounds[0] | has("sendThrough") | not)' "$reset" >/dev/null
+jq -e '.outbounds[1].sendThrough == "10.0.0.2"' "$reset" >/dev/null
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_fixed_remnawave_egress_refuses_shared_profile(self):
+        apply_egress = function_body(REMNA_EGRESS, "apply_send_through")
+
+        self.assertIn('[[ "$mode" == "fixed" && "$node_count" -gt 1 ]]', apply_egress)
+        self.assertIn('отдельный Config Profile', apply_egress)
+        self.assertIn('api_call PATCH /api/config-profiles', apply_egress)
+        self.assertIn('rewrite_profile_config', apply_egress)
+        self.assertIn('backup_file=', apply_egress)
+
+    def test_remnawave_node_detection_keeps_local_ips_when_public_probe_fails(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main "$@"$/d' scripts/kto-remnawave-egress.sh)
+ip() {
+    printf '%s\n' \
+        '2: ens3 inet 78.159.250.112/24 scope global ens3' \
+        '3: wan2 inet 185.141.227.93/26 scope global wan2'
+}
+curl() { return 28; }
+output="$(local_ipv4s)"
+grep -qx '78.159.250.112' <<< "$output"
+grep -qx '185.141.227.93' <<< "$output"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_origin_mode_documents_udp_limit(self):
+        status = function_body(REMNA_EGRESS, "show_status")
+        origin = function_body(REMNA_EGRESS, "configure_origin")
+
+        self.assertIn('origin работает для Reality/TCP', status)
+        self.assertIn('Hysteria2/UDP', status)
+        self.assertIn('Hysteria2/UDP продолжит использовать системный маршрут', origin)
 
     def test_additional_ip_metadata_parser_and_netplan_renderer(self):
         bash = bash_executable()
