@@ -12,6 +12,7 @@ COLLECTOR = (ROOT / "scripts" / "kto-stats-collector.py").read_text(encoding="ut
 MOBILE443 = (ROOT / "scripts" / "kto-mobile443.sh").read_text(encoding="utf-8")
 ADDITIONAL_IPS = (ROOT / "scripts" / "kto-additional-ips.sh").read_text(encoding="utf-8")
 REMNA_EGRESS = (ROOT / "scripts" / "kto-remnawave-egress.sh").read_text(encoding="utf-8")
+HAPROXY_BANDWIDTH = (ROOT / "scripts" / "kto-haproxy-bandwidth.sh").read_text(encoding="utf-8")
 
 
 def bash_executable():
@@ -39,12 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v266"', KTO)
-        self.assertIn('PUSH_BUILD="v266"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v266"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v266"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v266"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v266"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v267"', KTO)
+        self.assertIn('PUSH_BUILD="v267"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v267"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v267"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v267"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v267"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v267"', HAPROXY_BANDWIDTH)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -666,9 +668,166 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('6) Обновить HAProxy, сохранив маршруты', haproxy_menu)
         self.assertIn('7) Добавить или заменить backend-пул', haproxy_menu)
         self.assertIn('8) Массово добавить backend по следующим портам', haproxy_menu)
+        self.assertIn('9) Ограничить скорость по входному IP', haproxy_menu)
         self.assertIn('add_haproxy_source_route "$routes_file"', haproxy_menu)
         self.assertIn('replace_all_haproxy_sni "$routes_file"', haproxy_menu)
+        self.assertIn('haproxy_bandwidth_menu', haproxy_menu)
         self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
+
+    def test_haproxy_bandwidth_limit_is_scoped_to_selected_input_ip(self):
+        apply_limits = function_body(HAPROXY_BANDWIDTH, "apply_limits")
+        ensure_clsact = function_body(HAPROXY_BANDWIDTH, "ensure_clsact")
+        active_filters = function_body(HAPROXY_BANDWIDTH, "active_filter_count")
+        set_limit = function_body(KTO, "set_haproxy_input_bandwidth_limit")
+        commit = function_body(KTO, "commit_haproxy_bandwidth_config")
+        apply_routes = function_body(KTO, "apply_haproxy_routes_config")
+
+        self.assertIn('tc qdisc add dev "$interface" clsact', ensure_clsact)
+        self.assertNotIn(' root ', ensure_clsact)
+        self.assertIn('dst_ip "$ip" dst_port "$port"', apply_limits)
+        self.assertIn('src_ip "$ip" src_port "$port"', apply_limits)
+        self.assertIn('action police index "$action_index"', apply_limits)
+        self.assertIn('tc filter show dev "$interface" "$direction" protocol ip pref "$pref"', active_filters)
+        self.assertIn('haproxy_input_ip_available "$input_ip"', set_limit)
+        self.assertIn('Возвращаю предыдущие лимиты', commit)
+        self.assertIn('reapply_haproxy_bandwidth_limits', apply_routes)
+        self.assertIn('haproxy-limit|haproxy-bandwidth-limit', KTO)
+        self.assertIn('haproxy-limit-off|haproxy-bandwidth-off', KTO)
+        self.assertIn('haproxy-limit-status|haproxy-bandwidth-status', KTO)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export KTO_HAPROXY_BANDWIDTH_CONFIG="$work/limits"
+export KTO_HAPROXY_CONFIG="$work/haproxy.cfg"
+export KTO_HAPROXY_BANDWIDTH_STATE="$work/state"
+export KTO_HAPROXY_BANDWIDTH_LOG="$work/log"
+export KTO_HAPROXY_BANDWIDTH_LOCK="$work/lock"
+source <(sed '/^main /d' scripts/kto-haproxy-bandwidth.sh)
+printf '217.19.122.109\t2000\n' > "$LIMITS_CONFIG"
+cat > "$HAPROXY_CONFIG" <<'EOF'
+global
+    maxconn 10000
+defaults
+    mode tcp
+frontend vless_in_8443
+    bind *:8443 backlog 65535
+    default_backend vless_pool_8443
+frontend vless_in_8444
+    bind 0.0.0.0:8444 backlog 65535
+    default_backend vless_pool_8444
+backend vless_pool_8443
+    server xray1 1.1.1.1:443
+backend vless_pool_8444
+    server xray2 2.2.2.2:443
+EOF
+: > "$LOG_FILE"
+ip() {
+    if [[ "${1:-}" == -4 && "${2:-}" == -o && "${3:-}" == address &&
+        "${4:-}" == show && "${5:-}" == scope && "${6:-}" == global ]]; then
+        printf '2: ens3    inet 217.19.122.109/24 brd 217.19.122.255 scope global ens3\n'
+        return 0
+    fi
+    return 1
+}
+tc() {
+    printf '%s ' "$@" >> "$work/events"
+    printf '\n' >> "$work/events"
+    return 0
+}
+install() {
+    [[ "$1" == -m ]]
+    cp "$3" "$4"
+    chmod "$2" "$4"
+}
+apply_limits
+[[ "$(grep -c '^actions add action police ' "$work/events")" == 1 ]]
+[[ "$(grep -c '^filter add dev ens3 ' "$work/events")" == 4 ]]
+grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8443 action police index 3900001' "$work/events"
+grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8443 action police index 3900001' "$work/events"
+grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8444 action police index 3900001' "$work/events"
+grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8444 action police index 3900001' "$work/events"
+[[ "$(grep -c $'^F\t' "$STATE_FILE")" == 4 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_bandwidth_config_rolls_back_on_apply_failure(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export KTO_HAPROXY_CONFIG="$work/haproxy.cfg"
+export KTO_HAPROXY_BANDWIDTH_CONFIG="$work/limits"
+export KTO_HAPROXY_BANDWIDTH_MANAGER="$work/manager"
+export KTO_HAPROXY_BANDWIDTH_UNIT="$work/manager.service"
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+LOG_FILE="$work/log"
+: > "$LOG_FILE"
+printf 'global\n' > "$HAPROXY_CONFIG_FILE"
+cat > "$HAPROXY_BANDWIDTH_MANAGER" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$HAPROXY_BANDWIDTH_MANAGER"
+ip() {
+    if [[ "${1:-}" == -4 && "${2:-}" == route && "${3:-}" == get ]]; then
+        printf '1.1.1.1 via 217.19.122.1 dev ens3 src 217.19.122.109\n'
+        return 0
+    fi
+    if [[ "${1:-}" == -4 && "${2:-}" == -o && "${3:-}" == address ]]; then
+        printf '2: ens3    inet 217.19.122.109/24 brd 217.19.122.255 scope global ens3\n'
+        return 0
+    fi
+    return 1
+}
+write_root_file_mode() {
+    local mode="$1" path="$2"
+    cat > "$path"
+    chmod "$mode" "$path"
+}
+ensure_haproxy_bandwidth_manager() { :; }
+REAPPLY_FAIL=0
+reapply_haproxy_bandwidth_limits() { (( REAPPLY_FAIL == 0 )); }
+
+set_haproxy_input_bandwidth_limit 217.19.122.109 2000
+grep -qx $'217.19.122.109\t2000' "$HAPROXY_BANDWIDTH_CONFIG"
+
+REAPPLY_FAIL=1
+! set_haproxy_input_bandwidth_limit 217.19.122.109 3000
+grep -qx $'217.19.122.109\t2000' "$HAPROXY_BANDWIDTH_CONFIG"
+! grep -q $'\t3000$' "$HAPROXY_BANDWIDTH_CONFIG"
+
+REAPPLY_FAIL=0
+remove_haproxy_input_bandwidth_limit 217.19.122.109
+[[ ! -s "$HAPROXY_BANDWIDTH_CONFIG" ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_reality_profiles_expose_haproxy_bridge_on_8443(self):
         supported = function_body(KTO, "haproxy_mode_supported")

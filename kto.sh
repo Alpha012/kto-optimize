@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v266"
+SCRIPT_BUILD="v267"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -47,6 +47,11 @@ KTO_LIMITS_CONF="/etc/security/limits.d/99-kto-limits.conf"
 KTO_SYSTEMD_LIMITS_CONF="/etc/systemd/system.conf.d/99-kto-limits.conf"
 KTO_USER_LIMITS_CONF="/etc/systemd/user.conf.d/99-kto-limits.conf"
 HAPROXY_RESERVED_PORTS_SYSCTL_CONF="/etc/sysctl.d/99-z-kto-haproxy-ports.conf"
+HAPROXY_CONFIG_FILE="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
+HAPROXY_BANDWIDTH_MANAGER="${KTO_HAPROXY_BANDWIDTH_MANAGER:-/usr/local/sbin/kto-haproxy-bandwidth}"
+HAPROXY_BANDWIDTH_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
+HAPROXY_BANDWIDTH_UNIT="${KTO_HAPROXY_BANDWIDTH_UNIT:-/etc/systemd/system/kto-haproxy-bandwidth.service}"
+HAPROXY_BANDWIDTH_SERVICE="${KTO_HAPROXY_BANDWIDTH_SERVICE:-kto-haproxy-bandwidth.service}"
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
 DNS_GUARD_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-kto-dns.conf"
@@ -5397,6 +5402,11 @@ EOF
     route_count="$(haproxy_route_count "$routes_file")"
     ok "HAProxy маршрутов: ${route_count}"
     ok "HAProxy capacity: maxconn=${haproxy_maxconn}, nofile=${haproxy_nofile}, threads=${haproxy_threads}"
+    if "${SUDO[@]}" test -s "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null; then
+        if ! reapply_haproxy_bandwidth_limits; then
+            warn "HAProxy работает, но лимиты входных IP не переприменились. Запусти haproxy-limit-status."
+        fi
+    fi
 }
 
 apply_haproxy_config() {
@@ -5419,6 +5429,407 @@ ensure_haproxy_package() {
     stage "Устанавливаю HAProxy"
     must "apt update" apt_update_quiet
     must "Установка HAProxy" apt_install_quiet haproxy socat iproute2
+}
+
+validate_haproxy_bandwidth_rate() {
+    local rate="${1:-}"
+    [[ "$rate" =~ ^[0-9]+$ ]] || return 1
+    (( ${#rate} <= 6 )) || return 1
+    rate=$((10#$rate))
+    (( rate >= 1 && rate <= 100000 ))
+}
+
+install_haproxy_bandwidth_manager() {
+    install_asset_file scripts/kto-haproxy-bandwidth.sh "$HAPROXY_BANDWIDTH_MANAGER" 0755 || return 1
+    write_root_file "$HAPROXY_BANDWIDTH_UNIT" <<EOF
+[Unit]
+Description=KTO per-input-IP HAProxy bandwidth limits
+Wants=network-online.target
+After=network-online.target haproxy.service kto-additional-ip-routes.service
+
+[Service]
+Type=oneshot
+ExecStart=${HAPROXY_BANDWIDTH_MANAGER} apply
+ExecReload=${HAPROXY_BANDWIDTH_MANAGER} apply
+ExecStop=${HAPROXY_BANDWIDTH_MANAGER} clear
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if ! run_systemctl_bounded 20 daemon-reload >> "$LOG_FILE" 2>&1; then
+        fail "Не удалось обновить systemd для лимитов HAProxy"
+        return 1
+    fi
+    if ! run_systemctl_bounded 20 enable "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1; then
+        fail "Не удалось включить автозапуск лимитов HAProxy"
+        return 1
+    fi
+}
+
+ensure_haproxy_bandwidth_manager() {
+    must "Установка зависимостей лимита HAProxy" apt_install_with_update_if_missing iproute2 util-linux || return 1
+    if "${SUDO[@]}" test -x "$HAPROXY_BANDWIDTH_MANAGER" 2>/dev/null &&
+        "${SUDO[@]}" grep -Fqx "HAPROXY_BANDWIDTH_BUILD=\"${SCRIPT_BUILD}\"" "$HAPROXY_BANDWIDTH_MANAGER" 2>/dev/null &&
+        "${SUDO[@]}" test -s "$HAPROXY_BANDWIDTH_UNIT" 2>/dev/null &&
+        "${SUDO[@]}" grep -Fqx "ExecStart=${HAPROXY_BANDWIDTH_MANAGER} apply" "$HAPROXY_BANDWIDTH_UNIT" 2>/dev/null; then
+        if ! run_systemctl_bounded 5 is-enabled --quiet "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1; then
+            run_systemctl_bounded 20 enable "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1 || {
+                fail "Не удалось включить автозапуск лимитов HAProxy"
+                return 1
+            }
+        fi
+        return 0
+    fi
+    install_haproxy_bandwidth_manager
+}
+
+load_haproxy_bandwidth_config() {
+    local output_file="$1" raw_file line_number=0 ip rate extra numeric_rate
+    local -A seen=()
+
+    : > "$output_file"
+    if ! "${SUDO[@]}" test -e "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null; then
+        return 0
+    fi
+    raw_file="$(mktemp)"
+    if ! "${SUDO[@]}" cat "$HAPROXY_BANDWIDTH_CONFIG" > "$raw_file"; then
+        rm -f "$raw_file"
+        fail "Не удалось прочитать ${HAPROXY_BANDWIDTH_CONFIG}"
+        return 1
+    fi
+    while IFS=$'\t' read -r ip rate extra; do
+        line_number=$(( line_number + 1 ))
+        ip="${ip//$'\r'/}"
+        rate="${rate//$'\r'/}"
+        [[ -n "$ip" && "${ip:0:1}" != "#" ]] || continue
+        if [[ -n "${extra:-}" ]] || ! validate_ipv4 "$ip" || ! validate_haproxy_bandwidth_rate "$rate"; then
+            rm -f "$raw_file"
+            fail "Некорректная строка ${line_number} в ${HAPROXY_BANDWIDTH_CONFIG}"
+            return 1
+        fi
+        numeric_rate=$((10#$rate))
+        if [[ -n "${seen[$ip]+x}" && "${seen[$ip]}" != "$numeric_rate" ]]; then
+            rm -f "$raw_file"
+            fail "Для ${ip} указано несколько разных лимитов"
+            return 1
+        fi
+        seen[$ip]="$numeric_rate"
+    done < "$raw_file"
+    rm -f "$raw_file"
+
+    for ip in "${!seen[@]}"; do
+        printf '%s\t%s\n' "$ip" "${seen[$ip]}"
+    done | sort -t $'\t' -k1,1V > "$output_file"
+}
+
+list_haproxy_input_ips() {
+    local default_ip
+    default_ip="$(haproxy_default_source_ip)"
+    ip -4 -o address show scope global 2>/dev/null | awk -v default_ip="$default_ip" '
+        {
+            interface = $2
+            sub(/@.*/, "", interface)
+            split($4, cidr, "/")
+            if (cidr[1] != "") {
+                priority = (cidr[1] == default_ip ? 0 : 1)
+                print priority "\t" cidr[1] "\t" interface
+            }
+        }
+    ' | sort -t $'\t' -k1,1n -k3,3V -k2,2V | awk -F '\t' '!seen[$2]++ { print $2 "\t" $3 }'
+}
+
+haproxy_input_ip_available() {
+    local wanted="$1"
+    list_haproxy_input_ips |
+        awk -F '\t' -v wanted="$wanted" '$1 == wanted { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+haproxy_bandwidth_current_rate() {
+    local wanted="$1"
+    "${SUDO[@]}" awk -F '\t' -v wanted="$wanted" '$1 == wanted { print $2; exit }' \
+        "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null || true
+}
+
+print_haproxy_bandwidth_limits() {
+    local limits_file ip rate
+    limits_file="$(mktemp)"
+    if ! load_haproxy_bandwidth_config "$limits_file"; then
+        rm -f "$limits_file"
+        return 1
+    fi
+    echo -e "${BOLD}${PURPLE}[ ЛИМИТ СКОРОСТИ ПО ВХОДНОМУ IP ]${NC}"
+    if [[ ! -s "$limits_file" ]]; then
+        echo "Не настроен. Все входные IP без ограничения скорости."
+    else
+        while IFS=$'\t' read -r ip rate; do
+            printf '%-15s %s Mbit/s\n' "$ip" "$rate"
+        done < "$limits_file"
+    fi
+    echo "Лимит затрагивает только TCP-трафик listener-портов HAProxy на выбранном IP."
+    rm -f "$limits_file"
+}
+
+select_haproxy_input_ip() {
+    local choice ip interface rate index
+    local -a entries=()
+    mapfile -t entries < <(list_haproxy_input_ips)
+    if (( ${#entries[@]} == 0 )); then
+        fail "На машине не найдено локальных IPv4"
+        return 1
+    fi
+    if (( ${#entries[@]} == 1 )); then
+        IFS=$'\t' read -r ip interface <<< "${entries[0]}"
+        printf 'Доступен один входной IP: %s (%s)\n' "$ip" "$interface" >&2
+        printf '%s\n' "$ip"
+        return 0
+    fi
+
+    printf 'Выберите входной IP HAProxy:\n' >&2
+    for index in "${!entries[@]}"; do
+        IFS=$'\t' read -r ip interface <<< "${entries[$index]}"
+        rate="$(haproxy_bandwidth_current_rate "$ip")"
+        printf ' %d) %s (%s)%s\n' "$(( index + 1 ))" "$ip" "$interface" "${rate:+ — сейчас ${rate} Mbit/s}" >&2
+    done
+    printf ' 0) Назад\n' >&2
+    while true; do
+        printf '> ' >&2
+        read -r choice
+        [[ "$choice" == "0" ]] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            choice=$((10#$choice))
+            if (( choice >= 1 && choice <= ${#entries[@]} )); then
+                IFS=$'\t' read -r ip interface <<< "${entries[$(( choice - 1 ))]}"
+                printf '%s\n' "$ip"
+                return 0
+            fi
+        fi
+        fail "Неверный выбор"
+    done
+}
+
+select_configured_haproxy_bandwidth_ip() {
+    local limits_file choice ip rate index
+    local -a entries=()
+    limits_file="$(mktemp)"
+    if ! load_haproxy_bandwidth_config "$limits_file"; then
+        rm -f "$limits_file"
+        return 1
+    fi
+    mapfile -t entries < "$limits_file"
+    rm -f "$limits_file"
+    if (( ${#entries[@]} == 0 )); then
+        warn "Ограниченных входных IP нет"
+        return 1
+    fi
+    printf 'Выберите лимит для удаления:\n' >&2
+    for index in "${!entries[@]}"; do
+        IFS=$'\t' read -r ip rate <<< "${entries[$index]}"
+        printf ' %d) %s — %s Mbit/s\n' "$(( index + 1 ))" "$ip" "$rate" >&2
+    done
+    printf ' 0) Назад\n' >&2
+    while true; do
+        printf '> ' >&2
+        read -r choice
+        [[ "$choice" == "0" ]] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            choice=$((10#$choice))
+            if (( choice >= 1 && choice <= ${#entries[@]} )); then
+                IFS=$'\t' read -r ip rate <<< "${entries[$(( choice - 1 ))]}"
+                printf '%s\n' "$ip"
+                return 0
+            fi
+        fi
+        fail "Неверный выбор"
+    done
+}
+
+reapply_haproxy_bandwidth_limits() {
+    ensure_haproxy_bandwidth_manager || return 1
+    stage "Применяю лимиты выбранных входных IP HAProxy"
+    if ! "${SUDO[@]}" "$HAPROXY_BANDWIDTH_MANAGER" apply; then
+        fail "Не удалось применить лимиты входных IP HAProxy"
+        return 1
+    fi
+    run_systemctl_bounded 5 reset-failed "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1 || true
+}
+
+commit_haproxy_bandwidth_config() {
+    local previous_file="$1" next_file="$2" had_config="$3" restored=1
+    if ! write_root_file_mode 0600 "$HAPROXY_BANDWIDTH_CONFIG" < "$next_file"; then
+        fail "Не удалось сохранить ${HAPROXY_BANDWIDTH_CONFIG}"
+        return 1
+    fi
+    if reapply_haproxy_bandwidth_limits; then
+        return 0
+    fi
+
+    warn "Возвращаю предыдущие лимиты."
+    if (( had_config == 1 )); then
+        write_root_file_mode 0600 "$HAPROXY_BANDWIDTH_CONFIG" < "$previous_file" || restored=0
+    else
+        "${SUDO[@]}" rm -f "$HAPROXY_BANDWIDTH_CONFIG" >> "$LOG_FILE" 2>&1 || restored=0
+    fi
+    if (( restored == 0 )); then
+        "${SUDO[@]}" "$HAPROXY_BANDWIDTH_MANAGER" clear || true
+        run_systemctl_bounded 20 disable "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1 || true
+        fail "Не удалось вернуть файл лимитов. Kernel-лимиты очищены, автозапуск отключён."
+        return 1
+    fi
+    if ! "${SUDO[@]}" "$HAPROXY_BANDWIDTH_MANAGER" apply; then
+        warn "Предыдущие kernel-фильтры тоже не восстановились; трафик оставлен без лимита."
+    else
+        ok "Предыдущие лимиты восстановлены"
+    fi
+    return 1
+}
+
+set_haproxy_input_bandwidth_limit() {
+    local input_ip="$1" rate="$2" previous_file next_file had_config=0
+    if ! validate_ipv4 "$input_ip" || ! haproxy_input_ip_available "$input_ip"; then
+        fail "Входной IP ${input_ip:-пусто} не найден на локальных интерфейсах"
+        return 1
+    fi
+    if ! validate_haproxy_bandwidth_rate "$rate"; then
+        fail "Некорректный лимит. Допустимо: 1-100000 Mbit/s"
+        return 1
+    fi
+    rate=$((10#$rate))
+    if ! "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null; then
+        fail "HAProxy ещё не настроен"
+        return 1
+    fi
+    ensure_haproxy_bandwidth_manager || return 1
+
+    previous_file="$(mktemp)"
+    next_file="$(mktemp)"
+    "${SUDO[@]}" test -e "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null && had_config=1
+    if ! load_haproxy_bandwidth_config "$previous_file"; then
+        rm -f "$previous_file" "$next_file"
+        return 1
+    fi
+    awk -F '\t' -v wanted="$input_ip" '$1 != wanted { print }' "$previous_file" > "$next_file"
+    printf '%s\t%s\n' "$input_ip" "$rate" >> "$next_file"
+    sort -t $'\t' -k1,1V -o "$next_file" "$next_file"
+
+    if commit_haproxy_bandwidth_config "$previous_file" "$next_file" "$had_config"; then
+        rm -f "$previous_file" "$next_file"
+        ok "${input_ip}: HAProxy ограничен до ${rate} Mbit/s"
+        ok "Другие IP и не-HAProxy трафик не ограничены"
+        return 0
+    fi
+    rm -f "$previous_file" "$next_file"
+    return 1
+}
+
+remove_haproxy_input_bandwidth_limit() {
+    local input_ip="$1" previous_file next_file had_config=0
+    validate_ipv4 "$input_ip" || {
+        fail "Некорректный IPv4: ${input_ip:-пусто}"
+        return 1
+    }
+    ensure_haproxy_bandwidth_manager || return 1
+    previous_file="$(mktemp)"
+    next_file="$(mktemp)"
+    "${SUDO[@]}" test -e "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null && had_config=1
+    if ! load_haproxy_bandwidth_config "$previous_file"; then
+        rm -f "$previous_file" "$next_file"
+        return 1
+    fi
+    if ! awk -F '\t' -v wanted="$input_ip" '$1 == wanted { found = 1 } END { exit found ? 0 : 1 }' "$previous_file"; then
+        rm -f "$previous_file" "$next_file"
+        warn "Для ${input_ip} лимит уже отсутствует"
+        return 0
+    fi
+    awk -F '\t' -v wanted="$input_ip" '$1 != wanted { print }' "$previous_file" > "$next_file"
+    if commit_haproxy_bandwidth_config "$previous_file" "$next_file" "$had_config"; then
+        rm -f "$previous_file" "$next_file"
+        ok "${input_ip}: лимит HAProxy удалён"
+        return 0
+    fi
+    rm -f "$previous_file" "$next_file"
+    return 1
+}
+
+set_haproxy_input_bandwidth_limit_interactive() {
+    local input_ip current_rate rate
+    input_ip="$(select_haproxy_input_ip)" || return 1
+    current_rate="$(haproxy_bandwidth_current_rate "$input_ip")"
+    rate="$(ask_int "Лимит для ${input_ip}, Mbit/s" "${current_rate:-2000}" 1 100000)"
+    set_haproxy_input_bandwidth_limit "$input_ip" "$rate"
+}
+
+remove_haproxy_input_bandwidth_limit_interactive() {
+    local input_ip
+    input_ip="$(select_configured_haproxy_bandwidth_ip)" || return 1
+    remove_haproxy_input_bandwidth_limit "$input_ip"
+}
+
+show_haproxy_bandwidth_status() {
+    ensure_haproxy_bandwidth_manager || return 1
+    "${SUDO[@]}" "$HAPROXY_BANDWIDTH_MANAGER" status
+    if run_systemctl_bounded 5 is-enabled --quiet "$HAPROXY_BANDWIDTH_SERVICE" >/dev/null 2>&1; then
+        printf 'Автозапуск: enabled\n'
+    else
+        printf 'Автозапуск: disabled\n'
+    fi
+}
+
+haproxy_bandwidth_menu() {
+    local choice
+    while true; do
+        header
+        print_haproxy_bandwidth_limits || return 1
+        echo
+        echo "1) Добавить или изменить лимит"
+        echo "2) Убрать лимит с IP"
+        echo "3) Переприменить лимиты"
+        echo "4) Подробный статус и счётчики"
+        echo "0) Назад"
+        echo -e "${PURPLE}==========================================${NC}"
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+        read -r choice
+        case "$choice" in
+            1) set_haproxy_input_bandwidth_limit_interactive || true ;;
+            2) remove_haproxy_input_bandwidth_limit_interactive || true ;;
+            3) reapply_haproxy_bandwidth_limits || true ;;
+            4) show_haproxy_bandwidth_status || true ;;
+            0) return 0 ;;
+            *) fail "Неверный выбор" ;;
+        esac
+        echo
+        echo -ne "${PURPLE}>${NC} Нажмите Enter, чтобы продолжить..."
+        read -r _
+    done
+}
+
+set_haproxy_input_bandwidth_limit_cli() {
+    header
+    require_haproxy_mode
+    need_root
+    if (( $# != 2 )); then
+        fail "Использование: haproxy-limit INPUT_IP MBIT"
+        return 1
+    fi
+    set_haproxy_input_bandwidth_limit "$1" "$2"
+}
+
+remove_haproxy_input_bandwidth_limit_cli() {
+    header
+    require_haproxy_mode
+    need_root
+    if (( $# != 1 )); then
+        fail "Использование: haproxy-limit-off INPUT_IP"
+        return 1
+    fi
+    remove_haproxy_input_bandwidth_limit "$1"
+}
+
+show_haproxy_bandwidth_status_cli() {
+    header
+    require_haproxy_mode
+    need_root
+    show_haproxy_bandwidth_status
 }
 
 sync_haproxy_firewall() {
@@ -6090,6 +6501,7 @@ haproxy_menu() {
         echo -e "6) Обновить HAProxy, сохранив маршруты"
         echo -e "7) Добавить или заменить backend-пул"
         echo -e "8) Массово добавить backend по следующим портам"
+        echo -e "9) Ограничить скорость по входному IP"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -6108,6 +6520,7 @@ haproxy_menu() {
                 ;;
             7) add_haproxy_pool_route "$routes_file" || true ;;
             8) add_haproxy_sequential_routes "$routes_file" || true ;;
+            9) haproxy_bandwidth_menu || true ;;
             0)
                 rm -f "$routes_file"
                 return 0
@@ -7738,6 +8151,9 @@ main() {
         haproxy-pool-set|haproxy-set-pool) shift; set_haproxy_pool_route_cli "$@" ;;
         haproxy-pool-collapse|haproxy-collapse-pool) shift; collapse_haproxy_pool_cli "$@" ;;
         haproxy-routes-set|haproxy-set-routes) shift; set_haproxy_sequential_routes_cli "$@" ;;
+        haproxy-limit|haproxy-bandwidth-limit) shift; set_haproxy_input_bandwidth_limit_cli "$@" ;;
+        haproxy-limit-off|haproxy-bandwidth-off) shift; remove_haproxy_input_bandwidth_limit_cli "$@" ;;
+        haproxy-limit-status|haproxy-bandwidth-status) show_haproxy_bandwidth_status_cli ;;
         mobile443-lte|lte-only) mobile443_lte_menu ;;
         mobile443-lte-enable|lte-only-enable) enable_mobile443_lte ;;
         mobile443-lte-disable|lte-only-disable) disable_mobile443_lte ;;
