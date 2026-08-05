@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v264"', KTO)
-        self.assertIn('PUSH_BUILD="v264"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v264"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v264"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v264"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v264"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v265"', KTO)
+        self.assertIn('PUSH_BUILD="v265"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v265"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v265"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v265"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v265"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -1236,6 +1236,41 @@ grep -qx $'8470\t117.55.203.106:7443\tdev-yandex.sbs\t217.19.122.109\t10000' "$r
 cp "$routes" "$snapshot"
 set_haproxy_sequential_routes "$routes" 8450 217.19.122.109 dev-yandex.sbs 10000 "$pool"
 cmp -s "$routes" "$snapshot"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_port_range_collapses_to_one_balanced_pool(self):
+        main = function_body(KTO, "main")
+        self.assertIn('haproxy-pool-collapse|haproxy-collapse-pool', main)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+trap 'rm -f "$routes"' EXIT
+printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n8450\t31.59.140.66:7443\told.example.com\t217.19.122.109\t10000\n8451\t31.77.154.79:7443\told.example.com\t217.19.122.109\t10000\n8452\t31.76.113.188:7443\told.example.com\t217.19.122.109\t10000\n9000\t5.34.179.144:443\tkeep.example.com\tdefault\n' > "$routes"
+haproxy_additional_source_ip_available() { [[ "$1" == '217.19.122.109' ]]; }
+apply_haproxy_routes_config() { return 0; }
+sync_haproxy_firewall() { SYNC_CALLS=$((SYNC_CALLS + 1)); }
+haproxy_source_label() { printf '%s\n' "$1"; }
+SYNC_CALLS=0
+pool='31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443'
+collapse_haproxy_routes_to_pool "$routes" 8450 8470 217.19.122.109 'dev-yandex.sbs *.dev-yandex.sbs' 10000 "$pool"
+grep -Fqx $'8450\t31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443\tdev-yandex.sbs *.dev-yandex.sbs\t217.19.122.109\t10000' "$routes"
+! awk -F '\t' '$1 >= 8451 && $1 <= 8470 { found = 1 } END { exit found ? 0 : 1 }' "$routes"
+grep -q $'^9000\t' "$routes"
+[[ "$SYNC_CALLS" == 2 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

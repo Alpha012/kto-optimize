@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v264"
+SCRIPT_BUILD="v265"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5732,6 +5732,77 @@ set_haproxy_pool_route_cli() {
     return 1
 }
 
+collapse_haproxy_routes_to_pool() {
+    local routes_file="$1" start_port="$2" end_port="$3" source_ip="$4" allowed_sni="$5"
+    local server_maxconn="$6" target_pool="$7" filtered_file removed_count
+
+    [[ "$start_port" =~ ^[0-9]+$ && "$end_port" =~ ^[0-9]+$ ]] || {
+        fail "Некорректный диапазон HAProxy-портов"
+        return 1
+    }
+    start_port=$((10#$start_port))
+    end_port=$((10#$end_port))
+    (( start_port >= 1 && end_port >= start_port && end_port <= 65535 )) || {
+        fail "Некорректный диапазон HAProxy-портов: ${start_port}-${end_port}"
+        return 1
+    }
+
+    removed_count="$(awk -F '\t' -v start="$start_port" -v end="$end_port" '
+        $1 > start && $1 <= end { count++ }
+        END { print count + 0 }
+    ' "$routes_file")"
+    filtered_file="$(mktemp)"
+    awk -F '\t' -v start="$start_port" -v end="$end_port" '
+        !($1 > start && $1 <= end) { print }
+    ' "$routes_file" > "$filtered_file"
+
+    if set_haproxy_pool_route "$filtered_file" "$start_port" "$source_ip" "$allowed_sni" "$server_maxconn" "$target_pool"; then
+        sync_haproxy_firewall "$filtered_file" "$routes_file"
+        mv "$filtered_file" "$routes_file"
+        ok "Порты ${start_port}-${end_port} собраны в один пул на ${start_port}/tcp"
+        ok "Удалено лишних listener-портов: ${removed_count}"
+        return 0
+    fi
+    rm -f "$filtered_file"
+    return 1
+}
+
+collapse_haproxy_pool_cli() {
+    header
+    require_haproxy_mode
+    need_root
+    local start_port="${1:-}" end_port="${2:-}" source_ip="${3:-}" allowed_sni="${4:-}" server_maxconn="${5:-}"
+    local routes_file target target_pool=""
+    shift $(( $# >= 5 ? 5 : $# ))
+
+    if [[ -z "$start_port" || -z "$end_port" || -z "$source_ip" || -z "$allowed_sni" || -z "$server_maxconn" || $# -lt 2 ]]; then
+        fail "Использование: haproxy-pool-collapse START_PORT END_PORT SOURCE_IP SNI MAXCONN BACKEND1 BACKEND2 [...]"
+        return 1
+    fi
+    for target in "$@"; do
+        target_pool+="${target_pool:+,}${target}"
+    done
+    if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
+        fail "HAProxy ещё не настроен. Сначала запусти пункт HAProxy в меню."
+        return 1
+    fi
+
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+    if [[ ! -s "$routes_file" ]]; then
+        rm -f "$routes_file"
+        fail "Текущий HAProxy config не распознан. Конфиг не изменён."
+        return 1
+    fi
+    if collapse_haproxy_routes_to_pool "$routes_file" "$start_port" "$end_port" "$source_ip" \
+        "$allowed_sni" "$server_maxconn" "$target_pool"; then
+        rm -f "$routes_file"
+        return 0
+    fi
+    rm -f "$routes_file"
+    return 1
+}
+
 set_haproxy_sequential_routes() {
     local routes_file="$1" start_port="$2" source_ip="$3" allowed_sni="$4" server_maxconn="$5" target_pool="$6"
     local normalized_source_ip normalized_sni normalized_maxconn normalized_pool route_count end_port
@@ -7643,6 +7714,7 @@ main() {
         haproxy|install-haproxy) install_haproxy ;;
         haproxy-update|update-haproxy|haproxy-refresh) update_haproxy_existing_config ;;
         haproxy-pool-set|haproxy-set-pool) shift; set_haproxy_pool_route_cli "$@" ;;
+        haproxy-pool-collapse|haproxy-collapse-pool) shift; collapse_haproxy_pool_cli "$@" ;;
         haproxy-routes-set|haproxy-set-routes) shift; set_haproxy_sequential_routes_cli "$@" ;;
         mobile443-lte|lte-only) mobile443_lte_menu ;;
         mobile443-lte-enable|lte-only-enable) enable_mobile443_lte ;;
