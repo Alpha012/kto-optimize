@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-HAPROXY_BANDWIDTH_BUILD="v267"
+HAPROXY_BANDWIDTH_BUILD="v268"
 LIMITS_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
 HAPROXY_CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 STATE_FILE="${KTO_HAPROXY_BANDWIDTH_STATE:-/run/kto-haproxy-bandwidth.state}"
@@ -15,7 +15,10 @@ ACTION_BASE="${KTO_HAPROXY_BANDWIDTH_ACTION_BASE:-3900000}"
 PREF_BASE="${KTO_HAPROXY_BANDWIDTH_PREF_BASE:-42000}"
 
 ok() { printf '[OK] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
 fail() { printf '[ОШИБКА] %s\n' "$*" >&2; }
+
+TC_LAST_ERROR=""
 
 init_log() {
     mkdir -p "$(dirname "$LOG_FILE")"
@@ -153,6 +156,86 @@ ensure_clsact() {
     tc qdisc add dev "$interface" clsact >> "$LOG_FILE" 2>&1
 }
 
+tc_logged() {
+    local output rc=0 argument
+    output="$(tc "$@" 2>&1)" || rc=$?
+    {
+        printf '$ tc'
+        for argument in "$@"; do
+            printf ' %q' "$argument"
+        done
+        printf '\n'
+        [[ -z "$output" ]] || printf '%s\n' "$output"
+    } >> "$LOG_FILE"
+    TC_LAST_ERROR="$output"
+    return "$rc"
+}
+
+tc_error_summary() {
+    local summary="${TC_LAST_ERROR//$'\n'/; }"
+    [[ -n "$summary" ]] || summary="tc завершился с ошибкой без пояснения"
+    printf '%.500s\n' "$summary"
+}
+
+delete_filter_quiet() {
+    local interface="$1" direction="$2" pref="$3"
+    tc filter delete dev "$interface" "$direction" protocol ip pref "$pref" \
+        >> "$LOG_FILE" 2>&1 || true
+}
+
+delete_police_action_quiet() {
+    local action_index="$1"
+    tc actions delete action police index "$action_index" >> "$LOG_FILE" 2>&1 || true
+}
+
+add_police_filter() {
+    local interface="$1" direction="$2" pref="$3" ip="$4" port="$5"
+    local action_index="$6" rate="$7" burst="$8" define_action="$9"
+    local flower_error u32_error
+    local -a flower_match=() u32_match=() action_args=()
+
+    if [[ "$direction" == "ingress" ]]; then
+        flower_match=(dst_ip "$ip" dst_port "$port")
+        u32_match=(match ip dst "${ip}/32" match ip dport "$port" 0xffff)
+    else
+        flower_match=(src_ip "$ip" src_port "$port")
+        u32_match=(match ip src "${ip}/32" match ip sport "$port" 0xffff)
+    fi
+    if (( define_action == 1 )); then
+        action_args=(
+            action police rate "${rate}mbit" burst "$burst" mtu 64kb
+            conform-exceed drop/ok index "$action_index"
+        )
+    else
+        action_args=(action police index "$action_index")
+    fi
+
+    if tc_logged filter add dev "$interface" "$direction" protocol ip pref "$pref" \
+        flower skip_hw ip_proto tcp "${flower_match[@]}" "${action_args[@]}"; then
+        return 0
+    fi
+    flower_error="$(tc_error_summary)"
+    delete_filter_quiet "$interface" "$direction" "$pref"
+    if (( define_action == 1 )); then
+        delete_police_action_quiet "$action_index"
+    fi
+
+    # cls_flower is optional on some minimal Ubuntu kernels. u32 provides the
+    # same exact IPv4/TCP match without requiring that module.
+    if tc_logged filter add dev "$interface" "$direction" protocol ip pref "$pref" \
+        u32 match ip protocol 6 0xff "${u32_match[@]}" "${action_args[@]}"; then
+        TC_FILTER_FALLBACK_USED=1
+        return 0
+    fi
+    u32_error="$(tc_error_summary)"
+    delete_filter_quiet "$interface" "$direction" "$pref"
+    if (( define_action == 1 )); then
+        delete_police_action_quiet "$action_index"
+    fi
+    TC_LAST_ERROR="flower: ${flower_error}; u32: ${u32_error}"
+    return 1
+}
+
 cleanup_state_file() {
     local state_file="$1" kind interface direction pref action_index
     [[ -s "$state_file" ]] || return 0
@@ -176,9 +259,11 @@ clear_limits() {
 }
 
 apply_limits() {
+    (
     local limits_file ports_file next_state
     local ip rate interface port action_index burst pref filter_count=0 limit_count=0
-    local committed=0
+    local committed=0 action_bound=0
+    local TC_FILTER_FALLBACK_USED=0
     local -a interfaces=()
     local -A seen_interfaces=()
 
@@ -189,7 +274,7 @@ apply_limits() {
     rm -f "$next_state"
     : > "$next_state"
     chmod 0600 "$next_state" 2>/dev/null || true
-    trap 'if (( committed == 0 )); then cleanup_state_file "$next_state"; fi; rm -f "$limits_file" "$ports_file" "$next_state"' RETURN
+    trap 'rc=$?; trap - EXIT; if (( committed == 0 )); then cleanup_state_file "$next_state"; fi; rm -f "$limits_file" "$ports_file" "$next_state"; exit "$rc"' EXIT
 
     load_limits > "$limits_file" || return 1
     if [[ ! -s "$limits_file" ]]; then
@@ -225,13 +310,7 @@ apply_limits() {
         interface="$(interface_for_ipv4 "$ip")"
         action_index=$(( action_index + 1 ))
         burst="$(burst_bytes_for_rate "$rate")"
-        if ! tc actions add action police rate "${rate}mbit" burst "$burst" \
-            mtu 64kb conform-exceed drop/ok index "$action_index" >> "$LOG_FILE" 2>&1; then
-            fail "Не удалось создать общий limiter для ${ip}"
-            cleanup_state_file "$next_state"
-            return 1
-        fi
-        printf 'A\t%s\n' "$action_index" >> "$next_state"
+        action_bound=0
 
         # A shared indexed action makes every HAProxy port and both directions
         # consume one aggregate bucket for this exact local address.
@@ -243,20 +322,22 @@ apply_limits() {
                 cleanup_state_file "$next_state"
                 return 1
             fi
-            if ! tc filter add dev "$interface" ingress protocol ip pref "$pref" \
-                flower skip_hw ip_proto tcp dst_ip "$ip" dst_port "$port" \
-                action police index "$action_index" >> "$LOG_FILE" 2>&1; then
-                fail "Не удалось ограничить вход ${ip}:${port}"
+            if ! add_police_filter "$interface" ingress "$pref" "$ip" "$port" \
+                "$action_index" "$rate" "$burst" "$(( action_bound == 0 ? 1 : 0 ))"; then
+                fail "Не удалось ограничить вход ${ip}:${port}: $(tc_error_summary)"
                 cleanup_state_file "$next_state"
                 return 1
+            fi
+            if (( action_bound == 0 )); then
+                printf 'A\t%s\n' "$action_index" >> "$next_state"
+                action_bound=1
             fi
             printf 'F\t%s\tingress\t%s\t%s\n' "$interface" "$pref" "$action_index" >> "$next_state"
 
             pref=$(( pref + 1 ))
-            if ! tc filter add dev "$interface" egress protocol ip pref "$pref" \
-                flower skip_hw ip_proto tcp src_ip "$ip" src_port "$port" \
-                action police index "$action_index" >> "$LOG_FILE" 2>&1; then
-                fail "Не удалось ограничить выход ${ip}:${port}"
+            if ! add_police_filter "$interface" egress "$pref" "$ip" "$port" \
+                "$action_index" "$rate" "$burst" 0; then
+                fail "Не удалось ограничить выход ${ip}:${port}: $(tc_error_summary)"
                 cleanup_state_file "$next_state"
                 return 1
             fi
@@ -270,6 +351,10 @@ apply_limits() {
     ok "Лимитов входных IP: ${limit_count}"
     ok "HAProxy tc-фильтров: ${filter_count}"
     ok "Общий bucket учитывает все HAProxy-порты и оба направления"
+    if (( TC_FILTER_FALLBACK_USED == 1 )); then
+        warn "На этой системе применён совместимый classifier u32 вместо flower"
+    fi
+    )
 }
 
 active_filter_count() {

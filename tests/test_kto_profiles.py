@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v267"', KTO)
-        self.assertIn('PUSH_BUILD="v267"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v267"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v267"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v267"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v267"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v267"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v268"', KTO)
+        self.assertIn('PUSH_BUILD="v268"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v268"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v268"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v268"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v268"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v268"', HAPROXY_BANDWIDTH)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -676,6 +676,7 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
 
     def test_haproxy_bandwidth_limit_is_scoped_to_selected_input_ip(self):
         apply_limits = function_body(HAPROXY_BANDWIDTH, "apply_limits")
+        add_filter = function_body(HAPROXY_BANDWIDTH, "add_police_filter")
         ensure_clsact = function_body(HAPROXY_BANDWIDTH, "ensure_clsact")
         active_filters = function_body(HAPROXY_BANDWIDTH, "active_filter_count")
         set_limit = function_body(KTO, "set_haproxy_input_bandwidth_limit")
@@ -684,9 +685,14 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
 
         self.assertIn('tc qdisc add dev "$interface" clsact', ensure_clsact)
         self.assertNotIn(' root ', ensure_clsact)
-        self.assertIn('dst_ip "$ip" dst_port "$port"', apply_limits)
-        self.assertIn('src_ip "$ip" src_port "$port"', apply_limits)
-        self.assertIn('action police index "$action_index"', apply_limits)
+        self.assertIn('flower_match=(dst_ip "$ip" dst_port "$port")', add_filter)
+        self.assertIn('flower_match=(src_ip "$ip" src_port "$port")', add_filter)
+        self.assertIn('u32_match=(match ip dst "${ip}/32"', add_filter)
+        self.assertIn('u32_match=(match ip src "${ip}/32"', add_filter)
+        self.assertIn('action police rate "${rate}mbit"', add_filter)
+        self.assertIn('action_args=(action police index "$action_index")', add_filter)
+        self.assertIn("trap 'rc=$?; trap - EXIT;", apply_limits)
+        self.assertNotIn("RETURN", apply_limits)
         self.assertIn('tc filter show dev "$interface" "$direction" protocol ip pref "$pref"', active_filters)
         self.assertIn('haproxy_input_ip_available "$input_ip"', set_limit)
         self.assertIn('Возвращаю предыдущие лимиты', commit)
@@ -745,14 +751,92 @@ install() {
     cp "$3" "$4"
     chmod "$2" "$4"
 }
-apply_limits
-[[ "$(grep -c '^actions add action police ' "$work/events")" == 1 ]]
+run_apply() { apply_limits; }
+run_apply
+[[ -z "$(trap -p RETURN)" ]]
+[[ "$(grep -c '^actions add action police ' "$work/events" || true)" == 0 ]]
+[[ "$(grep -c 'action police rate 2000mbit ' "$work/events")" == 1 ]]
 [[ "$(grep -c '^filter add dev ens3 ' "$work/events")" == 4 ]]
-grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8443 action police index 3900001' "$work/events"
+grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8443 action police rate 2000mbit .* index 3900001' "$work/events"
 grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8443 action police index 3900001' "$work/events"
 grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8444 action police index 3900001' "$work/events"
 grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8444 action police index 3900001' "$work/events"
 [[ "$(grep -c $'^F\t' "$STATE_FILE")" == 4 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_bandwidth_falls_back_to_u32_when_flower_is_unavailable(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export KTO_HAPROXY_BANDWIDTH_CONFIG="$work/limits"
+export KTO_HAPROXY_CONFIG="$work/haproxy.cfg"
+export KTO_HAPROXY_BANDWIDTH_STATE="$work/state"
+export KTO_HAPROXY_BANDWIDTH_LOG="$work/log"
+export KTO_HAPROXY_BANDWIDTH_LOCK="$work/lock"
+source <(sed '/^main /d' scripts/kto-haproxy-bandwidth.sh)
+printf '217.19.122.109\t2000\n' > "$LIMITS_CONFIG"
+cat > "$HAPROXY_CONFIG" <<'EOF'
+global
+    maxconn 10000
+defaults
+    mode tcp
+frontend vless_in
+    bind *:443 backlog 65535
+    default_backend vless_pool
+backend vless_pool
+    server xray1 1.1.1.1:443
+EOF
+: > "$LOG_FILE"
+ip() {
+    if [[ "${1:-}" == -4 && "${2:-}" == -o && "${3:-}" == address &&
+        "${4:-}" == show && "${5:-}" == scope && "${6:-}" == global ]]; then
+        printf '2: ens3    inet 217.19.122.109/24 brd 217.19.122.255 scope global ens3\n'
+        return 0
+    fi
+    return 1
+}
+tc() {
+    local argument
+    printf '%s ' "$@" >> "$work/events"
+    printf '\n' >> "$work/events"
+    if [[ "${1:-}" == filter && "${2:-}" == add ]]; then
+        for argument in "$@"; do
+            if [[ "$argument" == flower ]]; then
+                printf "Unknown filter 'flower'\n" >&2
+                return 2
+            fi
+        done
+    fi
+    return 0
+}
+install() {
+    [[ "$1" == -m ]]
+    cp "$3" "$4"
+    chmod "$2" "$4"
+}
+outer() { apply_limits; }
+outer
+[[ -z "$(trap -p RETURN)" ]]
+[[ "$(grep -c '^filter add dev ens3 .* flower ' "$work/events")" == 2 ]]
+[[ "$(grep -c '^filter add dev ens3 .* u32 ' "$work/events")" == 2 ]]
+[[ "$(grep -c 'u32 .* action police rate 2000mbit ' "$work/events")" == 1 ]]
+grep -q 'u32 .* action police index 3900001' "$work/events"
+[[ "$(grep -c $'^F\t' "$STATE_FILE")" == 2 ]]
+[[ "$(grep -c $'^A\t' "$STATE_FILE")" == 1 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
