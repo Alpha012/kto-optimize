@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v256"
+SCRIPT_BUILD="v257"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4444,20 +4444,82 @@ install_common_stack() {
     ok "Время: $(format_duration "$duration")"
 }
 
+haproxy_tcp_port_owned_by_haproxy() {
+    local wanted="$1"
+    command_exists ss || return 1
+    "${SUDO[@]}" ss -H -ltnp 2>/dev/null | awk -v wanted="$wanted" '
+        {
+            address = $4
+            sub(/^.*:/, "", address)
+            if (address == wanted && tolower($0) ~ /haproxy/) found = 1
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+haproxy_missing_listener_ports() {
+    local routes_file="$1" port
+
+    while IFS=$'\t' read -r port _; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        if ! haproxy_tcp_port_owned_by_haproxy "$port"; then
+            printf '%s\n' "$port"
+        fi
+    done < "$routes_file"
+    return 0
+}
+
+wait_for_haproxy_routes() {
+    local routes_file="$1"
+    local attempts="${KTO_HAPROXY_STARTUP_ATTEMPTS:-20}"
+    local attempt missing
+
+    [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=20
+    attempts=$((10#$attempts))
+    (( attempts >= 1 && attempts <= 120 )) || attempts=20
+
+    for (( attempt = 1; attempt <= attempts; attempt++ )); do
+        if "${SUDO[@]}" systemctl is-active --quiet haproxy 2>/dev/null; then
+            missing="$(haproxy_missing_listener_ports "$routes_file")"
+            if [[ -z "$missing" ]]; then
+                return 0
+            fi
+        fi
+        sleep 0.25
+    done
+
+    missing="$(haproxy_missing_listener_ports "$routes_file")"
+    missing="${missing//$'\n'/, }"
+    if [[ -n "$missing" ]]; then
+        warn "HAProxy не слушает настроенные порты: ${missing}"
+    else
+        warn "HAProxy не перешёл в active после применения config"
+    fi
+    return 1
+}
+
 reload_haproxy_gracefully() {
+    local routes_file="${1:-}"
+
     if "${SUDO[@]}" systemctl is-active --quiet haproxy 2>/dev/null; then
         if "${SUDO[@]}" systemctl reload haproxy >> "$LOG_FILE" 2>&1; then
-            ok "HAProxy применён через reload"
-            return 0
+            if [[ -z "$routes_file" ]] || wait_for_haproxy_routes "$routes_file"; then
+                ok "HAProxy применён через reload"
+                return 0
+            fi
+            warn "HAProxy reload завершился без рабочих listener-портов, делаю restart."
+        else
+            warn "HAProxy reload не прошёл, делаю restart."
         fi
-        warn "HAProxy reload не прошёл, делаю restart."
     fi
 
     if "${SUDO[@]}" systemctl restart haproxy >> "$LOG_FILE" 2>&1; then
-        ok "HAProxy применён через restart"
-        return 0
+        if [[ -z "$routes_file" ]] || wait_for_haproxy_routes "$routes_file"; then
+            ok "HAProxy применён через restart"
+            return 0
+        fi
     fi
-    fail "Не удалось запустить HAProxy"
+    fail "HAProxy не запустил все настроенные listener-порты"
     return 1
 }
 
@@ -4573,26 +4635,69 @@ haproxy_route_count() {
     awk -F '\t' 'NF >= 3 { count++ } END { print count + 0 }' "$1"
 }
 
+haproxy_nofile_limit() {
+    local requested="${KTO_HAPROXY_NOFILE_LIMIT:-1048576}"
+    local kernel_max
+
+    if [[ ! "$requested" =~ ^[0-9]+$ ]]; then
+        requested=1048576
+    else
+        requested=$((10#$requested))
+        (( requested >= 8192 )) || requested=1048576
+    fi
+
+    kernel_max="$(cat /proc/sys/fs/nr_open 2>/dev/null || true)"
+    if [[ "$kernel_max" =~ ^[0-9]+$ ]]; then
+        kernel_max=$((10#$kernel_max))
+        if (( kernel_max >= 8192 && requested > kernel_max )); then
+            requested="$kernel_max"
+        fi
+    fi
+    echo "$requested"
+}
+
 recommended_haproxy_maxconn() {
     local override="${KTO_HAPROXY_MAXCONN:-}"
-    local total_mb maxconn
+    local total_mb maxconn nofile_limit fds_per_connection fd_reserve fd_cap
 
     if [[ "$override" =~ ^[0-9]+$ ]]; then
         maxconn=$(( 10#$override ))
-        if (( maxconn >= 1000 && maxconn <= 500000 )); then
-            echo "$maxconn"
-            return 0
-        fi
+        (( maxconn >= 1000 && maxconn <= 500000 )) || maxconn=0
+    else
+        maxconn=0
     fi
 
-    total_mb="$(memory_total_mb)"
-    [[ "$total_mb" =~ ^[0-9]+$ ]] || total_mb=0
-    (( total_mb > 0 )) || total_mb=2048
+    if (( maxconn == 0 )); then
+        total_mb="$(memory_total_mb)"
+        [[ "$total_mb" =~ ^[0-9]+$ ]] || total_mb=0
+        (( total_mb > 0 )) || total_mb=2048
 
-    # Two proxy-side sockets and HAProxy buffers make RAM the real connection limit.
-    maxconn=$(( total_mb * 16 ))
+        # Start with a memory-derived target, then clamp it to the process FD budget.
+        maxconn=$(( total_mb * 16 ))
+    fi
     (( maxconn < 10000 )) && maxconn=10000
     (( maxconn > 500000 )) && maxconn=500000
+
+    nofile_limit="$(haproxy_nofile_limit)"
+    fds_per_connection="${KTO_HAPROXY_FDS_PER_CONNECTION:-3}"
+    [[ "$fds_per_connection" =~ ^[0-9]+$ ]] || fds_per_connection=3
+    fds_per_connection=$((10#$fds_per_connection))
+    (( fds_per_connection >= 2 && fds_per_connection <= 8 )) || fds_per_connection=3
+
+    fd_reserve="${KTO_HAPROXY_FD_RESERVE:-8192}"
+    [[ "$fd_reserve" =~ ^[0-9]+$ ]] || fd_reserve=8192
+    fd_reserve=$((10#$fd_reserve))
+    if (( fd_reserve < 1024 || fd_reserve >= nofile_limit / 2 )); then
+        fd_reserve=$(( nofile_limit / 16 ))
+    fi
+
+    # splice-* can make HAProxy reserve roughly three descriptors per connection.
+    fd_cap=$(( (nofile_limit - fd_reserve) / fds_per_connection ))
+    if (( fd_cap >= 1000 )); then
+        fd_cap=$(( fd_cap / 1000 * 1000 ))
+    fi
+    (( fd_cap >= 1000 )) || fd_cap=1000
+    (( maxconn <= fd_cap )) || maxconn="$fd_cap"
     echo "$maxconn"
 }
 
@@ -4644,10 +4749,7 @@ global
     tune.ssl.default-dh-param 2048
 
 defaults
-    log global
     mode tcp
-    option tcplog
-    option dontlognull
 
     option clitcpka
     option srvtcpka
@@ -4722,7 +4824,7 @@ EOF
 apply_haproxy_routes_config() {
     local routes_file="$1"
     local config=/etc/haproxy/haproxy.cfg
-    local tmp_config backup had_config=0 haproxy_threads haproxy_maxconn route_count
+    local tmp_config backup had_config=0 haproxy_threads haproxy_maxconn haproxy_nofile route_count
 
     ensure_haproxy_package
     tmp_config="$(mktemp)"
@@ -4750,14 +4852,15 @@ apply_haproxy_routes_config() {
     "${SUDO[@]}" install -m 0644 "$tmp_config" "$config" >> "$LOG_FILE" 2>&1
 
     cmd "${SUDO[@]}" mkdir -p /etc/systemd/system/haproxy.service.d
-    write_root_file /etc/systemd/system/haproxy.service.d/99-kto-capacity.conf <<'EOF'
+    haproxy_nofile="$(haproxy_nofile_limit)"
+    write_root_file /etc/systemd/system/haproxy.service.d/99-kto-capacity.conf <<EOF
 [Service]
-LimitNOFILE=1048576
+LimitNOFILE=${haproxy_nofile}
 EOF
     cmd "${SUDO[@]}" systemctl daemon-reload
     cmd "${SUDO[@]}" systemctl enable haproxy || true
 
-    if ! reload_haproxy_gracefully; then
+    if ! reload_haproxy_gracefully "$routes_file"; then
         warn "Новый конфиг не запустился, возвращаю предыдущий."
         if (( had_config == 1 )); then
             "${SUDO[@]}" install -m 0644 "$backup" "$config" >> "$LOG_FILE" 2>&1
@@ -4777,7 +4880,7 @@ EOF
     haproxy_maxconn="$(recommended_haproxy_maxconn)"
     route_count="$(haproxy_route_count "$routes_file")"
     ok "HAProxy маршрутов: ${route_count}"
-    ok "HAProxy capacity: maxconn=${haproxy_maxconn}, threads=${haproxy_threads}"
+    ok "HAProxy capacity: maxconn=${haproxy_maxconn}, nofile=${haproxy_nofile}, threads=${haproxy_threads}"
 }
 
 apply_haproxy_config() {
@@ -4794,12 +4897,12 @@ apply_haproxy_config() {
 }
 
 ensure_haproxy_package() {
-    if command_exists haproxy && command_exists socat; then
+    if command_exists haproxy && command_exists socat && command_exists ss; then
         return 0
     fi
     stage "Устанавливаю HAProxy"
     must "apt update" apt_update_quiet
-    must "Установка HAProxy" apt_install_quiet haproxy socat
+    must "Установка HAProxy" apt_install_quiet haproxy socat iproute2
 }
 
 sync_haproxy_firewall() {

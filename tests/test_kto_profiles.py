@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v256"', KTO)
-        self.assertIn('PUSH_BUILD="v256"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v256"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v256"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v256"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v256"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v257"', KTO)
+        self.assertIn('PUSH_BUILD="v257"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v257"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v257"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v257"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v257"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -679,10 +679,81 @@ NODE_PROFILE=hysteria2
 
         self.assertIn('haproxy -c -f "$tmp_config"', apply_routes)
         self.assertIn('${config}.kto.bak', apply_routes)
+        self.assertIn('reload_haproxy_gracefully "$routes_file"', apply_routes)
         self.assertIn('возвращаю предыдущий', apply_routes)
         self.assertIn('install -m 0644 "$backup" "$config"', apply_routes)
         self.assertIn('extract_haproxy_routes > "$routes_file"', update)
         self.assertIn('маршруты сохранены', update)
+
+    def test_haproxy_capacity_respects_descriptor_budget(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+memory_total_mb() { printf '32768\n'; }
+KTO_HAPROXY_NOFILE_LIMIT=1048576
+KTO_HAPROXY_FDS_PER_CONNECTION=3
+KTO_HAPROXY_FD_RESERVE=8192
+unset KTO_HAPROXY_MAXCONN
+[[ "$(recommended_haproxy_maxconn)" == 346000 ]]
+KTO_HAPROXY_MAXCONN=500000
+[[ "$(recommended_haproxy_maxconn)" == 346000 ]]
+KTO_HAPROXY_MAXCONN=200000
+[[ "$(recommended_haproxy_maxconn)" == 200000 ]]
+KTO_HAPROXY_NOFILE_LIMIT=65536
+unset KTO_HAPROXY_MAXCONN
+[[ "$(recommended_haproxy_maxconn)" == 19000 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_activation_checks_every_listener(self):
+        wait_for_routes = function_body(KTO, "wait_for_haproxy_routes")
+        reload = function_body(KTO, "reload_haproxy_gracefully")
+        package = function_body(KTO, "ensure_haproxy_package")
+
+        self.assertIn('haproxy_missing_listener_ports "$routes_file"', wait_for_routes)
+        self.assertIn('systemctl is-active --quiet haproxy', wait_for_routes)
+        self.assertIn('wait_for_haproxy_routes "$routes_file"', reload)
+        self.assertIn('systemctl restart haproxy', reload)
+        self.assertIn('haproxy socat iproute2', package)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+KTO_HAPROXY_STARTUP_ATTEMPTS=1
+routes=$(mktemp)
+trap 'rm -f "$routes"' EXIT
+printf '8443\t65.108.1.173:443\tfaq.cdnvideo.work\tdefault\n8444\t65.108.1.174:443\tfaq.cdnvideo.work\tdefault\n' > "$routes"
+systemctl() { return 0; }
+sleep() { return 0; }
+haproxy_tcp_port_owned_by_haproxy() { [[ "$1" == 8443 ]]; }
+! wait_for_haproxy_routes "$routes"
+haproxy_tcp_port_owned_by_haproxy() { return 0; }
+wait_for_haproxy_routes "$routes"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_haproxy_firewall_and_wrong_sni_cover_extra_ports(self):
         firewall = function_body(KTO, "sync_haproxy_firewall")
