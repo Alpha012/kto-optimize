@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v262"', KTO)
-        self.assertIn('PUSH_BUILD="v262"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v262"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v262"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v262"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v262"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v263"', KTO)
+        self.assertIn('PUSH_BUILD="v263"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v263"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v263"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v263"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v263"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -623,6 +623,8 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('4) Удалить дополнительный порт', haproxy_menu)
         self.assertIn('5) Заменить SNI у всех маршрутов', haproxy_menu)
         self.assertIn('6) Обновить HAProxy, сохранив маршруты', haproxy_menu)
+        self.assertIn('7) Добавить или заменить backend-пул', haproxy_menu)
+        self.assertIn('8) Массово добавить backend по следующим портам', haproxy_menu)
         self.assertIn('add_haproxy_source_route "$routes_file"', haproxy_menu)
         self.assertIn('replace_all_haproxy_sni "$routes_file"', haproxy_menu)
         self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
@@ -1132,6 +1134,86 @@ list_haproxy_additional_source_ips() { printf '185.141.227.93\twan2\n217.19.122.
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_haproxy_backend_pool_round_trip_preserves_all_servers(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+routes=$(mktemp)
+config=$(mktemp)
+config2=$(mktemp)
+routes2=$(mktemp)
+trap 'rm -f "$routes" "$config" "$config2" "$routes2"' EXIT
+pool='31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443,31.76.113.189:7443,31.76.113.190:7443,144.31.94.40:7443,144.31.94.156:7443,144.31.94.135:7443,144.31.94.233:7443,144.31.94.107:7443,144.31.94.36:7443,144.31.94.153:7443,144.31.2.44:7443,144.31.130.226:7443,144.31.131.232:7443,144.31.129.206:7443,144.31.129.69:7443,144.31.131.228:7443,144.31.131.93:7443,13.143.134.143:7443,117.55.203.106:7443'
+printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n8450\t%s\tdev-yandex.sbs\t217.19.122.109\t10000\n' "$pool" > "$routes"
+render_haproxy_routes_config "$routes" "$config"
+[[ "$(awk '$1 == "backend" { active = ($2 == "vless_pool_8450"); next } active && $1 == "server" { count++ } END { print count + 0 }' "$config")" == 21 ]]
+grep -q '^    server xray1 31.59.140.66:7443 check weight 10 maxconn 10000 source 217.19.122.109$' "$config"
+grep -q '^    server xray21 117.55.203.106:7443 check weight 10 maxconn 10000 source 217.19.122.109$' "$config"
+extract_haproxy_routes "$config" > "$routes2"
+expected=$'443\t89.144.8.3:443\tbase.example.com\tdefault\n8450\t'"$pool"$'\tdev-yandex.sbs\t217.19.122.109\t10000'
+[[ "$(cat "$routes2")" == "$expected" ]]
+render_haproxy_routes_config "$routes2" "$config2"
+cmp -s "$config" "$config2"
+cat > "$config2" <<'EOF'
+frontend vless_in_8450
+    bind *:8450
+    acl allowed_sni req.ssl_sni -i dev-yandex.sbs
+    default_backend vless_pool_8450
+backend vless_pool_8450
+    server xray1 31.59.140.66:7443 check weight 10 maxconn 10000 source 217.19.122.109
+    server xray2 31.77.154.79:7443 check weight 10 maxconn 10000 source 217.19.122.110
+EOF
+[[ -z "$(extract_haproxy_routes "$config2")" ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_bulk_routes_reuse_source_ip_and_are_idempotent(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+snapshot=$(mktemp)
+trap 'rm -f "$routes" "$snapshot"' EXIT
+printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n8450\t1.1.1.1:7443\told.example.com\t217.19.122.109\t10000\n' > "$routes"
+haproxy_additional_source_ip_available() { [[ "$1" == '217.19.122.109' ]]; }
+haproxy_tcp_port_listening() { return 1; }
+apply_haproxy_routes_config() { return 0; }
+sync_haproxy_firewall() { return 0; }
+haproxy_source_label() { printf '%s\n' "$1"; }
+pool='31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443,31.76.113.189:7443,31.76.113.190:7443,144.31.94.40:7443,144.31.94.156:7443,144.31.94.135:7443,144.31.94.233:7443,144.31.94.107:7443,144.31.94.36:7443,144.31.94.153:7443,144.31.2.44:7443,144.31.130.226:7443,144.31.131.232:7443,144.31.129.206:7443,144.31.129.69:7443,144.31.131.228:7443,144.31.131.93:7443,13.143.134.143:7443,117.55.203.106:7443'
+set_haproxy_sequential_routes "$routes" 8450 217.19.122.109 dev-yandex.sbs 10000 "$pool"
+[[ "$(awk -F '\t' '$1 >= 8450 && $1 <= 8470 { count++ } END { print count + 0 }' "$routes")" == 21 ]]
+grep -qx $'8450\t31.59.140.66:7443\tdev-yandex.sbs\t217.19.122.109\t10000' "$routes"
+grep -qx $'8470\t117.55.203.106:7443\tdev-yandex.sbs\t217.19.122.109\t10000' "$routes"
+cp "$routes" "$snapshot"
+set_haproxy_sequential_routes "$routes" 8450 217.19.122.109 dev-yandex.sbs 10000 "$pool"
+cmp -s "$routes" "$snapshot"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_haproxy_add_source_route_saves_selected_ip(self):
         bash = bash_executable()
         if bash is None:
@@ -1173,12 +1255,12 @@ source <(sed '/^main /d' kto.sh)
 SUDO=()
 routes=$(mktemp)
 trap 'rm -f "$routes"' EXIT
-printf '443\t89.144.8.3:443\told.example.com\tdefault\n8443\t5.34.179.144:443\tother.example.com\t185.141.227.93\n' > "$routes"
+printf '443\t89.144.8.3:443\told.example.com\tdefault\n8443\t5.34.179.144:443\tother.example.com\t185.141.227.93\n8450\t31.59.140.66:7443,31.77.154.79:7443\tpool.example.com\t217.19.122.109\t10000\n' > "$routes"
 ask_haproxy_sni_list() { printf '%s\n' '*.rog-self.co.uk'; }
 apply_haproxy_routes_config() { return 0; }
 sync_haproxy_firewall() { return 0; }
 replace_all_haproxy_sni "$routes"
-expected=$'443\t89.144.8.3:443\t*.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\t*.rog-self.co.uk\t185.141.227.93'
+expected=$'443\t89.144.8.3:443\t*.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\t*.rog-self.co.uk\t185.141.227.93\n8450\t31.59.140.66:7443,31.77.154.79:7443\t*.rog-self.co.uk\t217.19.122.109\t10000'
 actual=$(cat "$routes")
 [[ "$actual" == "$expected" ]]
 '''

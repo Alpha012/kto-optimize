@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v262"
+SCRIPT_BUILD="v263"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -1327,6 +1327,48 @@ normalize_haproxy_target() {
     printf '%s:%d\n' "$ip" "$port"
 }
 
+normalize_haproxy_target_pool() {
+    local raw="${1:-}" item target existing
+    local -a items=() targets=()
+
+    raw="$(printf '%s' "$raw" | tr ';[:space:]' ',')"
+    IFS=',' read -r -a items <<< "$raw"
+    for item in "${items[@]}"; do
+        [[ -n "$item" ]] || continue
+        target="$(normalize_haproxy_target "$item" 2>/dev/null || true)"
+        [[ -n "$target" ]] || return 1
+        for existing in "${targets[@]:-}"; do
+            [[ "$existing" == "$target" ]] && continue 2
+        done
+        targets+=("$target")
+    done
+
+    (( ${#targets[@]} > 0 )) || return 1
+    local IFS=','
+    printf '%s\n' "${targets[*]}"
+}
+
+haproxy_target_pool_count() {
+    local normalized
+    local -a targets=()
+    normalized="$(normalize_haproxy_target_pool "${1:-}" 2>/dev/null || true)"
+    [[ -n "$normalized" ]] || return 1
+    IFS=',' read -r -a targets <<< "$normalized"
+    printf '%d\n' "${#targets[@]}"
+}
+
+normalize_haproxy_server_maxconn() {
+    local raw="${1:-default}"
+    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    case "${raw,,}" in
+        ""|0|auto|default|none) printf 'default\n'; return 0 ;;
+    esac
+    [[ "$raw" =~ ^[0-9]+$ ]] || return 1
+    raw=$((10#$raw))
+    (( raw >= 1 && raw <= 10000000 )) || return 1
+    printf '%d\n' "$raw"
+}
+
 normalize_haproxy_source_ip() {
     local raw="${1:-default}"
     raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
@@ -1562,6 +1604,18 @@ ask_haproxy_target_default() {
             return 0
         fi
         fail "Некорректный target. Пример: 1.2.3.4 или 1.2.3.4:8443"
+    done
+}
+
+ask_haproxy_target_pool_default() {
+    local prompt="$1" default="${2:-}" value targets
+    while true; do
+        value="$(ask_text "$prompt" "$default")"
+        if targets="$(normalize_haproxy_target_pool "$value")"; then
+            echo "$targets"
+            return 0
+        fi
+        fail "Некорректный список. Укажи IP[:порт] через пробел или запятую."
     done
 }
 
@@ -4757,7 +4811,9 @@ reload_haproxy_gracefully() {
 
 extract_haproxy_routes() {
     local config="${1:-/etc/haproxy/haproxy.cfg}"
-    local raw port target sni source_ip normalized_target normalized_sni normalized_source_ip
+    local raw port target_pool sni source_ip server_maxconn
+    local normalized_target_pool normalized_sni normalized_source_ip normalized_server_maxconn
+    local normalized_routes="" route_line
 
     "${SUDO[@]}" test -s "$config" 2>/dev/null || return 0
     raw="$("${SUDO[@]}" awk '
@@ -4811,12 +4867,25 @@ extract_haproxy_routes() {
             frontend_backend[name] = $2
             next
         }
-        section == "backend" && $1 == "server" && !(name in backend_target) {
-            backend_target[name] = $3
+        section == "backend" && $1 == "server" {
+            target = $3
+            source = "default"
+            maxconn = "default"
             for (i = 4; i <= NF; i++) {
                 if ($i == "source" && (i + 1) <= NF) {
-                    backend_source[name] = $(i + 1)
-                    break
+                    source = $(i + 1)
+                } else if ($i == "maxconn" && (i + 1) <= NF) {
+                    maxconn = $(i + 1)
+                }
+            }
+            if (!(name in backend_target)) {
+                backend_target[name] = target
+                backend_source[name] = source
+                backend_maxconn[name] = maxconn
+            } else {
+                backend_target[name] = backend_target[name] "," target
+                if (backend_source[name] != source || backend_maxconn[name] != maxconn) {
+                    backend_inconsistent[name] = 1
                 }
             }
             next
@@ -4825,29 +4894,48 @@ extract_haproxy_routes() {
             for (i = 1; i <= frontend_count; i++) {
                 frontend = frontend_order[i]
                 backend = frontend_backend[frontend]
-                if (frontend_port[frontend] != "" && frontend_sni[frontend] != "" && backend_target[backend] != "") {
+                if (frontend_port[frontend] != "" && frontend_sni[frontend] != "" &&
+                    backend != "" && backend_target[backend] != "" && backend_inconsistent[backend]) {
+                    exit 2
+                }
+            }
+            for (i = 1; i <= frontend_count; i++) {
+                frontend = frontend_order[i]
+                backend = frontend_backend[frontend]
+                if (frontend_port[frontend] != "" && frontend_sni[frontend] != "" &&
+                    backend_target[backend] != "" && !backend_inconsistent[backend]) {
                     source = backend_source[backend]
                     if (source == "") source = "default"
-                    printf "%s\t%s\t%s\t%s\n", frontend_port[frontend], backend_target[backend], frontend_sni[frontend], source
+                    maxconn = backend_maxconn[backend]
+                    if (maxconn == "") maxconn = "default"
+                    printf "%s\t%s\t%s\t%s\t%s\n", frontend_port[frontend], backend_target[backend], frontend_sni[frontend], source, maxconn
                 }
             }
         }
     ' "$config" 2>/dev/null || true)"
 
-    while IFS=$'\t' read -r port target sni source_ip; do
+    while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn; do
         [[ "$port" =~ ^[0-9]+$ ]] || continue
         port=$((10#$port))
         (( port >= 1 && port <= 65535 )) || continue
-        normalized_target="$(normalize_haproxy_target "$target" 2>/dev/null || true)"
+        normalized_target_pool="$(normalize_haproxy_target_pool "$target_pool" 2>/dev/null || true)"
         normalized_sni="$(normalize_haproxy_sni_list "$sni" 2>/dev/null || true)"
         normalized_source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}" 2>/dev/null || true)"
-        [[ -n "$normalized_target" && -n "$normalized_sni" && -n "$normalized_source_ip" ]] || continue
-        printf '%d\t%s\t%s\t%s\n' "$port" "$normalized_target" "$normalized_sni" "$normalized_source_ip"
-    done <<< "$raw" | sort -t $'\t' -k1,1n
+        normalized_server_maxconn="$(normalize_haproxy_server_maxconn "${server_maxconn:-default}" 2>/dev/null || true)"
+        [[ -n "$normalized_target_pool" && -n "$normalized_sni" && -n "$normalized_source_ip" && -n "$normalized_server_maxconn" ]] || return 0
+        if [[ "$normalized_server_maxconn" == default ]]; then
+            printf -v route_line '%d\t%s\t%s\t%s' "$port" "$normalized_target_pool" "$normalized_sni" "$normalized_source_ip"
+        else
+            printf -v route_line '%d\t%s\t%s\t%s\t%s' "$port" "$normalized_target_pool" "$normalized_sni" "$normalized_source_ip" "$normalized_server_maxconn"
+        fi
+        normalized_routes+="${route_line}"$'\n'
+    done <<< "$raw"
+    [[ -n "$normalized_routes" ]] || return 0
+    printf '%s' "$normalized_routes" | sort -t $'\t' -k1,1n
 }
 
 extract_haproxy_backend_target() {
-    extract_haproxy_routes | awk -F '\t' 'NR == 1 { print $2; exit }'
+    extract_haproxy_routes | awk -F '\t' 'NR == 1 { split($2, targets, ","); print targets[1]; exit }'
 }
 
 extract_haproxy_backend_ip() {
@@ -5001,11 +5089,14 @@ recommended_haproxy_maxconn() {
 
 render_haproxy_routes_config() {
     local routes_file="$1" output_file="$2"
-    local port backend_target allowed_sni source_ip normalized_target normalized_sni normalized_source_ip
-    local frontend_name backend_name server_name source_clause haproxy_threads haproxy_maxconn route_count=0
+    local port backend_target_pool allowed_sni source_ip server_maxconn
+    local normalized_target_pool normalized_sni normalized_source_ip normalized_server_maxconn
+    local frontend_name backend_name server_name source_clause maxconn_clause target index
+    local haproxy_threads haproxy_maxconn route_count=0
+    local -a backend_targets=()
     local -A seen_ports=()
 
-    while IFS=$'\t' read -r port backend_target allowed_sni source_ip; do
+    while IFS=$'\t' read -r port backend_target_pool allowed_sni source_ip server_maxconn; do
         [[ "$port" =~ ^[0-9]+$ ]] || {
             fail "Некорректный входной HAProxy порт: ${port:-пусто}"
             return 1
@@ -5019,10 +5110,11 @@ render_haproxy_routes_config() {
             fail "HAProxy порт $port указан дважды"
             return 1
         }
-        normalized_target="$(normalize_haproxy_target "$backend_target" 2>/dev/null || true)"
+        normalized_target_pool="$(normalize_haproxy_target_pool "$backend_target_pool" 2>/dev/null || true)"
         normalized_sni="$(normalize_haproxy_sni_list "$allowed_sni" 2>/dev/null || true)"
         normalized_source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}" 2>/dev/null || true)"
-        [[ -n "$normalized_target" && -n "$normalized_sni" && -n "$normalized_source_ip" ]] || {
+        normalized_server_maxconn="$(normalize_haproxy_server_maxconn "${server_maxconn:-default}" 2>/dev/null || true)"
+        [[ -n "$normalized_target_pool" && -n "$normalized_sni" && -n "$normalized_source_ip" && -n "$normalized_server_maxconn" ]] || {
             fail "Некорректный HAProxy маршрут на порту $port"
             return 1
         }
@@ -5069,21 +5161,24 @@ backend wrong_sni_names
     stick-table type string len 160 size 100k expire 30m store gpc0
 EOF
 
-    while IFS=$'\t' read -r port backend_target allowed_sni source_ip; do
+    while IFS=$'\t' read -r port backend_target_pool allowed_sni source_ip server_maxconn; do
         port=$((10#$port))
-        backend_target="$(normalize_haproxy_target "$backend_target")"
+        backend_target_pool="$(normalize_haproxy_target_pool "$backend_target_pool")"
         allowed_sni="$(normalize_haproxy_sni_list "$allowed_sni")"
         source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}")"
+        server_maxconn="$(normalize_haproxy_server_maxconn "${server_maxconn:-default}")"
         source_clause=""
+        maxconn_clause=""
         [[ "$source_ip" == default ]] || source_clause=" source ${source_ip}"
+        [[ "$server_maxconn" == default ]] || maxconn_clause=" maxconn ${server_maxconn}"
+        backend_targets=()
+        IFS=',' read -r -a backend_targets <<< "$backend_target_pool"
         if (( port == 443 )); then
             frontend_name="vless_in"
             backend_name="vless_pool"
-            server_name="xray1"
         else
             frontend_name="vless_in_${port}"
             backend_name="vless_pool_${port}"
-            server_name="xray_${port}"
         fi
 
         cat >> "$output_file" <<EOF
@@ -5113,8 +5208,21 @@ backend ${backend_name}
     mode tcp
     balance leastconn
 
-    server ${server_name} ${backend_target} check weight 10${source_clause}
 EOF
+        for index in "${!backend_targets[@]}"; do
+            target="${backend_targets[$index]}"
+            if (( ${#backend_targets[@]} == 1 )); then
+                if (( port == 443 )); then
+                    server_name="xray1"
+                else
+                    server_name="xray_${port}"
+                fi
+            else
+                server_name="xray$(( index + 1 ))"
+            fi
+            printf '    server %s %s check weight 10%s%s\n' \
+                "$server_name" "$target" "$maxconn_clause" "$source_clause" >> "$output_file"
+        done
     done < "$routes_file"
 }
 
@@ -5303,22 +5411,29 @@ configure_haproxy_backend() {
 }
 
 print_haproxy_routes() {
-    local routes_file="$1" port target sni source_ip source_label
+    local routes_file="$1" port target_pool sni source_ip server_maxconn source_label target_label pool_count
     echo -e "${BOLD}${PURPLE}[ МАРШРУТЫ ]${NC}"
-    while IFS=$'\t' read -r port target sni source_ip; do
+    while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn; do
         [[ -n "$port" ]] || continue
         source_label="$(haproxy_source_label "${source_ip:-default}")"
-        printf ' %5s/tcp -> %-21s Выход: %-24s SNI: %s\n' "$port" "$target" "$source_label" "$sni"
+        pool_count="$(haproxy_target_pool_count "$target_pool" 2>/dev/null || printf '0')"
+        if (( pool_count > 1 )); then
+            target_label="пул: ${pool_count} backend"
+        else
+            target_label="$target_pool"
+        fi
+        printf ' %5s/tcp -> %-21s Выход: %-24s SNI: %s\n' "$port" "$target_label" "$source_label" "$sni"
     done < "$routes_file"
 }
 
 select_haproxy_route() {
-    local routes_file="$1" mode="${2:-all}" choice index=0 port target sni source_ip source_label base_port
+    local routes_file="$1" mode="${2:-all}" choice index=0 port target_pool sni source_ip server_maxconn
+    local source_label target_label pool_count base_port
     local -a ports=()
     base_port="$(haproxy_base_port)"
 
     printf '%s\n' "Выберите HAProxy-порт:" >&2
-    while IFS=$'\t' read -r port target sni source_ip; do
+    while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn; do
         [[ -n "$port" ]] || continue
         if [[ "$mode" == "extra" && "$port" == "$base_port" ]]; then
             continue
@@ -5326,7 +5441,13 @@ select_haproxy_route() {
         ports+=("$port")
         index=$(( index + 1 ))
         source_label="$(haproxy_source_label "${source_ip:-default}")"
-        printf ' %d) %s/tcp -> %s | выход %s | %s\n' "$index" "$port" "$target" "$source_label" "$sni" >&2
+        pool_count="$(haproxy_target_pool_count "$target_pool" 2>/dev/null || printf '0')"
+        if (( pool_count > 1 )); then
+            target_label="пул ${pool_count} backend"
+        else
+            target_label="$target_pool"
+        fi
+        printf ' %d) %s/tcp -> %s | выход %s | %s\n' "$index" "$port" "$target_label" "$source_label" "$sni" >&2
     done < "$routes_file"
 
     if (( ${#ports[@]} == 0 )); then
@@ -5433,18 +5554,263 @@ add_haproxy_source_route() {
     add_haproxy_route_with_source "$routes_file" "$source_ip"
 }
 
+set_haproxy_pool_route() {
+    local routes_file="$1" port="$2" source_ip="$3" allowed_sni="$4" server_maxconn="$5" target_pool="$6"
+    local normalized_source_ip normalized_sni normalized_maxconn normalized_pool pool_count next_file
+
+    [[ "$port" =~ ^[0-9]+$ ]] || {
+        fail "Некорректный входной HAProxy порт: ${port:-пусто}"
+        return 1
+    }
+    port=$((10#$port))
+    (( port >= 1 && port <= 65535 )) || {
+        fail "HAProxy порт вне диапазона: $port"
+        return 1
+    }
+    normalized_source_ip="$(normalize_haproxy_source_ip "$source_ip" 2>/dev/null || true)"
+    normalized_sni="$(normalize_haproxy_sni_list "$allowed_sni" 2>/dev/null || true)"
+    normalized_maxconn="$(normalize_haproxy_server_maxconn "$server_maxconn" 2>/dev/null || true)"
+    normalized_pool="$(normalize_haproxy_target_pool "$target_pool" 2>/dev/null || true)"
+    pool_count="$(haproxy_target_pool_count "$normalized_pool" 2>/dev/null || true)"
+    if [[ -z "$normalized_source_ip" || -z "$normalized_sni" || -z "$normalized_maxconn" || -z "$normalized_pool" ]] ||
+        (( pool_count < 2 )); then
+        fail "Некорректный HAProxy backend-пул"
+        return 1
+    fi
+    if [[ "$normalized_source_ip" != default ]] && ! haproxy_additional_source_ip_available "$normalized_source_ip"; then
+        fail "Исходящий IP ${normalized_source_ip} не найден среди рабочих дополнительных IP"
+        return 1
+    fi
+    if ! haproxy_route_file_has_port "$routes_file" "$port" && haproxy_tcp_port_listening "$port"; then
+        fail "TCP-порт $port уже занят другим процессом"
+        return 1
+    fi
+
+    next_file="$(mktemp)"
+    awk -F '\t' -v OFS='\t' -v port="$port" -v pool="$normalized_pool" -v sni="$normalized_sni" \
+        -v source_ip="$normalized_source_ip" -v maxconn="$normalized_maxconn" '
+        $1 == port {
+            if (!replaced) print port, pool, sni, source_ip, maxconn
+            replaced = 1
+            next
+        }
+        { print }
+        END {
+            if (!replaced) print port, pool, sni, source_ip, maxconn
+        }
+    ' "$routes_file" > "$next_file"
+
+    if apply_haproxy_routes_config "$next_file"; then
+        sync_haproxy_firewall "$next_file" "$routes_file"
+        mv "$next_file" "$routes_file"
+        ok "HAProxy пул ${port}/tcp: ${pool_count} backend"
+        ok "SNI: ${normalized_sni}"
+        ok "Исходящий IP: $(haproxy_source_label "$normalized_source_ip")"
+        ok "maxconn на backend: ${normalized_maxconn}"
+        return 0
+    fi
+    rm -f "$next_file"
+    return 1
+}
+
+add_haproxy_pool_route() {
+    local routes_file="$1" default_port port source_ip allowed_sni server_maxconn raw_targets target_pool
+
+    default_port="$(default_haproxy_extra_port "$routes_file")" || {
+        fail "Нет свободного HAProxy-порта"
+        return 1
+    }
+    port="$(ask_int "Входной HAProxy порт" "$default_port" 1 65535)"
+    source_ip="$(ask_text "Исходящий IP (default или IPv4)" default)"
+    allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
+    server_maxconn="$(ask_int "maxconn на каждый backend" 10000 1 10000000)"
+    raw_targets="$(ask_text "Backend IP[:порт] через пробел или запятую")"
+    target_pool="$(normalize_haproxy_target_pool "$raw_targets" 2>/dev/null || true)"
+    [[ -n "$target_pool" ]] || {
+        fail "Не удалось прочитать список backend"
+        return 1
+    }
+    set_haproxy_pool_route "$routes_file" "$port" "$source_ip" "$allowed_sni" "$server_maxconn" "$target_pool"
+}
+
+set_haproxy_pool_route_cli() {
+    header
+    require_haproxy_mode
+    need_root
+    local port="${1:-}" source_ip="${2:-}" allowed_sni="${3:-}" server_maxconn="${4:-}"
+    local routes_file target target_pool=""
+    shift $(( $# >= 4 ? 4 : $# ))
+
+    if [[ -z "$port" || -z "$source_ip" || -z "$allowed_sni" || -z "$server_maxconn" || $# -lt 2 ]]; then
+        fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI MAXCONN BACKEND1 BACKEND2 [...]"
+        return 1
+    fi
+    for target in "$@"; do
+        target_pool+="${target_pool:+,}${target}"
+    done
+    if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
+        fail "HAProxy ещё не настроен. Сначала запусти пункт HAProxy в меню."
+        return 1
+    fi
+
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+    if [[ ! -s "$routes_file" ]]; then
+        rm -f "$routes_file"
+        fail "Текущий HAProxy config не распознан. Конфиг не изменён."
+        return 1
+    fi
+    if set_haproxy_pool_route "$routes_file" "$port" "$source_ip" "$allowed_sni" "$server_maxconn" "$target_pool"; then
+        rm -f "$routes_file"
+        return 0
+    fi
+    rm -f "$routes_file"
+    return 1
+}
+
+set_haproxy_sequential_routes() {
+    local routes_file="$1" start_port="$2" source_ip="$3" allowed_sni="$4" server_maxconn="$5" target_pool="$6"
+    local normalized_source_ip normalized_sni normalized_maxconn normalized_pool route_count end_port
+    local port target index next_file work_file sorted_file
+    local -a targets=()
+
+    [[ "$start_port" =~ ^[0-9]+$ ]] || {
+        fail "Некорректный первый HAProxy порт: ${start_port:-пусто}"
+        return 1
+    }
+    start_port=$((10#$start_port))
+    normalized_source_ip="$(normalize_haproxy_source_ip "$source_ip" 2>/dev/null || true)"
+    normalized_sni="$(normalize_haproxy_sni_list "$allowed_sni" 2>/dev/null || true)"
+    normalized_maxconn="$(normalize_haproxy_server_maxconn "$server_maxconn" 2>/dev/null || true)"
+    normalized_pool="$(normalize_haproxy_target_pool "$target_pool" 2>/dev/null || true)"
+    [[ -n "$normalized_source_ip" && -n "$normalized_sni" && -n "$normalized_maxconn" && -n "$normalized_pool" ]] || {
+        fail "Некорректные параметры массовых HAProxy-маршрутов"
+        return 1
+    }
+    IFS=',' read -r -a targets <<< "$normalized_pool"
+    route_count="${#targets[@]}"
+    (( route_count > 0 )) || {
+        fail "Список backend пуст"
+        return 1
+    }
+    end_port=$(( start_port + route_count - 1 ))
+    (( start_port >= 1 && end_port <= 65535 )) || {
+        fail "Диапазон HAProxy портов ${start_port}-${end_port} выходит за 1-65535"
+        return 1
+    }
+    if [[ "$normalized_source_ip" != default ]] && ! haproxy_additional_source_ip_available "$normalized_source_ip"; then
+        fail "Исходящий IP ${normalized_source_ip} не найден среди рабочих дополнительных IP"
+        return 1
+    fi
+    for (( port = start_port; port <= end_port; port++ )); do
+        if ! haproxy_route_file_has_port "$routes_file" "$port" && haproxy_tcp_port_listening "$port"; then
+            fail "TCP-порт $port уже занят другим процессом"
+            return 1
+        fi
+    done
+
+    next_file="$(mktemp)"
+    cp "$routes_file" "$next_file"
+    for index in "${!targets[@]}"; do
+        port=$(( start_port + index ))
+        target="${targets[$index]}"
+        work_file="$(mktemp)"
+        awk -F '\t' -v port="$port" '$1 != port { print }' "$next_file" > "$work_file"
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$port" "$target" "$normalized_sni" "$normalized_source_ip" "$normalized_maxconn" >> "$work_file"
+        mv "$work_file" "$next_file"
+    done
+    sorted_file="$(mktemp)"
+    sort -t $'\t' -k1,1n "$next_file" > "$sorted_file"
+    mv "$sorted_file" "$next_file"
+
+    if apply_haproxy_routes_config "$next_file"; then
+        sync_haproxy_firewall "$next_file" "$routes_file"
+        mv "$next_file" "$routes_file"
+        ok "HAProxy маршруты ${start_port}-${end_port}: ${route_count} backend"
+        ok "SNI: ${normalized_sni}"
+        ok "Исходящий IP: $(haproxy_source_label "$normalized_source_ip")"
+        ok "maxconn на backend: ${normalized_maxconn}"
+        return 0
+    fi
+    rm -f "$next_file"
+    return 1
+}
+
+add_haproxy_sequential_routes() {
+    local routes_file="$1" default_port start_port source_ip allowed_sni server_maxconn raw_targets target_pool
+
+    default_port="$(default_haproxy_extra_port "$routes_file")" || {
+        fail "Нет свободного HAProxy-порта"
+        return 1
+    }
+    start_port="$(ask_int "Первый входной HAProxy порт" "$default_port" 1 65535)"
+    source_ip="$(ask_text "Исходящий IP (default или IPv4)" default)"
+    allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
+    server_maxconn="$(ask_int "maxconn на каждый backend" 10000 1 10000000)"
+    raw_targets="$(ask_text "Backend IP[:порт] по порядку через пробел или запятую")"
+    target_pool="$(normalize_haproxy_target_pool "$raw_targets" 2>/dev/null || true)"
+    [[ -n "$target_pool" ]] || {
+        fail "Не удалось прочитать список backend"
+        return 1
+    }
+    set_haproxy_sequential_routes "$routes_file" "$start_port" "$source_ip" "$allowed_sni" "$server_maxconn" "$target_pool"
+}
+
+set_haproxy_sequential_routes_cli() {
+    header
+    require_haproxy_mode
+    need_root
+    local start_port="${1:-}" source_ip="${2:-}" allowed_sni="${3:-}" server_maxconn="${4:-}"
+    local routes_file target target_pool=""
+    shift $(( $# >= 4 ? 4 : $# ))
+
+    if [[ -z "$start_port" || -z "$source_ip" || -z "$allowed_sni" || -z "$server_maxconn" || $# -lt 1 ]]; then
+        fail "Использование: haproxy-routes-set START_PORT SOURCE_IP SNI MAXCONN BACKEND [...]"
+        return 1
+    fi
+    for target in "$@"; do
+        target_pool+="${target_pool:+,}${target}"
+    done
+    if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
+        fail "HAProxy ещё не настроен. Сначала запусти пункт HAProxy в меню."
+        return 1
+    fi
+
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+    if [[ ! -s "$routes_file" ]]; then
+        rm -f "$routes_file"
+        fail "Текущий HAProxy config не распознан. Конфиг не изменён."
+        return 1
+    fi
+    if set_haproxy_sequential_routes "$routes_file" "$start_port" "$source_ip" "$allowed_sni" "$server_maxconn" "$target_pool"; then
+        rm -f "$routes_file"
+        return 0
+    fi
+    rm -f "$routes_file"
+    return 1
+}
+
 edit_haproxy_route() {
-    local routes_file="$1" port current_line current_target current_sni current_source backend_target allowed_sni next_file
+    local routes_file="$1" port current_line current_target_pool current_sni current_source current_maxconn
+    local backend_target_pool allowed_sni next_file
     port="$(select_haproxy_route "$routes_file")" || return 1
     current_line="$(awk -F '\t' -v port="$port" '$1 == port { print; exit }' "$routes_file")"
-    IFS=$'\t' read -r _ current_target current_sni current_source <<< "$current_line"
+    IFS=$'\t' read -r _ current_target_pool current_sni current_source current_maxconn <<< "$current_line"
     current_source="$(normalize_haproxy_source_ip "${current_source:-default}")"
+    current_maxconn="$(normalize_haproxy_server_maxconn "${current_maxconn:-default}")"
 
-    backend_target="$(ask_haproxy_target_default "Backend IP или IP:порт" "$current_target")"
+    backend_target_pool="$(ask_haproxy_target_pool_default "Backend IP[:порт] или список через запятую" "$current_target_pool")"
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI" "$current_sni")"
     next_file="$(mktemp)"
-    awk -F '\t' -v OFS='\t' -v port="$port" -v target="$backend_target" -v sni="$allowed_sni" -v source_ip="$current_source" '
-        $1 == port { print port, target, sni, source_ip; next }
+    awk -F '\t' -v OFS='\t' -v port="$port" -v target_pool="$backend_target_pool" -v sni="$allowed_sni" \
+        -v source_ip="$current_source" -v maxconn="$current_maxconn" '
+        $1 == port {
+            if (maxconn == "default") print port, target_pool, sni, source_ip
+            else print port, target_pool, sni, source_ip, maxconn
+            next
+        }
         { print }
     ' "$routes_file" > "$next_file"
 
@@ -5464,7 +5830,12 @@ replace_all_haproxy_sni() {
     allowed_sni="$(ask_haproxy_sni_list "Новый SNI для всех HAProxy-портов" "$current_sni")"
     next_file="$(mktemp)"
     awk -F '\t' -v OFS='\t' -v sni="$allowed_sni" '
-        NF >= 3 { print $1, $2, sni, ($4 == "" ? "default" : $4); next }
+        NF >= 3 {
+            $3 = sni
+            if (NF < 4) $4 = "default"
+            print
+            next
+        }
         { print }
     ' "$routes_file" > "$next_file"
 
@@ -5560,6 +5931,8 @@ haproxy_menu() {
         echo -e "4) Удалить дополнительный порт"
         echo -e "5) Заменить SNI у всех маршрутов"
         echo -e "6) Обновить HAProxy, сохранив маршруты"
+        echo -e "7) Добавить или заменить backend-пул"
+        echo -e "8) Массово добавить backend по следующим портам"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -5576,6 +5949,8 @@ haproxy_menu() {
                     ok "HAProxy обновлён, все маршруты сохранены"
                 fi
                 ;;
+            7) add_haproxy_pool_route "$routes_file" || true ;;
+            8) add_haproxy_sequential_routes "$routes_file" || true ;;
             0)
                 rm -f "$routes_file"
                 return 0
@@ -7203,6 +7578,8 @@ main() {
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
         haproxy-update|update-haproxy|haproxy-refresh) update_haproxy_existing_config ;;
+        haproxy-pool-set|haproxy-set-pool) shift; set_haproxy_pool_route_cli "$@" ;;
+        haproxy-routes-set|haproxy-set-routes) shift; set_haproxy_sequential_routes_cli "$@" ;;
         mobile443-lte|lte-only) mobile443_lte_menu ;;
         mobile443-lte-enable|lte-only-enable) enable_mobile443_lte ;;
         mobile443-lte-disable|lte-only-disable) disable_mobile443_lte ;;
