@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v261"', KTO)
-        self.assertIn('PUSH_BUILD="v261"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v261"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v261"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v261"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v261"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v262"', KTO)
+        self.assertIn('PUSH_BUILD="v262"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v262"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v262"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v262"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v262"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -84,6 +84,81 @@ class CombinedNodeProfileTests(unittest.TestCase):
         self.assertNotIn("do_issue_ssl_certificate", reality)
         self.assertIn("do_issue_ssl_certificate", hysteria)
         self.assertNotIn("do_install_selfsteal", hysteria)
+
+    def test_selfsteal_caddy_timeouts_are_safe_and_idempotent(self):
+        install_selfsteal = function_body(KTO, "do_install_selfsteal")
+        harden = function_body(KTO, "harden_selfsteal_caddy")
+
+        self.assertIn("harden_selfsteal_caddy", install_selfsteal)
+        self.assertIn("# kto-selfsteal-timeouts-v1", harden)
+        self.assertIn('read_header 5s', harden)
+        self.assertIn('idle 15s', harden)
+        self.assertIn('max_header_size 64KB', harden)
+        self.assertNotIn('read_body', harden)
+        self.assertNotIn('write 15s', harden)
+        self.assertNotIn('fallback_policy', harden)
+        self.assertIn('caddy validate --config /etc/caddy/Caddyfile', harden)
+        self.assertIn('docker restart --time 3', harden)
+        self.assertIn('selfsteal-harden|selfsteal-timeouts', KTO)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+LOG_FILE=$(mktemp)
+work=$(mktemp -d)
+events="$work/events"
+KTO_SELFSTEAL_CADDYFILE="$work/Caddyfile"
+KTO_SELFSTEAL_CADDY_CONTAINER=caddy-selfsteal
+trap 'rm -rf "$work" "$LOG_FILE"' EXIT
+cat > "$KTO_SELFSTEAL_CADDYFILE" <<'EOF'
+{
+    https_port 9443
+    default_bind 127.0.0.1
+    servers {
+        protocols h1 h2
+        listener_wrappers {
+            proxy_protocol {
+                allow 127.0.0.1/32
+            }
+            tls
+        }
+    }
+    admin off
+}
+:9443 {
+    tls internal
+    respond 204
+}
+EOF
+docker() {
+    { printf '%s|' "$@"; printf '\n'; } >> "$events"
+    case "${1:-}" in
+        inspect|exec|restart) return 0 ;;
+    esac
+    return 1
+}
+harden_selfsteal_caddy
+harden_selfsteal_caddy
+[[ "$(grep -Fc '# kto-selfsteal-timeouts-v1' "$KTO_SELFSTEAL_CADDYFILE")" == 1 ]]
+grep -q 'read_header 5s' "$KTO_SELFSTEAL_CADDYFILE"
+grep -q 'idle 15s' "$KTO_SELFSTEAL_CADDYFILE"
+grep -q 'max_header_size 64KB' "$KTO_SELFSTEAL_CADDYFILE"
+[[ "$(grep -c '^exec|' "$events")" == 1 ]]
+[[ "$(grep -c '^restart|--time|3|caddy-selfsteal|' "$events")" == 1 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_combined_profile_mounts_certificates_and_opens_udp(self):
         node_install = function_body(KTO, "do_install_remnawave_node")

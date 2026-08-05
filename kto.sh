@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v261"
+SCRIPT_BUILD="v262"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -3482,9 +3482,77 @@ do_install_selfsteal() {
         "${SUDO[@]}" bash -c \
         'bash <(curl -Ls "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh") --force --domain "$1" install' \
         _ "$domain"
+    harden_selfsteal_caddy
 
     echo
     ok "SelfSteal установлен"
+}
+
+harden_selfsteal_caddy() {
+    local caddyfile="${KTO_SELFSTEAL_CADDYFILE:-/opt/caddy/Caddyfile}"
+    local container="${KTO_SELFSTEAL_CADDY_CONTAINER:-caddy-selfsteal}"
+    local marker="# kto-selfsteal-timeouts-v1"
+    local tmp backup
+
+    if ! "${SUDO[@]}" test -s "$caddyfile" 2>/dev/null; then
+        warn "SelfSteal Caddyfile не найден, HTTP-таймауты не применены"
+        return 0
+    fi
+    if "${SUDO[@]}" grep -Fq "$marker" "$caddyfile" 2>/dev/null; then
+        ok "SelfSteal Caddy: защитные таймауты уже применены"
+        return 0
+    fi
+
+    stage "Добавляю безопасные таймауты SelfSteal Caddy"
+    tmp="$(mktemp)"
+    backup="${caddyfile}.kto.bak"
+    if ! "${SUDO[@]}" awk -v marker="$marker" '
+        !inserted && $0 ~ /^[[:space:]]*servers[[:space:]]*[{][[:space:]]*$/ {
+            print
+            print "\t\t" marker
+            print "\t\ttimeouts {"
+            print "\t\t\tread_header 5s"
+            print "\t\t\tidle 15s"
+            print "\t\t}"
+            print "\t\tmax_header_size 64KB"
+            inserted = 1
+            next
+        }
+        { print }
+        END { if (!inserted) exit 42 }
+    ' "$caddyfile" > "$tmp"; then
+        rm -f "$tmp"
+        fail "Не нашёл глобальный servers-блок в $caddyfile"
+        return 1
+    fi
+
+    "${SUDO[@]}" cp -a "$caddyfile" "$backup" >> "$LOG_FILE" 2>&1
+    "${SUDO[@]}" install -m 0644 "$tmp" "$caddyfile" >> "$LOG_FILE" 2>&1
+    rm -f "$tmp"
+
+    if ! "${SUDO[@]}" docker inspect "$container" >/dev/null 2>&1; then
+        warn "Контейнер $container не найден; таймауты сохранены и применятся при его запуске"
+        return 0
+    fi
+    if ! "${SUDO[@]}" docker exec "$container" caddy validate --config /etc/caddy/Caddyfile >> "$LOG_FILE" 2>&1; then
+        "${SUDO[@]}" install -m 0644 "$backup" "$caddyfile" >> "$LOG_FILE" 2>&1 || true
+        fail "Caddy отклонил конфиг с таймаутами; предыдущий файл восстановлен"
+        return 1
+    fi
+    if ! "${SUDO[@]}" docker restart --time 3 "$container" >> "$LOG_FILE" 2>&1; then
+        "${SUDO[@]}" install -m 0644 "$backup" "$caddyfile" >> "$LOG_FILE" 2>&1 || true
+        "${SUDO[@]}" docker restart --time 3 "$container" >> "$LOG_FILE" 2>&1 || true
+        fail "Не удалось перезапустить $container; предыдущий файл восстановлен"
+        return 1
+    fi
+
+    ok "SelfSteal Caddy: read_header=5s, idle=15s, max_header=64KB"
+}
+
+harden_selfsteal_caddy_now() {
+    header
+    need_root
+    harden_selfsteal_caddy
 }
 
 install_selfsteal() {
@@ -7122,6 +7190,7 @@ main() {
         common|install-all|up) install_common_stack ;;
         node|install-node) install_remnawave_node ;;
         selfsteal) install_selfsteal ;;
+        selfsteal-harden|selfsteal-timeouts) harden_selfsteal_caddy_now ;;
         warp) install_warp_native ;;
         status) show_status ;;
         network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" ;;
