@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v255"
+SCRIPT_BUILD="v256"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -606,6 +606,19 @@ node_profile_includes_hysteria2() {
     [[ "${NODE_PROFILE:-}" == "hysteria2" || "${NODE_PROFILE:-}" == "reality_hysteria2" ]]
 }
 
+haproxy_mode_supported() {
+    [[ "$MACHINE_MODE" == "whitelist" ]] ||
+        { [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_reality; }
+}
+
+haproxy_base_port() {
+    if [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_reality; then
+        echo "8443"
+    else
+        echo "443"
+    fi
+}
+
 config_label() {
     if [[ "$MACHINE_MODE" == "node" ]]; then
         echo "node / $(node_profile_label)"
@@ -889,7 +902,7 @@ settings_menu() {
         echo -e "1) Изменение режима"
         echo -e "2) Проверка системы"
         echo -e "3) Очистка диска"
-        if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        if haproxy_mode_supported; then
             echo -e "4) HAProxy"
         fi
         echo -e "0) Выйти"
@@ -909,10 +922,10 @@ settings_menu() {
                 system_check_pause
                 ;;
             4)
-                if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+                if haproxy_mode_supported; then
                     haproxy_menu
                 else
-                    fail "Этот пункт доступен только для режима whitelist."
+                    fail "HAProxy доступен для whitelist, Reality и Reality + Hysteria2."
                     sleep 1
                 fi
                 ;;
@@ -964,6 +977,13 @@ require_reality_profile() {
 require_whitelist_mode() {
     if [[ "$MACHINE_MODE" != "whitelist" ]]; then
         fail "Этот пункт доступен только для режима whitelist."
+        exit 1
+    fi
+}
+
+require_haproxy_mode() {
+    if ! haproxy_mode_supported; then
+        fail "HAProxy доступен для whitelist, Reality и Reality + Hysteria2."
         exit 1
     fi
 }
@@ -2375,9 +2395,11 @@ opt_firewall() {
     else
         cmd "${SUDO[@]}" ufw allow "${ssh_port}/tcp"
     fi
-    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+    if haproxy_mode_supported; then
         routes_file="$(mktemp)"
         extract_haproxy_routes > "$routes_file"
+    fi
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
         if [[ -s "$routes_file" ]]; then
             while IFS=$'\t' read -r port target sni source_ip; do
                 [[ "$port" =~ ^[0-9]+$ ]] || continue
@@ -2388,6 +2410,12 @@ opt_firewall() {
         fi
     else
         cmd "${SUDO[@]}" ufw allow 443/tcp
+        if [[ "$MACHINE_MODE" == "node" && -n "$routes_file" && -s "$routes_file" ]]; then
+            while IFS=$'\t' read -r port target sni source_ip; do
+                [[ "$port" =~ ^[0-9]+$ ]] || continue
+                cmd "${SUDO[@]}" ufw allow "${port}/tcp"
+            done < "$routes_file"
+        fi
     fi
     if [[ "$MACHINE_MODE" == "node" ]]; then
         cmd "${SUDO[@]}" ufw allow 443/udp
@@ -3089,9 +3117,11 @@ system_check_firewall() {
     else
         ufw_rule_allowed "${ssh_port}/tcp" || missing+=("${ssh_port}/tcp")
     fi
-    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+    if haproxy_mode_supported; then
         routes_file="$(mktemp)"
         extract_haproxy_routes > "$routes_file"
+    fi
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
         if [[ -s "$routes_file" ]]; then
             while IFS=$'\t' read -r port target sni source_ip; do
                 [[ "$port" =~ ^[0-9]+$ ]] || continue
@@ -3102,6 +3132,12 @@ system_check_firewall() {
         fi
     else
         ufw_rule_allowed "443/tcp" || missing+=("443/tcp")
+        if [[ "$MACHINE_MODE" == "node" && -n "$routes_file" && -s "$routes_file" ]]; then
+            while IFS=$'\t' read -r port target sni source_ip; do
+                [[ "$port" =~ ^[0-9]+$ ]] || continue
+                ufw_rule_allowed "${port}/tcp" || missing+=("${port}/tcp")
+            done < "$routes_file"
+        fi
     fi
     if [[ "$MACHINE_MODE" == "node" ]]; then
         ufw_rule_allowed "443/udp" || missing+=("443/udp")
@@ -4745,9 +4781,10 @@ EOF
 }
 
 apply_haproxy_config() {
-    local backend_target="$1" allowed_sni="$2" routes_file
+    local backend_target="$1" allowed_sni="$2" routes_file base_port
+    base_port="$(haproxy_base_port)"
     routes_file="$(mktemp)"
-    printf '443\t%s\t%s\tdefault\n' "$backend_target" "$allowed_sni" > "$routes_file"
+    printf '%s\t%s\t%s\tdefault\n' "$base_port" "$backend_target" "$allowed_sni" > "$routes_file"
     if apply_haproxy_routes_config "$routes_file"; then
         rm -f "$routes_file"
         return 0
@@ -4765,7 +4802,7 @@ ensure_haproxy_package() {
     must "Установка HAProxy" apt_install_quiet haproxy socat
 }
 
-harden_whitelist_haproxy_firewall() {
+sync_haproxy_firewall() {
     local routes_file="${1:-}" previous_routes_file="${2:-}"
     local ssh_port port target sni source_ip generated_routes=""
     command_exists ufw || return 0
@@ -4776,9 +4813,10 @@ harden_whitelist_haproxy_firewall() {
         extract_haproxy_routes > "$generated_routes"
         routes_file="$generated_routes"
     fi
-    ssh_port="$(detect_ssh_port)"
-
-    apply_whitelist_ssh_rules "$ssh_port"
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        ssh_port="$(detect_ssh_port)"
+        apply_whitelist_ssh_rules "$ssh_port"
+    fi
     while IFS=$'\t' read -r port target sni source_ip; do
         [[ "$port" =~ ^[0-9]+$ ]] || continue
         if ! cmd "${SUDO[@]}" ufw allow "${port}/tcp" comment 'kto-haproxy'; then
@@ -4790,34 +4828,47 @@ harden_whitelist_haproxy_firewall() {
         while IFS=$'\t' read -r port target sni source_ip; do
             [[ "$port" =~ ^[0-9]+$ ]] || continue
             if ! haproxy_route_file_has_port "$routes_file" "$port"; then
+                if [[ "$MACHINE_MODE" == "node" && ( "$port" == "443" || "$port" == "$NODE_PORT" ) ]]; then
+                    continue
+                fi
                 cmd "${SUDO[@]}" ufw --force delete allow "${port}/tcp" || true
             fi
         done < "$previous_routes_file"
     fi
 
-    cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
-    if ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
-        cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
+        if ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
+            cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
+        fi
     fi
     [[ -z "$generated_routes" ]] || rm -f "$generated_routes"
 }
 
 configure_haproxy_backend() {
     header
-    require_whitelist_mode
+    require_haproxy_mode
     need_root
-    local backend_target allowed_sni routes_file previous_routes_file
+    local backend_target allowed_sni routes_file previous_routes_file base_port
+    base_port="$(haproxy_base_port)"
+    if haproxy_tcp_port_listening "$base_port"; then
+        fail "TCP-порт ${base_port} уже занят. HAProxy config не изменён."
+        if [[ "$MACHINE_MODE" == "node" ]]; then
+            warn "Проверь, не использует ли Xray/gRPC порт ${base_port}, и освободи его перед установкой HAProxy."
+        fi
+        return 1
+    fi
     backend_target="$(ask_haproxy_target "Введите Backend IP или IP:порт")"
     allowed_sni="$(ask_haproxy_sni_list "Введите разрешенный SNI")"
 
     routes_file="$(mktemp)"
     previous_routes_file="$(mktemp)"
     extract_haproxy_routes > "$previous_routes_file"
-    printf '443\t%s\t%s\tdefault\n' "$backend_target" "$allowed_sni" > "$routes_file"
+    printf '%s\t%s\t%s\tdefault\n' "$base_port" "$backend_target" "$allowed_sni" > "$routes_file"
 
     if apply_haproxy_routes_config "$routes_file"; then
-        harden_whitelist_haproxy_firewall "$routes_file" "$previous_routes_file"
-        ok "HAProxy установлен: 443 -> ${backend_target}"
+        sync_haproxy_firewall "$routes_file" "$previous_routes_file"
+        ok "HAProxy установлен: ${base_port}/tcp -> ${backend_target}"
         ok "Разрешенный SNI: ${allowed_sni}"
     else
         rm -f "$routes_file" "$previous_routes_file"
@@ -4837,13 +4888,14 @@ print_haproxy_routes() {
 }
 
 select_haproxy_route() {
-    local routes_file="$1" mode="${2:-all}" choice index=0 port target sni source_ip source_label
+    local routes_file="$1" mode="${2:-all}" choice index=0 port target sni source_ip source_label base_port
     local -a ports=()
+    base_port="$(haproxy_base_port)"
 
     printf '%s\n' "Выберите HAProxy-порт:" >&2
     while IFS=$'\t' read -r port target sni source_ip; do
         [[ -n "$port" ]] || continue
-        if [[ "$mode" == "extra" && "$port" == "443" ]]; then
+        if [[ "$mode" == "extra" && "$port" == "$base_port" ]]; then
             continue
         fi
         ports+=("$port")
@@ -4934,7 +4986,7 @@ add_haproxy_route_with_source() {
     printf '%s\t%s\t%s\t%s\n' "$port" "$backend_target" "$allowed_sni" "$source_ip" >> "$next_file"
 
     if apply_haproxy_routes_config "$next_file"; then
-        harden_whitelist_haproxy_firewall "$next_file" "$routes_file"
+        sync_haproxy_firewall "$next_file" "$routes_file"
         mv "$next_file" "$routes_file"
         ok "Добавлен HAProxy порт ${port}: ${backend_target}"
         ok "Исходящий IP: $(haproxy_source_label "$source_ip")"
@@ -4972,7 +5024,7 @@ edit_haproxy_route() {
     ' "$routes_file" > "$next_file"
 
     if apply_haproxy_routes_config "$next_file"; then
-        harden_whitelist_haproxy_firewall "$next_file" "$routes_file"
+        sync_haproxy_firewall "$next_file" "$routes_file"
         mv "$next_file" "$routes_file"
         ok "Маршрут ${port}/tcp обновлён"
         return 0
@@ -4992,7 +5044,7 @@ replace_all_haproxy_sni() {
     ' "$routes_file" > "$next_file"
 
     if apply_haproxy_routes_config "$next_file"; then
-        harden_whitelist_haproxy_firewall "$next_file" "$routes_file"
+        sync_haproxy_firewall "$next_file" "$routes_file"
         mv "$next_file" "$routes_file"
         route_count="$(haproxy_route_count "$routes_file")"
         ok "SNI заменён на всех HAProxy-маршрутах: ${route_count}"
@@ -5010,7 +5062,7 @@ delete_haproxy_route() {
     awk -F '\t' -v port="$port" '$1 != port { print }' "$routes_file" > "$next_file"
 
     if apply_haproxy_routes_config "$next_file"; then
-        harden_whitelist_haproxy_firewall "$next_file" "$routes_file"
+        sync_haproxy_firewall "$next_file" "$routes_file"
         mv "$next_file" "$routes_file"
         ok "HAProxy порт ${port}/tcp удалён"
         return 0
@@ -5021,12 +5073,13 @@ delete_haproxy_route() {
 
 update_haproxy_existing_config() {
     header
-    require_whitelist_mode
+    require_haproxy_mode
     need_root
-    local routes_file
+    local routes_file base_port
+    base_port="$(haproxy_base_port)"
 
     if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
-        warn "HAProxy config не найден, создаю базовый порт 443."
+        warn "HAProxy config не найден, создаю базовый порт ${base_port}."
         configure_haproxy_backend
         return
     fi
@@ -5040,7 +5093,7 @@ update_haproxy_existing_config() {
     fi
 
     if apply_haproxy_routes_config "$routes_file"; then
-        harden_whitelist_haproxy_firewall "$routes_file" "$routes_file"
+        sync_haproxy_firewall "$routes_file" "$routes_file"
         ok "HAProxy обновлён без повторного ввода, маршруты сохранены"
         rm -f "$routes_file"
         return 0
@@ -5051,13 +5104,14 @@ update_haproxy_existing_config() {
 
 haproxy_menu() {
     header
-    require_whitelist_mode
+    require_haproxy_mode
     need_root
-    local routes_file choice
+    local routes_file choice base_port
+    base_port="$(haproxy_base_port)"
     routes_file="$(mktemp)"
 
     if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
-        warn "HAProxy ещё не настроен. Сначала создаю базовый порт 443."
+        warn "HAProxy ещё не настроен. Сначала создаю базовый порт ${base_port}."
         if ! configure_haproxy_backend; then
             rm -f "$routes_file"
             return 1
@@ -5093,7 +5147,7 @@ haproxy_menu() {
             5) replace_all_haproxy_sni "$routes_file" || true ;;
             6)
                 if apply_haproxy_routes_config "$routes_file"; then
-                    harden_whitelist_haproxy_firewall "$routes_file" "$routes_file"
+                    sync_haproxy_firewall "$routes_file" "$routes_file"
                     ok "HAProxy обновлён, все маршруты сохранены"
                 fi
                 ;;
@@ -6621,7 +6675,8 @@ menu() {
     if [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_hysteria2; then
         labels+=("Сгенерировать SSL-сертификат")
         actions+=("ssl")
-    elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
+    fi
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
         labels+=("HAProxy")
         actions+=("haproxy")
         if mobile443_lte_configured; then
@@ -6634,6 +6689,9 @@ menu() {
         actions+=("mobile443-lte-status")
         labels+=("Push статистики")
         actions+=("stats-push-menu")
+    elif [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_reality; then
+        labels+=("HAProxy (мост, 8443/tcp)")
+        actions+=("haproxy")
     fi
 
     labels+=("Настройки")

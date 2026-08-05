@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v255"
+PUSH_BUILD="v256"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -271,17 +271,39 @@ normalize_sni_value() {
     printf '%s\n' "$value"
 }
 
+haproxy_base_frontend_name() {
+    local config="${1:-/etc/haproxy/haproxy.cfg}"
+    awk '
+        $1 == "frontend" && ($2 == "vless_in" || $2 ~ /^vless_in_[0-9]+$/) {
+            print $2
+            exit
+        }
+    ' "$config" 2>/dev/null || true
+}
+
+haproxy_base_server_name() {
+    local config="${1:-/etc/haproxy/haproxy.cfg}"
+    awk '
+        $1 == "server" && ($2 == "xray1" || $2 ~ /^xray_[0-9]+$/) {
+            print $2
+            exit
+        }
+    ' "$config" 2>/dev/null || true
+}
+
 read_haproxy_allowed_sni() {
-    local values
+    local values base_frontend
 
     haproxy_allowed_sni='[]'
     command -v jq >/dev/null 2>&1 || return 0
     [[ -r /etc/haproxy/haproxy.cfg ]] || return 0
+    base_frontend="$(haproxy_base_frontend_name)"
+    [[ -n "$base_frontend" ]] || return 0
 
-    values="$(awk '
-        $1 == "frontend" { base_frontend = ($2 == "vless_in"); next }
-        $1 == "backend" { base_frontend = 0; next }
-        base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+    values="$(awk -v wanted="$base_frontend" '
+        $1 == "frontend" { in_base_frontend = ($2 == wanted); next }
+        $1 == "backend" { in_base_frontend = 0; next }
+        in_base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
             suffix_match = 0
             for (i = 1; i <= NF; i++) {
                 if ($i == "-m" && $(i + 1) == "end") suffix_match = 1
@@ -330,13 +352,15 @@ render_haproxy_sni_acl_block() {
 }
 
 read_haproxy_backend_target() {
-    local target
+    local target base_server
 
     haproxy_backend_target=''
     [[ -r /etc/haproxy/haproxy.cfg ]] || return 0
+    base_server="$(haproxy_base_server_name)"
+    [[ -n "$base_server" ]] || return 0
 
-    target="$(awk '
-        $1 == "server" && $2 == "xray1" {
+    target="$(awk -v wanted="$base_server" '
+        $1 == "server" && $2 == wanted {
             print $3
             exit
         }
@@ -463,6 +487,7 @@ apply_collector_haproxy_config() {
     local response="$1"
     local desired_file tmp_cfg next_cfg desired_sni_block current_sni_block
     local desired_target current_target current_target_raw applied=0 changed=0 has_sni=0 has_target=0
+    local base_frontend base_server
 
     command -v jq >/dev/null 2>&1 || return 0
     command -v haproxy >/dev/null 2>&1 || return 0
@@ -476,21 +501,23 @@ apply_collector_haproxy_config() {
         rm -f "$desired_file" "$tmp_cfg" "$next_cfg"
         return 0
     fi
+    base_frontend="$(haproxy_base_frontend_name "$tmp_cfg")"
+    base_server="$(haproxy_base_server_name "$tmp_cfg")"
 
     desired_target="$(printf '%s' "$response" | jq -r '.haproxy_target // empty' 2>/dev/null || true)"
     if [[ -n "$desired_target" ]]; then
         if desired_target="$(normalize_haproxy_target "$desired_target" 2>/dev/null)"; then
-            current_target_raw="$(awk '
-                $1 == "server" && $2 == "xray1" {
+            current_target_raw="$(awk -v wanted="$base_server" '
+                $1 == "server" && $2 == wanted {
                     print $3
                     exit
                 }
             ' "$tmp_cfg" 2>/dev/null || true)"
             current_target="$(normalize_haproxy_target "$current_target_raw" 2>/dev/null || true)"
             if [[ -n "$current_target_raw" && "$current_target" != "$desired_target" ]]; then
-                if awk -v target="$desired_target" '
-                    $1 == "server" && $2 == "xray1" && replaced == 0 {
-                        line = "    server xray1 " target
+                if awk -v target="$desired_target" -v server_name="$base_server" '
+                    $1 == "server" && $2 == server_name && replaced == 0 {
+                        line = "    server " server_name " " target
                         for (i = 4; i <= NF; i++) line = line " " $i
                         print line
                         replaced = 1
@@ -507,7 +534,7 @@ apply_collector_haproxy_config() {
                     return 0
                 fi
             elif [[ -z "$current_target_raw" ]]; then
-                echo "push ${PUSH_BUILD}: haproxy target skipped, xray1 backend not found" >&2
+                echo "push ${PUSH_BUILD}: haproxy target skipped, managed backend not found" >&2
             fi
         else
             echo "push ${PUSH_BUILD}: haproxy target skipped, bad target from collector" >&2
@@ -524,18 +551,18 @@ apply_collector_haproxy_config() {
         if [[ -s "$desired_file" ]]; then
             has_sni=1
             desired_sni_block="$(render_haproxy_sni_acl_block "$desired_file")"
-            current_sni_block="$(awk '
-                $1 == "frontend" { base_frontend = ($2 == "vless_in"); next }
-                $1 == "backend" { base_frontend = 0; next }
-                base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+            current_sni_block="$(awk -v wanted="$base_frontend" '
+                $1 == "frontend" { in_base_frontend = ($2 == wanted); next }
+                $1 == "backend" { in_base_frontend = 0; next }
+                in_base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
                     print
                 }
             ' "$tmp_cfg" 2>/dev/null || true)"
             if [[ "$current_sni_block" != "$desired_sni_block" ]]; then
-                if awk -v replacement="$desired_sni_block" '
-                    $1 == "frontend" { base_frontend = ($2 == "vless_in") }
-                    $1 == "backend" { base_frontend = 0 }
-                    base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
+                if awk -v replacement="$desired_sni_block" -v frontend_name="$base_frontend" '
+                    $1 == "frontend" { in_base_frontend = ($2 == frontend_name) }
+                    $1 == "backend" { in_base_frontend = 0 }
+                    in_base_frontend && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
                         if (replaced == 0) {
                             print replacement
                             replaced = 1
@@ -699,9 +726,13 @@ ensure_node_identity() {
         if [[ -r /etc/kto-cfg.conf ]]; then
             machine_mode="$(awk -F= '$1 == "MACHINE_MODE" {gsub(/^"|"$/, "", $2); print tolower($2); exit}' /etc/kto-cfg.conf 2>/dev/null || true)"
         fi
-        if [[ "$machine_mode" == "whitelist" ]] || [[ -r /etc/haproxy/haproxy.cfg ]]; then
+        if [[ "$machine_mode" == "whitelist" ]]; then
             inferred_kind="wl"
-        elif [[ "$machine_mode" != "node" ]]; then
+        elif [[ "$machine_mode" == "node" ]]; then
+            inferred_kind="bl"
+        elif [[ -r /etc/haproxy/haproxy.cfg ]]; then
+            inferred_kind="wl"
+        else
             case "$lowered_name" in
                 *"обход"*|*whitelist*|*haproxy*) inferred_kind="wl" ;;
             esac

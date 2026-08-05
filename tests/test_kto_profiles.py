@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v255"', KTO)
-        self.assertIn('PUSH_BUILD="v255"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v255"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v255"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v255"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v255"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v256"', KTO)
+        self.assertIn('PUSH_BUILD="v256"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v256"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v256"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v256"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v256"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -552,6 +552,108 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('replace_all_haproxy_sni "$routes_file"', haproxy_menu)
         self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
 
+    def test_reality_profiles_expose_haproxy_bridge_on_8443(self):
+        supported = function_body(KTO, "haproxy_mode_supported")
+        base_port = function_body(KTO, "haproxy_base_port")
+        configure = function_body(KTO, "configure_haproxy_backend")
+        haproxy_menu = function_body(KTO, "haproxy_menu")
+        settings_menu = function_body(KTO, "settings_menu")
+        main_menu = function_body(KTO, "menu")
+
+        self.assertIn('[[ "$MACHINE_MODE" == "whitelist" ]]', supported)
+        self.assertIn('node_profile_includes_reality', supported)
+        self.assertIn('echo "8443"', base_port)
+        self.assertIn('echo "443"', base_port)
+        self.assertIn('require_haproxy_mode', configure)
+        self.assertIn('base_port="$(haproxy_base_port)"', configure)
+        self.assertIn('haproxy_tcp_port_listening "$base_port"', configure)
+        self.assertIn("printf '%s\\t%s\\t%s\\tdefault\\n'", configure)
+        self.assertIn('sync_haproxy_firewall "$routes_file" "$previous_routes_file"', configure)
+        self.assertIn('require_haproxy_mode', haproxy_menu)
+        self.assertIn('if haproxy_mode_supported; then', settings_menu)
+        self.assertIn('labels+=("HAProxy (мост, 8443/tcp)")', main_menu)
+
+    def test_reality_haproxy_does_not_reclassify_push_as_whitelist(self):
+        identity = function_body(PUSH, "ensure_node_identity")
+        node_branch = identity.index('elif [[ "$machine_mode" == "node" ]]')
+        haproxy_fallback = identity.index('elif [[ -r /etc/haproxy/haproxy.cfg ]]')
+
+        self.assertLess(node_branch, haproxy_fallback)
+        self.assertIn('inferred_kind="bl"', identity[node_branch:haproxy_fallback])
+
+    def test_push_manages_reality_haproxy_base_route(self):
+        frontend = function_body(PUSH, "haproxy_base_frontend_name")
+        server = function_body(PUSH, "haproxy_base_server_name")
+        read_sni = function_body(PUSH, "read_haproxy_allowed_sni")
+        read_target = function_body(PUSH, "read_haproxy_backend_target")
+        apply_config = function_body(PUSH, "apply_collector_haproxy_config")
+
+        self.assertIn('/^vless_in_[0-9]+$/', frontend)
+        self.assertIn('/^xray_[0-9]+$/', server)
+        self.assertIn('base_frontend="$(haproxy_base_frontend_name)"', read_sni)
+        self.assertIn('base_server="$(haproxy_base_server_name)"', read_target)
+        self.assertIn('server_name="$base_server"', apply_config)
+        self.assertIn('frontend_name="$base_frontend"', apply_config)
+
+        bash = bash_executable()
+        if bash is None:
+            return
+
+        harness = r'''
+source <(awk '/^haproxy_base_frontend_name\(\)/ { keep=1 } /^read_haproxy_allowed_sni\(\)/ { exit } keep' scripts/kto-stats-push.sh)
+config=$(mktemp)
+trap 'rm -f "$config"' EXIT
+cat > "$config" <<'EOF'
+frontend vless_in_8443
+    bind *:8443
+    default_backend vless_pool_8443
+backend vless_pool_8443
+    server xray_8443 5.34.179.144:443 check weight 10
+EOF
+[[ "$(haproxy_base_frontend_name "$config")" == vless_in_8443 ]]
+[[ "$(haproxy_base_server_name "$config")" == xray_8443 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_base_port_matches_machine_profile(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+MACHINE_MODE=whitelist
+NODE_PROFILE=
+haproxy_mode_supported
+[[ "$(haproxy_base_port)" == 443 ]]
+MACHINE_MODE=node
+NODE_PROFILE=reality
+haproxy_mode_supported
+[[ "$(haproxy_base_port)" == 8443 ]]
+NODE_PROFILE=reality_hysteria2
+haproxy_mode_supported
+[[ "$(haproxy_base_port)" == 8443 ]]
+NODE_PROFILE=hysteria2
+! haproxy_mode_supported
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_haproxy_wildcard_sni_and_ssh_defaults_are_managed(self):
         render_sni = function_body(KTO, "render_haproxy_sni_acl_lines")
         extract = function_body(KTO, "extract_haproxy_routes")
@@ -583,7 +685,7 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('маршруты сохранены', update)
 
     def test_haproxy_firewall_and_wrong_sni_cover_extra_ports(self):
-        firewall = function_body(KTO, "harden_whitelist_haproxy_firewall")
+        firewall = function_body(KTO, "sync_haproxy_firewall")
         optimize_firewall = function_body(KTO, "opt_firewall")
         check_firewall = function_body(KTO, "system_check_firewall")
         scan = function_body(PUSH, "read_haproxy_scan_stats")
@@ -597,6 +699,48 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('/^vless_in_[0-9]+$/', scan)
         self.assertIn("count[$1] += $2", scan)
         self.assertIn("show table %s", scan)
+
+    def test_reality_haproxy_firewall_does_not_apply_whitelist_ssh_rules(self):
+        firewall = function_body(KTO, "sync_haproxy_firewall")
+        self.assertIn('if [[ "$MACHINE_MODE" == "whitelist" ]]', firewall)
+        self.assertIn('apply_whitelist_ssh_rules "$ssh_port"', firewall)
+        self.assertIn('ufw allow "${port}/tcp"', firewall)
+        self.assertIn('"$port" == "443" || "$port" == "$NODE_PORT"', firewall)
+
+        bash = bash_executable()
+        if bash is None:
+            return
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+MACHINE_MODE=node
+NODE_PROFILE=reality
+SUDO=()
+routes=$(mktemp)
+previous=$(mktemp)
+events=$(mktemp)
+trap 'rm -f "$routes" "$previous" "$events"' EXIT
+printf '8443\t5.34.179.144:443\tbridge.example.com\tdefault\n' > "$routes"
+printf '443\t89.144.8.3:443\told.example.com\tdefault\n' > "$previous"
+command_exists() { [[ "$1" == ufw ]]; }
+ufw_active() { return 0; }
+apply_whitelist_ssh_rules() { printf 'ssh-filter\n' >> "$events"; }
+cmd() { local IFS=' '; printf '%s\n' "$*" >> "$events"; }
+sync_haproxy_firewall "$routes" "$previous"
+grep -q 'ufw allow 8443/tcp' "$events"
+! grep -q 'ssh-filter' "$events"
+! grep -q 'delete allow 443/tcp' "$events"
+! grep -q 'delete allow 443/udp' "$events"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_haproxy_multiport_config_round_trip(self):
         bash = bash_executable()
@@ -711,7 +855,7 @@ haproxy_tcp_port_listening() { return 1; }
 ask_haproxy_target_default() { printf '5.34.179.144:443\n'; }
 ask_haproxy_sni_list() { printf 'extra.example.com\n'; }
 apply_haproxy_routes_config() { return 0; }
-harden_whitelist_haproxy_firewall() { return 0; }
+sync_haproxy_firewall() { return 0; }
 add_haproxy_source_route "$routes"
 grep -qx $'8443\t5.34.179.144:443\textra.example.com\t185.141.227.93' "$routes"
 '''
@@ -738,7 +882,7 @@ trap 'rm -f "$routes"' EXIT
 printf '443\t89.144.8.3:443\told.example.com\tdefault\n8443\t5.34.179.144:443\tother.example.com\t185.141.227.93\n' > "$routes"
 ask_haproxy_sni_list() { printf '%s\n' '*.rog-self.co.uk'; }
 apply_haproxy_routes_config() { return 0; }
-harden_whitelist_haproxy_firewall() { return 0; }
+sync_haproxy_firewall() { return 0; }
 replace_all_haproxy_sni "$routes"
 expected=$'443\t89.144.8.3:443\t*.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\t*.rog-self.co.uk\t185.141.227.93'
 actual=$(cat "$routes")
