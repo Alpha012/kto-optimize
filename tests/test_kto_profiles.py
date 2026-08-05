@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v263"', KTO)
-        self.assertIn('PUSH_BUILD="v263"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v263"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v263"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v263"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v263"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v264"', KTO)
+        self.assertIn('PUSH_BUILD="v264"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v264"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v264"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v264"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v264"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -250,6 +250,39 @@ IFS=$'\t' read -r archive_url archive_hash deb_url deb_hash deb_arch <<< "$profi
 [[ "$archive_hash" == "$SPEEDTEST_X86_64_ARCHIVE_SHA256" ]]
 [[ "$deb_hash" == "$SPEEDTEST_AMD64_DEB_SHA256" ]]
 [[ "$deb_arch" == amd64 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_speedtest_ru_binds_all_test_traffic_to_requested_ip(self):
+        speedtest_ru = function_body(KTO, "speedtest_ru")
+        main = function_body(KTO, "main")
+
+        self.assertIn('local source_ip="${1:-}"', speedtest_ru)
+        self.assertIn('ip -4 route get 1.1.1.1 from "$source_ip"', speedtest_ru)
+        self.assertIn('"$bind_dir/iperf3" "$real_iperf3" -B "$source_ip"', speedtest_ru)
+        self.assertIn('"$bind_dir/ping" "$real_ping" -I "$source_ip"', speedtest_ru)
+        self.assertIn('"--bind-address=${source_ip}"', speedtest_ru)
+        self.assertIn('--interface "$source_ip"', speedtest_ru)
+        self.assertIn('PATH="${bind_dir}:${PATH}" bash "$bench_script"', speedtest_ru)
+        self.assertIn('speedtest_ru "${2:-}"', main)
+
+        bash = bash_executable()
+        if bash is None:
+            return
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+wrapper=$(mktemp)
+trap 'rm -f "$wrapper"' EXIT
+write_speedtest_ru_bind_wrapper "$wrapper" /bin/echo -B 217.19.122.109
+[[ "$("$wrapper" hello)" == '-B 217.19.122.109 hello' ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

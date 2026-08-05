@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v263"
+SCRIPT_BUILD="v264"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4082,18 +4082,54 @@ install_speedtest() {
     fi
 }
 
+write_speedtest_ru_bind_wrapper() {
+    local output_file="$1" executable="$2"
+    shift 2
+    {
+        printf '#!/usr/bin/env bash\nexec'
+        printf ' %q' "$executable" "$@"
+        printf ' "$@"\n'
+    } > "$output_file"
+    chmod 0755 "$output_file"
+}
+
 speedtest_ru() {
     header
     need_root
-    local bench_script
+    local source_ip="${1:-}" bench_script bind_dir="" route_line route_interface actual_ip
+    local real_iperf3 real_ping real_wget real_curl
 
     stage "Запускаю Speedtest (RU)"
-    apt_install_with_update_if_missing wget ca-certificates
+    if [[ -n "$source_ip" ]]; then
+        source_ip="$(printf '%s' "$source_ip" | tr -d '[:space:]')"
+        validate_ipv4 "$source_ip" || {
+            fail "Некорректный source IP: ${source_ip:-пусто}"
+            return 1
+        }
+        if ! ip -4 -o address show scope global 2>/dev/null | awk -v wanted="$source_ip" '
+            { split($4, cidr, "/"); if (cidr[1] == wanted) found = 1 }
+            END { exit found ? 0 : 1 }
+        '; then
+            fail "IP ${source_ip} не настроен на локальном интерфейсе"
+            return 1
+        fi
+        route_line="$(ip -4 route get 1.1.1.1 from "$source_ip" 2>/dev/null || true)"
+        route_interface="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<< "$route_line")"
+        if [[ -z "$route_line" || -z "$route_interface" ]]; then
+            fail "Для ${source_ip} нет рабочего source-route. Сначала запусти настройку дополнительных IP."
+            return 1
+        fi
+        stage "Тест через ${source_ip} (${route_interface})"
+        apt_install_with_update_if_missing wget curl ca-certificates iperf3 iproute2 iputils-ping
+    else
+        apt_install_with_update_if_missing wget ca-certificates
+    fi
 
     bench_script="$(mktemp)"
     cleanup_speedtest_ru() {
         trap - RETURN
         rm -f "$bench_script"
+        [[ -z "$bind_dir" ]] || rm -rf "$bind_dir"
     }
     trap cleanup_speedtest_ru RETURN
 
@@ -4106,7 +4142,35 @@ speedtest_ru() {
     fi
 
     echo "running: wget -qO- https://bench.tlab.pw | bash" >> "$LOG_FILE"
-    bash "$bench_script"
+    if [[ -z "$source_ip" ]]; then
+        bash "$bench_script"
+        return
+    fi
+
+    real_iperf3="$(command -v iperf3)"
+    real_ping="$(command -v ping)"
+    real_wget="$(command -v wget)"
+    real_curl="$(command -v curl)"
+    bind_dir="$(mktemp -d)"
+    write_speedtest_ru_bind_wrapper "$bind_dir/iperf3" "$real_iperf3" -B "$source_ip"
+    write_speedtest_ru_bind_wrapper "$bind_dir/ping" "$real_ping" -I "$source_ip"
+    write_speedtest_ru_bind_wrapper "$bind_dir/wget" "$real_wget" --no-proxy -4 "--bind-address=${source_ip}"
+    write_speedtest_ru_bind_wrapper "$bind_dir/curl" "$real_curl" --noproxy '*' -4 --interface "$source_ip"
+
+    actual_ip="$($real_curl -4 --noproxy '*' --interface "$source_ip" -fsS \
+        --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    if validate_ipv4 "$actual_ip"; then
+        if [[ "$actual_ip" == "$source_ip" ]]; then
+            ok "Внешний IP теста: ${actual_ip}"
+        else
+            warn "Source ${source_ip} выходит наружу как ${actual_ip} (NAT)"
+        fi
+    else
+        warn "Не удалось проверить внешний IP, но source-route найден: ${route_line}"
+    fi
+    echo "speedtest-ru source=${source_ip} route=${route_line}" >> "$LOG_FILE"
+    env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+        PATH="${bind_dir}:${PATH}" bash "$bench_script"
 }
 
 NETTEST_DNS_BAD=0
