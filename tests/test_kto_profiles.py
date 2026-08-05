@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v258"', KTO)
-        self.assertIn('PUSH_BUILD="v258"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v258"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v258"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v258"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v258"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v259"', KTO)
+        self.assertIn('PUSH_BUILD="v259"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v259"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v259"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v259"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v259"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -680,9 +680,11 @@ NODE_PROFILE=hysteria2
         self.assertIn('haproxy -c -f "$tmp_config"', apply_routes)
         self.assertIn('${config}.kto.bak', apply_routes)
         self.assertIn('${config}.kto.failed', apply_routes)
+        self.assertIn('extract_haproxy_routes "$backup" > "$backup_routes"', apply_routes)
         self.assertIn('reload_haproxy_gracefully "$routes_file"', apply_routes)
         self.assertIn('возвращаю предыдущий', apply_routes)
         self.assertIn('install -m 0644 "$backup" "$config"', apply_routes)
+        self.assertIn('start_haproxy_cleanly "$backup_routes"', apply_routes)
         self.assertIn('extract_haproxy_routes > "$routes_file"', update)
         self.assertIn('маршруты сохранены', update)
 
@@ -720,14 +722,23 @@ unset KTO_HAPROXY_MAXCONN
     def test_haproxy_activation_checks_every_listener(self):
         wait_for_routes = function_body(KTO, "wait_for_haproxy_routes")
         reload = function_body(KTO, "reload_haproxy_gracefully")
+        clean_start = function_body(KTO, "start_haproxy_cleanly")
+        stale_listeners = function_body(KTO, "kill_stale_haproxy_route_listeners")
         failure_details = function_body(KTO, "print_haproxy_failure_details")
         package = function_body(KTO, "ensure_haproxy_package")
 
         self.assertIn('haproxy_missing_listener_ports "$routes_file"', wait_for_routes)
         self.assertIn('systemctl is-active --quiet haproxy', wait_for_routes)
         self.assertIn('wait_for_haproxy_routes "$routes_file"', reload)
+        self.assertIn('start_haproxy_cleanly "$routes_file"', reload)
         self.assertIn('print_haproxy_failure_details', reload)
         self.assertIn('systemctl restart haproxy', reload)
+        self.assertIn('systemctl --no-block stop haproxy', clean_start)
+        self.assertIn('wait_for_haproxy_stopped_and_ports_free', clean_start)
+        self.assertIn('systemctl kill --kill-who=all --signal=KILL', clean_start)
+        self.assertIn('systemctl reset-failed haproxy', clean_start)
+        self.assertIn('grep -vi haproxy', stale_listeners)
+        self.assertIn('kill "-${signal}" "$pid"', stale_listeners)
         self.assertIn('journalctl -u haproxy -n 40', failure_details)
         self.assertIn('systemctl show haproxy -p LimitNOFILE', failure_details)
         self.assertIn('haproxy socat iproute2', package)
@@ -749,6 +760,64 @@ haproxy_tcp_port_owned_by_haproxy() { [[ "$1" == 8443 ]]; }
 ! wait_for_haproxy_routes "$routes"
 haproxy_tcp_port_owned_by_haproxy() { return 0; }
 wait_for_haproxy_routes "$routes"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_clean_start_waits_and_kills_only_stale_haproxy(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+LOG_FILE=$(mktemp)
+routes=$(mktemp)
+events=$(mktemp)
+trap 'rm -f "$LOG_FILE" "$routes" "$events"' EXIT
+printf '8443\t65.108.1.173:443\tfaq.cdnvideo.work\tdefault\n' > "$routes"
+systemctl() {
+    printf '%s|' "$@" >> "$events"
+    printf '\n' >> "$events"
+    if [[ "${1:-}" == show && "${4:-}" == ActiveState ]]; then
+        printf 'inactive\n'
+    elif [[ "${1:-}" == show && "${4:-}" == MainPID ]]; then
+        printf '0\n'
+    fi
+    return 0
+}
+haproxy_route_ports_are_free() { return 0; }
+wait_for_haproxy_routes() { return 0; }
+start_haproxy_cleanly "$routes"
+grep -q -- '--no-block|stop|haproxy|' "$events"
+grep -q 'reset-failed|haproxy|' "$events"
+grep -q 'start|haproxy|' "$events"
+
+MODE=haproxy
+haproxy_tcp_port_listener_details() {
+    if [[ "$MODE" == haproxy ]]; then
+        printf '%s\n' 'LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("haproxy",pid=123,fd=4))'
+    else
+        printf '%s\n' 'LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("xray",pid=456,fd=4))'
+    fi
+}
+cat() { printf 'haproxy\n'; }
+kill() { printf 'kill:%s:%s\n' "$1" "$2" >> "$events"; }
+kill_stale_haproxy_route_listeners "$routes" KILL
+grep -q 'kill:-KILL:123' "$events"
+before=$(grep -c '^kill:' "$events")
+MODE=foreign
+! kill_stale_haproxy_route_listeners "$routes" KILL
+after=$(grep -c '^kill:' "$events")
+[[ "$before" == "$after" ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

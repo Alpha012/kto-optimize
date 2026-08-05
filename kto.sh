@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v258"
+SCRIPT_BUILD="v259"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4457,6 +4457,97 @@ haproxy_tcp_port_owned_by_haproxy() {
     '
 }
 
+haproxy_tcp_port_listener_details() {
+    local wanted="$1"
+    command_exists ss || return 1
+    "${SUDO[@]}" ss -H -ltnp 2>/dev/null | awk -v wanted="$wanted" '
+        {
+            address = $4
+            sub(/^.*:/, "", address)
+            if (address == wanted) {
+                print
+                found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+haproxy_route_ports_are_free() {
+    local routes_file="$1" port
+
+    while IFS=$'\t' read -r port _; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        if haproxy_tcp_port_listener_details "$port" >/dev/null 2>&1; then
+            return 1
+        fi
+    done < "$routes_file"
+    return 0
+}
+
+haproxy_service_is_stopped() {
+    local active_state main_pid
+    active_state="$("${SUDO[@]}" systemctl show haproxy -p ActiveState --value 2>/dev/null || true)"
+    main_pid="$("${SUDO[@]}" systemctl show haproxy -p MainPID --value 2>/dev/null || true)"
+    [[ "$main_pid" == "0" ]] || return 1
+    [[ "$active_state" == "inactive" || "$active_state" == "failed" ]]
+}
+
+wait_for_haproxy_stopped_and_ports_free() {
+    local routes_file="$1" attempts="${2:-20}" attempt
+
+    for (( attempt = 1; attempt <= attempts; attempt++ )); do
+        if haproxy_service_is_stopped && haproxy_route_ports_are_free "$routes_file"; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
+kill_stale_haproxy_route_listeners() {
+    local routes_file="$1" signal="${2:-KILL}"
+    local port details foreign pids pid comm foreign_found=0
+
+    while IFS=$'\t' read -r port _; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        details="$(haproxy_tcp_port_listener_details "$port" 2>/dev/null || true)"
+        [[ -n "$details" ]] || continue
+
+        foreign="$(printf '%s\n' "$details" | grep -vi haproxy || true)"
+        if [[ -n "$foreign" ]]; then
+            fail "HAProxy порт ${port}/tcp занят чужим процессом:"
+            printf '%s\n' "$foreign" >&2
+            foreign_found=1
+            continue
+        fi
+
+        pids="$(printf '%s\n' "$details" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)"
+        while IFS= read -r pid; do
+            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            comm="$("${SUDO[@]}" cat "/proc/${pid}/comm" 2>/dev/null || true)"
+            [[ "$comm" == haproxy* ]] || continue
+            warn "Завершаю stale HAProxy PID ${pid}, который держит ${port}/tcp"
+            "${SUDO[@]}" kill "-${signal}" "$pid" >> "$LOG_FILE" 2>&1 || true
+        done <<< "$pids"
+    done < "$routes_file"
+
+    (( foreign_found == 0 ))
+}
+
+report_haproxy_busy_route_ports() {
+    local routes_file="$1" port details
+
+    while IFS=$'\t' read -r port _; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        details="$(haproxy_tcp_port_listener_details "$port" 2>/dev/null || true)"
+        if [[ -n "$details" ]]; then
+            fail "Порт ${port}/tcp всё ещё занят:"
+            printf '%s\n' "$details" >&2
+        fi
+    done < "$routes_file"
+}
+
 haproxy_missing_listener_ports() {
     local routes_file="$1" port
 
@@ -4498,6 +4589,27 @@ wait_for_haproxy_routes() {
     return 1
 }
 
+start_haproxy_cleanly() {
+    local routes_file="$1"
+
+    "${SUDO[@]}" systemctl --no-block stop haproxy >> "$LOG_FILE" 2>&1 || true
+    if ! wait_for_haproxy_stopped_and_ports_free "$routes_file" 20; then
+        warn "Старый HAProxy не остановился за 5 секунд, завершаю его worker-процессы."
+        "${SUDO[@]}" systemctl kill --kill-who=all --signal=KILL haproxy.service >> "$LOG_FILE" 2>&1 || true
+        kill_stale_haproxy_route_listeners "$routes_file" KILL || return 1
+        if ! wait_for_haproxy_stopped_and_ports_free "$routes_file" 20; then
+            report_haproxy_busy_route_ports "$routes_file"
+            return 1
+        fi
+    fi
+
+    "${SUDO[@]}" systemctl reset-failed haproxy >> "$LOG_FILE" 2>&1 || true
+    if ! "${SUDO[@]}" systemctl start haproxy >> "$LOG_FILE" 2>&1; then
+        return 1
+    fi
+    wait_for_haproxy_routes "$routes_file"
+}
+
 print_haproxy_failure_details() {
     local config="${1:-/etc/haproxy/haproxy.cfg}"
     local details
@@ -4529,17 +4641,18 @@ reload_haproxy_gracefully() {
                 ok "HAProxy применён через reload"
                 return 0
             fi
-            warn "HAProxy reload завершился без рабочих listener-портов, делаю restart."
+            warn "HAProxy reload завершился без рабочих listener-портов, делаю чистый start."
         else
-            warn "HAProxy reload не прошёл, делаю restart."
+            warn "HAProxy reload не прошёл, делаю чистый start."
         fi
     fi
 
-    if "${SUDO[@]}" systemctl restart haproxy >> "$LOG_FILE" 2>&1; then
-        if [[ -z "$routes_file" ]] || wait_for_haproxy_routes "$routes_file"; then
-            ok "HAProxy применён через restart"
-            return 0
-        fi
+    if [[ -n "$routes_file" ]] && start_haproxy_cleanly "$routes_file"; then
+        ok "HAProxy применён через чистый start"
+        return 0
+    elif [[ -z "$routes_file" ]] && "${SUDO[@]}" systemctl restart haproxy >> "$LOG_FILE" 2>&1; then
+        ok "HAProxy применён через restart"
+        return 0
     fi
     print_haproxy_failure_details
     fail "HAProxy не запустил все настроенные listener-порты"
@@ -4846,19 +4959,20 @@ EOF
 apply_haproxy_routes_config() {
     local routes_file="$1"
     local config=/etc/haproxy/haproxy.cfg
-    local tmp_config backup had_config=0 haproxy_threads haproxy_maxconn haproxy_nofile route_count
+    local tmp_config backup backup_routes had_config=0 haproxy_threads haproxy_maxconn haproxy_nofile route_count
 
     ensure_haproxy_package
     tmp_config="$(mktemp)"
     backup="$(mktemp)"
+    backup_routes="$(mktemp)"
     if ! render_haproxy_routes_config "$routes_file" "$tmp_config"; then
-        rm -f "$tmp_config" "$backup"
+        rm -f "$tmp_config" "$backup" "$backup_routes"
         return 1
     fi
 
     stage "Проверяю HAProxy config"
     if ! "${SUDO[@]}" haproxy -c -f "$tmp_config" >> "$LOG_FILE" 2>&1; then
-        rm -f "$tmp_config" "$backup"
+        rm -f "$tmp_config" "$backup" "$backup_routes"
         fail "Проверка HAProxy config"
         tail -n 25 "$LOG_FILE" >&2 || true
         return 1
@@ -4867,6 +4981,7 @@ apply_haproxy_routes_config() {
     if "${SUDO[@]}" test -s "$config" 2>/dev/null; then
         had_config=1
         "${SUDO[@]}" cat "$config" > "$backup"
+        extract_haproxy_routes "$backup" > "$backup_routes"
         "${SUDO[@]}" cp -a "$config" "${config}.kto.bak" >> "$LOG_FILE" 2>&1 || true
     fi
 
@@ -4888,7 +5003,11 @@ EOF
         warn "Новый конфиг не запустился, возвращаю предыдущий."
         if (( had_config == 1 )); then
             "${SUDO[@]}" install -m 0644 "$backup" "$config" >> "$LOG_FILE" 2>&1
-            if "${SUDO[@]}" systemctl restart haproxy >> "$LOG_FILE" 2>&1; then
+            if [[ -s "$backup_routes" ]] && start_haproxy_cleanly "$backup_routes"; then
+                ok "Предыдущий HAProxy config восстановлен"
+            elif [[ ! -s "$backup_routes" ]] && \
+                "${SUDO[@]}" systemctl reset-failed haproxy >> "$LOG_FILE" 2>&1 && \
+                "${SUDO[@]}" systemctl start haproxy >> "$LOG_FILE" 2>&1; then
                 ok "Предыдущий HAProxy config восстановлен"
             else
                 fail "Предыдущий HAProxy config тоже не запускается"
@@ -4898,12 +5017,12 @@ EOF
             "${SUDO[@]}" rm -f "$config" >> "$LOG_FILE" 2>&1 || true
             "${SUDO[@]}" systemctl stop haproxy >> "$LOG_FILE" 2>&1 || true
         fi
-        rm -f "$tmp_config" "$backup"
+        rm -f "$tmp_config" "$backup" "$backup_routes"
         tail -n 25 "$LOG_FILE" >&2 || true
         return 1
     fi
 
-    rm -f "$tmp_config" "$backup"
+    rm -f "$tmp_config" "$backup" "$backup_routes"
     haproxy_threads="$(cpu_count)"
     (( haproxy_threads > 64 )) && haproxy_threads=64
     haproxy_maxconn="$(recommended_haproxy_maxconn)"
