@@ -2,6 +2,7 @@
 import html
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import queue
@@ -22,7 +23,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v269"
+COLLECTOR_BUILD = "v270"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3127,6 +3128,109 @@ def dedupe_nodes(values):
     return list(deduped.values())
 
 
+TRAFFIC_COUNTER_FIELDS = (
+    "day_rx",
+    "day_tx",
+    "day_total",
+    "yesterday_rx",
+    "yesterday_tx",
+    "yesterday_total",
+    "month_rx",
+    "month_tx",
+    "month_total",
+)
+
+
+def normalize_traffic_counter(value):
+    try:
+        parsed = int(value or 0)
+    except Exception:
+        parsed = 0
+    return max(0, min(parsed, 2**63 - 1))
+
+
+def normalize_ipv4_text(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return ""
+    if address.version == 4:
+        return str(address)
+    if address.ipv4_mapped is not None:
+        return str(address.ipv4_mapped)
+    return ""
+
+
+def normalized_traffic_entry(raw, fallback_iface="", fallback_ip=""):
+    raw = raw if isinstance(raw, dict) else {}
+    iface = clean_display_text(raw.get("iface") or fallback_iface or "").strip()[:80]
+    ip_text = normalize_ipv4_text(raw.get("ip") or fallback_ip)
+    entry = {
+        "iface": iface,
+        "ip": ip_text,
+        "error": clean_display_text(raw.get("error") or "").strip()[:300],
+    }
+    for prefix in ("day", "yesterday", "month"):
+        rx = normalize_traffic_counter(raw.get(f"{prefix}_rx"))
+        tx = normalize_traffic_counter(raw.get(f"{prefix}_tx"))
+        supplied_total = normalize_traffic_counter(raw.get(f"{prefix}_total"))
+        calculated_total = rx + tx
+        entry[f"{prefix}_rx"] = rx
+        entry[f"{prefix}_tx"] = tx
+        entry[f"{prefix}_total"] = calculated_total if calculated_total > 0 or supplied_total <= 0 else supplied_total
+    return entry
+
+
+def normalize_ip_stats(value, fallback_ip="", fallback_iface="", fallback_record=None):
+    fallback_record = fallback_record if isinstance(fallback_record, dict) else {}
+    normalized = []
+    seen_interfaces = set()
+    if isinstance(value, list):
+        for raw in value[:64]:
+            if not isinstance(raw, dict):
+                continue
+            entry = normalized_traffic_entry(raw)
+            iface_key = entry["iface"].casefold()
+            dedupe_key = f"iface:{iface_key}" if iface_key else f"ip:{entry['ip']}"
+            if not entry["iface"] and not entry["ip"]:
+                continue
+            if dedupe_key in seen_interfaces:
+                continue
+            seen_interfaces.add(dedupe_key)
+            normalized.append(entry)
+
+    valid_fallback_ip = normalize_ipv4_text(fallback_ip)
+    clean_fallback_iface = clean_display_text(fallback_iface or "").strip()[:80]
+    if normalized:
+        if valid_fallback_ip:
+            filled = False
+            for entry in normalized:
+                if not entry["ip"] and clean_fallback_iface and entry["iface"] == clean_fallback_iface:
+                    entry["ip"] = valid_fallback_ip
+                    filled = True
+                    break
+            if not filled and not normalized[0]["ip"]:
+                normalized[0]["ip"] = valid_fallback_ip
+        return normalized
+
+    return [normalized_traffic_entry(fallback_record, clean_fallback_iface, valid_fallback_ip)]
+
+
+def node_ip_stats(node):
+    if not isinstance(node, dict):
+        return []
+    return normalize_ip_stats(node.get("ip_stats"), node.get("ip"), node.get("iface"), node)
+
+
+def traffic_stats_total(stats, field):
+    if field not in TRAFFIC_COUNTER_FIELDS:
+        return 0
+    return sum(normalize_traffic_counter(entry.get(field)) for entry in stats if isinstance(entry, dict))
+
+
 def nodes_day_traffic(nodes):
     total = 0
     for node in nodes:
@@ -3526,12 +3630,27 @@ def rich_text(value):
     return html.escape(clean_display_text(value if value is not None else "-"))
 
 
-def rich_cell(value, header=False, align="left"):
+def rich_cell(value, header=False, align="left", rowspan=1, colspan=1, valign=""):
     tag = "th" if header else "td"
-    attrs = ""
+    attrs = []
     if align in ("left", "center", "right"):
-        attrs = f' align="{align}"'
-    return f"<{tag}{attrs}>{rich_text(value)}</{tag}>"
+        attrs.append(f'align="{align}"')
+    if valign in ("top", "middle", "bottom"):
+        attrs.append(f'valign="{valign}"')
+    try:
+        rowspan = max(1, min(int(rowspan or 1), 64))
+    except Exception:
+        rowspan = 1
+    try:
+        colspan = max(1, min(int(colspan or 1), 20))
+    except Exception:
+        colspan = 1
+    if rowspan > 1:
+        attrs.append(f'rowspan="{rowspan}"')
+    if colspan > 1:
+        attrs.append(f'colspan="{colspan}"')
+    attrs_text = f" {' '.join(attrs)}" if attrs else ""
+    return f"<{tag}{attrs_text}>{rich_text(value)}</{tag}>"
 
 
 def rich_table(headers, rows, caption=""):
@@ -3542,7 +3661,22 @@ def rich_table(headers, rows, caption=""):
         parts.append(f"<caption>{rich_text(caption)}</caption>")
     parts.append("<tr>" + "".join(rich_cell(header, header=True, align="center") for header in headers) + "</tr>")
     for row in rows:
-        parts.append("<tr>" + "".join(rich_cell(value, align=align) for value, align in row) + "</tr>")
+        cells = []
+        for cell in row:
+            if isinstance(cell, dict):
+                cells.append(
+                    rich_cell(
+                        cell.get("value"),
+                        align=cell.get("align", "left"),
+                        rowspan=cell.get("rowspan", 1),
+                        colspan=cell.get("colspan", 1),
+                        valign=cell.get("valign", ""),
+                    )
+                )
+            else:
+                value, align = cell
+                cells.append(rich_cell(value, align=align))
+        parts.append("<tr>" + "".join(cells) + "</tr>")
     parts.append("</table>")
     return "".join(parts)
 
@@ -3571,26 +3705,48 @@ def node_status_text(node, ts):
 def rich_wl_rows(nodes, ts):
     rows = []
     for node in nodes:
-        error = clean_display_text(node.get("error") or "")
-        if error:
-            today = "ошибка"
-            yesterday = "-"
-            month = "ошибка"
-            sni = "-"
-        else:
-            today = format_bytes(node.get("day_total", 0))
-            yesterday = format_bytes(node.get("yesterday_total", 0))
-            month = format_bytes(node.get("month_total", 0))
-            sni = wrong_sni_table_text(node)
-        rows.append([
-            (node_display_name(node, "unknown").replace("№", "#"), "left"),
-            (str(node.get("ip") or "-"), "left"),
-            (today, "right"),
-            (yesterday, "right"),
-            (month, "right"),
-            (sni, "left"),
-            (node_status_text(node, ts), "center"),
-        ])
+        traffic_rows = node_ip_stats(node)
+        if not traffic_rows:
+            traffic_rows = [normalized_traffic_entry(node, node.get("iface"), node.get("ip"))]
+        rowspan = len(traffic_rows)
+        node_error = clean_display_text(node.get("error") or "")
+        sni = "-" if node_error else wrong_sni_table_text(node)
+        status = node_status_text(node, ts)
+        if status == "OK" and any(clean_display_text(entry.get("error") or "") for entry in traffic_rows):
+            status = "WARN"
+        shared = {
+            "rowspan": rowspan,
+            "valign": "middle",
+        }
+        for index, entry in enumerate(traffic_rows):
+            entry_error = node_error or clean_display_text(entry.get("error") or "")
+            if entry_error:
+                today = "ошибка"
+                yesterday = "-"
+                month = "ошибка"
+            else:
+                today = format_bytes(entry.get("day_total", 0))
+                yesterday = format_bytes(entry.get("yesterday_total", 0))
+                month = format_bytes(entry.get("month_total", 0))
+            row = []
+            if index == 0:
+                row.append({
+                    **shared,
+                    "value": node_display_name(node, "unknown").replace("№", "#"),
+                    "align": "left",
+                })
+            row.extend([
+                (str(entry.get("ip") or "-"), "left"),
+                (today, "right"),
+                (yesterday, "right"),
+                (month, "right"),
+            ])
+            if index == 0:
+                row.extend([
+                    {**shared, "value": sni, "align": "left"},
+                    {**shared, "value": status, "align": "center"},
+                ])
+            rows.append(row)
     return rows
 
 
@@ -5914,6 +6070,8 @@ def update_node(payload, remote_ip=""):
         push_interval_sec = int(payload.get("push_interval_sec") or 0)
     except Exception:
         push_interval_sec = 0
+    iface_value = clean_display_text(payload.get("iface") or "").strip()[:80]
+    ip_stats = normalize_ip_stats(payload.get("ip_stats"), remote_ip_value, iface_value, payload)
     record = {
         "id": node_id,
         "name": node_name or node_id,
@@ -5922,17 +6080,18 @@ def update_node(payload, remote_ip=""):
         "push_build": clean_display_text(payload.get("push_build") or payload.get("build") or ""),
         "ip": remote_ip_value,
         "uptime_sec": int(payload.get("uptime_sec") or 0),
-        "iface": str(payload.get("iface") or "")[:80],
+        "iface": iface_value,
         "hostname": hostname_value,
-        "day_total": int(payload.get("day_total") or 0),
-        "day_rx": int(payload.get("day_rx") or 0),
-        "day_tx": int(payload.get("day_tx") or 0),
-        "yesterday_total": int(payload.get("yesterday_total") or 0),
-        "yesterday_rx": int(payload.get("yesterday_rx") or 0),
-        "yesterday_tx": int(payload.get("yesterday_tx") or 0),
-        "month_total": int(payload.get("month_total") or 0),
-        "month_rx": int(payload.get("month_rx") or 0),
-        "month_tx": int(payload.get("month_tx") or 0),
+        "ip_stats": ip_stats,
+        "day_total": traffic_stats_total(ip_stats, "day_total"),
+        "day_rx": traffic_stats_total(ip_stats, "day_rx"),
+        "day_tx": traffic_stats_total(ip_stats, "day_tx"),
+        "yesterday_total": traffic_stats_total(ip_stats, "yesterday_total"),
+        "yesterday_rx": traffic_stats_total(ip_stats, "yesterday_rx"),
+        "yesterday_tx": traffic_stats_total(ip_stats, "yesterday_tx"),
+        "month_total": traffic_stats_total(ip_stats, "month_total"),
+        "month_rx": traffic_stats_total(ip_stats, "month_rx"),
+        "month_tx": traffic_stats_total(ip_stats, "month_tx"),
         "ram_total": int(payload.get("ram_total") or 0),
         "ram_used": int(payload.get("ram_used") or 0),
         "ram_percent": int(payload.get("ram_percent") or 0),

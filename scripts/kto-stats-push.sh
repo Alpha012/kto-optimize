@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v269"
+PUSH_BUILD="v270"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -49,6 +49,7 @@ KTO_PUSH_NODE_KIND="${KTO_PUSH_NODE_KIND:-}"
 KTO_PUSH_REQUIRE_SIGNED_RESPONSE="${KTO_PUSH_REQUIRE_SIGNED_RESPONSE:-0}"
 KTO_ALLOW_INSECURE_UPDATE_URL="${KTO_ALLOW_INSECURE_UPDATE_URL:-0}"
 KTO_PUSH_CPU_STATE="${KTO_PUSH_CPU_STATE:-/run/kto-stats-push-cpu.state}"
+KTO_VNSTAT_DISCOVERY_STATE="${KTO_VNSTAT_DISCOVERY_STATE:-/var/lib/kto-stats-push/vnstat-interfaces-v270}"
 KTO_TUNING_SYSCTL_CONF="${KTO_TUNING_SYSCTL_CONF:-/etc/sysctl.d/99-kto-tuning.conf}"
 KTO_LIMITS_CONF="${KTO_LIMITS_CONF:-/etc/security/limits.d/99-kto-limits.conf}"
 KTO_SYSTEMD_LIMITS_CONF="${KTO_SYSTEMD_LIMITS_CONF:-/etc/systemd/system.conf.d/99-kto-limits.conf}"
@@ -66,6 +67,7 @@ collector_url="${KTO_PUSH_COLLECTOR_URL%/}/push"
 hostname_value="$(hostname 2>/dev/null || echo unknown)"
 updated_at="$(date +%s)"
 error=""
+ip_stats='[]'
 day_rx=0
 day_tx=0
 yesterday_rx=0
@@ -109,6 +111,139 @@ number_or_zero() {
     else
         echo 0
     fi
+}
+
+is_public_ipv4() {
+    local ip="${1:-}" a b c d extra part
+    IFS=. read -r a b c d extra <<< "$ip"
+    [[ -z "$extra" && -n "$a" && -n "$b" && -n "$c" && -n "$d" ]] || return 1
+    for part in "$a" "$b" "$c" "$d"; do
+        [[ "$part" =~ ^[0-9]+$ ]] || return 1
+        (( 10#$part >= 0 && 10#$part <= 255 )) || return 1
+    done
+    a=$((10#$a)); b=$((10#$b))
+    (( a != 0 && a != 10 && a != 127 && a < 224 )) || return 1
+    (( !(a == 100 && b >= 64 && b <= 127) )) || return 1
+    (( !(a == 169 && b == 254) )) || return 1
+    (( !(a == 172 && b >= 16 && b <= 31) )) || return 1
+    (( !(a == 192 && b == 168) )) || return 1
+    (( !(a == 198 && (b == 18 || b == 19)) )) || return 1
+    return 0
+}
+
+list_public_ipv4_interfaces() {
+    local raw_iface cidr iface ip priority found_primary=0
+    {
+        while read -r raw_iface cidr; do
+            iface="${raw_iface%%@*}"
+            ip="${cidr%%/*}"
+            is_public_ipv4 "$ip" || continue
+            priority=1
+            if [[ "$iface" == "$KTO_PUSH_IFACE" ]]; then
+                priority=0
+                found_primary=1
+            fi
+            printf '%s\t%s\t%s\n' "$priority" "$iface" "$ip"
+        done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}')
+        if (( found_primary == 0 )); then
+            # NAT nodes may only have a private address. The collector fills this IP from the request source.
+            printf '0\t%s\t\n' "$KTO_PUSH_IFACE"
+        fi
+    } | sort -t $'\t' -k1,1n -k2,2V | awk -F '\t' '!seen[$2]++ {print $2 "\t" $3}'
+}
+
+ensure_vnstat_interfaces() {
+    local interface_list stored_list="" iface _ip changed=0 ready=1 state_dir state_tmp
+    (( EUID == 0 )) || return 0
+    interface_list="$(list_public_ipv4_interfaces | cut -f1)"
+    [[ -n "$interface_list" ]] || return 0
+    if [[ -r "$KTO_VNSTAT_DISCOVERY_STATE" ]]; then
+        stored_list="$(cat "$KTO_VNSTAT_DISCOVERY_STATE" 2>/dev/null || true)"
+    fi
+    [[ "$stored_list" == "$interface_list" ]] && return 0
+
+    while IFS=$'\t' read -r iface _ip; do
+        [[ -n "$iface" ]] || continue
+        if vnstat -i "$iface" --json >/dev/null 2>&1; then
+            continue
+        fi
+        if vnstat -i "$iface" --add >/dev/null 2>&1; then
+            changed=1
+        else
+            ready=0
+        fi
+    done < <(list_public_ipv4_interfaces)
+    if (( changed == 1 )); then
+        systemctl try-restart vnstat >/dev/null 2>&1 || true
+    fi
+    (( ready == 1 )) || return 0
+
+    state_dir="$(dirname "$KTO_VNSTAT_DISCOVERY_STATE")"
+    mkdir -p "$state_dir" 2>/dev/null || return 0
+    state_tmp="${KTO_VNSTAT_DISCOVERY_STATE}.$$"
+    if printf '%s\n' "$interface_list" > "$state_tmp" 2>/dev/null; then
+        mv -f "$state_tmp" "$KTO_VNSTAT_DISCOVERY_STATE" 2>/dev/null || rm -f "$state_tmp"
+    fi
+}
+
+vnstat_entry_json() {
+    local iface="$1" ip="$2" traffic_json stats entry_error=""
+    local entry_day_rx=0 entry_day_tx=0 entry_yesterday_rx=0 entry_yesterday_tx=0 entry_month_rx=0 entry_month_tx=0
+
+    if ! traffic_json="$(vnstat -i "$iface" --json 2>&1)"; then
+        entry_error="vnstat: $(printf '%s' "$traffic_json" | tr '\r\n' ' ' | cut -c1-300)"
+    elif [[ -z "$traffic_json" ]]; then
+        entry_error="vnstat не вернул данные по интерфейсу ${iface}"
+    else
+        stats="$(printf '%s' "$traffic_json" | jq -r '
+            def day_key: (.date.year * 10000 + .date.month * 100 + .date.day);
+            def month_key: (.date.year * 100 + .date.month);
+            (.interfaces[0].traffic.day // []) as $days |
+            (.interfaces[0].traffic.month // []) as $months |
+            ($days | sort_by(day_key)) as $sorted_days |
+            ($sorted_days | length) as $days_len |
+            (if $days_len > 0 then $sorted_days[$days_len - 1] else {rx:0, tx:0} end) as $day |
+            (if $days_len > 1 then $sorted_days[$days_len - 2] else {rx:0, tx:0} end) as $yesterday |
+            ($months | max_by(month_key) // {rx:0, tx:0}) as $month |
+            "\($day.rx // 0) \($day.tx // 0) \($yesterday.rx // 0) \($yesterday.tx // 0) \($month.rx // 0) \($month.tx // 0)"
+        ' 2>/dev/null || true)"
+        if [[ -z "$stats" ]]; then
+            entry_error="jq не смог разобрать vnstat json для ${iface}"
+        else
+            read -r entry_day_rx entry_day_tx entry_yesterday_rx entry_yesterday_tx entry_month_rx entry_month_tx <<< "$stats"
+            entry_day_rx="$(int_or_zero "$entry_day_rx")"
+            entry_day_tx="$(int_or_zero "$entry_day_tx")"
+            entry_yesterday_rx="$(int_or_zero "$entry_yesterday_rx")"
+            entry_yesterday_tx="$(int_or_zero "$entry_yesterday_tx")"
+            entry_month_rx="$(int_or_zero "$entry_month_rx")"
+            entry_month_tx="$(int_or_zero "$entry_month_tx")"
+        fi
+    fi
+
+    jq -nc \
+        --arg iface "$iface" \
+        --arg ip "$ip" \
+        --arg error "$entry_error" \
+        --argjson day_rx "$entry_day_rx" \
+        --argjson day_tx "$entry_day_tx" \
+        --argjson yesterday_rx "$entry_yesterday_rx" \
+        --argjson yesterday_tx "$entry_yesterday_tx" \
+        --argjson month_rx "$entry_month_rx" \
+        --argjson month_tx "$entry_month_tx" \
+        '{
+            iface: $iface,
+            ip: $ip,
+            day_rx: $day_rx,
+            day_tx: $day_tx,
+            day_total: ($day_rx + $day_tx),
+            yesterday_rx: $yesterday_rx,
+            yesterday_tx: $yesterday_tx,
+            yesterday_total: ($yesterday_rx + $yesterday_tx),
+            month_rx: $month_rx,
+            month_tx: $month_tx,
+            month_total: ($month_rx + $month_tx),
+            error: $error
+        }'
 }
 
 memory_stats() {
@@ -2055,25 +2190,37 @@ if ! command -v jq >/dev/null 2>&1; then
 elif ! command -v vnstat >/dev/null 2>&1; then
     error="vnstat не установлен"
 else
-    if ! traffic_json="$(vnstat -i "$KTO_PUSH_IFACE" --json 2>&1)"; then
-        error="vnstat: ${traffic_json}"
-    elif [[ -z "$traffic_json" ]]; then
-        error="vnstat не вернул данные по интерфейсу ${KTO_PUSH_IFACE}"
+    ensure_vnstat_interfaces
+    traffic_stats_file="$(mktemp)"
+    interface_count=0
+    while IFS=$'\t' read -r traffic_iface traffic_ip; do
+        [[ -n "$traffic_iface" ]] || continue
+        vnstat_entry_json "$traffic_iface" "$traffic_ip" >> "$traffic_stats_file"
+        interface_count=$(( interface_count + 1 ))
+        (( interface_count < 64 )) || break
+    done < <(list_public_ipv4_interfaces)
+    ip_stats="$(jq -s '.[0:64]' "$traffic_stats_file" 2>/dev/null || echo '[]')"
+    rm -f "$traffic_stats_file"
+
+    successful_interfaces="$(printf '%s' "$ip_stats" | jq -r '[.[] | select((.error // "") == "")] | length' 2>/dev/null || echo 0)"
+    successful_interfaces="$(int_or_zero "$successful_interfaces")"
+    if (( successful_interfaces == 0 )); then
+        first_traffic_error="$(printf '%s' "$ip_stats" | jq -r '.[0].error // "vnstat не вернул данные"' 2>/dev/null || echo 'vnstat не вернул данные')"
+        error="${first_traffic_error}"
     else
-        stats="$(printf '%s' "$traffic_json" | jq -r '
-            def day_key: (.date.year * 10000 + .date.month * 100 + .date.day);
-            def month_key: (.date.year * 100 + .date.month);
-            (.interfaces[0].traffic.day // []) as $days |
-            (.interfaces[0].traffic.month // []) as $months |
-            ($days | sort_by(day_key)) as $sorted_days |
-            ($sorted_days | length) as $days_len |
-            (if $days_len > 0 then $sorted_days[$days_len - 1] else {rx:0, tx:0} end) as $day |
-            (if $days_len > 1 then $sorted_days[$days_len - 2] else {rx:0, tx:0} end) as $yesterday |
-            ($months | max_by(month_key) // {rx:0, tx:0}) as $month |
-            "\($day.rx // 0) \($day.tx // 0) \($yesterday.rx // 0) \($yesterday.tx // 0) \($month.rx // 0) \($month.tx // 0)"
+        stats="$(printf '%s' "$ip_stats" | jq -r '
+            [.[] | select((.error // "") == "")] as $ok |
+            [
+                ($ok | map(.day_rx // 0) | add // 0),
+                ($ok | map(.day_tx // 0) | add // 0),
+                ($ok | map(.yesterday_rx // 0) | add // 0),
+                ($ok | map(.yesterday_tx // 0) | add // 0),
+                ($ok | map(.month_rx // 0) | add // 0),
+                ($ok | map(.month_tx // 0) | add // 0)
+            ] | @tsv
         ' 2>/dev/null || true)"
         if [[ -z "$stats" ]]; then
-            error="jq не смог разобрать vnstat json"
+            error="jq не смог собрать общую статистику vnstat"
         else
             read -r day_rx day_tx yesterday_rx yesterday_tx month_rx month_tx <<< "$stats"
             day_rx="$(int_or_zero "$day_rx")"
@@ -2099,6 +2246,7 @@ if ! payload="$(jq -n \
     --arg iface "$KTO_PUSH_IFACE" \
     --arg hostname "$hostname_value" \
     --arg error "$error" \
+    --argjson ip_stats "$ip_stats" \
     --argjson day_rx "$day_rx" \
     --argjson day_tx "$day_tx" \
     --argjson day_total "$day_total" \
@@ -2137,6 +2285,7 @@ if ! payload="$(jq -n \
         push_build: $push_build,
         iface: $iface,
         hostname: $hostname,
+        ip_stats: $ip_stats,
         day_rx: $day_rx,
         day_tx: $day_tx,
         day_total: $day_total,

@@ -148,6 +148,53 @@ class CollectorRegressionTests(unittest.TestCase):
         rich_names = [name.replace("№", "#") for name in expected]
         self.assertEqual(sorted(rich.index(name) for name in rich_names), [rich.index(name) for name in rich_names])
 
+    def test_wl_rich_report_groups_per_interface_ip_rows(self):
+        payload = self.payload("Обход №4", str(uuid.uuid4()), "wl")
+        payload.update(
+            {
+                "iface": "ens3",
+                "day_total": 999999,
+                "ip_stats": [
+                    {
+                        "iface": "ens3",
+                        "ip": "217.19.122.109",
+                        "day_rx": 100,
+                        "day_tx": 200,
+                        "yesterday_rx": 300,
+                        "yesterday_tx": 400,
+                        "month_rx": 500,
+                        "month_tx": 600,
+                    },
+                    {
+                        "iface": "wan2",
+                        "ip": "185.141.227.93",
+                        "day_rx": 1000,
+                        "day_tx": 2000,
+                        "yesterday_rx": 3000,
+                        "yesterday_tx": 4000,
+                        "month_rx": 5000,
+                        "month_tx": 6000,
+                    },
+                    {
+                        "iface": "wan2",
+                        "ip": "185.141.227.94",
+                        "day_total": 999999,
+                    },
+                ],
+            }
+        )
+
+        node = collector.update_node(payload, "217.19.122.109")
+        rich = collector.aggregate_wl_rich_message()
+
+        self.assertEqual(3300, node["day_total"])
+        self.assertEqual(2, len(node["ip_stats"]))
+        self.assertEqual(1, rich.count("Обход #4"))
+        self.assertIn('valign="middle" rowspan="2">Обход #4</td>', rich)
+        self.assertIn("217.19.122.109", rich)
+        self.assertIn("185.141.227.93", rich)
+        self.assertNotIn("185.141.227.94", rich)
+
     def test_daily_report_uses_same_rich_table_senders_as_manual_stats(self):
         loop_source = inspect.getsource(collector.daily_report_loop)
         self.assertIn("send_stats_wl(use_rich=True)", loop_source)

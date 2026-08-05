@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v269"
+SCRIPT_BUILD="v270"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -7499,9 +7499,18 @@ install_stats_push_client() {
         stage "Устанавливаю push статистики"
     fi
     must "Установка пакетов push" apt_install_with_update_if_missing curl jq vnstat iptables conntrack socat openssl
-    if ! "${SUDO[@]}" vnstat --json -i "$iface" >/dev/null 2>&1; then
-        cmd "${SUDO[@]}" vnstat -i "$iface" --add || true
-    fi
+    local monitor_iface
+    while IFS= read -r monitor_iface; do
+        [[ -n "$monitor_iface" ]] || continue
+        if ! "${SUDO[@]}" vnstat --json -i "$monitor_iface" >/dev/null 2>&1; then
+            cmd "${SUDO[@]}" vnstat -i "$monitor_iface" --add || true
+        fi
+    done < <(
+        {
+            printf '%s\n' "$iface"
+            list_haproxy_additional_source_ips | awk -F '\t' '{print $2}'
+        } | awk 'NF && !seen[$0]++'
+    )
     cmd "${SUDO[@]}" systemctl enable --now vnstat || true
     cmd "${SUDO[@]}" systemctl restart vnstat || true
     local legacy_unit

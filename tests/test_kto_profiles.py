@@ -40,13 +40,19 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v269"', KTO)
-        self.assertIn('PUSH_BUILD="v269"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v269"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v269"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v269"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v269"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v269"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v270"', KTO)
+        self.assertIn('PUSH_BUILD="v270"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v270"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v270"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v270"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v270"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v270"', HAPROXY_BANDWIDTH)
+
+    def test_stats_push_discovers_and_reports_per_interface_traffic(self):
+        self.assertIn("list_public_ipv4_interfaces()", PUSH)
+        self.assertIn("ensure_vnstat_interfaces", PUSH)
+        self.assertIn("ip_stats: $ip_stats", PUSH)
+        self.assertIn("list_haproxy_additional_source_ips | awk", KTO)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
