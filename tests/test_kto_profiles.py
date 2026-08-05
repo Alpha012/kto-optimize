@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v268"', KTO)
-        self.assertIn('PUSH_BUILD="v268"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v268"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v268"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v268"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v268"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v268"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v269"', KTO)
+        self.assertIn('PUSH_BUILD="v269"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v269"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v269"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v269"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v269"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v269"', HAPROXY_BANDWIDTH)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -691,6 +691,8 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('u32_match=(match ip src "${ip}/32"', add_filter)
         self.assertIn('action police rate "${rate}mbit"', add_filter)
         self.assertIn('action_args=(action police index "$action_index")', add_filter)
+        self.assertIn('"$ingress_action_index" "$rate" "$burst"', apply_limits)
+        self.assertIn('"$egress_action_index" "$rate" "$burst"', apply_limits)
         self.assertIn("trap 'rc=$?; trap - EXIT;", apply_limits)
         self.assertNotIn("RETURN", apply_limits)
         self.assertIn('tc filter show dev "$interface" "$direction" protocol ip pref "$pref"', active_filters)
@@ -732,6 +734,7 @@ backend vless_pool_8443
 backend vless_pool_8444
     server xray2 2.2.2.2:443
 EOF
+printf 'A\t3900001\nF\tens3\tingress\t42001\t3900001\nF\tens3\tegress\t42002\t3900001\n' > "$STATE_FILE"
 : > "$LOG_FILE"
 ip() {
     if [[ "${1:-}" == -4 && "${2:-}" == -o && "${3:-}" == address &&
@@ -754,14 +757,21 @@ install() {
 run_apply() { apply_limits; }
 run_apply
 [[ -z "$(trap -p RETURN)" ]]
+grep -q '^actions delete action police index 3900001 ' "$work/events"
 [[ "$(grep -c '^actions add action police ' "$work/events" || true)" == 0 ]]
-[[ "$(grep -c 'action police rate 2000mbit ' "$work/events")" == 1 ]]
+[[ "$(grep -c 'action police rate 2000mbit ' "$work/events")" == 2 ]]
 [[ "$(grep -c '^filter add dev ens3 ' "$work/events")" == 4 ]]
 grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8443 action police rate 2000mbit .* index 3900001' "$work/events"
-grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8443 action police index 3900001' "$work/events"
+grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8443 action police rate 2000mbit .* index 3900002' "$work/events"
 grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8444 action police index 3900001' "$work/events"
-grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8444 action police index 3900001' "$work/events"
+grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8444 action police index 3900002' "$work/events"
 [[ "$(grep -c $'^F\t' "$STATE_FILE")" == 4 ]]
+[[ "$(grep -c $'^A\t' "$STATE_FILE")" == 2 ]]
+status_output="$(show_status)"
+grep -q '2000 Mbit/s на каждое направление' <<< "$status_output"
+grep -q 'Вход (RX): OK' <<< "$status_output"
+grep -q 'Выход (TX): OK' <<< "$status_output"
+[[ -z "$(trap -p RETURN)" ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -833,10 +843,11 @@ outer
 [[ -z "$(trap -p RETURN)" ]]
 [[ "$(grep -c '^filter add dev ens3 .* flower ' "$work/events")" == 2 ]]
 [[ "$(grep -c '^filter add dev ens3 .* u32 ' "$work/events")" == 2 ]]
-[[ "$(grep -c 'u32 .* action police rate 2000mbit ' "$work/events")" == 1 ]]
-grep -q 'u32 .* action police index 3900001' "$work/events"
+[[ "$(grep -c 'u32 .* action police rate 2000mbit ' "$work/events")" == 2 ]]
+grep -q 'u32 .* match ip dst 217.19.122.109/32 match ip dport 443 .* index 3900001' "$work/events"
+grep -q 'u32 .* match ip src 217.19.122.109/32 match ip sport 443 .* index 3900002' "$work/events"
 [[ "$(grep -c $'^F\t' "$STATE_FILE")" == 2 ]]
-[[ "$(grep -c $'^A\t' "$STATE_FILE")" == 1 ]]
+[[ "$(grep -c $'^A\t' "$STATE_FILE")" == 2 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

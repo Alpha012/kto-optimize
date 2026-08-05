@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-HAPROXY_BANDWIDTH_BUILD="v268"
+HAPROXY_BANDWIDTH_BUILD="v269"
 LIMITS_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
 HAPROXY_CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 STATE_FILE="${KTO_HAPROXY_BANDWIDTH_STATE:-/run/kto-haproxy-bandwidth.state}"
@@ -261,8 +261,9 @@ clear_limits() {
 apply_limits() {
     (
     local limits_file ports_file next_state
-    local ip rate interface port action_index burst pref filter_count=0 limit_count=0
-    local committed=0 action_bound=0
+    local ip rate interface port action_index ingress_action_index egress_action_index burst pref
+    local filter_count=0 limit_count=0 committed=0
+    local ingress_action_bound=0 egress_action_bound=0
     local TC_FILTER_FALLBACK_USED=0
     local -a interfaces=()
     local -A seen_interfaces=()
@@ -308,12 +309,15 @@ apply_limits() {
     pref="$PREF_BASE"
     while IFS=$'\t' read -r ip rate; do
         interface="$(interface_for_ipv4 "$ip")"
-        action_index=$(( action_index + 1 ))
+        ingress_action_index=$(( action_index + 1 ))
+        egress_action_index=$(( action_index + 2 ))
+        action_index="$egress_action_index"
         burst="$(burst_bytes_for_rate "$rate")"
-        action_bound=0
+        ingress_action_bound=0
+        egress_action_bound=0
 
-        # A shared indexed action makes every HAProxy port and both directions
-        # consume one aggregate bucket for this exact local address.
+        # Each direction gets its own shared action, so the configured rate is
+        # available independently to RX and TX across every HAProxy port.
         while read -r port; do
             [[ "$port" =~ ^[0-9]+$ ]] || continue
             pref=$(( pref + 1 ))
@@ -323,25 +327,33 @@ apply_limits() {
                 return 1
             fi
             if ! add_police_filter "$interface" ingress "$pref" "$ip" "$port" \
-                "$action_index" "$rate" "$burst" "$(( action_bound == 0 ? 1 : 0 ))"; then
+                "$ingress_action_index" "$rate" "$burst" \
+                "$(( ingress_action_bound == 0 ? 1 : 0 ))"; then
                 fail "Не удалось ограничить вход ${ip}:${port}: $(tc_error_summary)"
                 cleanup_state_file "$next_state"
                 return 1
             fi
-            if (( action_bound == 0 )); then
-                printf 'A\t%s\n' "$action_index" >> "$next_state"
-                action_bound=1
+            if (( ingress_action_bound == 0 )); then
+                printf 'A\t%s\n' "$ingress_action_index" >> "$next_state"
+                ingress_action_bound=1
             fi
-            printf 'F\t%s\tingress\t%s\t%s\n' "$interface" "$pref" "$action_index" >> "$next_state"
+            printf 'F\t%s\tingress\t%s\t%s\n' \
+                "$interface" "$pref" "$ingress_action_index" >> "$next_state"
 
             pref=$(( pref + 1 ))
             if ! add_police_filter "$interface" egress "$pref" "$ip" "$port" \
-                "$action_index" "$rate" "$burst" 0; then
+                "$egress_action_index" "$rate" "$burst" \
+                "$(( egress_action_bound == 0 ? 1 : 0 ))"; then
                 fail "Не удалось ограничить выход ${ip}:${port}: $(tc_error_summary)"
                 cleanup_state_file "$next_state"
                 return 1
             fi
-            printf 'F\t%s\tegress\t%s\t%s\n' "$interface" "$pref" "$action_index" >> "$next_state"
+            if (( egress_action_bound == 0 )); then
+                printf 'A\t%s\n' "$egress_action_index" >> "$next_state"
+                egress_action_bound=1
+            fi
+            printf 'F\t%s\tegress\t%s\t%s\n' \
+                "$interface" "$pref" "$egress_action_index" >> "$next_state"
             filter_count=$(( filter_count + 2 ))
         done < "$ports_file"
     done < "$limits_file"
@@ -350,7 +362,7 @@ apply_limits() {
     committed=1
     ok "Лимитов входных IP: ${limit_count}"
     ok "HAProxy tc-фильтров: ${filter_count}"
-    ok "Общий bucket учитывает все HAProxy-порты и оба направления"
+    ok "Для каждого IP: отдельный лимит RX и отдельный лимит TX"
     if (( TC_FILTER_FALLBACK_USED == 1 )); then
         warn "На этой системе применён совместимый classifier u32 вместо flower"
     fi
@@ -372,9 +384,11 @@ active_filter_count() {
 }
 
 show_status() {
-    local limits_file ip rate interface action_index active filters expected ports_count limit_count overall="РАБОТАЕТ"
+    (
+    local limits_file ip rate interface action_index ingress_action_index egress_action_index
+    local ingress_active egress_active filters expected ports_count limit_count overall="РАБОТАЕТ"
     limits_file="$(mktemp)"
-    trap 'rm -f "$limits_file"' RETURN
+    trap 'rm -f "$limits_file"' EXIT
     load_limits > "$limits_file" || return 1
 
     printf '[ ЛИМИТЫ ВХОДНЫХ IP HAPROXY ]\n'
@@ -389,18 +403,35 @@ show_status() {
     [[ "$ports_count" =~ ^[0-9]+$ ]] || ports_count=0
     action_index="$ACTION_BASE"
     while IFS=$'\t' read -r ip rate; do
-        action_index=$(( action_index + 1 ))
+        ingress_action_index=$(( action_index + 1 ))
+        egress_action_index=$(( action_index + 2 ))
+        action_index="$egress_action_index"
         interface="$(interface_for_ipv4 "$ip")"
-        active="НЕТ"
-        if [[ -n "$interface" ]] && tc actions get action police index "$action_index" >/dev/null 2>&1; then
-            active="OK"
+        ingress_active="НЕТ"
+        egress_active="НЕТ"
+        if [[ -n "$interface" ]] && \
+            tc actions get action police index "$ingress_action_index" >/dev/null 2>&1; then
+            ingress_active="OK"
         else
             overall="ОШИБКА"
         fi
-        printf '%s (%s): %s Mbit/s, limiter %s\n' "$ip" "${interface:-нет интерфейса}" "$rate" "$active"
-        if [[ "$active" == "OK" ]]; then
-            tc -s actions get action police index "$action_index" 2>/dev/null |
-                awk '/Sent / { sub(/^[[:space:]]+/, ""); print "  " $0; exit }'
+        if [[ -n "$interface" ]] && \
+            tc actions get action police index "$egress_action_index" >/dev/null 2>&1; then
+            egress_active="OK"
+        else
+            overall="ОШИБКА"
+        fi
+        printf '%s (%s): %s Mbit/s на каждое направление\n' \
+            "$ip" "${interface:-нет интерфейса}" "$rate"
+        printf '  Вход (RX): %s\n' "$ingress_active"
+        if [[ "$ingress_active" == "OK" ]]; then
+            tc -s actions get action police index "$ingress_action_index" 2>/dev/null |
+                awk '/Sent / { sub(/^[[:space:]]+/, ""); print "    " $0; exit }'
+        fi
+        printf '  Выход (TX): %s\n' "$egress_active"
+        if [[ "$egress_active" == "OK" ]]; then
+            tc -s actions get action police index "$egress_action_index" 2>/dev/null |
+                awk '/Sent / { sub(/^[[:space:]]+/, ""); print "    " $0; exit }'
         fi
     done < "$limits_file"
 
@@ -415,7 +446,8 @@ show_status() {
     printf 'HAProxy-портов: %s\n' "$ports_count"
     printf 'Фильтров: %s/%s\n' "$filters" "$expected"
     printf 'Итог: %s\n' "$overall"
-    printf 'Лимит общий для upload + download выбранного IP.\n'
+    printf 'RX и TX ограничиваются независимо; каждому доступен полный указанный лимит.\n'
+    )
 }
 
 main() {

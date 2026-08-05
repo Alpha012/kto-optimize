@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v268"
+SCRIPT_BUILD="v269"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5443,7 +5443,7 @@ install_haproxy_bandwidth_manager() {
     install_asset_file scripts/kto-haproxy-bandwidth.sh "$HAPROXY_BANDWIDTH_MANAGER" 0755 || return 1
     write_root_file "$HAPROXY_BANDWIDTH_UNIT" <<EOF
 [Unit]
-Description=KTO per-input-IP HAProxy bandwidth limits
+Description=KTO per-input-IP and per-direction HAProxy bandwidth limits
 Wants=network-online.target
 After=network-online.target haproxy.service kto-additional-ip-routes.service
 
@@ -5563,10 +5563,10 @@ print_haproxy_bandwidth_limits() {
         echo "Не настроен. Все входные IP без ограничения скорости."
     else
         while IFS=$'\t' read -r ip rate; do
-            printf '%-15s %s Mbit/s\n' "$ip" "$rate"
+            printf '%-15s %s Mbit/s RX + %s Mbit/s TX\n' "$ip" "$rate" "$rate"
         done < "$limits_file"
     fi
-    echo "Лимит затрагивает только TCP-трафик listener-портов HAProxy на выбранном IP."
+    echo "RX и TX ограничиваются отдельно. Лимит затрагивает только TCP listener-портов HAProxy."
     rm -f "$limits_file"
 }
 
@@ -5589,7 +5589,7 @@ select_haproxy_input_ip() {
     for index in "${!entries[@]}"; do
         IFS=$'\t' read -r ip interface <<< "${entries[$index]}"
         rate="$(haproxy_bandwidth_current_rate "$ip")"
-        printf ' %d) %s (%s)%s\n' "$(( index + 1 ))" "$ip" "$interface" "${rate:+ — сейчас ${rate} Mbit/s}" >&2
+        printf ' %d) %s (%s)%s\n' "$(( index + 1 ))" "$ip" "$interface" "${rate:+ — сейчас ${rate} Mbit/s на направление}" >&2
     done
     printf ' 0) Назад\n' >&2
     while true; do
@@ -5625,7 +5625,8 @@ select_configured_haproxy_bandwidth_ip() {
     printf 'Выберите лимит для удаления:\n' >&2
     for index in "${!entries[@]}"; do
         IFS=$'\t' read -r ip rate <<< "${entries[$index]}"
-        printf ' %d) %s — %s Mbit/s\n' "$(( index + 1 ))" "$ip" "$rate" >&2
+        printf ' %d) %s — %s Mbit/s RX + %s Mbit/s TX\n' \
+            "$(( index + 1 ))" "$ip" "$rate" "$rate" >&2
     done
     printf ' 0) Назад\n' >&2
     while true; do
@@ -5714,7 +5715,7 @@ set_haproxy_input_bandwidth_limit() {
 
     if commit_haproxy_bandwidth_config "$previous_file" "$next_file" "$had_config"; then
         rm -f "$previous_file" "$next_file"
-        ok "${input_ip}: HAProxy ограничен до ${rate} Mbit/s"
+        ok "${input_ip}: HAProxy ограничен до ${rate} Mbit/s отдельно на RX и TX"
         ok "Другие IP и не-HAProxy трафик не ограничены"
         return 0
     fi
@@ -5755,7 +5756,7 @@ set_haproxy_input_bandwidth_limit_interactive() {
     local input_ip current_rate rate
     input_ip="$(select_haproxy_input_ip)" || return 1
     current_rate="$(haproxy_bandwidth_current_rate "$input_ip")"
-    rate="$(ask_int "Лимит для ${input_ip}, Mbit/s" "${current_rate:-2000}" 1 100000)"
+    rate="$(ask_int "Лимит для ${input_ip} на каждое направление, Mbit/s" "${current_rate:-2000}" 1 100000)"
     set_haproxy_input_bandwidth_limit "$input_ip" "$rate"
 }
 
@@ -5808,7 +5809,7 @@ set_haproxy_input_bandwidth_limit_cli() {
     require_haproxy_mode
     need_root
     if (( $# != 2 )); then
-        fail "Использование: haproxy-limit INPUT_IP MBIT"
+        fail "Использование: haproxy-limit INPUT_IP MBIT_PER_DIRECTION"
         return 1
     fi
     set_haproxy_input_bandwidth_limit "$1" "$2"
