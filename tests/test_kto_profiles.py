@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v260"', KTO)
-        self.assertIn('PUSH_BUILD="v260"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v260"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v260"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v260"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v260"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v261"', KTO)
+        self.assertIn('PUSH_BUILD="v261"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v261"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v261"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v261"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v261"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -724,28 +724,33 @@ unset KTO_HAPROXY_MAXCONN
         wait_for_routes = function_body(KTO, "wait_for_haproxy_routes")
         reload = function_body(KTO, "reload_haproxy_gracefully")
         clean_start = function_body(KTO, "start_haproxy_cleanly")
+        bounded_systemctl = function_body(KTO, "run_systemctl_bounded")
+        bounded_command = function_body(KTO, "run_bounded_command")
         stale_listeners = function_body(KTO, "kill_stale_haproxy_route_listeners")
         socket_details = function_body(KTO, "haproxy_tcp_port_socket_details")
         failure_details = function_body(KTO, "print_haproxy_failure_details")
         package = function_body(KTO, "ensure_haproxy_package")
 
         self.assertIn('haproxy_missing_listener_ports "$routes_file"', wait_for_routes)
-        self.assertIn('systemctl is-active --quiet haproxy', wait_for_routes)
+        self.assertIn('run_systemctl_bounded 3 is-active --quiet haproxy', wait_for_routes)
         self.assertIn('wait_for_haproxy_routes "$routes_file"', reload)
         self.assertIn('start_haproxy_cleanly "$routes_file"', reload)
         self.assertIn('print_haproxy_failure_details', reload)
-        self.assertIn('systemctl restart haproxy', reload)
-        self.assertIn('systemctl --no-block stop haproxy', clean_start)
+        self.assertIn('run_systemctl_bounded 15 restart haproxy', reload)
+        self.assertIn('run_bounded_command "$timeout_sec" "${SUDO[@]}" systemctl', bounded_systemctl)
+        self.assertIn('timeout --foreground --signal=TERM --kill-after=3s', bounded_command)
+        self.assertIn('run_systemctl_bounded 10 --no-block stop haproxy', clean_start)
         self.assertIn('reserve_haproxy_route_ports "$routes_file"', clean_start)
         self.assertIn('wait_for_haproxy_stopped_and_ports_free', clean_start)
-        self.assertIn('systemctl kill --kill-who=all --signal=KILL', clean_start)
-        self.assertIn('systemctl reset-failed haproxy', clean_start)
+        self.assertIn('run_systemctl_bounded 10 kill --kill-who=all --signal=KILL', clean_start)
+        self.assertIn('run_systemctl_bounded 10 reset-failed haproxy', clean_start)
+        self.assertIn('run_systemctl_bounded 10 --no-block start haproxy', clean_start)
         self.assertIn('grep -vi haproxy', stale_listeners)
         self.assertIn('kill "-${signal}" "$pid"', stale_listeners)
         self.assertIn('ss -K state connected', stale_listeners)
         self.assertIn('ss -H -tanp', socket_details)
         self.assertIn('journalctl -u haproxy -n 40', failure_details)
-        self.assertIn('systemctl show haproxy -p LimitNOFILE', failure_details)
+        self.assertIn('run_systemctl_bounded 5 show haproxy -p LimitNOFILE', failure_details)
         self.assertIn('haproxy socat iproute2', package)
 
         bash = bash_executable()
@@ -760,6 +765,10 @@ routes=$(mktemp)
 trap 'rm -f "$routes"' EXIT
 printf '8443\t65.108.1.173:443\tfaq.cdnvideo.work\tdefault\n8444\t65.108.1.174:443\tfaq.cdnvideo.work\tdefault\n' > "$routes"
 systemctl() { return 0; }
+run_systemctl_bounded() {
+    shift
+    systemctl "$@"
+}
 sleep() { return 0; }
 haproxy_tcp_port_owned_by_haproxy() { [[ "$1" == 8443 ]]; }
 ! wait_for_haproxy_routes "$routes"
@@ -799,13 +808,17 @@ systemctl() {
     fi
     return 0
 }
+run_systemctl_bounded() {
+    shift
+    systemctl "$@"
+}
 haproxy_route_ports_are_free() { return 0; }
 wait_for_haproxy_routes() { return 0; }
 reserve_haproxy_route_ports() { return 0; }
 start_haproxy_cleanly "$routes"
 grep -q -- '--no-block|stop|haproxy|' "$events"
 grep -q 'reset-failed|haproxy|' "$events"
-grep -q 'start|haproxy|' "$events"
+grep -q -- '--no-block|start|haproxy|' "$events"
 
 MODE=haproxy
 haproxy_tcp_port_socket_details() {
