@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v270"
+COLLECTOR_BUILD = "v271"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -8540,6 +8540,78 @@ def handle_emoji(message):
     send_message("\n".join(lines))
 
 
+BOT_HELP_SECTIONS = (
+    ("Статистика", (
+        ("/help", "Показать все актуальные команды."),
+        ("/stats", "Показать полную статистику всех машин."),
+        ("/stats_wl", "Показать таблицу обходов с трафиком по IP."),
+        ("/stats_wl_table", "Принудительно отправить rich-таблицу обходов."),
+        ("/stats_wl_full", "Показать расширенную статистику обходов с ресурсами."),
+        ("/stats_bl", "Открыть статистику обычных машин по группам."),
+        ("/stats_off <машина|список>", "Исключить машины из статистики, SLA и downtime."),
+        ("/stats_on <машина|список>", "Вернуть машины в статистику, SLA и downtime."),
+        ("/statsrevoke <время|full>", "Скорректировать или сбросить downtime за сегодня."),
+        ("/push_debug [машина]", "Показать push-записи, которые видит collector."),
+    )),
+    ("Машины и уведомления", (
+        ("/disable_push <машина|список>", "Отключить только lost/restored уведомления."),
+        ("/enable_push <машина|список>", "Включить lost/restored уведомления обратно."),
+        ("/delete <машина>", "Удалить машину и её падения из collector."),
+        ("/rename <машина>", "Переименовать машину через ответное сообщение."),
+        ("/add_ip <IPv4>", "Добавить IP в SSH whitelist обходов."),
+        ("/haproxy <машина>", "Изменить backend и SNI HAProxy через диалог."),
+        ("/allow_sni <машина>", "Добавить SNI в allow-list машины."),
+        ("/delete_sni <машина>", "Удалить SNI из allow-list машины."),
+    )),
+    ("Обновление и оптимизация", (
+        ("/update_collector", "Обновить только collector на панели."),
+        ("/update_collector_full", "Обновить collector и push на всех машинах."),
+        ("/update_collector_wl", "Обновить collector и push только на обходах."),
+        ("/update_collector_bl", "Обновить collector и push только на обычных машинах."),
+        ("/update_node <машина>", "Обновить Remnawave-контейнеры одной ноды."),
+        ("/update_node_list", "Обновить Remnawave на указанном списке нод."),
+        ("/update_nodes", "Обновить Remnawave-контейнеры всех нод."),
+        ("/update_node_status", "Показать ход последнего обновления нод."),
+        ("/optimize <машина>", "Проверить и применить недостающую оптимизацию."),
+        ("/optimize_status <машина>", "Только проверить оптимизацию без изменений."),
+        ("/clean_all [status|stop]", "Очистить collector и удалить push со всех машин."),
+    )),
+    ("IP limit", (
+        ("/ip <машина>", "Показать IP-limit статистику по машине."),
+        ("/top_ip [N]", "Показать топ пользователей по активным IP."),
+        ("/ip_limit <Remna/TG ID>", "Открыть пользователя и его персональный IP лимит."),
+        ("/limit_ip <Remna/TG ID>", "Алиас команды /ip_limit."),
+        ("/limit_ip_total <N|0|auto>", "Задать общий лимит алертов для всех пользователей."),
+        ("/ip_enable <машина>", "Включить сбор IP и алерты на машине."),
+        ("/ip_enable_force <машина>", "То же, что /ip_enable; блокировки отключены."),
+    )),
+    ("Проверка и диалоги", (
+        ("/down <машина>", "Отправить тестовый lost-алерт."),
+        ("/up <машина>", "Отправить тестовый restored-алерт."),
+        ("/emoji <premium emoji>", "Получить ID premium emoji и готовый тег."),
+        ("/statstest", "Проверить связь collector с Telegram."),
+        ("/cancel", "Отменить текущий диалог с ботом."),
+    )),
+)
+
+
+def bot_help_command_names():
+    return {
+        syntax.split(maxsplit=1)[0]
+        for _section, commands in BOT_HELP_SECTIONS
+        for syntax, _description in commands
+    }
+
+
+def bot_help_message():
+    lines = ["<b>Команды бота</b>", ALERT_SEPARATOR]
+    for section, commands in BOT_HELP_SECTIONS:
+        lines += ["", f"<b>{html.escape(section)}</b>"]
+        for syntax, description in commands:
+            lines.append(f"<code>{html.escape(syntax)}</code> — {html.escape(description)}")
+    return "\n".join(lines)
+
+
 def bot_loop():
     offset = load_offset()
     try:
@@ -8601,7 +8673,9 @@ def bot_loop():
                         continue
                     if handle_pending_ip_limit(chat_id, from_id, text):
                         continue
-                if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats":
+                if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/help":
+                    send_message(bot_help_message())
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats":
                     send_message(aggregate_message())
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/stats_wl":
                     send_stats_wl()

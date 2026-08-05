@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v270"
+PUSH_BUILD="v271"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -49,7 +49,7 @@ KTO_PUSH_NODE_KIND="${KTO_PUSH_NODE_KIND:-}"
 KTO_PUSH_REQUIRE_SIGNED_RESPONSE="${KTO_PUSH_REQUIRE_SIGNED_RESPONSE:-0}"
 KTO_ALLOW_INSECURE_UPDATE_URL="${KTO_ALLOW_INSECURE_UPDATE_URL:-0}"
 KTO_PUSH_CPU_STATE="${KTO_PUSH_CPU_STATE:-/run/kto-stats-push-cpu.state}"
-KTO_VNSTAT_DISCOVERY_STATE="${KTO_VNSTAT_DISCOVERY_STATE:-/var/lib/kto-stats-push/vnstat-interfaces-v270}"
+KTO_VNSTAT_DISCOVERY_STATE="${KTO_VNSTAT_DISCOVERY_STATE:-/var/lib/kto-stats-push/vnstat-interfaces}"
 KTO_TUNING_SYSCTL_CONF="${KTO_TUNING_SYSCTL_CONF:-/etc/sysctl.d/99-kto-tuning.conf}"
 KTO_LIMITS_CONF="${KTO_LIMITS_CONF:-/etc/security/limits.d/99-kto-limits.conf}"
 KTO_SYSTEMD_LIMITS_CONF="${KTO_SYSTEMD_LIMITS_CONF:-/etc/systemd/system.conf.d/99-kto-limits.conf}"

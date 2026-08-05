@@ -4,6 +4,7 @@ import inspect
 import io
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -201,6 +202,17 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertIn("send_grouped_bl_stats(use_rich=True)", loop_source)
         self.assertNotIn('send_message(aggregate_message("wl"))', loop_source)
         self.assertNotIn("send_message(aggregate_grouped_bl_summary_message())", loop_source)
+
+    def test_help_lists_every_routed_bot_command(self):
+        loop_source = inspect.getsource(collector.bot_loop)
+        routed_commands = set(re.findall(r'"(/[a-z_]+)"', loop_source))
+        help_commands = collector.bot_help_command_names()
+        message = collector.bot_help_message()
+
+        self.assertEqual(routed_commands, help_commands)
+        self.assertLessEqual(len(message), 4096)
+        self.assertIn("<code>/help</code> — Показать все актуальные команды.", message)
+        self.assertIn("<code>/ip_enable_force &lt;машина&gt;</code> — То же, что /ip_enable; блокировки отключены.", message)
 
     def test_grouped_daily_bl_report_contains_manual_rich_tables(self):
         first_uuid = str(uuid.uuid4())
