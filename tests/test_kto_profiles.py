@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v257"', KTO)
-        self.assertIn('PUSH_BUILD="v257"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v257"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v257"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v257"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v257"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v258"', KTO)
+        self.assertIn('PUSH_BUILD="v258"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v258"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v258"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v258"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v258"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -679,6 +679,7 @@ NODE_PROFILE=hysteria2
 
         self.assertIn('haproxy -c -f "$tmp_config"', apply_routes)
         self.assertIn('${config}.kto.bak', apply_routes)
+        self.assertIn('${config}.kto.failed', apply_routes)
         self.assertIn('reload_haproxy_gracefully "$routes_file"', apply_routes)
         self.assertIn('возвращаю предыдущий', apply_routes)
         self.assertIn('install -m 0644 "$backup" "$config"', apply_routes)
@@ -719,12 +720,16 @@ unset KTO_HAPROXY_MAXCONN
     def test_haproxy_activation_checks_every_listener(self):
         wait_for_routes = function_body(KTO, "wait_for_haproxy_routes")
         reload = function_body(KTO, "reload_haproxy_gracefully")
+        failure_details = function_body(KTO, "print_haproxy_failure_details")
         package = function_body(KTO, "ensure_haproxy_package")
 
         self.assertIn('haproxy_missing_listener_ports "$routes_file"', wait_for_routes)
         self.assertIn('systemctl is-active --quiet haproxy', wait_for_routes)
         self.assertIn('wait_for_haproxy_routes "$routes_file"', reload)
+        self.assertIn('print_haproxy_failure_details', reload)
         self.assertIn('systemctl restart haproxy', reload)
+        self.assertIn('journalctl -u haproxy -n 40', failure_details)
+        self.assertIn('systemctl show haproxy -p LimitNOFILE', failure_details)
         self.assertIn('haproxy socat iproute2', package)
 
         bash = bash_executable()
@@ -826,6 +831,9 @@ config=$(mktemp)
 trap 'rm -f "$routes" "$config"' EXIT
 printf '443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\textra.example.com *.other.example.com\t185.141.227.93\n' > "$routes"
 render_haproxy_routes_config "$routes" "$config"
+grep -q '^    maxpipes 0$' "$config"
+grep -q '^    nosplice$' "$config"
+! grep -q 'option splice-' "$config"
 grep -q '^frontend vless_in$' "$config"
 grep -q '^frontend vless_in_8443$' "$config"
 grep -q '^    server xray1 89.144.8.3:443 check weight 10$' "$config"

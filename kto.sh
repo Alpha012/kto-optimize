@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v257"
+SCRIPT_BUILD="v258"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4498,6 +4498,28 @@ wait_for_haproxy_routes() {
     return 1
 }
 
+print_haproxy_failure_details() {
+    local config="${1:-/etc/haproxy/haproxy.cfg}"
+    local details
+
+    details="$({
+        echo "=== HAProxy service ==="
+        "${SUDO[@]}" systemctl status haproxy --no-pager -l 2>&1 || true
+        echo "=== HAProxy journal ==="
+        "${SUDO[@]}" journalctl -u haproxy -n 40 --no-pager -o cat 2>&1 || true
+        echo "=== HAProxy limits ==="
+        "${SUDO[@]}" systemctl show haproxy -p LimitNOFILE -p LimitNPROC -p MainPID 2>&1 || true
+        echo "=== HAProxy capacity ==="
+        "${SUDO[@]}" grep -E '^[[:space:]]*(maxconn|maxpipes|nosplice|nbthread)[[:space:]]' "$config" 2>&1 || true
+        echo "=== HAProxy listeners ==="
+        "${SUDO[@]}" ss -H -ltnp 2>&1 | grep -i haproxy || true
+    })"
+
+    printf '\n%s\n' "$details" >> "$LOG_FILE" 2>/dev/null || true
+    echo >&2
+    printf '%s\n' "$details" | tail -n 60 >&2
+}
+
 reload_haproxy_gracefully() {
     local routes_file="${1:-}"
 
@@ -4519,6 +4541,7 @@ reload_haproxy_gracefully() {
             return 0
         fi
     fi
+    print_haproxy_failure_details
     fail "HAProxy не запустил все настроенные listener-порты"
     return 1
 }
@@ -4744,6 +4767,8 @@ render_haproxy_routes_config() {
 # Managed by kto. Edit routes through the HAProxy menu.
 global
     maxconn ${haproxy_maxconn}
+    maxpipes 0
+    nosplice
     nbthread ${haproxy_threads}
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
     tune.ssl.default-dh-param 2048
@@ -4755,9 +4780,6 @@ defaults
     option srvtcpka
     option tcp-smart-accept
     option tcp-smart-connect
-    option splice-auto
-    option splice-request
-    option splice-response
 
     timeout connect 5s
     timeout client 2h
@@ -4861,10 +4883,17 @@ EOF
     cmd "${SUDO[@]}" systemctl enable haproxy || true
 
     if ! reload_haproxy_gracefully "$routes_file"; then
+        "${SUDO[@]}" cp -a "$config" "${config}.kto.failed" >> "$LOG_FILE" 2>&1 || true
+        warn "Неудачный config сохранён: ${config}.kto.failed"
         warn "Новый конфиг не запустился, возвращаю предыдущий."
         if (( had_config == 1 )); then
             "${SUDO[@]}" install -m 0644 "$backup" "$config" >> "$LOG_FILE" 2>&1
-            "${SUDO[@]}" systemctl restart haproxy >> "$LOG_FILE" 2>&1 || true
+            if "${SUDO[@]}" systemctl restart haproxy >> "$LOG_FILE" 2>&1; then
+                ok "Предыдущий HAProxy config восстановлен"
+            else
+                fail "Предыдущий HAProxy config тоже не запускается"
+                print_haproxy_failure_details "$config"
+            fi
         else
             "${SUDO[@]}" rm -f "$config" >> "$LOG_FILE" 2>&1 || true
             "${SUDO[@]}" systemctl stop haproxy >> "$LOG_FILE" 2>&1 || true
