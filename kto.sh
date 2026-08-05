@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v265"
+SCRIPT_BUILD="v266"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -101,6 +101,7 @@ ASN_CACHE_SEC_DEFAULT="${KTO_COLLECTOR_ASN_CACHE_SEC_DEFAULT:-604800}"
 ASN_TIMEOUT_SEC_DEFAULT="${KTO_COLLECTOR_ASN_TIMEOUT_SEC_DEFAULT:-2}"
 SPEEDTEST_TIMEOUT="${KTO_SPEEDTEST_TIMEOUT:-240}"
 SPEEDTEST_DOWNLOAD_TIMEOUT="${KTO_SPEEDTEST_DOWNLOAD_TIMEOUT:-180}"
+SPEEDTEST_RU_URL="${KTO_SPEEDTEST_RU_URL:-https://bench.tlab.pw/bench.sh}"
 SPEEDTEST_STATIC_VERSION="1.2.0"
 SPEEDTEST_PACKAGE_VERSION="1.2.0.84-1.ea6b6773cf"
 SPEEDTEST_X86_64_ARCHIVE_SHA256="5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7"
@@ -1312,7 +1313,7 @@ validate_ipv4() {
 
 normalize_haproxy_target() {
     local raw="${1:-}" ip port
-    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    raw="${raw//[[:space:]]/}"
     if [[ "$raw" == *:* ]]; then
         ip="${raw%%:*}"
         port="${raw##*:}"
@@ -1331,7 +1332,8 @@ normalize_haproxy_target_pool() {
     local raw="${1:-}" item target existing
     local -a items=() targets=()
 
-    raw="$(printf '%s' "$raw" | tr ';[:space:]' ',')"
+    raw="${raw//;/,}"
+    raw="${raw//[[:space:]]/,}"
     IFS=',' read -r -a items <<< "$raw"
     for item in "${items[@]}"; do
         [[ -n "$item" ]] || continue
@@ -1359,7 +1361,7 @@ haproxy_target_pool_count() {
 
 normalize_haproxy_server_maxconn() {
     local raw="${1:-default}"
-    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    raw="${raw//[[:space:]]/}"
     case "${raw,,}" in
         ""|0|auto|default|none) printf 'default\n'; return 0 ;;
     esac
@@ -1371,7 +1373,7 @@ normalize_haproxy_server_maxconn() {
 
 normalize_haproxy_source_ip() {
     local raw="${1:-default}"
-    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    raw="${raw//[[:space:]]/}"
     case "${raw,,}" in
         ""|auto|default) printf 'default\n'; return 0 ;;
     esac
@@ -4093,6 +4095,22 @@ write_speedtest_ru_bind_wrapper() {
     chmod 0755 "$output_file"
 }
 
+download_speedtest_ru_bench() {
+    local output_file="$1" source_ip="${2:-}"
+    local -a wget_args=(--no-proxy -4 -q -O "$output_file" --timeout=20 --tries=3)
+    local -a curl_args=(-q -4 --noproxy '*' -fsSL --connect-timeout 10 --max-time 45 \
+        --retry 2 --retry-delay 2 -o "$output_file")
+
+    [[ -z "$source_ip" ]] || wget_args+=("--bind-address=${source_ip}")
+    if wget "${wget_args[@]}" "$SPEEDTEST_RU_URL"; then
+        return 0
+    fi
+
+    warn "wget не скачал RU bench, пробую curl"
+    [[ -z "$source_ip" ]] || curl_args+=(--interface "$source_ip")
+    curl "${curl_args[@]}" "$SPEEDTEST_RU_URL"
+}
+
 speedtest_ru() {
     header
     need_root
@@ -4101,7 +4119,7 @@ speedtest_ru() {
 
     stage "Запускаю Speedtest (RU)"
     if [[ -n "$source_ip" ]]; then
-        source_ip="$(printf '%s' "$source_ip" | tr -d '[:space:]')"
+        source_ip="${source_ip//[[:space:]]/}"
         validate_ipv4 "$source_ip" || {
             fail "Некорректный source IP: ${source_ip:-пусто}"
             return 1
@@ -4122,7 +4140,7 @@ speedtest_ru() {
         stage "Тест через ${source_ip} (${route_interface})"
         apt_install_with_update_if_missing wget curl ca-certificates iperf3 iproute2 iputils-ping
     else
-        apt_install_with_update_if_missing wget ca-certificates
+        apt_install_with_update_if_missing wget curl ca-certificates
     fi
 
     bench_script="$(mktemp)"
@@ -4133,15 +4151,19 @@ speedtest_ru() {
     }
     trap cleanup_speedtest_ru RETURN
 
-    must "Скачивание bench.tlab.pw" wget -qO "$bench_script" https://bench.tlab.pw
+    stage "Скачиваю ${SPEEDTEST_RU_URL}"
+    if ! download_speedtest_ru_bench "$bench_script" "$source_ip"; then
+        fail "Не удалось скачать RU bench через доступные сетевые пути"
+        return 1
+    fi
     if ! head -n 1 "$bench_script" | grep -Eq '^#!.*bash' \
         || ! grep -q '^speed_test()' "$bench_script" \
         || ! bash -n "$bench_script"; then
-        fail "bench.tlab.pw вернул неожиданный скрипт"
+        fail "${SPEEDTEST_RU_URL} вернул невалидный Bash-скрипт"
         return 1
     fi
 
-    echo "running: wget -qO- https://bench.tlab.pw | bash" >> "$LOG_FILE"
+    echo "running: ${SPEEDTEST_RU_URL}${source_ip:+ source=${source_ip}}" >> "$LOG_FILE"
     if [[ -z "$source_ip" ]]; then
         bash "$bench_script"
         return
