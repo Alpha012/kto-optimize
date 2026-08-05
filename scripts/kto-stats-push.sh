@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v259"
+PUSH_BUILD="v260"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -892,6 +892,7 @@ optimize_check_json() {
     opt_root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.ipv4.tcp_congestion_control = bbr" || sysctl_file_ok=0
     opt_root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.core.default_qdisc = fq" || sysctl_file_ok=0
     opt_root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "fs.file-max = 2097152" || sysctl_file_ok=0
+    opt_root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.ipv4.ip_local_port_range = 10000 65535" || sysctl_file_ok=0
     opt_root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "vm.swappiness = 1" || sysctl_file_ok=0
     if [[ "$sysctl_file_ok" == "1" ]]; then
         append_optimize_row "$rows_file" "sysctl_file" "sysctl file" "ok" "$KTO_TUNING_SYSCTL_CONF" "kto tuning profile"
@@ -1348,7 +1349,7 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_local_port_range = 10000 65535
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5

@@ -39,12 +39,12 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v259"', KTO)
-        self.assertIn('PUSH_BUILD="v259"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v259"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v259"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v259"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v259"', REMNA_EGRESS)
+        self.assertIn('SCRIPT_BUILD="v260"', KTO)
+        self.assertIn('PUSH_BUILD="v260"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v260"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v260"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v260"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v260"', REMNA_EGRESS)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")
@@ -681,6 +681,7 @@ NODE_PROFILE=hysteria2
         self.assertIn('${config}.kto.bak', apply_routes)
         self.assertIn('${config}.kto.failed', apply_routes)
         self.assertIn('extract_haproxy_routes "$backup" > "$backup_routes"', apply_routes)
+        self.assertIn('reserve_haproxy_route_ports "$routes_file"', apply_routes)
         self.assertIn('reload_haproxy_gracefully "$routes_file"', apply_routes)
         self.assertIn('возвращаю предыдущий', apply_routes)
         self.assertIn('install -m 0644 "$backup" "$config"', apply_routes)
@@ -724,6 +725,7 @@ unset KTO_HAPROXY_MAXCONN
         reload = function_body(KTO, "reload_haproxy_gracefully")
         clean_start = function_body(KTO, "start_haproxy_cleanly")
         stale_listeners = function_body(KTO, "kill_stale_haproxy_route_listeners")
+        socket_details = function_body(KTO, "haproxy_tcp_port_socket_details")
         failure_details = function_body(KTO, "print_haproxy_failure_details")
         package = function_body(KTO, "ensure_haproxy_package")
 
@@ -734,11 +736,14 @@ unset KTO_HAPROXY_MAXCONN
         self.assertIn('print_haproxy_failure_details', reload)
         self.assertIn('systemctl restart haproxy', reload)
         self.assertIn('systemctl --no-block stop haproxy', clean_start)
+        self.assertIn('reserve_haproxy_route_ports "$routes_file"', clean_start)
         self.assertIn('wait_for_haproxy_stopped_and_ports_free', clean_start)
         self.assertIn('systemctl kill --kill-who=all --signal=KILL', clean_start)
         self.assertIn('systemctl reset-failed haproxy', clean_start)
         self.assertIn('grep -vi haproxy', stale_listeners)
         self.assertIn('kill "-${signal}" "$pid"', stale_listeners)
+        self.assertIn('ss -K state connected', stale_listeners)
+        self.assertIn('ss -H -tanp', socket_details)
         self.assertIn('journalctl -u haproxy -n 40', failure_details)
         self.assertIn('systemctl show haproxy -p LimitNOFILE', failure_details)
         self.assertIn('haproxy socat iproute2', package)
@@ -796,21 +801,29 @@ systemctl() {
 }
 haproxy_route_ports_are_free() { return 0; }
 wait_for_haproxy_routes() { return 0; }
+reserve_haproxy_route_ports() { return 0; }
 start_haproxy_cleanly "$routes"
 grep -q -- '--no-block|stop|haproxy|' "$events"
 grep -q 'reset-failed|haproxy|' "$events"
 grep -q 'start|haproxy|' "$events"
 
 MODE=haproxy
-haproxy_tcp_port_listener_details() {
-    if [[ "$MODE" == haproxy ]]; then
-        printf '%s\n' 'LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("haproxy",pid=123,fd=4))'
-    else
-        printf '%s\n' 'LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("xray",pid=456,fd=4))'
-    fi
+haproxy_tcp_port_socket_details() {
+    case "$MODE" in
+        haproxy)
+            printf '%s\n' 'LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("haproxy",pid=123,fd=4))'
+            ;;
+        foreign)
+            printf '%s\n' 'LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("xray",pid=456,fd=4))'
+            ;;
+        connected)
+            printf '%s\n' 'ESTAB 0 0 127.0.0.1:8443 127.0.0.1:9443 users:(("rw-core",pid=789,fd=5))'
+            ;;
+    esac
 }
 cat() { printf 'haproxy\n'; }
 kill() { printf 'kill:%s:%s\n' "$1" "$2" >> "$events"; }
+ss() { { printf 'ss:'; printf '%s|' "$@"; printf '\n'; } >> "$events"; }
 kill_stale_haproxy_route_listeners "$routes" KILL
 grep -q 'kill:-KILL:123' "$events"
 before=$(grep -c '^kill:' "$events")
@@ -818,6 +831,51 @@ MODE=foreign
 ! kill_stale_haproxy_route_listeners "$routes" KILL
 after=$(grep -c '^kill:' "$events")
 [[ "$before" == "$after" ]]
+MODE=connected
+kill_stale_haproxy_route_listeners "$routes" KILL
+grep -q 'ss:-K|state|connected|' "$events"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_ports_are_reserved_and_ephemeral_range_avoids_service_ports(self):
+        self.assertIn("net.ipv4.ip_local_port_range = 10000 65535", KTO)
+        self.assertIn("net.ipv4.ip_local_port_range = 10000 65535", PUSH)
+        self.assertNotIn("net.ipv4.ip_local_port_range = 1024 65535", KTO)
+        self.assertNotIn("net.ipv4.ip_local_port_range = 1024 65535", PUSH)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+LOG_FILE=$(mktemp)
+HAPROXY_RESERVED_PORTS_SYSCTL_CONF=$(mktemp)
+routes=$(mktemp)
+events=$(mktemp)
+trap 'rm -f "$LOG_FILE" "$HAPROXY_RESERVED_PORTS_SYSCTL_CONF" "$routes" "$events"' EXIT
+printf '8443\t65.108.1.173:443\ta.example\tdefault\n8444\t65.108.1.174:443\tb.example\tdefault\n' > "$routes"
+[[ "$(merge_reserved_port_list '22,8000-8400' 8443)" == '22,8000-8400,8443' ]]
+[[ "$(merge_reserved_port_list '22,8000-9000' 8443)" == '22,8000-9000' ]]
+sysctl() {
+    if [[ "${1:-}" == -n ]]; then
+        printf '22,8000-8400\n'
+    elif [[ "${1:-}" == -w ]]; then
+        printf '%s\n' "${2:-}" >> "$events"
+    fi
+}
+reserve_haproxy_route_ports "$routes"
+grep -q '^net.ipv4.ip_local_reserved_ports = 22,8000-8400,8443,8444$' "$HAPROXY_RESERVED_PORTS_SYSCTL_CONF"
+grep -q '^net.ipv4.ip_local_reserved_ports=22,8000-8400,8443,8444$' "$events"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

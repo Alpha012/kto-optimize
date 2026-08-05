@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v259"
+SCRIPT_BUILD="v260"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -46,6 +46,7 @@ KTO_TUNING_SYSCTL_CONF="/etc/sysctl.d/99-kto-tuning.conf"
 KTO_LIMITS_CONF="/etc/security/limits.d/99-kto-limits.conf"
 KTO_SYSTEMD_LIMITS_CONF="/etc/systemd/system.conf.d/99-kto-limits.conf"
 KTO_USER_LIMITS_CONF="/etc/systemd/user.conf.d/99-kto-limits.conf"
+HAPROXY_RESERVED_PORTS_SYSCTL_CONF="/etc/sysctl.d/99-z-kto-haproxy-ports.conf"
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
 DNS_GUARD_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-kto-dns.conf"
@@ -2331,7 +2332,7 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_local_port_range = 10000 65535
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
@@ -3054,6 +3055,7 @@ system_check_network_limits() {
     root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.ipv4.tcp_congestion_control = bbr" || sysctl_file_ok=0
     root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.core.default_qdisc = fq" || sysctl_file_ok=0
     root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "fs.file-max = 2097152" || sysctl_file_ok=0
+    root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.ipv4.ip_local_port_range = 10000 65535" || sysctl_file_ok=0
     root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "vm.swappiness = 1" || sysctl_file_ok=0
     if [[ "$sysctl_file_ok" == "1" ]]; then
         system_check_row ok "sysctl file" "$KTO_TUNING_SYSCTL_CONF"
@@ -4457,10 +4459,10 @@ haproxy_tcp_port_owned_by_haproxy() {
     '
 }
 
-haproxy_tcp_port_listener_details() {
+haproxy_tcp_port_socket_details() {
     local wanted="$1"
     command_exists ss || return 1
-    "${SUDO[@]}" ss -H -ltnp 2>/dev/null | awk -v wanted="$wanted" '
+    "${SUDO[@]}" ss -H -tanp 2>/dev/null | awk -v wanted="$wanted" '
         {
             address = $4
             sub(/^.*:/, "", address)
@@ -4478,7 +4480,7 @@ haproxy_route_ports_are_free() {
 
     while IFS=$'\t' read -r port _; do
         [[ "$port" =~ ^[0-9]+$ ]] || continue
-        if haproxy_tcp_port_listener_details "$port" >/dev/null 2>&1; then
+        if haproxy_tcp_port_socket_details "$port" >/dev/null 2>&1; then
             return 1
         fi
     done < "$routes_file"
@@ -4507,14 +4509,16 @@ wait_for_haproxy_stopped_and_ports_free() {
 
 kill_stale_haproxy_route_listeners() {
     local routes_file="$1" signal="${2:-KILL}"
-    local port details foreign pids pid comm foreign_found=0
+    local port details listeners connected foreign pids pid comm foreign_found=0
 
     while IFS=$'\t' read -r port _; do
         [[ "$port" =~ ^[0-9]+$ ]] || continue
-        details="$(haproxy_tcp_port_listener_details "$port" 2>/dev/null || true)"
+        details="$(haproxy_tcp_port_socket_details "$port" 2>/dev/null || true)"
         [[ -n "$details" ]] || continue
 
-        foreign="$(printf '%s\n' "$details" | grep -vi haproxy || true)"
+        listeners="$(printf '%s\n' "$details" | awk 'toupper($1) == "LISTEN"' || true)"
+        connected="$(printf '%s\n' "$details" | awk 'toupper($1) != "LISTEN"' || true)"
+        foreign="$(printf '%s\n' "$listeners" | grep -vi haproxy || true)"
         if [[ -n "$foreign" ]]; then
             fail "HAProxy порт ${port}/tcp занят чужим процессом:"
             printf '%s\n' "$foreign" >&2
@@ -4522,7 +4526,12 @@ kill_stale_haproxy_route_listeners() {
             continue
         fi
 
-        pids="$(printf '%s\n' "$details" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)"
+        if [[ -n "$connected" ]]; then
+            warn "Закрываю исходящие TCP-соединения, занявшие HAProxy порт ${port}/tcp"
+            "${SUDO[@]}" ss -K state connected "( sport = :${port} )" >> "$LOG_FILE" 2>&1 || true
+        fi
+
+        pids="$(printf '%s\n' "$listeners" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)"
         while IFS= read -r pid; do
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
             comm="$("${SUDO[@]}" cat "/proc/${pid}/comm" 2>/dev/null || true)"
@@ -4540,7 +4549,7 @@ report_haproxy_busy_route_ports() {
 
     while IFS=$'\t' read -r port _; do
         [[ "$port" =~ ^[0-9]+$ ]] || continue
-        details="$(haproxy_tcp_port_listener_details "$port" 2>/dev/null || true)"
+        details="$(haproxy_tcp_port_socket_details "$port" 2>/dev/null || true)"
         if [[ -n "$details" ]]; then
             fail "Порт ${port}/tcp всё ещё занят:"
             printf '%s\n' "$details" >&2
@@ -4592,6 +4601,7 @@ wait_for_haproxy_routes() {
 start_haproxy_cleanly() {
     local routes_file="$1"
 
+    reserve_haproxy_route_ports "$routes_file" || return 1
     "${SUDO[@]}" systemctl --no-block stop haproxy >> "$LOG_FILE" 2>&1 || true
     if ! wait_for_haproxy_stopped_and_ports_free "$routes_file" 20; then
         warn "Старый HAProxy не остановился за 5 секунд, завершаю его worker-процессы."
@@ -4769,6 +4779,72 @@ haproxy_route_file_has_port() {
 
 haproxy_route_count() {
     awk -F '\t' 'NF >= 3 { count++ } END { print count + 0 }' "$1"
+}
+
+reserved_port_list_contains() {
+    local list="${1//[[:space:]]/}" wanted="$2" item first last
+    local -a entries=()
+    local IFS=','
+
+    [[ "$wanted" =~ ^[0-9]+$ ]] || return 1
+    wanted=$((10#$wanted))
+    read -r -a entries <<< "$list"
+    for item in "${entries[@]}"; do
+        if [[ "$item" =~ ^[0-9]+$ ]]; then
+            (( wanted == 10#$item )) && return 0
+        elif [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            first=$((10#${BASH_REMATCH[1]}))
+            last=$((10#${BASH_REMATCH[2]}))
+            (( wanted >= first && wanted <= last )) && return 0
+        fi
+    done
+    return 1
+}
+
+merge_reserved_port_list() {
+    local list="${1//[[:space:]]/}" port="$2"
+    if reserved_port_list_contains "$list" "$port"; then
+        printf '%s\n' "$list"
+    elif [[ -n "$list" ]]; then
+        printf '%s,%s\n' "$list" "$port"
+    else
+        printf '%s\n' "$port"
+    fi
+}
+
+reserve_haproxy_route_ports() {
+    local routes_file="$1" current merged port desired_line changed=0
+    command_exists sysctl || {
+        fail "sysctl не найден: не могу зарезервировать HAProxy-порты"
+        return 1
+    }
+
+    current="$("${SUDO[@]}" sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
+    current="${current//[[:space:]]/}"
+    merged="$current"
+    while IFS=$'\t' read -r port _; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        if ! reserved_port_list_contains "$merged" "$port"; then
+            merged="$(merge_reserved_port_list "$merged" "$port")"
+            changed=1
+        fi
+    done < "$routes_file"
+    [[ -n "$merged" ]] || return 0
+
+    desired_line="net.ipv4.ip_local_reserved_ports = ${merged}"
+    if ! root_file_has_line "$HAPROXY_RESERVED_PORTS_SYSCTL_CONF" "$desired_line"; then
+        write_root_file "$HAPROXY_RESERVED_PORTS_SYSCTL_CONF" <<EOF
+# Managed by kto. Existing reservations are preserved when HAProxy routes change.
+${desired_line}
+EOF
+    fi
+    if (( changed == 1 )); then
+        if ! "${SUDO[@]}" sysctl -w "net.ipv4.ip_local_reserved_ports=${merged}" >> "$LOG_FILE" 2>&1; then
+            fail "Не удалось зарезервировать HAProxy-порты: ${merged}"
+            return 1
+        fi
+        ok "Зарезервированы локальные порты HAProxy: ${merged}"
+    fi
 }
 
 haproxy_nofile_limit() {
@@ -4975,6 +5051,10 @@ apply_haproxy_routes_config() {
         rm -f "$tmp_config" "$backup" "$backup_routes"
         fail "Проверка HAProxy config"
         tail -n 25 "$LOG_FILE" >&2 || true
+        return 1
+    fi
+    if ! reserve_haproxy_route_ports "$routes_file"; then
+        rm -f "$tmp_config" "$backup" "$backup_routes"
         return 1
     fi
 
