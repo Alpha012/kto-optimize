@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v273"', KTO)
-        self.assertIn('PUSH_BUILD="v273"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v273"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v273"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v273"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v273"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v273"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v274"', KTO)
+        self.assertIn('PUSH_BUILD="v274"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v274"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v274"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v274"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v274"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v274"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -385,6 +385,84 @@ list_test_source_ipv4s() { printf '198.51.100.10\tens3\tосновной\n'; }
 select_test_source_ipv4 </dev/null
 [[ "$TEST_SOURCE_IP" == 198.51.100.10 ]]
 [[ "$TEST_SOURCE_INTERFACE" == ens3 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dpi_detector_is_one_shot_hardened_and_source_routed(self):
+        menu = function_body(KTO, "menu")
+        runner = function_body(KTO, "run_dpi_detector")
+        policy = function_body(KTO, "dpi_detector_prepare_source_policy")
+        cleanup = function_body(KTO, "dpi_detector_cleanup")
+        main = function_body(KTO, "main")
+
+        self.assertIn(
+            'DPI_DETECTOR_IMAGE="${KTO_DPI_DETECTOR_IMAGE:-ghcr.io/runnin4ik/dpi-detector:3.3.0}"',
+            KTO,
+        )
+        self.assertIn('labels+=("Проверка ТСПУ")', menu)
+        self.assertIn('actions+=("dpi-test")', menu)
+        self.assertIn('[[ "$MACHINE_MODE" != "panel" ]]', menu)
+        self.assertIn('[[ "$MACHINE_MODE" == "panel" ]]', runner)
+        self.assertIn('select_test_source_ipv4 "$requested_source_ip"', runner)
+        self.assertIn('docker pull "$DPI_DETECTOR_IMAGE"', runner)
+        self.assertIn('run --rm --name "$container_name"', runner)
+        self.assertIn('--network host', runner)
+        self.assertIn('--user "${uid}:${uid}"', runner)
+        self.assertIn('--cap-drop ALL', runner)
+        self.assertIn('--security-opt no-new-privileges:true', runner)
+        self.assertIn('--read-only', runner)
+        self.assertIn('--tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m', runner)
+        self.assertIn('detector_args=(--batch)', runner)
+        self.assertIn('detector_args=(-t 123 --batch)', runner)
+        self.assertIn("trap 'dpi_detector_cleanup", runner)
+        self.assertIn('uidrange "${uid}-${uid}"', policy)
+        self.assertIn('src "$source_ip"', policy)
+        self.assertIn('route get 1.1.1.1 uid "$uid"', policy)
+        self.assertIn('ip -4 rule del priority "$priority"', cleanup)
+        self.assertIn('ip -4 route flush table "$table"', cleanup)
+        self.assertIn('dpi-test|dpi-detector|tspu-test|tspu', main)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+LOG_FILE=$(mktemp)
+events=$(mktemp)
+trap 'rm -f "$LOG_FILE" "$events"' EXIT
+ip() {
+    { printf '%s|' "$@"; printf '\n'; } >> "$events"
+    if [[ "${1:-}" == -4 && "${2:-}" == rule && "${3:-}" == help ]]; then
+        printf 'uidrange\n'
+        return 2
+    fi
+    if [[ "${1:-}" == -4 && "${2:-}" == route && "${3:-}" == get && "${5:-}" == from ]]; then
+        printf '1.1.1.1 from 203.0.113.20 via 203.0.113.1 dev wan2 table 102\n'
+        return 0
+    fi
+    if [[ "${1:-}" == -4 && "${2:-}" == route && "${3:-}" == get && "${5:-}" == uid ]]; then
+        printf '1.1.1.1 via 203.0.113.1 dev wan2 src 203.0.113.20 uid 61000\n'
+        return 0
+    fi
+    return 0
+}
+dpi_detector_prepare_source_policy 203.0.113.20 wan2 61000 61000 21000
+dpi_detector_cleanup '' 61000 21000
+grep -Fq -- '-4|route|add|table|61000|default|via|203.0.113.1|dev|wan2|onlink|src|203.0.113.20|' "$events"
+grep -Fq -- '-4|rule|add|priority|21000|uidrange|61000-61000|lookup|61000|' "$events"
+grep -Fq -- '-4|route|get|1.1.1.1|uid|61000|' "$events"
+grep -Fq -- '-4|rule|del|priority|21000|' "$events"
+grep -Fq -- '-4|route|flush|table|61000|' "$events"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

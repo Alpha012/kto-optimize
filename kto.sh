@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v273"
+SCRIPT_BUILD="v274"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -107,6 +107,7 @@ ASN_TIMEOUT_SEC_DEFAULT="${KTO_COLLECTOR_ASN_TIMEOUT_SEC_DEFAULT:-2}"
 SPEEDTEST_TIMEOUT="${KTO_SPEEDTEST_TIMEOUT:-240}"
 SPEEDTEST_DOWNLOAD_TIMEOUT="${KTO_SPEEDTEST_DOWNLOAD_TIMEOUT:-180}"
 SPEEDTEST_RU_URL="${KTO_SPEEDTEST_RU_URL:-https://bench.tlab.pw/bench.sh}"
+DPI_DETECTOR_IMAGE="${KTO_DPI_DETECTOR_IMAGE:-ghcr.io/runnin4ik/dpi-detector:3.3.0}"
 SPEEDTEST_STATIC_VERSION="1.2.0"
 SPEEDTEST_PACKAGE_VERSION="1.2.0.84-1.ea6b6773cf"
 SPEEDTEST_X86_64_ARCHIVE_SHA256="5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7"
@@ -4603,6 +4604,175 @@ network_test() {
     ok "Сеть выглядит нормально по базовым проверкам."
 }
 
+dpi_detector_policy_slot() {
+    local offset uid table priority used_uids rules table_routes
+    used_uids="$(ps -e -o uid= 2>/dev/null | awk '{$1=$1; if ($1 != "") print $1}' | sort -u || true)"
+    rules="$(ip -4 rule show 2>/dev/null || true)"
+
+    for (( offset = 0; offset < 1000; offset++ )); do
+        uid=$(( 61000 + offset ))
+        table=$(( 61000 + offset ))
+        priority=$(( 21000 + offset ))
+        grep -qx "$uid" <<< "$used_uids" && continue
+        getent passwd "$uid" >/dev/null 2>&1 && continue
+        grep -Eq "^${priority}:" <<< "$rules" && continue
+        grep -Eq "(^|[[:space:]])(lookup|table)[[:space:]]+${table}([[:space:]]|$)" <<< "$rules" && continue
+        if grep -RqsE "^[[:space:]]*${table}[[:space:]]" /etc/iproute2/rt_tables /etc/iproute2/rt_tables.d 2>/dev/null; then
+            continue
+        fi
+        table_routes="$(ip -4 route show table "$table" 2>/dev/null || true)"
+        [[ -z "$table_routes" ]] || continue
+        printf '%s\t%s\t%s\n' "$uid" "$table" "$priority"
+        return 0
+    done
+    return 1
+}
+
+dpi_detector_prepare_source_policy() {
+    local source_ip="$1" interface="$2" uid="$3" table="$4" priority="$5"
+    local rule_help route_line route_interface gateway check_line check_interface check_source
+
+    rule_help="$(ip -4 rule help 2>&1 || true)"
+    if ! grep -q 'uidrange' <<< "$rule_help"; then
+        fail "Этот iproute2 не поддерживает uidrange для безопасного выбора IP"
+        return 1
+    fi
+
+    route_line="$(ip -4 route get 1.1.1.1 from "$source_ip" 2>/dev/null || true)"
+    route_interface="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<< "$route_line")"
+    gateway="$(awk '{for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}' <<< "$route_line")"
+    if [[ "$route_interface" != "$interface" ]]; then
+        fail "Source-route ${source_ip} больше не ведёт через ${interface}"
+        return 1
+    fi
+
+    if [[ -n "$gateway" ]]; then
+        if ! "${SUDO[@]}" ip -4 route add table "$table" default via "$gateway" dev "$interface" \
+            onlink src "$source_ip" >> "$LOG_FILE" 2>&1; then
+            fail "Не удалось создать временный маршрут ТСПУ через ${source_ip}"
+            return 1
+        fi
+    elif ! "${SUDO[@]}" ip -4 route add table "$table" default dev "$interface" \
+        src "$source_ip" >> "$LOG_FILE" 2>&1; then
+        fail "Не удалось создать временный маршрут ТСПУ через ${source_ip}"
+        return 1
+    fi
+
+    if ! "${SUDO[@]}" ip -4 rule add priority "$priority" uidrange "${uid}-${uid}" \
+        lookup "$table" >> "$LOG_FILE" 2>&1; then
+        "${SUDO[@]}" ip -4 route flush table "$table" >/dev/null 2>&1 || true
+        fail "Не удалось закрепить контейнер ТСПУ за ${source_ip}"
+        return 1
+    fi
+    "${SUDO[@]}" ip -4 route flush cache >/dev/null 2>&1 || true
+
+    check_line="$(ip -4 route get 1.1.1.1 uid "$uid" 2>/dev/null || true)"
+    check_interface="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<< "$check_line")"
+    check_source="$(awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}' <<< "$check_line")"
+    if [[ "$check_interface" != "$interface" || "$check_source" != "$source_ip" ]]; then
+        fail "Проверка временного маршрута не прошла: ${check_line:-нет маршрута}"
+        return 1
+    fi
+    echo "dpi-detector policy uid=${uid} table=${table} priority=${priority} route=${check_line}" >> "$LOG_FILE"
+}
+
+dpi_detector_cleanup() {
+    local container_name="${1:-}" table="${2:-}" priority="${3:-}"
+    if [[ -n "$container_name" ]] && command_exists docker; then
+        "${SUDO[@]}" docker rm -f "$container_name" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$priority" ]]; then
+        "${SUDO[@]}" ip -4 rule del priority "$priority" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$table" ]]; then
+        "${SUDO[@]}" ip -4 route flush table "$table" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$priority" || -n "$table" ]]; then
+        "${SUDO[@]}" ip -4 route flush cache >/dev/null 2>&1 || true
+    fi
+}
+
+run_dpi_detector() {
+    header
+    local requested_source_ip="${1:-}" source_ip source_interface
+    local slot uid table priority container_name security_options rc=0
+
+    if [[ "$MACHINE_MODE" == "panel" ]]; then
+        fail "Проверка ТСПУ доступна для node и whitelist."
+        return 1
+    fi
+    need_root
+    select_test_source_ipv4 "$requested_source_ip" || return 1
+    source_ip="$TEST_SOURCE_IP"
+    source_interface="$TEST_SOURCE_INTERFACE"
+
+    ensure_docker
+    stage "Обновляю DPI Detector ${DPI_DETECTOR_IMAGE}"
+    if ! "${SUDO[@]}" docker pull "$DPI_DETECTOR_IMAGE"; then
+        fail "Не удалось скачать образ DPI Detector"
+        return 1
+    fi
+
+    security_options="$("${SUDO[@]}" docker info --format '{{join .SecurityOptions ","}}' 2>/dev/null || true)"
+    if grep -Eqi 'userns|rootless' <<< "$security_options"; then
+        fail "Docker userns/rootless не поддерживается безопасной привязкой проверки ТСПУ"
+        return 1
+    fi
+
+    slot="$(dpi_detector_policy_slot 2>/dev/null || true)"
+    if [[ -z "$slot" ]]; then
+        fail "Не удалось найти свободные UID и routing table для проверки ТСПУ"
+        return 1
+    fi
+    IFS=$'\t' read -r uid table priority <<< "$slot"
+    container_name="kto-dpi-detector-${uid}-$$"
+
+    if (
+        local -a docker_args detector_args
+        trap 'dpi_detector_cleanup "$container_name" "$table" "$priority"' EXIT
+        trap 'exit 130' INT TERM HUP
+
+        stage "Закрепляю тест за ${source_ip} (${source_interface})"
+        dpi_detector_prepare_source_policy "$source_ip" "$source_interface" "$uid" "$table" "$priority" || exit 1
+
+        docker_args=(
+            run --rm --name "$container_name"
+            --network host
+            --user "${uid}:${uid}"
+            --cap-drop ALL
+            --security-opt no-new-privileges:true
+            --pids-limit 512
+            --read-only
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m
+            --env HOME=/tmp
+            --env PYTHONDONTWRITEBYTECODE=1
+            --env "TERM=${TERM:-xterm-256color}"
+            --init
+        )
+        detector_args=(--batch)
+        if [[ -t 0 && -t 1 ]]; then
+            docker_args+=(-it)
+        else
+            detector_args=(-t 123 --batch)
+            warn "Терминал не интерактивный: запускаю стандартные тесты 1, 2, 3."
+        fi
+
+        stage "Проверка ТСПУ через ${source_ip} (${source_interface})"
+        warn "Активный zapret, системный proxy или принудительный WARP может исказить результат."
+        "${SUDO[@]}" docker "${docker_args[@]}" "$DPI_DETECTOR_IMAGE" "${detector_args[@]}"
+    ); then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    if (( rc != 0 )); then
+        fail "DPI Detector завершился с кодом ${rc}"
+        return "$rc"
+    fi
+    ok "Проверка ТСПУ завершена, временный контейнер и маршруты удалены"
+}
+
 install_additional_ip_manager() {
     install_asset_file scripts/kto-additional-ips.sh "$ADDITIONAL_IP_MANAGER" 0755
 }
@@ -8184,6 +8354,10 @@ menu() {
     labels+=("Тест сети")
     actions+=("network-test")
     if [[ "$MACHINE_MODE" != "panel" ]]; then
+        labels+=("Проверка ТСПУ")
+        actions+=("dpi-test")
+    fi
+    if [[ "$MACHINE_MODE" != "panel" ]]; then
         labels+=("Проверить и завести дополнительные IP")
         actions+=("additional-ips")
     fi
@@ -8264,6 +8438,7 @@ menu() {
         warp) install_warp_native ;;
         status) show_status ;;
         network-test) network_test ;;
+        dpi-test) run_dpi_detector ;;
         additional-ips) setup_additional_ips || true ;;
         remnawave-egress) configure_remnawave_egress || true ;;
         stats-collector) install_stats_collector ;;
@@ -8308,6 +8483,7 @@ main() {
         warp) install_warp_native ;;
         status) show_status ;;
         network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" ;;
+        dpi-test|dpi-detector|tspu-test|tspu) run_dpi_detector "${2:-}" ;;
         additional-ips|extra-ips|multi-ip|multiwan) setup_additional_ips ;;
         remnawave-egress|remna-egress|reality-egress|xray-egress) shift; configure_remnawave_egress "${1:-menu}" ;;
         speedtest) install_speedtest "${2:-}" "${3:-}" ;;
