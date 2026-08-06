@@ -195,6 +195,40 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertIn("217.19.122.109", rich)
         self.assertIn("185.141.227.93", rich)
         self.assertNotIn("185.141.227.94", rich)
+        self.assertIn(
+            f'colspan="7"><b>Общий трафик: {collector.format_bytes(3300)}</b></td>',
+            rich,
+        )
+
+    def test_rich_tables_show_separate_centered_traffic_totals(self):
+        exact_payload = self.payload("Обход №2", str(uuid.uuid4()), "wl")
+        exact_payload.update({"day_rx": 100, "day_tx": 200})
+        other_payload = self.payload("Обход №2 (resell)", str(uuid.uuid4()), "wl")
+        other_payload.update({"day_rx": 400, "day_tx": 500})
+        bl_payload = self.payload("Германия", str(uuid.uuid4()), "bl")
+        bl_payload.update({"day_rx": 1000, "day_tx": 2000})
+
+        collector.update_node(exact_payload, "203.0.113.21")
+        collector.update_node(other_payload, "203.0.113.22")
+        bl_node = collector.update_node(bl_payload, "203.0.113.23")
+
+        wl_rich = collector.aggregate_wl_rich_message()
+        bl_rich = collector.bl_nodes_rich_section("kto VPN", [bl_node])
+
+        self.assertEqual(2, wl_rich.count("Общий трафик:"))
+        self.assertIn(
+            f'align="center" colspan="7"><b>Общий трафик: {collector.format_bytes(300)}</b>',
+            wl_rich,
+        )
+        self.assertIn(
+            f'align="center" colspan="7"><b>Общий трафик: {collector.format_bytes(900)}</b>',
+            wl_rich,
+        )
+        self.assertIn(
+            f'align="center" colspan="9"><b>Общий трафик: {collector.format_bytes(3000)}</b>',
+            bl_rich,
+        )
+        self.assertNotIn("Объем трафика:", wl_rich + bl_rich)
 
     def test_daily_report_uses_same_rich_table_senders_as_manual_stats(self):
         loop_source = inspect.getsource(collector.daily_report_loop)

@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v271"
+COLLECTOR_BUILD = "v272"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3653,7 +3653,7 @@ def rich_cell(value, header=False, align="left", rowspan=1, colspan=1, valign=""
     return f"<{tag}{attrs_text}>{rich_text(value)}</{tag}>"
 
 
-def rich_table(headers, rows, caption=""):
+def rich_table(headers, rows, caption="", footer=""):
     if not rows:
         return ""
     parts = ["<table bordered striped>"]
@@ -3677,6 +3677,11 @@ def rich_table(headers, rows, caption=""):
                 value, align = cell
                 cells.append(rich_cell(value, align=align))
         parts.append("<tr>" + "".join(cells) + "</tr>")
+    if footer:
+        colspan = max(1, min(len(headers), 20))
+        parts.append(
+            f'<tr><td align="center" colspan="{colspan}"><b>{rich_text(footer)}</b></td></tr>'
+        )
     parts.append("</table>")
     return "".join(parts)
 
@@ -3758,7 +3763,6 @@ def rich_status_summary(nodes, ts, expected_total):
         "<h4>На данный момент</h4>",
         f"<p><b>Живо:</b> {rich_text(f'{live_count}/{expected_total}')}</p>",
         f"<p><b>SLA за сегодня:</b> {rich_text(format_sla_percent(total_downtime, expected_total, ts))}</p>",
-        f"<p><b>Объем трафика:</b> {rich_text(format_bytes(nodes_day_traffic(nodes)))}</p>",
         f"<p><b>Общее кол-во падений за сегодня:</b> {rich_text(int(falls.get('total', 0) or 0))}</p>",
         f"<p><b>Общее время даунтайма за сегодня:</b> {rich_text(format_duration_ru(total_downtime))}</p>",
     ]
@@ -3780,6 +3784,10 @@ def rich_status_summary(nodes, ts, expected_total):
     return "".join(parts)
 
 
+def rich_traffic_total_text(nodes):
+    return f"Общий трафик: {format_bytes(nodes_day_traffic(nodes))}"
+
+
 def aggregate_wl_rich_message():
     with LOCK:
         all_nodes = [node for node in dedupe_nodes(NODES.values()) if not node_stats_disabled(node)]
@@ -3795,12 +3803,19 @@ def aggregate_wl_rich_message():
     headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "SNI", "Статус"]
     parts = [
         "<h3>Статистика обходов</h3>",
-        rich_table(headers, rich_wl_rows(nodes, ts)),
+        rich_table(headers, rich_wl_rows(nodes, ts), footer=rich_traffic_total_text(nodes)),
         rich_status_summary(nodes, ts, expected_total),
     ]
     if other_nodes:
         other_caption = f"Другие: {live_node_count(other_nodes, ts)}/{len(other_nodes)}"
-        parts.append(rich_table(headers, rich_wl_rows(other_nodes, ts), caption=other_caption))
+        parts.append(
+            rich_table(
+                headers,
+                rich_wl_rows(other_nodes, ts),
+                caption=other_caption,
+                footer=rich_traffic_total_text(other_nodes),
+            )
+        )
     return "".join(part for part in parts if part)
 
 
@@ -3892,7 +3907,7 @@ def bl_nodes_rich_section(group_name, group_nodes, ts=None):
     headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "RAM", "CPU", "Remnawave", "Статус"]
     parts = [
         f"<h4>{rich_text(group_name)}</h4>",
-        rich_table(headers, rich_bl_rows(group_nodes, ts)),
+        rich_table(headers, rich_bl_rows(group_nodes, ts), footer=rich_traffic_total_text(group_nodes)),
         rich_status_summary(group_nodes, ts, max(len(group_nodes), 1)),
     ]
     return "".join(part for part in parts if part)
