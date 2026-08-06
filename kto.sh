@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v272"
+SCRIPT_BUILD="v273"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -114,6 +114,8 @@ SPEEDTEST_AARCH64_ARCHIVE_SHA256="3953d231da3783e2bf8904b6dd72767c5c6e533e163d37
 SPEEDTEST_AMD64_DEB_SHA256="35e084567a6388631fb10cf01e5e0d6b57a67d34ede2b72ba111b3d9164c8b94"
 SPEEDTEST_ARM64_DEB_SHA256="98e7de9db3bf181d08bc67e647bcfc71349c8014e387289c08e54e5c55d82f37"
 APT_UPDATED=0
+TEST_SOURCE_IP=""
+TEST_SOURCE_INTERFACE=""
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -1418,6 +1420,87 @@ list_haproxy_additional_source_ips() {
     done < <(ip -4 -o address show scope global 2>/dev/null || true) |
         sort -t $'\t' -k2,2V -k1,1V |
         awk -F '\t' '!seen[$1]++'
+}
+
+list_test_source_ipv4s() {
+    local default_ip default_interface line interface cidr source_ip route route_interface kind
+    default_ip="$(haproxy_default_source_ip)"
+    default_interface="$(haproxy_default_source_interface)"
+
+    {
+        if validate_ipv4 "$default_ip" && [[ -n "$default_interface" ]]; then
+            printf '%s\t%s\t%s\n' "$default_ip" "$default_interface" "основной"
+        fi
+
+        while read -r line; do
+            interface="$(awk '{print $2}' <<< "$line")"
+            interface="${interface%%@*}"
+            cidr="$(awk '{print $4}' <<< "$line")"
+            source_ip="${cidr%%/*}"
+            [[ -n "$interface" && "$interface" != lo && "$source_ip" != "$default_ip" ]] || continue
+            validate_ipv4 "$source_ip" || continue
+            route="$(ip -4 route get 1.1.1.1 from "$source_ip" 2>/dev/null || true)"
+            route_interface="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<< "$route")"
+            [[ "$route_interface" == "$interface" ]] || continue
+            kind="дополнительный"
+            printf '%s\t%s\t%s\n' "$source_ip" "$interface" "$kind"
+        done < <(ip -4 -o address show scope global 2>/dev/null | sort -k2,2V -k4,4V || true)
+    } | awk -F '\t' 'NF >= 2 && !seen[$1]++'
+}
+
+select_test_source_ipv4() {
+    local requested="${1:-${KTO_TEST_SOURCE_IP:-}}" row source_ip interface kind choice index
+    local -a rows=()
+    TEST_SOURCE_IP=""
+    TEST_SOURCE_INTERFACE=""
+    requested="${requested//[[:space:]]/}"
+    mapfile -t rows < <(list_test_source_ipv4s)
+
+    if (( ${#rows[@]} == 0 )); then
+        fail "Не найдено ни одного IPv4 с рабочим source-route"
+        return 1
+    fi
+
+    if [[ -n "$requested" ]]; then
+        for row in "${rows[@]}"; do
+            IFS=$'\t' read -r source_ip interface kind <<< "$row"
+            if [[ "$source_ip" == "$requested" ]]; then
+                TEST_SOURCE_IP="$source_ip"
+                TEST_SOURCE_INTERFACE="$interface"
+                return 0
+            fi
+        done
+        fail "IP ${requested} не найден среди рабочих исходящих адресов"
+        return 1
+    fi
+
+    if (( ${#rows[@]} == 1 )); then
+        IFS=$'\t' read -r TEST_SOURCE_IP TEST_SOURCE_INTERFACE _ <<< "${rows[0]}"
+        return 0
+    fi
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ИСХОДЯЩИЙ IP ДЛЯ ТЕСТА ]${NC}"
+    for index in "${!rows[@]}"; do
+        IFS=$'\t' read -r source_ip interface kind <<< "${rows[$index]}"
+        printf ' %d) %s | %s | %s\n' "$(( index + 1 ))" "$source_ip" "$interface" "$kind"
+    done
+
+    while true; do
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите IP:${NC} "
+        if ! read -r choice; then
+            fail "Не удалось прочитать выбор IP"
+            return 1
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            choice=$(( 10#$choice ))
+            if (( choice >= 1 && choice <= ${#rows[@]} )); then
+                IFS=$'\t' read -r TEST_SOURCE_IP TEST_SOURCE_INTERFACE _ <<< "${rows[$(( choice - 1 ))]}"
+                return 0
+            fi
+        fi
+        fail "Неверный выбор"
+    done
 }
 
 haproxy_additional_source_ip_available() {
@@ -3971,15 +4054,19 @@ speedtest_install_packagecloud_deb() {
 install_speedtest() {
     header
     need_root
-    local output filtered output_file arch rc server_id binary profile
+    local output filtered output_file arch rc server_id binary profile requested_source_ip source_ip source_interface
     local archive_url archive_hash deb_url deb_hash deb_arch
     local -a speedtest_args speedtest_retry_args
 
     server_id="${1:-${KTO_SPEEDTEST_SERVER_ID:-}}"
+    requested_source_ip="${2:-}"
     if [[ -n "$server_id" ]] && ! [[ "$server_id" =~ ^[0-9]+$ ]]; then
         fail "Speedtest server id должен быть числом"
         return 1
     fi
+    select_test_source_ipv4 "$requested_source_ip" || return 1
+    source_ip="$TEST_SOURCE_IP"
+    source_interface="$TEST_SOURCE_INTERFACE"
 
     stage "Готовлю Speedtest"
     binary="$(speedtest_find_binary 2>/dev/null || true)"
@@ -4029,13 +4116,14 @@ install_speedtest() {
         ok "Ookla CLI уже установлен: ${binary}"
     fi
 
-    speedtest_args=("$binary" --accept-license --accept-gdpr --progress=yes)
-    speedtest_retry_args=("$binary" --accept-license --accept-gdpr --progress=no)
+    speedtest_args=("$binary" --accept-license --accept-gdpr --progress=yes --ip="$source_ip")
+    speedtest_retry_args=("$binary" --accept-license --accept-gdpr --progress=no --ip="$source_ip")
     if [[ -n "$server_id" ]]; then
         speedtest_args+=(--server-id="$server_id")
         speedtest_retry_args+=(--server-id="$server_id")
         ok "Сервер Speedtest: ${server_id}"
     fi
+    ok "Исходящий IP теста: ${source_ip} (${source_interface})"
 
     echo
     stage "Запускаю Speedtest"
@@ -4123,30 +4211,16 @@ speedtest_ru() {
     local real_iperf3 real_ping real_wget real_curl
 
     stage "Запускаю Speedtest (RU)"
-    if [[ -n "$source_ip" ]]; then
-        source_ip="${source_ip//[[:space:]]/}"
-        validate_ipv4 "$source_ip" || {
-            fail "Некорректный source IP: ${source_ip:-пусто}"
-            return 1
-        }
-        if ! ip -4 -o address show scope global 2>/dev/null | awk -v wanted="$source_ip" '
-            { split($4, cidr, "/"); if (cidr[1] == wanted) found = 1 }
-            END { exit found ? 0 : 1 }
-        '; then
-            fail "IP ${source_ip} не настроен на локальном интерфейсе"
-            return 1
-        fi
-        route_line="$(ip -4 route get 1.1.1.1 from "$source_ip" 2>/dev/null || true)"
-        route_interface="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<< "$route_line")"
-        if [[ -z "$route_line" || -z "$route_interface" ]]; then
-            fail "Для ${source_ip} нет рабочего source-route. Сначала запусти настройку дополнительных IP."
-            return 1
-        fi
-        stage "Тест через ${source_ip} (${route_interface})"
-        apt_install_with_update_if_missing wget curl ca-certificates iperf3 iproute2 iputils-ping
-    else
-        apt_install_with_update_if_missing wget curl ca-certificates
+    select_test_source_ipv4 "$source_ip" || return 1
+    source_ip="$TEST_SOURCE_IP"
+    route_interface="$TEST_SOURCE_INTERFACE"
+    route_line="$(ip -4 route get 1.1.1.1 from "$source_ip" 2>/dev/null || true)"
+    if [[ -z "$route_line" || -z "$route_interface" ]]; then
+        fail "Для ${source_ip} нет рабочего source-route. Сначала запусти настройку дополнительных IP."
+        return 1
     fi
+    stage "Тест через ${source_ip} (${route_interface})"
+    apt_install_with_update_if_missing wget curl ca-certificates iperf3 iproute2 iputils-ping
 
     bench_script="$(mktemp)"
     cleanup_speedtest_ru() {
@@ -4169,11 +4243,6 @@ speedtest_ru() {
     fi
 
     echo "running: ${SPEEDTEST_RU_URL}${source_ip:+ source=${source_ip}}" >> "$LOG_FILE"
-    if [[ -z "$source_ip" ]]; then
-        bash "$bench_script"
-        return
-    fi
-
     real_iperf3="$(command -v iperf3)"
     real_ping="$(command -v ping)"
     real_wget="$(command -v wget)"
@@ -4206,6 +4275,8 @@ NETTEST_RAW_OK=0
 NETTEST_RAW_BAD=0
 NETTEST_PING_BAD=0
 NETTEST_WARN=0
+NETTEST_SOURCE_IP=""
+NETTEST_SOURCE_INTERFACE=""
 
 network_test_badge() {
     case "$1" in
@@ -4239,7 +4310,12 @@ network_test_short() {
 network_test_resolve() {
     local host="$1"
     local ips status
-    ips="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd ' ' - || true)"
+    if command_exists dig; then
+        ips="$(dig -4 -b "$NETTEST_SOURCE_IP" "$host" A +time=4 +tries=1 +short 2>/dev/null |
+            awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' | sort -u | paste -sd ' ' - || true)"
+    else
+        ips="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd ' ' - || true)"
+    fi
     if [[ -n "$ips" ]]; then
         status="ok"
     else
@@ -4254,11 +4330,29 @@ network_test_tcp() {
     local host="$1"
     local port="${2:-443}"
     local timeout_sec="${3:-4}"
-    if command_exists timeout; then
-        timeout --foreground "${timeout_sec}s" bash -c 'cat </dev/null >/dev/tcp/"$1"/"$2"' _ "$host" "$port" >/dev/null 2>&1
-    else
-        bash -c 'cat </dev/null >/dev/tcp/"$1"/"$2"' _ "$host" "$port" >/dev/null 2>&1
+    if command_exists python3; then
+        python3 - "$NETTEST_SOURCE_IP" "$host" "$port" "$timeout_sec" >/dev/null 2>&1 <<'PY'
+import socket
+import sys
+
+source_ip, host, port, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+for family, socktype, proto, _, address in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+    sock = socket.socket(family, socktype, proto)
+    try:
+        sock.settimeout(timeout)
+        sock.bind((source_ip, 0))
+        sock.connect(address)
+        raise SystemExit(0)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+raise SystemExit(1)
+PY
+        return $?
     fi
+    command_exists nc || return 127
+    nc -4 -z -s "$NETTEST_SOURCE_IP" -w "$timeout_sec" "$host" "$port" >/dev/null 2>&1
 }
 
 network_test_https() {
@@ -4271,7 +4365,7 @@ network_test_https() {
         return 0
     fi
 
-    if output="$(curl -4 -sS -o /dev/null \
+    if output="$(curl -4 --noproxy '*' --interface "$NETTEST_SOURCE_IP" -sS -o /dev/null \
         -w 'http=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s ip=%{remote_ip}' \
         --connect-timeout 4 -m 10 "$url" 2>&1)"; then
         rc=0
@@ -4305,7 +4399,7 @@ network_test_raw_ip() {
         return 0
     fi
 
-    if output="$(curl -4 -sS -o /dev/null \
+    if output="$(curl -4 --noproxy '*' --interface "$NETTEST_SOURCE_IP" -sS -o /dev/null \
         -w 'http=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s' \
         --resolve "raw.githubusercontent.com:443:${ip}" \
         --connect-timeout 4 -m 10 https://raw.githubusercontent.com/ 2>&1)"; then
@@ -4337,7 +4431,7 @@ network_test_ping() {
     fi
 
     tmp="$(mktemp)"
-    if ping -c 4 -W 2 "$target" > "$tmp" 2>&1; then
+    if ping -4 -I "$NETTEST_SOURCE_IP" -c 4 -W 2 "$target" > "$tmp" 2>&1; then
         status="ok"
     else
         status="warn"
@@ -4353,11 +4447,12 @@ network_test_mtr() {
     local target="$1"
     local label="${2:-$1}"
     local out
+    local -a mtr_args=(-4 -a "$NETTEST_SOURCE_IP" -T -P 443 -c 5 -r)
     if ! command_exists mtr; then
         network_test_row "mtr ${label}" "mtr не установлен" "skip"
         return 0
     fi
-    out="$(mtr -4 -T -P 443 -c 5 -r "$target" 2>/dev/null | tail -n 4 | sed 's/^[[:space:]]*//' | paste -sd ' | ' - || true)"
+    out="$(mtr "${mtr_args[@]}" "$target" 2>/dev/null | tail -n 4 | sed 's/^[[:space:]]*//' | paste -sd ' | ' - || true)"
     network_test_row "mtr ${label}" "$(network_test_short "${out:-нет вывода}")"
 }
 
@@ -4390,8 +4485,20 @@ network_test_extra_target() {
 
 network_test() {
     header
-    local iface route_line default_route src_ip mtu dns_line host gateway ip target
+    local iface route_line default_route src_ip mtu dns_line host gateway ip target requested_source_ip
     local -a raw_ips default_hosts extra_targets
+    requested_source_ip="${KTO_TEST_SOURCE_IP:-}"
+    if [[ "${1:-}" == "--source-ip" ]]; then
+        if (( $# < 2 )); then
+            fail "После --source-ip нужен IPv4"
+            return 1
+        fi
+        requested_source_ip="$2"
+        shift 2
+    fi
+    select_test_source_ipv4 "$requested_source_ip" || return 1
+    NETTEST_SOURCE_IP="$TEST_SOURCE_IP"
+    NETTEST_SOURCE_INTERFACE="$TEST_SOURCE_INTERFACE"
     extra_targets=("$@")
     raw_ips=(185.199.108.133 185.199.109.133 185.199.110.133 185.199.111.133)
     default_hosts=(raw.githubusercontent.com github.com api.github.com)
@@ -4404,10 +4511,11 @@ network_test() {
     NETTEST_WARN=0
 
     echo -e "${BOLD}${PURPLE}[ СЕТЬ ]${NC}"
-    route_line="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
+    route_line="$(ip -4 route get 1.1.1.1 from "$NETTEST_SOURCE_IP" 2>/dev/null || true)"
     iface="$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$route_line")"
     src_ip="$(awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' <<< "$route_line")"
-    gateway="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}' || true)"
+    [[ -n "$src_ip" ]] || src_ip="$NETTEST_SOURCE_IP"
+    gateway="$(awk '{for (i=1; i<=NF; i++) if ($i=="via") {print $(i+1); exit}}' <<< "$route_line")"
     default_route="$(ip -4 route show default 2>/dev/null | head -n 1 || true)"
     if [[ -n "$iface" ]]; then
         mtu="$(ip -o link show dev "$iface" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="mtu") {print $(i+1); exit}}' || true)"
@@ -4415,6 +4523,7 @@ network_test() {
         mtu=""
     fi
     network_test_row "interface" "${iface:--}${src_ip:+ src=${src_ip}}${mtu:+ mtu=${mtu}}"
+    network_test_row "source route" "${route_line:--}"
     network_test_row "default route" "${default_route:--}"
 
     if command_exists resolvectl; then
@@ -4546,20 +4655,70 @@ configure_remnawave_egress() {
         "$REMNA_EGRESS_MANAGER" "${1:-menu}"
 }
 
+download_ip_test_script() {
+    local url="$1" output_file="$2" source_ip="$3"
+    local -a curl_args=(-q -4 --noproxy '*' --interface "$source_ip" -fsSL \
+        --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 -o "$output_file")
+    local -a wget_args=(--no-proxy -4 "--bind-address=${source_ip}" -q -O "$output_file" \
+        --timeout=20 --tries=3)
+
+    if command_exists curl && curl "${curl_args[@]}" "$url"; then
+        return 0
+    fi
+    warn "curl не скачал тест через ${source_ip}, пробую wget"
+    command_exists wget && wget "${wget_args[@]}" "$url"
+}
+
+validate_ip_test_script() {
+    local script="$1" label="$2"
+    if [[ ! -s "$script" ]] || ! head -n 1 "$script" | grep -Eq '^#!.*(bash|sh)' || ! bash -n "$script"; then
+        fail "${label} вернул невалидный Bash-скрипт"
+        return 1
+    fi
+}
+
 ipcheck_place() {
     header
-    stage "Проверяю IP.Check.Place"
-    if ! bash <(curl -Ls https://IP.Check.Place) -l en; then
+    local source_ip="${1:-}" script
+    select_test_source_ipv4 "$source_ip" || return 1
+    source_ip="$TEST_SOURCE_IP"
+    stage "Проверяю IP.Check.Place через ${source_ip} (${TEST_SOURCE_INTERFACE})"
+    script="$(mktemp)"
+    if ! download_ip_test_script "https://IP.Check.Place" "$script" "$source_ip" ||
+        ! validate_ip_test_script "$script" "IP.Check.Place"; then
+        rm -f "$script"
+        return 1
+    fi
+    if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+        bash "$script" -4 -i "$source_ip" -l en; then
+        :
+    else
         warn "IP.Check.Place завершился с нестандартным кодом, вывод выше оставил как есть."
     fi
+    rm -f "$script"
+    return 0
 }
 
 ipcheck_region() {
     header
-    stage "Проверяю регион IP"
-    if ! bash <(wget -qO- https://github.com/Davoyan/ipregion/raw/main/ipregion.sh); then
+    local source_ip="${1:-}" script
+    select_test_source_ipv4 "$source_ip" || return 1
+    source_ip="$TEST_SOURCE_IP"
+    stage "Проверяю регион IP через ${source_ip} (${TEST_SOURCE_INTERFACE})"
+    script="$(mktemp)"
+    if ! download_ip_test_script "https://raw.githubusercontent.com/Davoyan/ipregion/main/ipregion.sh" "$script" "$source_ip" ||
+        ! validate_ip_test_script "$script" "Region Check"; then
+        rm -f "$script"
+        return 1
+    fi
+    if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+        bash "$script" --ipv4 --interface "$source_ip"; then
+        :
+    else
         warn "Region Check завершился с нестандартным кодом, вывод выше оставил как есть."
     fi
+    rm -f "$script"
+    return 0
 }
 
 container_running() {
@@ -8151,10 +8310,10 @@ main() {
         network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" ;;
         additional-ips|extra-ips|multi-ip|multiwan) setup_additional_ips ;;
         remnawave-egress|remna-egress|reality-egress|xray-egress) shift; configure_remnawave_egress "${1:-menu}" ;;
-        speedtest) install_speedtest "${2:-}" ;;
+        speedtest) install_speedtest "${2:-}" "${3:-}" ;;
         speedtest-ru|speedtestru|bench-ru|benchru) speedtest_ru "${2:-}" ;;
-        ipcheck-place) ipcheck_place ;;
-        ipcheck-region) ipcheck_region ;;
+        ipcheck-place) ipcheck_place "${2:-}" ;;
+        ipcheck-region) ipcheck_region "${2:-}" ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
         haproxy-update|update-haproxy|haproxy-refresh) update_haproxy_existing_config ;;

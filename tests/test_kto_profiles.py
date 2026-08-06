@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v272"', KTO)
-        self.assertIn('PUSH_BUILD="v272"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v272"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v272"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v272"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v272"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v272"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v273"', KTO)
+        self.assertIn('PUSH_BUILD="v273"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v273"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v273"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v273"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v273"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v273"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -299,6 +299,92 @@ wrapper=$(mktemp)
 trap 'rm -f "$wrapper"' EXIT
 write_speedtest_ru_bind_wrapper "$wrapper" /bin/echo -B 217.19.122.109
 [[ "$("$wrapper" hello)" == '-B 217.19.122.109 hello' ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_ip_dependent_tests_select_and_bind_the_source_ipv4(self):
+        listing = function_body(KTO, "list_test_source_ipv4s")
+        selector = function_body(KTO, "select_test_source_ipv4")
+        speedtest = function_body(KTO, "install_speedtest")
+        speedtest_ru = function_body(KTO, "speedtest_ru")
+        network = function_body(KTO, "network_test")
+        network_resolve = function_body(KTO, "network_test_resolve")
+        network_tcp = function_body(KTO, "network_test_tcp")
+        network_https = function_body(KTO, "network_test_https")
+        network_raw = function_body(KTO, "network_test_raw_ip")
+        network_ping = function_body(KTO, "network_test_ping")
+        network_mtr = function_body(KTO, "network_test_mtr")
+        ipcheck_place = function_body(KTO, "ipcheck_place")
+        ipcheck_region = function_body(KTO, "ipcheck_region")
+        downloader = function_body(KTO, "download_ip_test_script")
+
+        self.assertIn('ip -4 route get 1.1.1.1 from "$source_ip"', listing)
+        self.assertIn('[[ "$route_interface" == "$interface" ]]', listing)
+        self.assertIn('if (( ${#rows[@]} == 1 )); then', selector)
+        self.assertIn('Выберите IP', selector)
+        self.assertIn('select_test_source_ipv4 "$requested_source_ip"', speedtest)
+        self.assertIn('--ip="$source_ip"', speedtest)
+        self.assertIn('select_test_source_ipv4 "$source_ip"', speedtest_ru)
+        self.assertIn('select_test_source_ipv4 "$requested_source_ip"', network)
+        self.assertIn('from "$NETTEST_SOURCE_IP"', network)
+        self.assertIn('dig -4 -b "$NETTEST_SOURCE_IP" "$host" A', network_resolve)
+        self.assertIn('sock.bind((source_ip, 0))', network_tcp)
+        self.assertIn('--interface "$NETTEST_SOURCE_IP"', network_https)
+        self.assertIn('--interface "$NETTEST_SOURCE_IP"', network_raw)
+        self.assertIn('-I "$NETTEST_SOURCE_IP"', network_ping)
+        self.assertIn('-a "$NETTEST_SOURCE_IP"', network_mtr)
+        self.assertIn('select_test_source_ipv4 "$source_ip"', ipcheck_place)
+        self.assertIn('bash "$script" -4 -i "$source_ip" -l en', ipcheck_place)
+        self.assertIn('select_test_source_ipv4 "$source_ip"', ipcheck_region)
+        self.assertIn('bash "$script" --ipv4 --interface "$source_ip"', ipcheck_region)
+        self.assertIn('--interface "$source_ip"', downloader)
+        self.assertIn('"--bind-address=${source_ip}"', downloader)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+fail() { return 1; }
+ip() {
+    if [[ "${1:-}" == -4 && "${2:-}" == route && "${3:-}" == get ]]; then
+        case "${6:-}" in
+            203.0.113.20) echo '1.1.1.1 from 203.0.113.20 via 203.0.113.1 dev wan2 table 102' ;;
+            172.17.0.1) echo '1.1.1.1 from 172.17.0.1 via 198.51.100.1 dev ens3' ;;
+            *) echo '1.1.1.1 via 198.51.100.1 dev ens3 src 198.51.100.10' ;;
+        esac
+        return 0
+    fi
+    if [[ "${1:-}" == -4 && "${2:-}" == -o && "${3:-}" == address ]]; then
+        cat <<'EOF'
+2: ens3    inet 198.51.100.10/24 scope global ens3
+3: wan2    inet 203.0.113.20/24 scope global wan2
+4: docker0 inet 172.17.0.1/16 scope global docker0
+EOF
+        return 0
+    fi
+    return 1
+}
+mapfile -t rows < <(list_test_source_ipv4s)
+[[ "${#rows[@]}" == 2 ]]
+[[ "${rows[0]}" == $'198.51.100.10\tens3\tосновной' ]]
+[[ "${rows[1]}" == $'203.0.113.20\twan2\tдополнительный' ]]
+select_test_source_ipv4 <<< '2' >/dev/null
+[[ "$TEST_SOURCE_IP" == 203.0.113.20 ]]
+[[ "$TEST_SOURCE_INTERFACE" == wan2 ]]
+list_test_source_ipv4s() { printf '198.51.100.10\tens3\tосновной\n'; }
+select_test_source_ipv4 </dev/null
+[[ "$TEST_SOURCE_IP" == 198.51.100.10 ]]
+[[ "$TEST_SOURCE_INTERFACE" == ens3 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
