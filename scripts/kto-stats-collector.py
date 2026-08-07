@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v277"
+COLLECTOR_BUILD = "v278"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -294,6 +294,7 @@ ALERTS_OFF_FILE = os.path.join(STATE_DIR, "connection_alerts_off.json")
 REMNA_NODES_FILE = os.path.join(STATE_DIR, "remna_nodes.json")
 IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
 IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
+IP_NOTES_FILE = os.path.join(STATE_DIR, "ip_notes.json")
 UPDATE_STATE_FILE = os.path.join(STATE_DIR, "update_state.json")
 LOCK = threading.RLock()
 NODES = {}
@@ -306,6 +307,7 @@ STATS_OFF_STATE = {"nodes": {}}
 ALERTS_OFF_STATE = {"nodes": {}}
 REMNA_NODE_STATE = {"nodes": {}}
 UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
+IP_NOTE_STATE = {"notes": {}, "pending": {}}
 IP_LIMIT_DB = None
 REMNA_USER_CACHE = {}
 EVENT_QUEUE = queue.Queue(maxsize=10000)
@@ -313,6 +315,8 @@ NODES_DIRTY = False
 AUTH_NONCES = {}
 AUTH_NONCE_LAST_PURGE = 0
 ALERT_SEPARATOR = "➖" * 9
+IP_NOTE_MAX_LENGTH = 160
+IP_NOTE_PENDING_TTL = 600
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
 LOST_EMOJI = '<tg-emoji emoji-id="5447183459602669338">🚨</tg-emoji>'
 BL_NODE_ORDER = [
@@ -2006,6 +2010,108 @@ def clean_display_text(value):
     text = text.replace("Санкрт-Петербург", "Санкт-Петербург")
     text = text.replace("санкрт-петербург", "санкт-петербург")
     return text
+
+
+def normalize_note_ip(value):
+    text = str(value or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    address = ipaddress.ip_address(text)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.compressed
+
+
+def normalize_ip_note_text(value):
+    note = clean_display_text(value)
+    if not note:
+        raise ValueError("empty note")
+    if len(note) > IP_NOTE_MAX_LENGTH:
+        raise ValueError("note too long")
+    return note
+
+
+def load_ip_note_state():
+    global IP_NOTE_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    for candidate in (IP_NOTES_FILE, f"{IP_NOTES_FILE}.bak"):
+        try:
+            with open(candidate, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if not isinstance(loaded, dict):
+                raise ValueError("state is not an object")
+            raw_notes = loaded.get("notes")
+            raw_pending = loaded.get("pending")
+            if not isinstance(raw_notes, dict):
+                raw_notes = {}
+            if not isinstance(raw_pending, dict):
+                raw_pending = {}
+
+            notes = {}
+            for raw_ip, raw_item in raw_notes.items():
+                try:
+                    ip = normalize_note_ip(raw_ip)
+                    item = raw_item if isinstance(raw_item, dict) else {"text": raw_item}
+                    note = normalize_ip_note_text(item.get("text"))
+                    notes[ip] = {
+                        "text": note,
+                        "updated_at": max(0, int(item.get("updated_at") or 0)),
+                    }
+                except (TypeError, ValueError):
+                    continue
+
+            pending = {}
+            ts = now_ts()
+            for key, raw_item in raw_pending.items():
+                if not isinstance(raw_item, dict):
+                    continue
+                try:
+                    ip = normalize_note_ip(raw_item.get("ip"))
+                    created_at = int(raw_item.get("created_at") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not key or created_at <= 0 or ts - created_at > IP_NOTE_PENDING_TTL:
+                    continue
+                pending[str(key)] = {"ip": ip, "created_at": created_at}
+
+            IP_NOTE_STATE = {"notes": notes, "pending": pending}
+            if candidate != IP_NOTES_FILE:
+                log(f"ip notes recovered from backup: {candidate}")
+            return
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            log(f"ip notes load failed path={candidate}: {exc}")
+    IP_NOTE_STATE = {"notes": {}, "pending": {}}
+
+
+def save_ip_note_state():
+    atomic_write(
+        IP_NOTES_FILE,
+        json.dumps(IP_NOTE_STATE, ensure_ascii=False, indent=2, sort_keys=True),
+        keep_backup=True,
+    )
+
+
+def ip_note_text(value):
+    try:
+        ip = normalize_note_ip(value)
+    except ValueError:
+        return ""
+    with LOCK:
+        item = IP_NOTE_STATE.setdefault("notes", {}).get(ip)
+        if isinstance(item, dict):
+            return clean_display_text(item.get("text"))
+        return clean_display_text(item)
+
+
+def ip_with_note_html(value):
+    display_ip = clean_display_text(value) or "-"
+    note = ip_note_text(display_ip)
+    result = html.escape(display_ip)
+    if note:
+        result += f" | {html.escape(note)}"
+    return result
 
 
 def natural_sort_key(value):
@@ -5510,7 +5616,7 @@ def ip_limit_user_block(user, rows, ts):
     for row in rows[:8]:
         nodes = ", ".join(row.get("nodes") or []) or "-"
         age = format_age(ts - int(row.get("last_seen") or 0))
-        lines.append(f"{html.escape(row['ip'])} — {html.escape(nodes)} — {html.escape(age)} назад")
+        lines.append(f"{ip_with_note_html(row['ip'])} — {html.escape(nodes)} — {html.escape(age)} назад")
     if len(rows) > 8:
         lines.append(f"... ещё {len(rows) - 8}")
     return "<blockquote>" + "\n".join(lines) + "</blockquote>"
@@ -5520,7 +5626,7 @@ def ip_limit_entry_detail_line(item, ts):
     ip = str(item.get("ip") or "-")
     nodes = ", ".join(item.get("nodes") or []) or "-"
     age = format_age(ts - int(item.get("last_seen") or 0))
-    parts = [html.escape(ip), html.escape(nodes), html.escape(f"{age} назад")]
+    parts = [ip_with_note_html(ip), html.escape(nodes), html.escape(f"{age} назад")]
     asn = asn_info_text(ip, fetch=False)
     if asn:
         parts.append(html.escape(asn))
@@ -5536,7 +5642,8 @@ def ip_limit_report(query=""):
         lines = [
             "<b>IP лимит</b>",
             ALERT_SEPARATOR,
-            "<b>Пример:</b> <code>/ip Нидерланды</code>",
+            "<b>По машине:</b> <code>/ip Нидерланды</code>",
+            "<b>Заметка для IP:</b> <code>/ip 203.0.113.10</code>",
         ]
         if node_names:
             lines += ["", "<b>Активные машины:</b>"]
@@ -5815,7 +5922,7 @@ def ip_limit_user_card(query):
 def ip_limit_entry_alert_line(item):
     ip = str(item.get("ip") or "-")
     nodes = ", ".join(item.get("nodes") or []) or "-"
-    parts = [html.escape(ip), html.escape(nodes)]
+    parts = [ip_with_note_html(ip), html.escape(nodes)]
     asn = asn_info_text(ip)
     if asn:
         parts.append(html.escape(asn))
@@ -8182,10 +8289,131 @@ def handle_update_callback(callback):
     return True
 
 
-def handle_ip(text):
+def set_pending_ip_note(chat_id, from_id, value):
+    ip = normalize_note_ip(value)
+    with LOCK:
+        IP_NOTE_STATE.setdefault("pending", {})[pending_key(chat_id, from_id)] = {
+            "ip": ip,
+            "created_at": now_ts(),
+        }
+        save_ip_note_state()
+    return ip
+
+
+def pop_pending_ip_note(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = IP_NOTE_STATE.setdefault("pending", {}).pop(key, None)
+        if item is not None:
+            save_ip_note_state()
+        return dict(item) if isinstance(item, dict) else None
+
+
+def peek_pending_ip_note(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = IP_NOTE_STATE.setdefault("pending", {}).get(key)
+        if not isinstance(item, dict):
+            return None
+        if now_ts() - int(item.get("created_at") or 0) > IP_NOTE_PENDING_TTL:
+            IP_NOTE_STATE.setdefault("pending", {}).pop(key, None)
+            save_ip_note_state()
+            return None
+        return dict(item)
+
+
+def clear_ip_note_dialog_conflicts(chat_id, from_id):
+    for popper in (
+        pop_pending_ip_limit,
+        pop_pending_sni,
+        pop_pending_rename,
+        pop_pending_bl_group,
+        pop_pending_update_node_list,
+    ):
+        try:
+            popper(chat_id, from_id)
+        except Exception as exc:
+            log(f"pending dialog cleanup failed handler={popper.__name__}: {exc}")
+
+
+def ip_note_prompt(ip):
+    lines = [
+        "<b>Заметка для IP</b>",
+        ALERT_SEPARATOR,
+        detail_line("IP", ip),
+    ]
+    current = ip_note_text(ip)
+    if current:
+        lines.append(detail_line("Сейчас", current))
+    lines += [
+        "",
+        "Напиши заметку следующим сообщением.",
+        f"Максимум: <code>{IP_NOTE_MAX_LENGTH}</code> символов.",
+        "Удалить заметку: <code>-</code>",
+        "Отмена: <code>/cancel</code>",
+    ]
+    return "\n".join(lines)
+
+
+def handle_ip(text, chat_id="", from_id=""):
     parts = text.split(maxsplit=1)
     query = parts[1].strip() if len(parts) > 1 else ""
-    send_message(ip_limit_report(query))
+    try:
+        ip = normalize_note_ip(query)
+    except ValueError:
+        if chat_id and from_id:
+            pop_pending_ip_note(chat_id, from_id)
+        send_message(ip_limit_report(query))
+        return
+    clear_ip_note_dialog_conflicts(chat_id, from_id)
+    set_pending_ip_note(chat_id, from_id, ip)
+    send_message(ip_note_prompt(ip))
+
+
+def handle_pending_ip_note(chat_id, from_id, text):
+    pending = peek_pending_ip_note(chat_id, from_id)
+    if not pending:
+        return False
+    ip = str(pending.get("ip") or "")
+    value = clean_display_text(text)
+    if value != "-":
+        if not value:
+            send_message("<b>Заметка пустая.</b>\n\nНапиши текст или отправь <code>-</code> для удаления.")
+            return True
+        if len(value) > IP_NOTE_MAX_LENGTH:
+            send_message(
+                f"<b>Слишком длинная заметка.</b>\n\n"
+                f"Максимум: <code>{IP_NOTE_MAX_LENGTH}</code> символов. Сейчас: <code>{len(value)}</code>."
+            )
+            return True
+
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        current = IP_NOTE_STATE.setdefault("pending", {}).get(key)
+        if not isinstance(current, dict) or str(current.get("ip") or "") != ip:
+            return False
+        IP_NOTE_STATE["pending"].pop(key, None)
+        if value == "-":
+            removed = IP_NOTE_STATE.setdefault("notes", {}).pop(ip, None) is not None
+        else:
+            value = normalize_ip_note_text(value)
+            IP_NOTE_STATE.setdefault("notes", {})[ip] = {
+                "text": value,
+                "updated_at": now_ts(),
+            }
+            removed = False
+        save_ip_note_state()
+
+    if value == "-":
+        title = "Заметка удалена" if removed else "Заметки для IP не было"
+        send_message(f"<b>{title}</b>\n{ALERT_SEPARATOR}\n{detail_line('IP', ip)}")
+    else:
+        send_message(
+            "<b>Заметка сохранена</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"<blockquote>{ip_with_note_html(ip)}</blockquote>"
+        )
+    return True
 
 
 def handle_top_ip(text):
@@ -8592,7 +8820,7 @@ BOT_HELP_SECTIONS = (
         ("/clean_all [status|stop]", "Очистить collector и удалить push со всех машин."),
     )),
     ("IP limit", (
-        ("/ip <машина>", "Показать IP-limit статистику по машине."),
+        ("/ip <машина|IP>", "Показать IP-limit по машине или записать заметку для IP."),
         ("/top_ip [N]", "Показать топ пользователей по активным IP."),
         ("/ip_limit <Remna/TG ID>", "Открыть пользователя и его персональный IP лимит."),
         ("/limit_ip <Remna/TG ID>", "Алиас команды /ip_limit."),
@@ -8670,6 +8898,7 @@ def bot_loop():
                 text = str(message.get("text") or "")
                 command = text.split()[0].split("@", 1)[0].lower() if text.split() else ""
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/cancel":
+                    pop_pending_ip_note(chat_id, from_id)
                     pop_pending_ip_limit(chat_id, from_id)
                     pop_pending_sni(chat_id, from_id)
                     pop_pending_rename(chat_id, from_id)
@@ -8677,7 +8906,16 @@ def bot_loop():
                     pop_pending_update_node_list(chat_id, from_id)
                     send_message("<b>Отменил.</b>")
                     continue
+                if (
+                    chat_id == str(CHAT_ID)
+                    and from_id == ALLOWED_USER_ID
+                    and command.startswith("/")
+                    and command not in ("/cancel", "/ip")
+                ):
+                    pop_pending_ip_note(chat_id, from_id)
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and not command.startswith("/"):
+                    if handle_pending_ip_note(chat_id, from_id, text):
+                        continue
                     if handle_pending_update_node_list(chat_id, from_id, text):
                         continue
                     if handle_pending_bl_group(chat_id, from_id, text):
@@ -8745,7 +8983,7 @@ def bot_loop():
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete_sni":
                     handle_sni_command(text, "delete_sni", chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ip":
-                    handle_ip(text)
+                    handle_ip(text, chat_id, from_id)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/top_ip":
                     handle_top_ip(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/push_debug":
@@ -8785,6 +9023,7 @@ def main():
     load_alerts_off_state()
     load_remna_node_state()
     load_update_state()
+    load_ip_note_state()
     load_ip_limit_state()
     disable_ip_limit_actions_runtime()
     threading.Thread(target=event_worker_loop, daemon=True).start()

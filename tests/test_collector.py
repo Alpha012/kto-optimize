@@ -35,16 +35,19 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.UPDATE_STATE_FILE = os.path.join(self.state.name, "update_state.json")
         collector.ALERTS_OFF_FILE = os.path.join(self.state.name, "connection_alerts_off.json")
         collector.IP_LIMIT_DB_FILE = os.path.join(self.state.name, "ip_limit.sqlite")
+        collector.IP_NOTES_FILE = os.path.join(self.state.name, "ip_notes.json")
         if collector.IP_LIMIT_DB is not None:
             collector.IP_LIMIT_DB.close()
         collector.IP_LIMIT_DB = None
         collector.NODES = {}
         collector.FALLS = {}
+        collector.SNI_STATE = {"nodes": {}, "pending": {}}
         collector.NODE_NAME_STATE = {"nodes": {}, "pending": {}}
         collector.STATS_OFF_STATE = {"nodes": {}}
         collector.ALERTS_OFF_STATE = {"nodes": {}}
         collector.BL_GROUP_STATE = {"groups": {}, "pending": {}}
         collector.UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
+        collector.IP_NOTE_STATE = {"notes": {}, "pending": {}}
         collector.AUTH_NONCES = {}
         collector.NODES_DIRTY = False
         collector.init_ip_limit_db()
@@ -247,6 +250,84 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertLessEqual(len(message), 4096)
         self.assertIn("<code>/help</code> — Показать все актуальные команды.", message)
         self.assertIn("<code>/ip_enable_force &lt;машина&gt;</code> — То же, что /ip_enable; блокировки отключены.", message)
+
+    def test_ip_command_preserves_machine_report_and_starts_note_dialog_for_ip(self):
+        messages = []
+        original_send = collector.send_message
+        original_report = collector.ip_limit_report
+        collector.send_message = lambda text, **_kwargs: messages.append(text)
+        collector.ip_limit_report = lambda query="": f"machine-report:{query}"
+        try:
+            collector.handle_ip("/ip Нидерланды", "chat", "user")
+            self.assertEqual("machine-report:Нидерланды", messages[-1])
+            self.assertIsNone(collector.peek_pending_ip_note("chat", "user"))
+
+            collector.handle_ip("/ip 203.0.113.010", "chat", "user")
+            self.assertEqual("machine-report:203.0.113.010", messages[-1])
+
+            collector.handle_ip("/ip 203.0.113.10", "chat", "user")
+            pending = collector.peek_pending_ip_note("chat", "user")
+            self.assertEqual("203.0.113.10", pending["ip"])
+            self.assertIn("Заметка для IP", messages[-1])
+            self.assertIn("203.0.113.10", messages[-1])
+        finally:
+            collector.send_message = original_send
+            collector.ip_limit_report = original_report
+
+    def test_ip_note_is_persistent_escaped_rendered_and_deletable(self):
+        messages = []
+        original_send = collector.send_message
+        original_asn = collector.asn_info_text
+        collector.send_message = lambda text, **_kwargs: messages.append(text)
+        collector.asn_info_text = lambda _ip, **_kwargs: ""
+        try:
+            collector.handle_ip("/ip 198.51.100.7", "chat", "user")
+            self.assertTrue(collector.handle_pending_ip_note("chat", "user", "дом <офис> & резерв"))
+            self.assertIsNone(collector.peek_pending_ip_note("chat", "user"))
+            self.assertEqual("дом <офис> & резерв", collector.ip_note_text("198.51.100.7"))
+            self.assertIn("198.51.100.7 | дом &lt;офис&gt; &amp; резерв", messages[-1])
+
+            stored = json.loads(Path(collector.IP_NOTES_FILE).read_text(encoding="utf-8"))
+            self.assertEqual("дом <офис> & резерв", stored["notes"]["198.51.100.7"]["text"])
+            collector.IP_NOTE_STATE = {"notes": {}, "pending": {}}
+            collector.load_ip_note_state()
+            self.assertEqual("дом <офис> & резерв", collector.ip_note_text("198.51.100.7"))
+
+            detail = collector.ip_limit_entry_detail_line(
+                {"ip": "198.51.100.7", "nodes": ["Нидерланды"], "last_seen": int(time.time())},
+                int(time.time()),
+            )
+            alert = collector.ip_limit_entry_alert_line({"ip": "198.51.100.7", "nodes": ["Нидерланды"]})
+            self.assertIn("198.51.100.7 | дом &lt;офис&gt; &amp; резерв", detail)
+            self.assertIn("198.51.100.7 | дом &lt;офис&gt; &amp; резерв", alert)
+
+            collector.handle_ip("/ip 198.51.100.7", "chat", "user")
+            self.assertIn("Сейчас", messages[-1])
+            self.assertTrue(collector.handle_pending_ip_note("chat", "user", "-"))
+            self.assertEqual("", collector.ip_note_text("198.51.100.7"))
+            self.assertIn("Заметка удалена", messages[-1])
+        finally:
+            collector.send_message = original_send
+            collector.asn_info_text = original_asn
+
+    def test_ip_note_rejects_overlong_text_without_losing_dialog(self):
+        messages = []
+        original_send = collector.send_message
+        collector.send_message = lambda text, **_kwargs: messages.append(text)
+        try:
+            collector.handle_ip("/ip 2001:db8::1", "chat", "user")
+            self.assertTrue(
+                collector.handle_pending_ip_note(
+                    "chat",
+                    "user",
+                    "x" * (collector.IP_NOTE_MAX_LENGTH + 1),
+                )
+            )
+            self.assertIsNotNone(collector.peek_pending_ip_note("chat", "user"))
+            self.assertEqual("", collector.ip_note_text("2001:db8::1"))
+            self.assertIn("Слишком длинная", messages[-1])
+        finally:
+            collector.send_message = original_send
 
     def test_grouped_daily_bl_report_contains_manual_rich_tables(self):
         first_uuid = str(uuid.uuid4())
