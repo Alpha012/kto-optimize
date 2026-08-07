@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v275"
+SCRIPT_BUILD="v276"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -48,6 +48,7 @@ KTO_SYSTEMD_LIMITS_CONF="/etc/systemd/system.conf.d/99-kto-limits.conf"
 KTO_USER_LIMITS_CONF="/etc/systemd/user.conf.d/99-kto-limits.conf"
 HAPROXY_RESERVED_PORTS_SYSCTL_CONF="/etc/sysctl.d/99-z-kto-haproxy-ports.conf"
 HAPROXY_CONFIG_FILE="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
+HAPROXY_BACKUP_DIR="${KTO_HAPROXY_BACKUP_DIR:-/var/backups/kto-haproxy}"
 HAPROXY_BANDWIDTH_MANAGER="${KTO_HAPROXY_BANDWIDTH_MANAGER:-/usr/local/sbin/kto-haproxy-bandwidth}"
 HAPROXY_BANDWIDTH_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
 HAPROXY_BANDWIDTH_UNIT="${KTO_HAPROXY_BANDWIDTH_UNIT:-/etc/systemd/system/kto-haproxy-bandwidth.service}"
@@ -1482,6 +1483,10 @@ list_test_source_ipv4s() {
             printf '%s\t%s\t%s\n' "$source_ip" "$interface" "$kind"
         done < <(ip -4 -o address show scope global 2>/dev/null | sort -k2,2V -k4,4V || true)
     } | awk -F '\t' 'NF >= 2 && !seen[$1]++'
+}
+
+list_haproxy_preparable_input_ips() {
+    list_test_source_ipv4s | awk -F '\t' 'NF >= 2 && !seen[$1]++ { print $1 "\t" $2 }'
 }
 
 select_test_source_ipv4() {
@@ -5757,11 +5762,79 @@ EOF
     done < "$routes_file"
 }
 
+HAPROXY_LAST_BACKUP=""
+
+create_haproxy_persistent_backup() {
+    local label="${1:-before-apply}" config="${2:-$HAPROXY_CONFIG_FILE}"
+    local safe_label timestamp backup checksum_file tmp checksum_tmp expected actual
+
+    HAPROXY_LAST_BACKUP=""
+    "${SUDO[@]}" test -s "$config" 2>/dev/null || return 0
+    command_exists sha256sum || {
+        fail "sha256sum не найден, безопасный HAProxy backup не создан"
+        return 1
+    }
+
+    safe_label="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+    [[ -n "$safe_label" ]] || safe_label="backup"
+    timestamp="$(date -u +%Y%m%d-%H%M%S-%N)"
+    backup="${HAPROXY_BACKUP_DIR}/haproxy-${timestamp}-${safe_label}-${BASHPID:-$$}-${RANDOM}.cfg"
+    checksum_file="${backup}.sha256"
+    tmp="$(mktemp)"
+    checksum_tmp="$(mktemp)"
+
+    if ! "${SUDO[@]}" cat "$config" > "$tmp" || [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp" "$checksum_tmp"
+        fail "Не удалось прочитать текущий HAProxy config для backup"
+        return 1
+    fi
+    expected="$(sha256sum "$tmp" | awk '{print $1}')"
+    printf '%s  %s\n' "$expected" "$(basename "$backup")" > "$checksum_tmp"
+
+    if ! "${SUDO[@]}" mkdir -p "$HAPROXY_BACKUP_DIR" >> "$LOG_FILE" 2>&1 ||
+        ! "${SUDO[@]}" chmod 0700 "$HAPROXY_BACKUP_DIR" >> "$LOG_FILE" 2>&1 ||
+        ! "${SUDO[@]}" install -m 0600 "$tmp" "$backup" >> "$LOG_FILE" 2>&1 ||
+        ! "${SUDO[@]}" install -m 0600 "$checksum_tmp" "$checksum_file" >> "$LOG_FILE" 2>&1; then
+        "${SUDO[@]}" rm -f "$backup" "$checksum_file" >> "$LOG_FILE" 2>&1 || true
+        rm -f "$tmp" "$checksum_tmp"
+        fail "Не удалось сохранить постоянный HAProxy backup"
+        return 1
+    fi
+    actual="$("${SUDO[@]}" sha256sum "$backup" 2>/dev/null | awk '{print $1}' || true)"
+    rm -f "$tmp" "$checksum_tmp"
+    if [[ -z "$actual" || "$actual" != "$expected" ]]; then
+        "${SUDO[@]}" rm -f "$backup" "$checksum_file" >> "$LOG_FILE" 2>&1 || true
+        fail "Проверка записанного HAProxy backup не прошла"
+        return 1
+    fi
+
+    HAPROXY_LAST_BACKUP="$backup"
+    printf 'HAProxy backup: %s\n' "$backup" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+verify_haproxy_backup() {
+    local backup="$1" checksum_file="${1}.sha256" expected actual
+
+    "${SUDO[@]}" test -s "$backup" 2>/dev/null || return 1
+    "${SUDO[@]}" test -s "$checksum_file" 2>/dev/null || return 1
+    command_exists sha256sum || return 1
+    expected="$("${SUDO[@]}" awk 'NR == 1 { print $1; exit }' "$checksum_file" 2>/dev/null || true)"
+    actual="$("${SUDO[@]}" sha256sum "$backup" 2>/dev/null | awk '{print $1}' || true)"
+    [[ "$expected" =~ ^[a-fA-F0-9]{64}$ && "$actual" == "$expected" ]]
+}
+
+list_haproxy_backups() {
+    "${SUDO[@]}" test -d "$HAPROXY_BACKUP_DIR" 2>/dev/null || return 0
+    "${SUDO[@]}" find "$HAPROXY_BACKUP_DIR" -maxdepth 1 -type f -name 'haproxy-*.cfg' \
+        -printf '%T@\t%p\n' 2>/dev/null | sort -t $'\t' -k1,1nr | cut -f2-
+}
+
 apply_haproxy_routes_config() {
     local routes_file="$1"
-    local config=/etc/haproxy/haproxy.cfg
+    local config="$HAPROXY_CONFIG_FILE"
     local tmp_config backup backup_routes had_config=0 haproxy_threads haproxy_maxconn haproxy_nofile route_count activation_ready=1
 
+    HAPROXY_LAST_BACKUP=""
     ensure_haproxy_package
     tmp_config="$(mktemp)"
     backup="$(mktemp)"
@@ -5787,6 +5860,10 @@ apply_haproxy_routes_config() {
         had_config=1
         "${SUDO[@]}" cat "$config" > "$backup"
         extract_haproxy_routes "$backup" > "$backup_routes"
+        if ! create_haproxy_persistent_backup "before-apply" "$config"; then
+            rm -f "$tmp_config" "$backup" "$backup_routes"
+            return 1
+        fi
         "${SUDO[@]}" cp -a "$config" "${config}.kto.bak" >> "$LOG_FILE" 2>&1 || true
     fi
 
@@ -5842,6 +5919,7 @@ EOF
     route_count="$(haproxy_route_count "$routes_file")"
     ok "HAProxy маршрутов: ${route_count}"
     ok "HAProxy capacity: maxconn=${haproxy_maxconn}, nofile=${haproxy_nofile}, threads=${haproxy_threads}"
+    [[ -z "$HAPROXY_LAST_BACKUP" ]] || ok "Backup: ${HAPROXY_LAST_BACKUP}"
     if "${SUDO[@]}" test -s "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null; then
         if ! reapply_haproxy_bandwidth_limits; then
             warn "HAProxy работает, но лимиты входных IP не переприменились. Запусти haproxy-limit-status."
@@ -7067,6 +7145,255 @@ update_haproxy_existing_config() {
     return 1
 }
 
+HAPROXY_PREPARE_IP_COUNT=0
+HAPROXY_PREPARE_IP_LIST=""
+HAPROXY_PREPARE_WILDCARDS=0
+HAPROXY_PREPARE_ROUTES_BEFORE=0
+HAPROXY_PREPARE_ROUTES_AFTER=0
+
+build_haproxy_multi_ip_routes() {
+    local routes_file="$1" output_file="$2" row ip interface
+    local port target_pool sni source_ip server_maxconn listen_ip key sorted_file
+    local -a input_rows=() input_ips=()
+    local -A emitted=()
+
+    HAPROXY_PREPARE_IP_COUNT=0
+    HAPROXY_PREPARE_IP_LIST=""
+    HAPROXY_PREPARE_WILDCARDS=0
+    HAPROXY_PREPARE_ROUTES_BEFORE=0
+    HAPROXY_PREPARE_ROUTES_AFTER=0
+    mapfile -t input_rows < <(list_haproxy_preparable_input_ips)
+    for row in "${input_rows[@]}"; do
+        IFS=$'\t' read -r ip interface <<< "$row"
+        validate_ipv4 "$ip" || continue
+        input_ips+=("$ip")
+        HAPROXY_PREPARE_IP_LIST+="${HAPROXY_PREPARE_IP_LIST:+, }${ip} (${interface})"
+    done
+    HAPROXY_PREPARE_IP_COUNT="${#input_ips[@]}"
+    (( HAPROXY_PREPARE_IP_COUNT > 0 )) || {
+        fail "Не найдено рабочих IPv4 для адресных HAProxy listener"
+        return 1
+    }
+
+    : > "$output_file"
+    while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        HAPROXY_PREPARE_ROUTES_BEFORE=$(( HAPROXY_PREPARE_ROUTES_BEFORE + 1 ))
+        listen_ip="$(haproxy_route_listen_ip "$listen_ip")"
+        if [[ "$listen_ip" == "*" ]]; then
+            HAPROXY_PREPARE_WILDCARDS=$(( HAPROXY_PREPARE_WILDCARDS + 1 ))
+            for ip in "${input_ips[@]}"; do
+                key="${ip}|${port}"
+                if [[ -n "${emitted[$key]+x}" ]]; then
+                    fail "Нельзя безопасно разложить *:${port}: маршрут ${ip}:${port} уже существует"
+                    return 1
+                fi
+                emitted[$key]=1
+                print_haproxy_route "$port" "$target_pool" "$sni" \
+                    "${source_ip:-default}" "${server_maxconn:-default}" "$ip" >> "$output_file"
+                HAPROXY_PREPARE_ROUTES_AFTER=$(( HAPROXY_PREPARE_ROUTES_AFTER + 1 ))
+            done
+        else
+            key="${listen_ip}|${port}"
+            if [[ -n "${emitted[$key]+x}" ]]; then
+                fail "В конфиге повторяется HAProxy listener ${listen_ip}:${port}"
+                return 1
+            fi
+            emitted[$key]=1
+            print_haproxy_route "$port" "$target_pool" "$sni" \
+                "${source_ip:-default}" "${server_maxconn:-default}" "$listen_ip" >> "$output_file"
+            HAPROXY_PREPARE_ROUTES_AFTER=$(( HAPROXY_PREPARE_ROUTES_AFTER + 1 ))
+        fi
+    done < "$routes_file"
+
+    (( HAPROXY_PREPARE_ROUTES_BEFORE > 0 && HAPROXY_PREPARE_ROUTES_AFTER > 0 )) || {
+        fail "HAProxy маршруты для подготовки не найдены"
+        return 1
+    }
+    sorted_file="$(mktemp)"
+    sort -s -t $'\t' -k1,1n "$output_file" > "$sorted_file"
+    mv "$sorted_file" "$output_file"
+}
+
+prepare_haproxy_multi_ip_config() {
+    local routes_file="$1" next_file preview_file parsed_file answer current_valid=1 runtime_valid=1 missing=""
+
+    ensure_haproxy_package
+    next_file="$(mktemp)"
+    preview_file="$(mktemp)"
+    parsed_file="$(mktemp)"
+    if ! "${SUDO[@]}" haproxy -c -f "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1; then
+        current_valid=0
+    fi
+    if command_exists ss && command_exists systemctl; then
+        missing="$(haproxy_missing_listener_ports "$routes_file")"
+        if [[ -n "$missing" ]] || ! run_systemctl_bounded 3 is-active --quiet haproxy 2>/dev/null; then
+            runtime_valid=0
+        fi
+    fi
+    if ! build_haproxy_multi_ip_routes "$routes_file" "$next_file" ||
+        ! render_haproxy_routes_config "$next_file" "$preview_file" ||
+        ! "${SUDO[@]}" haproxy -c -f "$preview_file" >> "$LOG_FILE" 2>&1; then
+        rm -f "$next_file" "$preview_file" "$parsed_file"
+        fail "Подготовленный HAProxy config не прошёл проверку. Текущий config не изменён."
+        return 1
+    fi
+    extract_haproxy_routes "$preview_file" > "$parsed_file"
+    if ! cmp -s "$next_file" "$parsed_file"; then
+        rm -f "$next_file" "$preview_file" "$parsed_file"
+        fail "Round-trip проверка HAProxy config не прошла. Текущий config не изменён."
+        return 1
+    fi
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ПРОВЕРКА И ПОДГОТОВКА HAPROXY ]${NC}"
+    if (( current_valid == 1 )); then
+        ok "Текущий config: синтаксис OK"
+    else
+        warn "Текущий config: haproxy -c вернул ошибку; исправленный candidate валиден"
+    fi
+    if (( runtime_valid == 1 )); then
+        ok "Runtime: service и listener в норме"
+    else
+        missing="${missing//$'\n'/, }"
+        warn "Runtime: HAProxy не active или не слушает ${missing:-настроенные адреса}"
+    fi
+    ok "Рабочие входные IP: ${HAPROXY_PREPARE_IP_COUNT}"
+    printf '  %s\n' "$HAPROXY_PREPARE_IP_LIST"
+    ok "Маршрутов сейчас: ${HAPROXY_PREPARE_ROUTES_BEFORE}"
+    ok "Wildcard listener: ${HAPROXY_PREPARE_WILDCARDS}"
+    ok "Маршрутов после подготовки: ${HAPROXY_PREPARE_ROUTES_AFTER}"
+    ok "Candidate: haproxy -c и round-trip OK"
+
+    if (( HAPROXY_PREPARE_WILDCARDS == 0 && current_valid == 1 && runtime_valid == 1 )); then
+        rm -f "$next_file" "$preview_file" "$parsed_file"
+        ok "Config уже подготовлен для отдельных IP:порт. Изменения не нужны."
+        return 0
+    fi
+
+    echo
+    if (( HAPROXY_PREPARE_WILDCARDS > 0 )); then
+        warn "Wildcard будет разложен на отдельный listener для каждого указанного IP."
+    else
+        warn "Валидный candidate будет применён для восстановления runtime HAProxy."
+    fi
+    echo -ne "${YELLOW}Создать backup и применить candidate? [y/N]:${NC} "
+    read -r answer
+    if [[ "${answer,,}" != "y" && "${answer,,}" != "yes" && "${answer,,}" != "д" && "${answer,,}" != "да" ]]; then
+        rm -f "$next_file" "$preview_file" "$parsed_file"
+        warn "Изменения отменены"
+        return 0
+    fi
+
+    if apply_haproxy_routes_config "$next_file"; then
+        sync_haproxy_firewall "$next_file" "$routes_file"
+        mv "$next_file" "$routes_file"
+        rm -f "$preview_file" "$parsed_file"
+        ok "HAProxy подготовлен для независимых IP:порт"
+        return 0
+    fi
+    rm -f "$next_file" "$preview_file" "$parsed_file"
+    return 1
+}
+
+restore_haproxy_backup() {
+    local routes_file="$1" choice answer selected index status current_copy current_routes restored_routes
+    local -a backups=()
+
+    mapfile -t backups < <(list_haproxy_backups | head -n 10)
+    if (( ${#backups[@]} == 0 )); then
+        fail "Сохранённых HAProxy backup нет: ${HAPROXY_BACKUP_DIR}"
+        return 1
+    fi
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ HAPROXY BACKUPS ]${NC}"
+    for index in "${!backups[@]}"; do
+        status="checksum FAIL"
+        verify_haproxy_backup "${backups[$index]}" && status="checksum OK"
+        printf ' %d) %s | %s\n' "$(( index + 1 ))" "$(basename "${backups[$index]}")" "$status"
+    done
+    echo " 0) Назад"
+    while true; do
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите backup:${NC} "
+        read -r choice
+        [[ "$choice" == "0" ]] && return 0
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            choice=$((10#$choice))
+            if (( choice >= 1 && choice <= ${#backups[@]} )); then
+                selected="${backups[$(( choice - 1 ))]}"
+                break
+            fi
+        fi
+        fail "Неверный выбор"
+    done
+
+    if ! verify_haproxy_backup "$selected"; then
+        fail "Checksum backup не совпадает. Восстановление отменено."
+        return 1
+    fi
+    ensure_haproxy_package
+    if ! "${SUDO[@]}" haproxy -c -f "$selected" >> "$LOG_FILE" 2>&1; then
+        fail "Backup не прошёл haproxy -c. Восстановление отменено."
+        return 1
+    fi
+
+    restored_routes="$(mktemp)"
+    current_copy="$(mktemp)"
+    current_routes="$(mktemp)"
+    extract_haproxy_routes "$selected" > "$restored_routes"
+    if [[ ! -s "$restored_routes" ]]; then
+        rm -f "$restored_routes" "$current_copy" "$current_routes"
+        fail "Маршруты в backup не распознаны. Восстановление отменено."
+        return 1
+    fi
+
+    echo
+    warn "Будет восстановлен точный config: ${selected}"
+    echo -ne "${YELLOW}Создать backup текущего config и продолжить? [y/N]:${NC} "
+    read -r answer
+    if [[ "${answer,,}" != "y" && "${answer,,}" != "yes" && "${answer,,}" != "д" && "${answer,,}" != "да" ]]; then
+        rm -f "$restored_routes" "$current_copy" "$current_routes"
+        warn "Восстановление отменено"
+        return 0
+    fi
+
+    if ! "${SUDO[@]}" cat "$HAPROXY_CONFIG_FILE" > "$current_copy" || [[ ! -s "$current_copy" ]]; then
+        rm -f "$restored_routes" "$current_copy" "$current_routes"
+        fail "Не удалось сохранить текущий config перед восстановлением"
+        return 1
+    fi
+    extract_haproxy_routes "$current_copy" > "$current_routes"
+    if ! create_haproxy_persistent_backup "before-restore" "$HAPROXY_CONFIG_FILE" ||
+        ! reserve_haproxy_route_ports "$restored_routes"; then
+        rm -f "$restored_routes" "$current_copy" "$current_routes"
+        return 1
+    fi
+
+    stage "Восстанавливаю HAProxy backup"
+    if ! "${SUDO[@]}" install -m 0644 "$selected" "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1 ||
+        ! reload_haproxy_gracefully "$restored_routes"; then
+        "${SUDO[@]}" cp -a "$HAPROXY_CONFIG_FILE" "${HAPROXY_CONFIG_FILE}.kto.failed-restore" >> "$LOG_FILE" 2>&1 || true
+        warn "Backup не запустился, возвращаю config, который был до восстановления."
+        "${SUDO[@]}" install -m 0644 "$current_copy" "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1 || true
+        if [[ -s "$current_routes" ]]; then
+            start_haproxy_cleanly "$current_routes" || true
+        else
+            run_systemctl_bounded 15 restart haproxy >> "$LOG_FILE" 2>&1 || true
+        fi
+        rm -f "$restored_routes" "$current_copy" "$current_routes"
+        fail "Восстановление не применено; предыдущий config возвращён"
+        return 1
+    fi
+
+    sync_haproxy_firewall "$restored_routes" "$current_routes"
+    cp "$restored_routes" "$routes_file"
+    rm -f "$restored_routes" "$current_copy" "$current_routes"
+    ok "HAProxy backup восстановлен"
+    ok "Config: ${selected}"
+    ok "Backup предыдущего config: ${HAPROXY_LAST_BACKUP}"
+}
+
 haproxy_menu() {
     header
     require_haproxy_mode
@@ -7103,6 +7430,8 @@ haproxy_menu() {
         echo -e "7) Добавить или заменить backend-пул"
         echo -e "8) Массово добавить backend по следующим портам"
         echo -e "9) Ограничить скорость по входному IP"
+        echo -e "10) Проверить и подготовить config для отдельных IP:порт"
+        echo -e "11) Восстановить HAProxy backup"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -7122,6 +7451,8 @@ haproxy_menu() {
             7) add_haproxy_pool_route "$routes_file" || true ;;
             8) add_haproxy_sequential_routes "$routes_file" || true ;;
             9) haproxy_bandwidth_menu || true ;;
+            10) prepare_haproxy_multi_ip_config "$routes_file" || true ;;
+            11) restore_haproxy_backup "$routes_file" || true ;;
             0)
                 rm -f "$routes_file"
                 return 0
