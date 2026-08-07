@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v279"', KTO)
-        self.assertIn('PUSH_BUILD="v279"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v279"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v279"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v279"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v279"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v279"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v280"', KTO)
+        self.assertIn('PUSH_BUILD="v280"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v280"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v280"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v280"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v280"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v280"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -949,7 +949,7 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('backend_name="vless_pool_${port}"', render)
         self.assertIn('2) Добавить маршрут через основной выходной IP', haproxy_menu)
         self.assertIn('3) Добавить маршрут через другой выходной IP', haproxy_menu)
-        self.assertIn('4) Удалить дополнительный маршрут', haproxy_menu)
+        self.assertIn('4) Удалить маршрут', haproxy_menu)
         self.assertIn('5) Заменить SNI у всех маршрутов', haproxy_menu)
         self.assertIn('6) Обновить HAProxy, сохранив маршруты', haproxy_menu)
         self.assertIn('7) Добавить или заменить backend-пул', haproxy_menu)
@@ -1708,18 +1708,107 @@ routes=$(mktemp)
 trap 'rm -f "$routes"' EXIT
 printf '443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112\n443\t5.34.179.144:443\tb.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
 select_haproxy_route() { printf '443\t217.19.122.48\n'; }
+select_haproxy_route_for_delete() { printf '443\t217.19.122.48\n'; }
 select_haproxy_route_listen_ip() { printf '217.19.122.48\n'; }
 haproxy_input_ip_available() { return 0; }
 ask_haproxy_target_pool_default() { printf '5.34.179.145:443\n'; }
 ask_haproxy_sni_list() { printf 'changed.example.com\n'; }
 apply_haproxy_routes_config() { return 0; }
 sync_haproxy_firewall() { return 0; }
+haproxy_bandwidth_current_rate() { return 0; }
 edit_haproxy_route "$routes"
 grep -Fqx $'443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112' "$routes"
 grep -Fqx $'443\t5.34.179.145:443\tchanged.example.com\t217.19.122.48\tdefault\t217.19.122.48' "$routes"
-delete_haproxy_route "$routes"
+delete_haproxy_route "$routes" <<< 'y'
 [[ "$(wc -l < "$routes")" == 1 ]]
 grep -Fqx $'443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112' "$routes"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_route_delete_selects_input_ip_then_port(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+applied=$(mktemp)
+events=$(mktemp)
+output=$(mktemp)
+trap 'rm -f "$routes" "$applied" "$events" "$output"' EXIT
+printf '443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112\n443\t5.34.179.143:443\tb.example.com\t217.19.122.48\tdefault\t217.19.122.48\n8443\t5.34.179.144:443\tc.example.com\t217.19.122.48\tdefault\t217.19.122.48\n8444\t5.34.179.145:443\td.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
+apply_haproxy_routes_config() { cp "$1" "$applied"; }
+sync_haproxy_firewall() { printf 'sync\n' >> "$events"; }
+haproxy_bandwidth_current_rate() { return 0; }
+remove_haproxy_input_bandwidth_limit() { printf 'limit-removed:%s\n' "$1" >> "$events"; }
+delete_haproxy_route "$routes" <<< $'2\n2\ny' > "$output" 2>&1
+grep -q 'Выберите входной IP маршрута:' "$output"
+grep -q '217.19.122.48 | портов: 443, 8443, 8444' "$output"
+grep -q 'Выберите порт для 217.19.122.48:' "$output"
+grep -q 'Будет удалён маршрут 217.19.122.48:8443/tcp' "$output"
+grep -Fqx $'443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112' "$routes"
+grep -Fqx $'443\t5.34.179.143:443\tb.example.com\t217.19.122.48\tdefault\t217.19.122.48' "$routes"
+grep -Fqx $'8444\t5.34.179.145:443\td.example.com\t217.19.122.48\tdefault\t217.19.122.48' "$routes"
+! grep -q $'^8443\t' "$routes"
+cmp -s "$routes" "$applied"
+grep -Fqx 'sync' "$events"
+! grep -q '^limit-removed:' "$events"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_route_delete_protects_last_route_and_cleans_unused_ip_limit(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+events=$(mktemp)
+output=$(mktemp)
+trap 'rm -f "$routes" "$events" "$output"' EXIT
+printf '443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112\n443\t5.34.179.144:443\tb.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
+apply_haproxy_routes_config() { return 0; }
+sync_haproxy_firewall() { printf 'sync\n' >> "$events"; }
+haproxy_bandwidth_current_rate() {
+    if [[ "$1" == '217.19.122.48' ]]; then
+        printf '2000\n'
+    fi
+    return 0
+}
+remove_haproxy_input_bandwidth_limit() { printf 'limit-removed:%s\n' "$1" >> "$events"; }
+cp "$routes" "$routes.cancelled"
+delete_haproxy_route "$routes" <<< $'2\nn' > "$output" 2>&1
+cmp -s "$routes" "$routes.cancelled"
+[[ ! -s "$events" ]]
+rm -f "$routes.cancelled"
+delete_haproxy_route "$routes" <<< $'2\ny' > "$output" 2>&1
+[[ "$(wc -l < "$routes")" == 1 ]]
+grep -Fqx 'limit-removed:217.19.122.48' "$events"
+cp "$routes" "$routes.before"
+if delete_haproxy_route "$routes" > "$output" 2>&1; then
+    exit 1
+fi
+cmp -s "$routes" "$routes.before"
+grep -q 'Нельзя удалить последний HAProxy-маршрут' "$output"
+rm -f "$routes.before"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

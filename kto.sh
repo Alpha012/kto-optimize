@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v279"
+SCRIPT_BUILD="v280"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -6785,6 +6785,115 @@ select_haproxy_route() {
     done
 }
 
+select_haproxy_route_for_delete() {
+    local routes_file="$1" choice index selected_ip ip display_ip ports route_count
+    local port target_pool sni source_ip server_maxconn listen_ip source_label target_label pool_count
+    local -a input_ips=() route_rows=()
+
+    mapfile -t input_ips < <(
+        awk -F '\t' 'NF >= 3 { print ($6 == "" ? "*" : $6) }' "$routes_file" |
+            LC_ALL=C sort -uV
+    )
+    if (( ${#input_ips[@]} == 0 )); then
+        fail "HAProxy-маршруты не найдены"
+        return 1
+    fi
+
+    printf '%s\n' "Выберите входной IP маршрута:" >&2
+    for index in "${!input_ips[@]}"; do
+        ip="${input_ips[$index]}"
+        display_ip="$ip"
+        [[ "$ip" == "*" ]] && display_ip="* (все локальные IP)"
+        ports="$(awk -F '\t' -v wanted="$ip" '
+            {
+                listen_ip = ($6 == "" ? "*" : $6)
+                if (listen_ip == wanted && $1 ~ /^[0-9]+$/) print $1
+            }
+        ' "$routes_file" | sort -n -u | paste -sd ',' -)"
+        ports="${ports//,/, }"
+        route_count="$(awk -F '\t' -v wanted="$ip" '
+            {
+                listen_ip = ($6 == "" ? "*" : $6)
+                if (listen_ip == wanted) count++
+            }
+            END { print count + 0 }
+        ' "$routes_file")"
+        printf ' %d) %s | портов: %s | маршрутов: %s\n' \
+            "$(( index + 1 ))" "$display_ip" "${ports:-нет}" "$route_count" >&2
+    done
+    printf ' 0) Назад\n' >&2
+
+    while true; do
+        printf '> ' >&2
+        read -r choice
+        if [[ "$choice" == "0" ]]; then
+            warn "Удаление отменено"
+            return 1
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            choice=$((10#$choice))
+            if (( choice >= 1 && choice <= ${#input_ips[@]} )); then
+                selected_ip="${input_ips[$(( choice - 1 ))]}"
+                break
+            fi
+        fi
+        fail "Неверный выбор"
+    done
+
+    mapfile -t route_rows < <(awk -F '\t' -v wanted="$selected_ip" '
+        {
+            listen_ip = ($6 == "" ? "*" : $6)
+            if (listen_ip == wanted) print
+        }
+    ' "$routes_file" | sort -s -t $'\t' -k1,1n)
+    if (( ${#route_rows[@]} == 0 )); then
+        fail "Маршруты для ${selected_ip} больше не найдены"
+        return 1
+    fi
+
+    display_ip="$selected_ip"
+    [[ "$selected_ip" == "*" ]] && display_ip="* (все локальные IP)"
+    if (( ${#route_rows[@]} == 1 )); then
+        IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip <<< "${route_rows[0]}"
+        printf 'Единственный маршрут для %s: %s/tcp\n' "$display_ip" "$port" >&2
+        printf '%s\t%s\n' "$port" "$selected_ip"
+        return 0
+    fi
+
+    printf 'Выберите порт для %s:\n' "$display_ip" >&2
+    for index in "${!route_rows[@]}"; do
+        IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip <<< "${route_rows[$index]}"
+        source_label="$(haproxy_source_label "${source_ip:-default}")"
+        pool_count="$(haproxy_target_pool_count "$target_pool" 2>/dev/null || printf '0')"
+        if (( pool_count > 1 )); then
+            target_label="пул ${pool_count} backend"
+        else
+            target_label="$target_pool"
+        fi
+        printf ' %d) %s/tcp -> %s | выход %s | SNI: %s\n' \
+            "$(( index + 1 ))" "$port" "$target_label" "$source_label" "$sni" >&2
+    done
+    printf ' 0) Назад\n' >&2
+
+    while true; do
+        printf '> ' >&2
+        read -r choice
+        if [[ "$choice" == "0" ]]; then
+            warn "Удаление отменено"
+            return 1
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            choice=$((10#$choice))
+            if (( choice >= 1 && choice <= ${#route_rows[@]} )); then
+                IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip <<< "${route_rows[$(( choice - 1 ))]}"
+                printf '%s\t%s\n' "$port" "$selected_ip"
+                return 0
+            fi
+        fi
+        fail "Неверный выбор"
+    done
+}
+
 default_haproxy_extra_port() {
     local routes_file="$1" listen_ip base_port port
     listen_ip="$(normalize_haproxy_listen_ip "${2:-*}")" || return 1
@@ -7342,10 +7451,72 @@ replace_all_haproxy_sni() {
     return 1
 }
 
+haproxy_route_file_uses_input_ip() {
+    local routes_file="$1" wanted_ip="$2"
+    [[ "$wanted_ip" == "*" ]] && return 0
+    awk -F '\t' -v wanted="$wanted_ip" '
+        {
+            listen_ip = ($6 == "" ? "*" : $6)
+            if (listen_ip == "*" || listen_ip == wanted) found = 1
+        }
+        END { exit found ? 0 : 1 }
+    ' "$routes_file"
+}
+
+cleanup_haproxy_bandwidth_after_route_delete() {
+    local routes_file="$1" input_ip="$2" current_rate
+    [[ "$input_ip" != "*" ]] || return 0
+    haproxy_route_file_uses_input_ip "$routes_file" "$input_ip" && return 0
+    current_rate="$(haproxy_bandwidth_current_rate "$input_ip")"
+    [[ -n "$current_rate" ]] || return 0
+
+    stage "Убираю больше не используемый лимит HAProxy для ${input_ip}"
+    if ! remove_haproxy_input_bandwidth_limit "$input_ip"; then
+        warn "Маршрут удалён, но лимит ${input_ip} не очистился. Убери его через меню лимитов HAProxy."
+        return 1
+    fi
+}
+
 delete_haproxy_route() {
-    local routes_file="$1" selection port listen_ip next_file
-    selection="$(select_haproxy_route "$routes_file" extra)" || return 1
+    local routes_file="$1" selection port listen_ip next_file answer before_count after_count
+    local current_line target_pool sni source_ip server_maxconn _current_listen target_label pool_count
+
+    before_count="$(haproxy_route_count "$routes_file")"
+    if (( before_count <= 1 )); then
+        fail "Нельзя удалить последний HAProxy-маршрут. Сначала добавь замену."
+        return 1
+    fi
+
+    selection="$(select_haproxy_route_for_delete "$routes_file")" || return 1
     IFS=$'\t' read -r port listen_ip <<< "$selection"
+    current_line="$(awk -F '\t' -v port="$port" -v listen_ip="$listen_ip" '
+        {
+            current_listen = ($6 == "" ? "*" : $6)
+            if ($1 == port && current_listen == listen_ip) { print; exit }
+        }
+    ' "$routes_file")"
+    if [[ -z "$current_line" ]]; then
+        fail "Выбранный HAProxy-маршрут больше не найден"
+        return 1
+    fi
+    IFS=$'\t' read -r _ target_pool sni source_ip server_maxconn _current_listen <<< "$current_line"
+    pool_count="$(haproxy_target_pool_count "$target_pool" 2>/dev/null || printf '0')"
+    if (( pool_count > 1 )); then
+        target_label="пул ${pool_count} backend"
+    else
+        target_label="$target_pool"
+    fi
+
+    echo
+    warn "Будет удалён маршрут ${listen_ip}:${port}/tcp -> ${target_label}"
+    printf 'SNI: %s | Выход: %s\n' "$sni" "$(haproxy_source_label "${source_ip:-default}")"
+    echo -ne "${YELLOW}Удалить этот маршрут? [y/N]:${NC} "
+    read -r answer
+    if [[ "${answer,,}" != "y" && "${answer,,}" != "yes" && "${answer,,}" != "д" && "${answer,,}" != "да" ]]; then
+        warn "Удаление отменено"
+        return 0
+    fi
+
     next_file="$(mktemp)"
     awk -F '\t' -v port="$port" -v listen_ip="$listen_ip" '
         {
@@ -7353,11 +7524,19 @@ delete_haproxy_route() {
             if (!($1 == port && current_listen == listen_ip)) print
         }
     ' "$routes_file" > "$next_file"
+    after_count="$(haproxy_route_count "$next_file")"
+    if (( after_count != before_count - 1 )); then
+        rm -f "$next_file"
+        fail "Безопасная проверка удаления не прошла. HAProxy config не изменён."
+        return 1
+    fi
 
     if apply_haproxy_routes_config "$next_file"; then
         sync_haproxy_firewall "$next_file" "$routes_file"
         mv "$next_file" "$routes_file"
+        cleanup_haproxy_bandwidth_after_route_delete "$routes_file" "$listen_ip" || true
         ok "HAProxy listener ${listen_ip}:${port}/tcp удалён"
+        ok "Осталось HAProxy-маршрутов: ${after_count}"
         return 0
     fi
     rm -f "$next_file"
@@ -7674,7 +7853,7 @@ haproxy_menu() {
         echo -e "1) Изменить маршрут, backend, SNI или входной IP"
         echo -e "2) Добавить маршрут через основной выходной IP"
         echo -e "3) Добавить маршрут через другой выходной IP"
-        echo -e "4) Удалить дополнительный маршрут"
+        echo -e "4) Удалить маршрут"
         echo -e "5) Заменить SNI у всех маршрутов"
         echo -e "6) Обновить HAProxy, сохранив маршруты"
         echo -e "7) Добавить или заменить backend-пул"
