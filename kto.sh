@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v276"
+SCRIPT_BUILD="v277"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -56,6 +56,10 @@ HAPROXY_BANDWIDTH_SERVICE="${KTO_HAPROXY_BANDWIDTH_SERVICE:-kto-haproxy-bandwidt
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
 DNS_GUARD_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-kto-dns.conf"
+HOSTS_FILE="${KTO_HOSTS_FILE:-/etc/hosts}"
+HOSTS_BACKUP_FILE="${KTO_HOSTS_BACKUP_FILE:-/etc/hosts.kto-backup}"
+DPI_RESOLV_CONF_FILE="${KTO_DPI_RESOLV_CONF_FILE:-/etc/resolv.conf}"
+DPI_RESOLVED_UPSTREAM_FILE="${KTO_DPI_RESOLVED_UPSTREAM_FILE:-/run/systemd/resolve/resolv.conf}"
 IPV6_WHITELIST_SYSCTL_CONF="/etc/sysctl.d/98-kto-whitelist-ipv6.conf"
 STATS_COLLECTOR_CONFIG="/etc/kto-stats-collector.conf"
 STATS_COLLECTOR_SCRIPT="/usr/local/bin/kto-stats-collector"
@@ -1777,33 +1781,65 @@ hosts_file_has_hostname() {
             }
         }
         END { exit found ? 0 : 1 }
-    ' /etc/hosts 2>/dev/null
+    ' "$HOSTS_FILE" 2>/dev/null
 }
 
 hostname_hosts_configured() {
     local host
     host="$(hostname 2>/dev/null || true)"
     [[ -n "$host" ]] || return 0
-    hosts_file_has_hostname "$host" || getent hosts "$host" >/dev/null 2>&1
+    hosts_file_has_hostname "$host" || run_bounded_command 2 getent hosts "$host" >/dev/null 2>&1
 }
 
 ensure_hostname_hosts_entry() {
-    local host short tmp
+    local host short tmp backup="$HOSTS_BACKUP_FILE" had_hosts=0
     host="$(hostname 2>/dev/null || true)"
     [[ -n "$host" ]] || return 0
     hostname_hosts_configured && return 0
 
+    if [[ ! "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        fail "Некорректный hostname для /etc/hosts: ${host}"
+        return 1
+    fi
+
     short="${host%%.*}"
     tmp="$(mktemp)"
+    if "${SUDO[@]}" test -e "$HOSTS_FILE" 2>/dev/null; then
+        had_hosts=1
+        if ! "${SUDO[@]}" cat "$HOSTS_FILE" > "$tmp" 2>> "$LOG_FILE"; then
+            rm -f "$tmp"
+            fail "Не удалось прочитать /etc/hosts"
+            return 1
+        fi
+    else
+        printf '127.0.0.1\tlocalhost\n' > "$tmp"
+    fi
     {
         printf '\n127.0.1.1\t%s' "$host"
         if [[ -n "$short" && "$short" != "$host" ]]; then
             printf ' %s' "$short"
         fi
         printf '\n'
-    } > "$tmp"
-    "${SUDO[@]}" tee -a /etc/hosts < "$tmp" >> "$LOG_FILE" 2>&1 || true
+    } >> "$tmp"
+
+    if (( had_hosts == 1 )) && ! "${SUDO[@]}" test -e "$backup" 2>/dev/null; then
+        if ! "${SUDO[@]}" cp -a "$HOSTS_FILE" "$backup" >> "$LOG_FILE" 2>&1; then
+            rm -f "$tmp"
+            fail "Не удалось создать backup /etc/hosts"
+            return 1
+        fi
+    fi
+    if ! "${SUDO[@]}" install -m 0644 "$tmp" "$HOSTS_FILE" >> "$LOG_FILE" 2>&1; then
+        rm -f "$tmp"
+        fail "Не удалось добавить hostname в /etc/hosts"
+        return 1
+    fi
     rm -f "$tmp"
+    if ! hosts_file_has_hostname "$host"; then
+        fail "Hostname не появился в /etc/hosts после записи"
+        return 1
+    fi
+    echo "hostname guard: added ${host} to /etc/hosts, backup=${backup}" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 systemd_resolved_available() {
@@ -1839,19 +1875,31 @@ dns_guard_configured() {
     fi
 }
 
+dns_host_resolves() {
+    local host="${1:-}"
+    [[ -n "$host" ]] || return 1
+    run_bounded_command 2 getent ahosts "$host" >/dev/null 2>&1
+}
+
+wait_for_dns_host() {
+    local host="$1" timeout_sec="${2:-10}" deadline
+    [[ "$timeout_sec" =~ ^[0-9]+$ ]] || timeout_sec=10
+    deadline=$(( SECONDS + timeout_sec ))
+    while (( SECONDS < deadline )); do
+        dns_host_resolves "$host" && return 0
+        sleep 1
+    done
+    return 1
+}
+
 dns_resolution_ok() {
-    getent hosts api.telegram.org >/dev/null 2>&1 ||
-        getent hosts raw.githubusercontent.com >/dev/null 2>&1
+    dns_host_resolves api.telegram.org ||
+        dns_host_resolves raw.githubusercontent.com
 }
 
 wait_for_dns_resolution() {
-    local waited=0
-    while (( waited < 10 )); do
-        dns_resolution_ok && return 0
-        sleep 1
-        waited=$(( waited + 1 ))
-    done
-    return 1
+    wait_for_dns_host api.telegram.org 5 ||
+        wait_for_dns_host raw.githubusercontent.com 5
 }
 
 ipv6_sysctl_available() {
@@ -4638,6 +4686,209 @@ network_test() {
     ok "Сеть выглядит нормально по базовым проверкам."
 }
 
+DPI_RESOLV_SNAPSHOT_DIR=""
+DPI_RESOLV_CHANGED=0
+
+dpi_detector_snapshot_resolver() {
+    [[ -z "$DPI_RESOLV_SNAPSHOT_DIR" ]] || return 0
+
+    DPI_RESOLV_SNAPSHOT_DIR="$(mktemp -d)"
+    if "${SUDO[@]}" test -e "$DPI_RESOLV_CONF_FILE" 2>/dev/null ||
+        "${SUDO[@]}" test -L "$DPI_RESOLV_CONF_FILE" 2>/dev/null; then
+        if ! "${SUDO[@]}" cp -a "$DPI_RESOLV_CONF_FILE" "${DPI_RESOLV_SNAPSHOT_DIR}/resolv.conf" >> "$LOG_FILE" 2>&1; then
+            rm -rf "$DPI_RESOLV_SNAPSHOT_DIR"
+            DPI_RESOLV_SNAPSHOT_DIR=""
+            fail "Не удалось сохранить текущий /etc/resolv.conf"
+            return 1
+        fi
+        : > "${DPI_RESOLV_SNAPSHOT_DIR}/present"
+    else
+        : > "${DPI_RESOLV_SNAPSHOT_DIR}/missing"
+    fi
+}
+
+dpi_detector_restore_resolver() {
+    local snapshot_dir="$DPI_RESOLV_SNAPSHOT_DIR" rc=0
+    [[ -n "$snapshot_dir" && -d "$snapshot_dir" ]] || return 0
+
+    if (( DPI_RESOLV_CHANGED == 1 )); then
+        if ! "${SUDO[@]}" rm -f "$DPI_RESOLV_CONF_FILE" >> "$LOG_FILE" 2>&1; then
+            rc=1
+        elif [[ -e "${snapshot_dir}/present" ]] &&
+            ! "${SUDO[@]}" cp -a "${snapshot_dir}/resolv.conf" "$DPI_RESOLV_CONF_FILE" >> "$LOG_FILE" 2>&1; then
+            rc=1
+        fi
+        if (( rc == 0 )); then
+            echo "dpi-detector resolver: original /etc/resolv.conf restored" >> "$LOG_FILE" 2>/dev/null || true
+        else
+            warn "Не удалось автоматически вернуть исходный /etc/resolv.conf; snapshot: ${snapshot_dir}"
+        fi
+    fi
+
+    if (( rc == 0 )); then
+        rm -rf "$snapshot_dir"
+    fi
+    DPI_RESOLV_SNAPSHOT_DIR=""
+    DPI_RESOLV_CHANGED=0
+    return "$rc"
+}
+
+dpi_detector_use_resolved_upstream() {
+    local upstream="$DPI_RESOLVED_UPSTREAM_FILE"
+    "${SUDO[@]}" test -s "$upstream" 2>/dev/null || return 1
+    "${SUDO[@]}" awk '
+        $1 == "nameserver" && $2 !~ /^127\./ && $2 != "::1" { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' "$upstream" 2>/dev/null || return 1
+    dpi_detector_snapshot_resolver || return 1
+    DPI_RESOLV_CHANGED=1
+    "${SUDO[@]}" rm -f "$DPI_RESOLV_CONF_FILE" >> "$LOG_FILE" 2>&1 || return 1
+    "${SUDO[@]}" ln -s "$upstream" "$DPI_RESOLV_CONF_FILE" >> "$LOG_FILE" 2>&1 || return 1
+}
+
+dpi_detector_use_public_resolver() {
+    local tmp
+    tmp="$(mktemp)"
+    cat > "$tmp" <<'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+options timeout:2 attempts:2 rotate
+EOF
+    if ! dpi_detector_snapshot_resolver; then
+        rm -f "$tmp"
+        return 1
+    fi
+    DPI_RESOLV_CHANGED=1
+    if ! "${SUDO[@]}" rm -f "$DPI_RESOLV_CONF_FILE" >> "$LOG_FILE" 2>&1 ||
+        ! "${SUDO[@]}" install -m 0644 "$tmp" "$DPI_RESOLV_CONF_FILE" >> "$LOG_FILE" 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+}
+
+dpi_detector_dns_diagnostics() {
+    local nameservers resolved_state ufw_output
+    nameservers="$("${SUDO[@]}" awk '$1 == "nameserver" { print $2 }' "$DPI_RESOLV_CONF_FILE" 2>/dev/null | paste -sd ',' - || true)"
+    resolved_state="$(run_systemctl_bounded 3 is-active systemd-resolved 2>/dev/null || true)"
+    ufw_output="$("${SUDO[@]}" ufw status verbose 2>/dev/null | awk -F: '/Default:/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' || true)"
+    echo "dpi-detector dns failure: nameservers=${nameservers:--} resolved=${resolved_state:-unknown} ufw_default=${ufw_output:--}" >> "$LOG_FILE" 2>/dev/null || true
+    warn "DNS: ${nameservers:--}; systemd-resolved: ${resolved_state:-unknown}; UFW: ${ufw_output:--}"
+}
+
+dpi_detector_prepare_registry_dns() {
+    local host="${1:-ghcr.io}"
+
+    dns_host_resolves "$host" && return 0
+    warn "DNS не резолвит ${host}. Пробую безопасное временное восстановление."
+
+    if systemd_resolved_available; then
+        run_systemctl_bounded 10 restart systemd-resolved >> "$LOG_FILE" 2>&1 || true
+        if command_exists resolvectl; then
+            run_bounded_command 5 "${SUDO[@]}" resolvectl flush-caches >> "$LOG_FILE" 2>&1 || true
+        fi
+        if wait_for_dns_host "$host" 4; then
+            ok "DNS восстановлен после перезапуска systemd-resolved"
+            return 0
+        fi
+
+        if dpi_detector_use_resolved_upstream && wait_for_dns_host "$host" 5; then
+            warn "Локальный DNS stub 127.0.0.53 недоступен. На время теста включён upstream resolver."
+            return 0
+        fi
+    fi
+
+    if dpi_detector_use_public_resolver && wait_for_dns_host "$host" 6; then
+        warn "На время теста включены прямые DNS 1.1.1.1/8.8.8.8. Исходный resolver будет возвращён автоматически."
+        return 0
+    fi
+
+    dpi_detector_dns_diagnostics
+    dpi_detector_restore_resolver || true
+    fail "DNS не удалось восстановить для ${host}. Проверь OUTPUT/loopback firewall и доступ к UDP/TCP 53."
+    return 1
+}
+
+dpi_detector_docker_ready() {
+    local deadline
+    if run_bounded_command 5 "${SUDO[@]}" docker info >/dev/null 2>&1; then
+        return 0
+    fi
+    command_exists systemctl || {
+        fail "Docker daemon недоступен, systemctl не найден"
+        return 1
+    }
+
+    stage "Запускаю Docker daemon"
+    run_systemctl_bounded 20 enable --now docker >> "$LOG_FILE" 2>&1 || true
+    deadline=$(( SECONDS + 15 ))
+    while (( SECONDS < deadline )); do
+        if run_bounded_command 5 "${SUDO[@]}" docker info >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    fail "Docker daemon не отвечает"
+    return 1
+}
+
+dpi_detector_image_cached() {
+    run_bounded_command 10 "${SUDO[@]}" docker image inspect "$DPI_DETECTOR_IMAGE" >/dev/null 2>&1
+}
+
+dpi_detector_pull_image() {
+    local output_file timeout_sec rc reason
+    output_file="$(mktemp)"
+    timeout_sec="${KTO_DPI_PULL_TIMEOUT:-180}"
+    [[ "$timeout_sec" =~ ^[0-9]+$ && "$timeout_sec" -ge 30 ]] || timeout_sec=180
+
+    stage "Обновляю DPI Detector ${DPI_DETECTOR_IMAGE}"
+    if run_bounded_command "$timeout_sec" "${SUDO[@]}" docker pull "$DPI_DETECTOR_IMAGE" 2>&1 |
+        tee -a "$LOG_FILE" "$output_file"; then
+        rm -f "$output_file"
+        return 0
+    fi
+    rc="${PIPESTATUS[0]}"
+
+    if dpi_detector_image_cached; then
+        warn "Registry временно недоступен, использую уже скачанный ${DPI_DETECTOR_IMAGE}."
+        echo "dpi-detector pull failed rc=${rc}; cached image selected" >> "$LOG_FILE" 2>/dev/null || true
+        rm -f "$output_file"
+        return 0
+    fi
+
+    reason="ошибка registry или сети"
+    if (( rc == 124 )); then
+        reason="таймаут загрузки (${timeout_sec}s)"
+    elif grep -Eqi 'no space left|insufficient space' "$output_file"; then
+        reason="на диске закончилось место"
+    elif grep -Eqi 'lookup .*(:53|no such host)|server misbehaving|operation not permitted' "$output_file"; then
+        reason="DNS или firewall блокирует резолв registry"
+    elif grep -Eqi 'cannot connect to the docker daemon|is the docker daemon running' "$output_file"; then
+        reason="Docker daemon недоступен"
+    elif grep -Eqi 'TLS handshake timeout|SSL connection timeout|i/o timeout|connection timed out' "$output_file"; then
+        reason="таймаут маршрута/TLS до ghcr.io"
+    elif grep -Eqi 'unauthorized|denied' "$output_file"; then
+        reason="registry отклонил доступ к образу"
+    fi
+    rm -f "$output_file"
+    fail "Не удалось скачать DPI Detector: ${reason}; локального образа нет"
+    return 1
+}
+
+dpi_detector_prepare_image() {
+    ensure_hostname_hosts_entry || return 1
+
+    if ! command_exists docker || ! "${SUDO[@]}" docker compose version >/dev/null 2>&1; then
+        dpi_detector_prepare_registry_dns ghcr.io || return 1
+    fi
+    ensure_docker
+    dpi_detector_docker_ready || return 1
+    dpi_detector_prepare_registry_dns ghcr.io || return 1
+    dpi_detector_pull_image
+}
+
 dpi_detector_policy_slot() {
     local offset uid table priority used_uids rules table_routes
     used_uids="$(ps -e -o uid= 2>/dev/null | awk '{$1=$1; if ($1 != "") print $1}' | sort -u || true)"
@@ -4740,31 +4991,30 @@ run_dpi_detector() {
     source_ip="$TEST_SOURCE_IP"
     source_interface="$TEST_SOURCE_INTERFACE"
 
-    ensure_docker
-    stage "Обновляю DPI Detector ${DPI_DETECTOR_IMAGE}"
-    if ! "${SUDO[@]}" docker pull "$DPI_DETECTOR_IMAGE"; then
-        fail "Не удалось скачать образ DPI Detector"
-        return 1
-    fi
-
-    security_options="$("${SUDO[@]}" docker info --format '{{join .SecurityOptions ","}}' 2>/dev/null || true)"
-    if grep -Eqi 'userns|rootless' <<< "$security_options"; then
-        fail "Docker userns/rootless не поддерживается безопасной привязкой проверки ТСПУ"
-        return 1
-    fi
-
-    slot="$(dpi_detector_policy_slot 2>/dev/null || true)"
-    if [[ -z "$slot" ]]; then
-        fail "Не удалось найти свободные UID и routing table для проверки ТСПУ"
-        return 1
-    fi
-    IFS=$'\t' read -r uid table priority <<< "$slot"
-    container_name="kto-dpi-detector-${uid}-$$"
-
     if (
         local -a docker_args detector_args
-        trap 'dpi_detector_cleanup "$container_name" "$table" "$priority"' EXIT
+        DPI_RESOLV_SNAPSHOT_DIR=""
+        DPI_RESOLV_CHANGED=0
+        container_name=""
+        table=""
+        priority=""
+        trap 'dpi_detector_cleanup "$container_name" "$table" "$priority"; dpi_detector_restore_resolver || true' EXIT
         trap 'exit 130' INT TERM HUP
+
+        dpi_detector_prepare_image || exit 1
+        security_options="$(run_bounded_command 5 "${SUDO[@]}" docker info --format '{{join .SecurityOptions ","}}' 2>/dev/null || true)"
+        if grep -Eqi 'userns|rootless' <<< "$security_options"; then
+            fail "Docker userns/rootless не поддерживается безопасной привязкой проверки ТСПУ"
+            exit 1
+        fi
+
+        slot="$(dpi_detector_policy_slot 2>/dev/null || true)"
+        if [[ -z "$slot" ]]; then
+            fail "Не удалось найти свободные UID и routing table для проверки ТСПУ"
+            exit 1
+        fi
+        IFS=$'\t' read -r uid table priority <<< "$slot"
+        container_name="kto-dpi-detector-${uid}-$$"
 
         stage "Закрепляю тест за ${source_ip} (${source_interface})"
         dpi_detector_prepare_source_policy "$source_ip" "$source_interface" "$uid" "$table" "$priority" || exit 1
@@ -4777,7 +5027,7 @@ run_dpi_detector() {
             --security-opt no-new-privileges:true
             --pids-limit 512
             --read-only
-            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m
+            --tmpfs "/tmp:rw,nosuid,nodev,noexec,size=128m"
             --env HOME=/tmp
             --env PYTHONDONTWRITEBYTECODE=1
             --env "TERM=${TERM:-xterm-256color}"

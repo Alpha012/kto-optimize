@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v276"', KTO)
-        self.assertIn('PUSH_BUILD="v276"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v276"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v276"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v276"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v276"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v276"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v277"', KTO)
+        self.assertIn('PUSH_BUILD="v277"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v277"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v277"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v277"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v277"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v277"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -399,6 +399,9 @@ select_test_source_ipv4 </dev/null
     def test_dpi_detector_is_one_shot_hardened_and_source_routed(self):
         menu = function_body(KTO, "menu")
         runner = function_body(KTO, "run_dpi_detector")
+        image_prepare = function_body(KTO, "dpi_detector_prepare_image")
+        image_pull = function_body(KTO, "dpi_detector_pull_image")
+        dns_prepare = function_body(KTO, "dpi_detector_prepare_registry_dns")
         policy = function_body(KTO, "dpi_detector_prepare_source_policy")
         cleanup = function_body(KTO, "dpi_detector_cleanup")
         main = function_body(KTO, "main")
@@ -412,14 +415,22 @@ select_test_source_ipv4 </dev/null
         self.assertIn('[[ "$MACHINE_MODE" != "panel" ]]', menu)
         self.assertIn('[[ "$MACHINE_MODE" == "panel" ]]', runner)
         self.assertIn('select_test_source_ipv4 "$requested_source_ip"', runner)
-        self.assertIn('docker pull "$DPI_DETECTOR_IMAGE"', runner)
+        self.assertIn('dpi_detector_prepare_image', runner)
+        self.assertIn('dpi_detector_restore_resolver || true', runner)
+        self.assertIn('ensure_hostname_hosts_entry', image_prepare)
+        self.assertIn('dpi_detector_prepare_registry_dns ghcr.io', image_prepare)
+        self.assertIn('run_bounded_command "$timeout_sec"', image_pull)
+        self.assertIn('docker pull "$DPI_DETECTOR_IMAGE"', image_pull)
+        self.assertIn('dpi_detector_image_cached', image_pull)
+        self.assertIn('dpi_detector_use_resolved_upstream', dns_prepare)
+        self.assertIn('dpi_detector_use_public_resolver', dns_prepare)
         self.assertIn('run --rm --name "$container_name"', runner)
         self.assertIn('--network host', runner)
         self.assertIn('--user "${uid}:${uid}"', runner)
         self.assertIn('--cap-drop ALL', runner)
         self.assertIn('--security-opt no-new-privileges:true', runner)
         self.assertIn('--read-only', runner)
-        self.assertIn('--tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m', runner)
+        self.assertIn('--tmpfs "/tmp:rw,nosuid,nodev,noexec,size=128m"', runner)
         self.assertIn('detector_args=(--batch)', runner)
         self.assertIn('detector_args=(-t 123 --batch)', runner)
         self.assertIn("trap 'dpi_detector_cleanup", runner)
@@ -463,6 +474,108 @@ grep -Fq -- '-4|rule|add|priority|21000|uidrange|61000-61000|lookup|61000|' "$ev
 grep -Fq -- '-4|route|get|1.1.1.1|uid|61000|' "$events"
 grep -Fq -- '-4|rule|del|priority|21000|' "$events"
 grep -Fq -- '-4|route|flush|table|61000|' "$events"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dpi_detector_preflight_restores_resolver_and_uses_cached_image(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+LOG_FILE="$root/kto.log"
+DPI_RESOLV_CONF_FILE="$root/resolv.conf"
+DPI_RESOLVED_UPSTREAM_FILE="$root/upstream.conf"
+original="$root/original.conf"
+printf 'nameserver 127.0.0.53\noptions edns0 trust-ad\n' > "$original"
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$DPI_RESOLVED_UPSTREAM_FILE"
+cp "$original" "$DPI_RESOLV_CONF_FILE"
+
+dns_host_resolves() { return 1; }
+systemd_resolved_available() { return 0; }
+run_systemctl_bounded() { return 0; }
+command_exists() { [[ "$1" != resolvectl ]]; }
+wait_for_dns_host() {
+    cmp -s "$DPI_RESOLV_CONF_FILE" "$DPI_RESOLVED_UPSTREAM_FILE"
+}
+dpi_detector_prepare_registry_dns ghcr.io
+[[ "$DPI_RESOLV_CHANGED" == 1 ]]
+cmp -s "$DPI_RESOLV_CONF_FILE" "$DPI_RESOLVED_UPSTREAM_FILE"
+snapshot="$DPI_RESOLV_SNAPSHOT_DIR"
+[[ -d "$snapshot" ]]
+dpi_detector_restore_resolver
+cmp -s "$DPI_RESOLV_CONF_FILE" "$original"
+[[ ! -e "$snapshot" ]]
+
+wait_for_dns_host() { return 1; }
+! dpi_detector_prepare_registry_dns ghcr.io
+cmp -s "$DPI_RESOLV_CONF_FILE" "$original"
+[[ -z "$DPI_RESOLV_SNAPSHOT_DIR" && "$DPI_RESOLV_CHANGED" == 0 ]]
+
+run_bounded_command() { shift; "$@"; }
+cached=1
+docker() {
+    if [[ "${1:-}" == pull ]]; then
+        printf 'dial tcp: lookup ghcr.io on 127.0.0.53:53: operation not permitted\n'
+        return 1
+    fi
+    if [[ "${1:-}" == image && "${2:-}" == inspect ]]; then
+        [[ "$cached" == 1 ]]
+        return
+    fi
+    return 0
+}
+KTO_DPI_PULL_TIMEOUT=30
+dpi_detector_pull_image
+cached=0
+! dpi_detector_pull_image
+grep -q 'cached image selected' "$LOG_FILE"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_hostname_guard_is_backed_up_and_idempotent(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+LOG_FILE="$root/kto.log"
+HOSTS_FILE="$root/hosts"
+HOSTS_BACKUP_FILE="$root/hosts.kto-backup"
+printf '127.0.0.1\tlocalhost\n' > "$HOSTS_FILE"
+cp "$HOSTS_FILE" "$root/original"
+hostname() { printf 'kto-test\n'; }
+getent() { return 2; }
+run_bounded_command() { shift; "$@"; }
+ensure_hostname_hosts_entry
+cmp -s "$HOSTS_BACKUP_FILE" "$root/original"
+grep -Fqx $'127.0.1.1\tkto-test' "$HOSTS_FILE"
+ensure_hostname_hosts_entry
+[[ "$(grep -c 'kto-test' "$HOSTS_FILE")" == 1 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
