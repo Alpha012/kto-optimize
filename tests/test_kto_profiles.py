@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v274"', KTO)
-        self.assertIn('PUSH_BUILD="v274"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v274"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v274"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v274"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v274"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v274"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v275"', KTO)
+        self.assertIn('PUSH_BUILD="v275"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v275"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v275"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v275"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v275"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v275"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -831,9 +831,9 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('server_name="xray1"', render)
         self.assertIn('frontend_name="vless_in_${port}"', render)
         self.assertIn('backend_name="vless_pool_${port}"', render)
-        self.assertIn('2) Добавить порт через основной выходной IP', haproxy_menu)
-        self.assertIn('3) Добавить конфиг для другого выходного IP', haproxy_menu)
-        self.assertIn('4) Удалить дополнительный порт', haproxy_menu)
+        self.assertIn('2) Добавить маршрут через основной выходной IP', haproxy_menu)
+        self.assertIn('3) Добавить маршрут через другой выходной IP', haproxy_menu)
+        self.assertIn('4) Удалить дополнительный маршрут', haproxy_menu)
         self.assertIn('5) Заменить SNI у всех маршрутов', haproxy_menu)
         self.assertIn('6) Обновить HAProxy, сохранив маршруты', haproxy_menu)
         self.assertIn('7) Добавить или заменить backend-пул', haproxy_menu)
@@ -1108,8 +1108,9 @@ remove_haproxy_input_bandwidth_limit 217.19.122.109
         self.assertIn('echo "443"', base_port)
         self.assertIn('require_haproxy_mode', configure)
         self.assertIn('base_port="$(haproxy_base_port)"', configure)
-        self.assertIn('haproxy_tcp_port_listening "$base_port"', configure)
-        self.assertIn("printf '%s\\t%s\\t%s\\tdefault\\n'", configure)
+        self.assertIn('haproxy_tcp_port_listening "$base_port" "$listen_ip"', configure)
+        self.assertIn('select_haproxy_route_listen_ip "*"', configure)
+        self.assertIn('print_haproxy_route "$base_port"', configure)
         self.assertIn('sync_haproxy_firewall "$routes_file" "$previous_routes_file"', configure)
         self.assertIn('require_haproxy_mode', haproxy_menu)
         self.assertIn('if haproxy_mode_supported; then', settings_menu)
@@ -1454,7 +1455,7 @@ grep -q '^net.ipv4.ip_local_reserved_ports=22,8000-8400,8443,8444$' "$events"
         self.assertIn('ufw allow "${port}/tcp"', optimize_firewall)
         self.assertIn('extract_haproxy_routes > "$routes_file"', check_firewall)
         self.assertIn('ufw_rule_allowed "${port}/tcp"', check_firewall)
-        self.assertIn('/^vless_in_[0-9]+$/', scan)
+        self.assertIn('/^vless_in_[0-9_]+$/', scan)
         self.assertIn("count[$1] += $2", scan)
         self.assertIn("show table %s", scan)
 
@@ -1536,6 +1537,113 @@ expected=$'443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\n8443
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_haproxy_same_port_on_distinct_input_ips_round_trip(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+routes=$(mktemp)
+config=$(mktemp)
+conflict=$(mktemp)
+trap 'rm -f "$routes" "$config" "$conflict"' EXIT
+printf '443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112\n443\t5.34.179.144:443\tb.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
+render_haproxy_routes_config "$routes" "$config"
+grep -q '^frontend vless_in$' "$config"
+grep -q '^    bind 78.159.250.112:443 backlog 65535$' "$config"
+grep -q '^frontend vless_in_443_217_19_122_48$' "$config"
+grep -q '^    bind 217.19.122.48:443 backlog 65535$' "$config"
+grep -q '^    server xray1 5.34.179.144:443 check weight 10 source 217.19.122.48$' "$config"
+actual=$(extract_haproxy_routes "$config")
+expected=$'443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112\n443\t5.34.179.144:443\tb.example.com\t217.19.122.48\tdefault\t217.19.122.48'
+[[ "$actual" == "$expected" ]]
+haproxy_route_file_has_endpoint "$routes" 443 78.159.250.112
+haproxy_route_file_has_endpoint "$routes" 443 217.19.122.48
+! haproxy_route_file_conflicts_endpoint "$routes" 443 185.141.227.93
+
+printf '443\t89.144.8.3:443\ta.example.com\tdefault\n443\t5.34.179.144:443\tb.example.com\tdefault\tdefault\t217.19.122.48\n' > "$conflict"
+! render_haproxy_routes_config "$conflict" "$config"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_same_port_edit_and_delete_are_endpoint_scoped(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+trap 'rm -f "$routes"' EXIT
+printf '443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112\n443\t5.34.179.144:443\tb.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
+select_haproxy_route() { printf '443\t217.19.122.48\n'; }
+select_haproxy_route_listen_ip() { printf '217.19.122.48\n'; }
+haproxy_input_ip_available() { return 0; }
+ask_haproxy_target_pool_default() { printf '5.34.179.145:443\n'; }
+ask_haproxy_sni_list() { printf 'changed.example.com\n'; }
+apply_haproxy_routes_config() { return 0; }
+sync_haproxy_firewall() { return 0; }
+edit_haproxy_route "$routes"
+grep -Fqx $'443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112' "$routes"
+grep -Fqx $'443\t5.34.179.145:443\tchanged.example.com\t217.19.122.48\tdefault\t217.19.122.48' "$routes"
+delete_haproxy_route "$routes"
+[[ "$(wc -l < "$routes")" == 1 ]]
+grep -Fqx $'443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112' "$routes"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_listener_checks_are_input_ip_scoped(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+command_exists() { [[ "$1" == ss ]]; }
+ss() {
+    printf '%s\n' \
+        'LISTEN 0 4096 78.159.250.112:443 0.0.0.0:* users:(("haproxy",pid=10,fd=4))' \
+        'LISTEN 0 4096 217.19.122.48:443 0.0.0.0:* users:(("xray",pid=11,fd=4))' \
+        'LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("haproxy",pid=10,fd=5))'
+}
+haproxy_tcp_port_owned_by_haproxy 443 78.159.250.112
+! haproxy_tcp_port_owned_by_haproxy 443 217.19.122.48
+! haproxy_tcp_port_owned_by_haproxy 443 '*'
+haproxy_tcp_port_owned_by_haproxy 8443 '*'
+grep -q haproxy < <(haproxy_tcp_port_socket_details 443 78.159.250.112)
+grep -q xray < <(haproxy_tcp_port_socket_details 443 217.19.122.48)
+! haproxy_tcp_port_socket_details 443 185.141.227.93
+haproxy_tcp_port_socket_details 8443 185.141.227.93 >/dev/null
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_haproxy_legacy_routes_default_source_and_additional_ips_are_routable(self):
         bash = bash_executable()
         if bash is None:
@@ -1587,7 +1695,7 @@ expected=$'185.141.227.93\twan2\n217.19.122.48\twan3\n217.19.122.49\twan4'
 [[ "$actual" == "$expected" ]]
 printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n8443\t5.34.179.144:443\textra.example.com\t185.141.227.93\n8444\t5.34.179.145:443\textra2.example.com\t217.19.122.48\n' > "$routes"
 list_haproxy_additional_source_ips() { printf '185.141.227.93\twan2\n217.19.122.48\twan3\n217.19.122.49\twan4\n'; }
-[[ "$(select_haproxy_additional_source_ip "$routes")" == '217.19.122.49' ]]
+[[ "$(printf '1\n' | select_haproxy_additional_source_ip "$routes")" == '185.141.227.93' ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -1726,6 +1834,7 @@ trap 'rm -f "$routes"' EXIT
 printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n' > "$routes"
 select_haproxy_additional_source_ip() { printf '185.141.227.93\n'; }
 haproxy_additional_source_ip_available() { [[ "$1" == '185.141.227.93' ]]; }
+select_haproxy_route_listen_ip() { printf '*\n'; }
 ask_int() { printf '8443\n'; }
 haproxy_tcp_port_listening() { return 1; }
 ask_haproxy_target_default() { printf '5.34.179.144:443\n'; }

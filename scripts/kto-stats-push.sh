@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v274"
+PUSH_BUILD="v275"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -1891,7 +1891,7 @@ read_haproxy_scan_stats() {
     [[ -S "$socket" ]] || return 0
 
     tables="$(awk '
-        $1 == "frontend" && ($2 == "vless_in" || $2 ~ /^vless_in_[0-9]+$/) { print $2 }
+        $1 == "frontend" && ($2 == "vless_in" || $2 ~ /^vless_in_[0-9_]+$/) { print $2 }
     ' /etc/haproxy/haproxy.cfg 2>/dev/null | awk '!seen[$0]++' || true)"
     [[ -n "$tables" ]] || tables="vless_in"
 
