@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v280"', KTO)
-        self.assertIn('PUSH_BUILD="v280"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v280"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v280"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v280"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v280"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v280"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v281"', KTO)
+        self.assertIn('PUSH_BUILD="v281"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v281"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v281"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v281"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v281"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v281"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -963,6 +963,33 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('prepare_haproxy_multi_ip_config "$routes_file"', haproxy_menu)
         self.assertIn('restore_haproxy_backup "$routes_file"', haproxy_menu)
         self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
+
+    def test_haproxy_route_list_uses_compact_input_backend_sni_format(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+trap 'rm -f "$routes"' EXIT
+printf '443\t144.31.128.40:443\t*.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\tbridge.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
+haproxy_default_source_ip() { printf '78.159.245.250\n'; }
+output=$(print_haproxy_routes "$routes")
+grep -Fq 'Вход: 78.159.245.250:443 -> 144.31.128.40:443 | SNI: *.rog-self.co.uk' <<< "$output"
+grep -Fq 'Вход: 217.19.122.48:8443 -> 5.34.179.144:443 | SNI: bridge.example.com' <<< "$output"
+! grep -Fq 'Выход:' <<< "$output"
+! grep -Fq '/tcp' <<< "$output"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_haproxy_bandwidth_limit_is_scoped_to_selected_input_ip(self):
         apply_limits = function_body(HAPROXY_BANDWIDTH, "apply_limits")

@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v280"
+SCRIPT_BUILD="v281"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -6723,20 +6723,24 @@ configure_haproxy_backend() {
 
 print_haproxy_routes() {
     local routes_file="$1" port target_pool sni source_ip server_maxconn listen_ip
-    local source_label target_label pool_count
+    local default_ip display_ip target_label pool_count
+    default_ip="$(haproxy_default_source_ip)"
     echo -e "${BOLD}${PURPLE}[ МАРШРУТЫ ]${NC}"
     while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip; do
         [[ -n "$port" ]] || continue
         listen_ip="$(haproxy_route_listen_ip "$listen_ip")"
-        source_label="$(haproxy_source_label "${source_ip:-default}")"
+        display_ip="$listen_ip"
+        if [[ "$listen_ip" == "*" ]] && validate_ipv4 "$default_ip"; then
+            display_ip="$default_ip"
+        fi
         pool_count="$(haproxy_target_pool_count "$target_pool" 2>/dev/null || printf '0')"
         if (( pool_count > 1 )); then
             target_label="пул: ${pool_count} backend"
         else
             target_label="$target_pool"
         fi
-        printf ' Вход: %-21s -> %-21s Выход: %-24s SNI: %s\n' \
-            "${listen_ip}:${port}/tcp" "$target_label" "$source_label" "$sni"
+        printf ' Вход: %s:%s -> %s | SNI: %s\n' \
+            "$display_ip" "$port" "$target_label" "$sni"
     done < "$routes_file"
 }
 
