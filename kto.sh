@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v281"
+SCRIPT_BUILD="v282"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -6739,9 +6739,56 @@ print_haproxy_routes() {
         else
             target_label="$target_pool"
         fi
-        printf ' Вход: %s:%s -> %s | SNI: %s\n' \
+        printf ' %s:%s -> %s | SNI: %s\n' \
             "$display_ip" "$port" "$target_label" "$sni"
     done < "$routes_file"
+}
+
+check_haproxy_bindings() {
+    local routes_file="$1" port _target _sni _source _maxconn listen_ip
+    local endpoint scope runtime_status details total=0 ok_count=0 problem_count=0
+
+    command_exists ss || {
+        fail "ss не найден: проверить runtime-бинды невозможно"
+        return 1
+    }
+
+    echo -e "${BOLD}${PURPLE}[ ПРОВЕРКА БИНДОВ HAPROXY ]${NC}"
+    while IFS=$'\t' read -r port _target _sni _source _maxconn listen_ip; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        listen_ip="$(haproxy_route_listen_ip "$listen_ip")"
+        endpoint="${listen_ip}:${port}"
+        if [[ "$listen_ip" == "*" ]]; then
+            scope="FULL: занимает ${port}/tcp на всех IP"
+        else
+            scope="ТОЧЕЧНЫЙ: только IP ${listen_ip}"
+        fi
+
+        if haproxy_tcp_port_owned_by_haproxy "$port" "$listen_ip"; then
+            runtime_status="OK"
+            ok_count=$(( ok_count + 1 ))
+        elif [[ "$listen_ip" != "*" ]] && haproxy_tcp_port_owned_by_haproxy "$port" "*"; then
+            runtime_status="ОШИБКА: HAProxy реально слушает *:${port} на всех IP"
+            problem_count=$(( problem_count + 1 ))
+        else
+            details="$(haproxy_tcp_port_socket_details "$port" "$listen_ip" 2>/dev/null |
+                awk 'toupper($1) == "LISTEN"' || true)"
+            if [[ -n "$details" ]] && grep -qi haproxy <<< "$details"; then
+                runtime_status="ОШИБКА: HAProxy слушает другой адрес на порту ${port}"
+            elif [[ -n "$details" ]]; then
+                runtime_status="ОШИБКА: порт занят другим процессом"
+            else
+                runtime_status="ОШИБКА: не слушается"
+            fi
+            problem_count=$(( problem_count + 1 ))
+        fi
+        total=$(( total + 1 ))
+        printf ' %s — %s | Runtime: %s\n' "$endpoint" "$scope" "$runtime_status"
+    done < "$routes_file"
+
+    echo
+    printf 'Проверено: %s | OK: %s | Проблем: %s\n' "$total" "$ok_count" "$problem_count"
+    (( total > 0 && problem_count == 0 ))
 }
 
 select_haproxy_route() {
@@ -7865,6 +7912,7 @@ haproxy_menu() {
         echo -e "9) Ограничить скорость по входному IP"
         echo -e "10) Проверить и подготовить config для отдельных IP:порт"
         echo -e "11) Восстановить HAProxy backup"
+        echo -e "12) Проверить бинды"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -7886,6 +7934,7 @@ haproxy_menu() {
             9) haproxy_bandwidth_menu || true ;;
             10) prepare_haproxy_multi_ip_config "$routes_file" || true ;;
             11) restore_haproxy_backup "$routes_file" || true ;;
+            12) check_haproxy_bindings "$routes_file" || true ;;
             0)
                 rm -f "$routes_file"
                 return 0

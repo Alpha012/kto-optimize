@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v281"', KTO)
-        self.assertIn('PUSH_BUILD="v281"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v281"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v281"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v281"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v281"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v281"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v282"', KTO)
+        self.assertIn('PUSH_BUILD="v282"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v282"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v282"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v282"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v282"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v282"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -957,11 +957,13 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('9) Ограничить скорость по входному IP', haproxy_menu)
         self.assertIn('10) Проверить и подготовить config для отдельных IP:порт', haproxy_menu)
         self.assertIn('11) Восстановить HAProxy backup', haproxy_menu)
+        self.assertIn('12) Проверить бинды', haproxy_menu)
         self.assertIn('add_haproxy_source_route "$routes_file"', haproxy_menu)
         self.assertIn('replace_all_haproxy_sni "$routes_file"', haproxy_menu)
         self.assertIn('haproxy_bandwidth_menu', haproxy_menu)
         self.assertIn('prepare_haproxy_multi_ip_config "$routes_file"', haproxy_menu)
         self.assertIn('restore_haproxy_backup "$routes_file"', haproxy_menu)
+        self.assertIn('check_haproxy_bindings "$routes_file"', haproxy_menu)
         self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
 
     def test_haproxy_route_list_uses_compact_input_backend_sni_format(self):
@@ -976,10 +978,44 @@ trap 'rm -f "$routes"' EXIT
 printf '443\t144.31.128.40:443\t*.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\tbridge.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
 haproxy_default_source_ip() { printf '78.159.245.250\n'; }
 output=$(print_haproxy_routes "$routes")
-grep -Fq 'Вход: 78.159.245.250:443 -> 144.31.128.40:443 | SNI: *.rog-self.co.uk' <<< "$output"
-grep -Fq 'Вход: 217.19.122.48:8443 -> 5.34.179.144:443 | SNI: bridge.example.com' <<< "$output"
+grep -Fq '78.159.245.250:443 -> 144.31.128.40:443 | SNI: *.rog-self.co.uk' <<< "$output"
+grep -Fq '217.19.122.48:8443 -> 5.34.179.144:443 | SNI: bridge.example.com' <<< "$output"
+! grep -Fq 'Вход:' <<< "$output"
 ! grep -Fq 'Выход:' <<< "$output"
 ! grep -Fq '/tcp' <<< "$output"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_binding_check_distinguishes_wildcard_and_specific_ip(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+trap 'rm -f "$routes"' EXIT
+printf '443\t144.31.128.40:443\ta.example.com\tdefault\n8443\t5.34.179.144:443\tb.example.com\tdefault\tdefault\t217.19.122.48\n9443\t5.34.179.145:443\tc.example.com\tdefault\tdefault\t185.141.227.93\n' > "$routes"
+command_exists() { [[ "$1" == ss ]]; }
+haproxy_tcp_port_owned_by_haproxy() {
+    [[ "$1|$2" == '443|*' || "$1|$2" == '8443|217.19.122.48' || "$1|$2" == '9443|*' ]]
+}
+haproxy_tcp_port_socket_details() { return 1; }
+rc=0
+output=$(check_haproxy_bindings "$routes") || rc=$?
+[[ "$rc" == 1 ]]
+grep -Fq '*:443 — FULL: занимает 443/tcp на всех IP | Runtime: OK' <<< "$output"
+grep -Fq '217.19.122.48:8443 — ТОЧЕЧНЫЙ: только IP 217.19.122.48 | Runtime: OK' <<< "$output"
+grep -Fq '185.141.227.93:9443 — ТОЧЕЧНЫЙ: только IP 185.141.227.93 | Runtime: ОШИБКА: HAProxy реально слушает *:9443 на всех IP' <<< "$output"
+grep -Fq 'Проверено: 3 | OK: 2 | Проблем: 1' <<< "$output"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
