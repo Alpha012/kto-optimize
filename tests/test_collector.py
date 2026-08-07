@@ -35,10 +35,15 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.UPDATE_STATE_FILE = os.path.join(self.state.name, "update_state.json")
         collector.ALERTS_OFF_FILE = os.path.join(self.state.name, "connection_alerts_off.json")
         collector.IP_LIMIT_DB_FILE = os.path.join(self.state.name, "ip_limit.sqlite")
+        collector.NETWORK_RATE_DB_FILE = os.path.join(self.state.name, "network_rate.sqlite")
         collector.IP_NOTES_FILE = os.path.join(self.state.name, "ip_notes.json")
         if collector.IP_LIMIT_DB is not None:
             collector.IP_LIMIT_DB.close()
         collector.IP_LIMIT_DB = None
+        if collector.NETWORK_RATE_DB is not None:
+            collector.NETWORK_RATE_DB.close()
+        collector.NETWORK_RATE_DB = None
+        collector.NETWORK_RATE_LAST_PURGE_MINUTE = 0
         collector.NODES = {}
         collector.FALLS = {}
         collector.SNI_STATE = {"nodes": {}, "pending": {}}
@@ -51,6 +56,7 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.AUTH_NONCES = {}
         collector.NODES_DIRTY = False
         collector.init_ip_limit_db()
+        collector.init_network_rate_db()
         self.original_enqueue = collector.enqueue_event
         collector.enqueue_event = lambda *_args, **_kwargs: True
 
@@ -59,6 +65,9 @@ class CollectorRegressionTests(unittest.TestCase):
         if collector.IP_LIMIT_DB is not None:
             collector.IP_LIMIT_DB.close()
         collector.IP_LIMIT_DB = None
+        if collector.NETWORK_RATE_DB is not None:
+            collector.NETWORK_RATE_DB.close()
+        collector.NETWORK_RATE_DB = None
         self.state.cleanup()
 
     @staticmethod
@@ -199,9 +208,69 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertIn("185.141.227.93", rich)
         self.assertNotIn("185.141.227.94", rich)
         self.assertIn(
-            f'colspan="7"><b>Общий трафик: {collector.format_bytes(3300)}</b></td>',
+            f'colspan="8"><b>Общий трафик: {collector.format_bytes(3300)}</b></td>',
             rich,
         )
+
+    def test_network_peak_is_per_ip_and_rolls_over_after_24_hours(self):
+        node_uuid = str(uuid.uuid4())
+        base_time = 1_800_000_000
+        original_now = collector.now_ts
+
+        def rate_payload(counter_rx, counter_tx, sample_ms):
+            payload = self.payload("Обход №8", node_uuid, "wl")
+            payload["ip_stats"] = [{
+                "iface": "ens3",
+                "ip": "203.0.113.80",
+                "counter_rx_bytes": counter_rx,
+                "counter_tx_bytes": counter_tx,
+                "counter_sample_ms": sample_ms,
+            }]
+            return payload
+
+        try:
+            collector.now_ts = lambda: base_time
+            first = collector.update_node(rate_payload(1_000_000_000, 2_000_000_000, 10_000), "203.0.113.80")
+            self.assertEqual("-", collector.peak_rate_table_text(first["ip_stats"][0]))
+
+            collector.now_ts = lambda: base_time + 5
+            second = collector.update_node(rate_payload(1_100_000_000, 2_050_000_000, 15_000), "203.0.113.80")
+            entry = second["ip_stats"][0]
+            self.assertEqual(160_000_000, entry["peak_rx_bps_24h"])
+            self.assertEqual(80_000_000, entry["peak_tx_bps_24h"])
+            self.assertEqual("80 | 160 Mbit/s", collector.peak_rate_table_text(entry))
+            rich = collector.aggregate_wl_rich_message()
+            self.assertIn("Пик ↑/↓ (24ч)", rich)
+            self.assertIn("80 | 160 Mbit/s", rich)
+
+            collector.now_ts = lambda: base_time + 10
+            third = collector.update_node(rate_payload(1_110_000_000, 2_055_000_000, 20_000), "203.0.113.80")
+            self.assertEqual(160_000_000, third["ip_stats"][0]["peak_rx_bps_24h"])
+            self.assertEqual(80_000_000, third["ip_stats"][0]["peak_tx_bps_24h"])
+
+            collector.now_ts = lambda: base_time + collector.NETWORK_RATE_RETENTION_SEC + 61
+            expired = collector.update_node(
+                rate_payload(1_110_000_000, 2_055_000_000, 86_471_000),
+                "203.0.113.80",
+            )
+            self.assertEqual("-", collector.peak_rate_table_text(expired["ip_stats"][0]))
+        finally:
+            collector.now_ts = original_now
+
+    def test_bl_rich_report_groups_additional_ip_rows(self):
+        payload = self.payload("Германия", str(uuid.uuid4()), "bl")
+        payload["ip_stats"] = [
+            {"iface": "ens3", "ip": "203.0.113.31", "day_rx": 100, "day_tx": 200},
+            {"iface": "wan2", "ip": "203.0.113.32", "day_rx": 300, "day_tx": 400},
+        ]
+        node = collector.update_node(payload, "203.0.113.31")
+        rich = collector.bl_nodes_rich_section("kto VPN", [node])
+
+        self.assertEqual(1, rich.count("Германия"))
+        self.assertIn('valign="middle" rowspan="2">Германия</td>', rich)
+        self.assertIn("203.0.113.31", rich)
+        self.assertIn("203.0.113.32", rich)
+        self.assertIn('colspan="10"', rich)
 
     def test_rich_tables_show_separate_centered_traffic_totals(self):
         exact_payload = self.payload("Обход №2", str(uuid.uuid4()), "wl")
@@ -220,15 +289,15 @@ class CollectorRegressionTests(unittest.TestCase):
 
         self.assertEqual(2, wl_rich.count("Общий трафик:"))
         self.assertIn(
-            f'align="center" colspan="7"><b>Общий трафик: {collector.format_bytes(300)}</b>',
+            f'align="center" colspan="8"><b>Общий трафик: {collector.format_bytes(300)}</b>',
             wl_rich,
         )
         self.assertIn(
-            f'align="center" colspan="7"><b>Общий трафик: {collector.format_bytes(900)}</b>',
+            f'align="center" colspan="8"><b>Общий трафик: {collector.format_bytes(900)}</b>',
             wl_rich,
         )
         self.assertIn(
-            f'align="center" colspan="9"><b>Общий трафик: {collector.format_bytes(3000)}</b>',
+            f'align="center" colspan="10"><b>Общий трафик: {collector.format_bytes(3000)}</b>',
             bl_rich,
         )
         self.assertNotIn("Объем трафика:", wl_rich + bl_rich)

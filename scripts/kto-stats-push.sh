@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v278"
+PUSH_BUILD="v279"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -113,6 +113,10 @@ number_or_zero() {
     fi
 }
 
+monotonic_milliseconds() {
+    awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime 2>/dev/null || echo 0
+}
+
 is_public_ipv4() {
     local ip="${1:-}" a b c d extra part
     IFS=. read -r a b c d extra <<< "$ip"
@@ -189,6 +193,11 @@ ensure_vnstat_interfaces() {
 vnstat_entry_json() {
     local iface="$1" ip="$2" traffic_json stats entry_error=""
     local entry_day_rx=0 entry_day_tx=0 entry_yesterday_rx=0 entry_yesterday_tx=0 entry_month_rx=0 entry_month_tx=0
+    local counter_rx_bytes=0 counter_tx_bytes=0 counter_sample_ms=0
+
+    counter_rx_bytes="$(int_or_zero "$(cat "/sys/class/net/${iface}/statistics/rx_bytes" 2>/dev/null || echo 0)")"
+    counter_tx_bytes="$(int_or_zero "$(cat "/sys/class/net/${iface}/statistics/tx_bytes" 2>/dev/null || echo 0)")"
+    counter_sample_ms="$(int_or_zero "$(monotonic_milliseconds)")"
 
     if ! traffic_json="$(vnstat -i "$iface" --json 2>&1)"; then
         entry_error="vnstat: $(printf '%s' "$traffic_json" | tr '\r\n' ' ' | cut -c1-300)"
@@ -230,6 +239,9 @@ vnstat_entry_json() {
         --argjson yesterday_tx "$entry_yesterday_tx" \
         --argjson month_rx "$entry_month_rx" \
         --argjson month_tx "$entry_month_tx" \
+        --arg counter_rx_bytes "$counter_rx_bytes" \
+        --arg counter_tx_bytes "$counter_tx_bytes" \
+        --argjson counter_sample_ms "$counter_sample_ms" \
         '{
             iface: $iface,
             ip: $ip,
@@ -242,6 +254,9 @@ vnstat_entry_json() {
             month_rx: $month_rx,
             month_tx: $month_tx,
             month_total: ($month_rx + $month_tx),
+            counter_rx_bytes: $counter_rx_bytes,
+            counter_tx_bytes: $counter_tx_bytes,
+            counter_sample_ms: $counter_sample_ms,
             error: $error
         }'
 }

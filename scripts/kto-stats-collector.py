@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v278"
+COLLECTOR_BUILD = "v279"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -294,6 +294,7 @@ ALERTS_OFF_FILE = os.path.join(STATE_DIR, "connection_alerts_off.json")
 REMNA_NODES_FILE = os.path.join(STATE_DIR, "remna_nodes.json")
 IP_LIMIT_FILE = os.path.join(STATE_DIR, "ip_limit.json")
 IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
+NETWORK_RATE_DB_FILE = os.path.join(STATE_DIR, "network_rate.sqlite")
 IP_NOTES_FILE = os.path.join(STATE_DIR, "ip_notes.json")
 UPDATE_STATE_FILE = os.path.join(STATE_DIR, "update_state.json")
 LOCK = threading.RLock()
@@ -309,6 +310,8 @@ REMNA_NODE_STATE = {"nodes": {}}
 UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
 IP_NOTE_STATE = {"notes": {}, "pending": {}}
 IP_LIMIT_DB = None
+NETWORK_RATE_DB = None
+NETWORK_RATE_LAST_PURGE_MINUTE = 0
 REMNA_USER_CACHE = {}
 EVENT_QUEUE = queue.Queue(maxsize=10000)
 NODES_DIRTY = False
@@ -317,6 +320,10 @@ AUTH_NONCE_LAST_PURGE = 0
 ALERT_SEPARATOR = "➖" * 9
 IP_NOTE_MAX_LENGTH = 160
 IP_NOTE_PENDING_TTL = 600
+NETWORK_RATE_BUCKET_SEC = 60
+NETWORK_RATE_RETENTION_SEC = 24 * 60 * 60
+NETWORK_RATE_MAX_SAMPLE_MS = 5 * 60 * 1000
+NETWORK_RATE_MAX_BPS = 100_000_000_000_000
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
 LOST_EMOJI = '<tg-emoji emoji-id="5447183459602669338">🚨</tg-emoji>'
 BL_NODE_ORDER = [
@@ -1350,6 +1357,39 @@ install -m 0755 "$tmp" /usr/local/bin/kto-stats-collector
 
 def start_local_collector_update(job):
     threading.Thread(target=local_collector_update, args=(dict(job),), daemon=True).start()
+
+
+def network_rate_db():
+    global NETWORK_RATE_DB
+    if NETWORK_RATE_DB is None:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        NETWORK_RATE_DB = sqlite3.connect(NETWORK_RATE_DB_FILE, check_same_thread=False)
+        NETWORK_RATE_DB.row_factory = sqlite3.Row
+        NETWORK_RATE_DB.execute("PRAGMA journal_mode=WAL")
+        NETWORK_RATE_DB.execute("PRAGMA synchronous=NORMAL")
+        NETWORK_RATE_DB.execute("PRAGMA temp_store=MEMORY")
+    return NETWORK_RATE_DB
+
+
+def init_network_rate_db():
+    db = network_rate_db()
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS network_rate_minute (
+            node_key TEXT NOT NULL,
+            series_key TEXT NOT NULL,
+            iface TEXT NOT NULL DEFAULT '',
+            ip TEXT NOT NULL DEFAULT '',
+            minute INTEGER NOT NULL,
+            peak_rx_bps INTEGER NOT NULL DEFAULT 0,
+            peak_tx_bps INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (node_key, series_key, minute)
+        );
+        CREATE INDEX IF NOT EXISTS idx_network_rate_minute_time
+            ON network_rate_minute(minute);
+        CREATE INDEX IF NOT EXISTS idx_network_rate_minute_node
+            ON network_rate_minute(node_key, minute);
+    """)
+    db.commit()
 
 
 def ip_limit_db():
@@ -3128,6 +3168,7 @@ def node_message(node, status=None, compact=False):
     remna_line = remna_html_line(node)
     if remna_line:
         cpu_line = f"{cpu_line}\n{remna_line}"
+    peak_rate = node_peak_rate_table_text(node)
     if compact:
         lines = [f"<blockquote><b>{name}</b>\nIP: {ip}</blockquote>", ""]
         if error:
@@ -3142,6 +3183,8 @@ def node_message(node, status=None, compact=False):
         lines += [
             f"<b>Сегодня: {format_bytes(node.get('day_total', 0))} | Вчера: {format_bytes(node.get('yesterday_total', 0))} | Месяц: {format_bytes(node.get('month_total', 0))}</b>",
         ]
+        if peak_rate != "-":
+            lines.append(f"<b>Пик ↑/↓ за 24ч: {peak_rate}</b>")
         if wrong_sni_line:
             lines += ["", f"<b><i>{wrong_sni_line}</i></b>"]
         if remna_line:
@@ -3165,12 +3208,10 @@ def node_message(node, status=None, compact=False):
     lines += [
         f"<b>I/O: {format_bytes(node.get('day_rx', 0))} | {format_bytes(node.get('day_tx', 0))}</b>",
         f"<b>Сегодня: {format_bytes(node.get('day_total', 0))} | Вчера: {format_bytes(node.get('yesterday_total', 0))} | Месяц: {format_bytes(node.get('month_total', 0))}</b>",
-        "",
-        f"<b><i>{ram_line}",
-        f"{cpu_line}</i></b>",
-        "",
-        footer,
     ]
+    if peak_rate != "-":
+        lines.append(f"<b>Пик ↑/↓ за 24ч: {peak_rate}</b>")
+    lines += ["", f"<b><i>{ram_line}", f"{cpu_line}</i></b>", "", footer]
     return "\n".join(lines)
 
 
@@ -3255,6 +3296,22 @@ def normalize_traffic_counter(value):
     return max(0, min(parsed, 2**63 - 1))
 
 
+def normalize_network_counter(value):
+    try:
+        parsed = int(value or 0)
+    except Exception:
+        parsed = 0
+    return max(0, min(parsed, 2**64 - 1))
+
+
+def normalize_network_rate(value):
+    try:
+        parsed = int(value or 0)
+    except Exception:
+        parsed = 0
+    return max(0, min(parsed, NETWORK_RATE_MAX_BPS))
+
+
 def normalize_ipv4_text(value):
     text = str(value or "").strip()
     if not text:
@@ -3278,6 +3335,15 @@ def normalized_traffic_entry(raw, fallback_iface="", fallback_ip=""):
         "iface": iface,
         "ip": ip_text,
         "error": clean_display_text(raw.get("error") or "").strip()[:300],
+        "counter_rx_bytes": normalize_network_counter(raw.get("counter_rx_bytes")),
+        "counter_tx_bytes": normalize_network_counter(raw.get("counter_tx_bytes")),
+        "counter_sample_ms": normalize_traffic_counter(raw.get("counter_sample_ms")),
+        "rate_rx_bps": normalize_network_rate(raw.get("rate_rx_bps")),
+        "rate_tx_bps": normalize_network_rate(raw.get("rate_tx_bps")),
+        "rate_sample_ms": normalize_traffic_counter(raw.get("rate_sample_ms")),
+        "peak_rx_bps_24h": normalize_network_rate(raw.get("peak_rx_bps_24h")),
+        "peak_tx_bps_24h": normalize_network_rate(raw.get("peak_tx_bps_24h")),
+        "rate_samples_24h": normalize_traffic_counter(raw.get("rate_samples_24h")),
     }
     for prefix in ("day", "yesterday", "month"):
         rx = normalize_traffic_counter(raw.get(f"{prefix}_rx"))
@@ -3329,6 +3395,115 @@ def node_ip_stats(node):
     if not isinstance(node, dict):
         return []
     return normalize_ip_stats(node.get("ip_stats"), node.get("ip"), node.get("iface"), node)
+
+
+def network_rate_series_key(entry):
+    if not isinstance(entry, dict):
+        return ""
+    iface = clean_display_text(entry.get("iface") or "").strip().casefold()[:80]
+    ip_text = normalize_ipv4_text(entry.get("ip"))
+    if iface and ip_text:
+        return f"iface:{iface}|ip:{ip_text}"
+    if iface:
+        return f"iface:{iface}"
+    if ip_text:
+        return f"ip:{ip_text}"
+    return ""
+
+
+def calculate_network_rate_sample(entry, previous):
+    if not isinstance(entry, dict) or not isinstance(previous, dict):
+        return None
+    current_ms = normalize_traffic_counter(entry.get("counter_sample_ms"))
+    previous_ms = normalize_traffic_counter(previous.get("counter_sample_ms"))
+    elapsed_ms = current_ms - previous_ms
+    if elapsed_ms < 250 or elapsed_ms > NETWORK_RATE_MAX_SAMPLE_MS:
+        return None
+    rx_delta = normalize_network_counter(entry.get("counter_rx_bytes")) - normalize_network_counter(previous.get("counter_rx_bytes"))
+    tx_delta = normalize_network_counter(entry.get("counter_tx_bytes")) - normalize_network_counter(previous.get("counter_tx_bytes"))
+    if rx_delta < 0 or tx_delta < 0:
+        return None
+    return {
+        "rx_bps": normalize_network_rate((rx_delta * 8000) // elapsed_ms),
+        "tx_bps": normalize_network_rate((tx_delta * 8000) // elapsed_ms),
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def enrich_network_rate_stats(node_key, entries, previous_entries, current):
+    global NETWORK_RATE_LAST_PURGE_MINUTE
+    node_key = str(node_key or "").strip()[:200]
+    if not node_key or not isinstance(entries, list):
+        return entries
+    previous_map = {}
+    for previous in previous_entries if isinstance(previous_entries, list) else []:
+        series_key = network_rate_series_key(previous)
+        if series_key:
+            previous_map[series_key] = previous
+
+    minute = (int(current) // NETWORK_RATE_BUCKET_SEC) * NETWORK_RATE_BUCKET_SEC
+    oldest_minute = minute - NETWORK_RATE_RETENTION_SEC + NETWORK_RATE_BUCKET_SEC
+    db = network_rate_db()
+    series_keys = []
+    for entry in entries:
+        series_key = network_rate_series_key(entry)
+        if not series_key:
+            continue
+        series_keys.append(series_key)
+        sample = calculate_network_rate_sample(entry, previous_map.get(series_key))
+        if sample is None:
+            entry["rate_rx_bps"] = 0
+            entry["rate_tx_bps"] = 0
+            entry["rate_sample_ms"] = 0
+            continue
+        entry["rate_rx_bps"] = sample["rx_bps"]
+        entry["rate_tx_bps"] = sample["tx_bps"]
+        entry["rate_sample_ms"] = sample["elapsed_ms"]
+        db.execute(
+            "INSERT INTO network_rate_minute(node_key, series_key, iface, ip, minute, peak_rx_bps, peak_tx_bps) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(node_key, series_key, minute) DO UPDATE SET "
+            "iface = excluded.iface, ip = excluded.ip, "
+            "peak_rx_bps = max(network_rate_minute.peak_rx_bps, excluded.peak_rx_bps), "
+            "peak_tx_bps = max(network_rate_minute.peak_tx_bps, excluded.peak_tx_bps) "
+            "WHERE excluded.peak_rx_bps > network_rate_minute.peak_rx_bps "
+            "OR excluded.peak_tx_bps > network_rate_minute.peak_tx_bps "
+            "OR excluded.iface != network_rate_minute.iface "
+            "OR excluded.ip != network_rate_minute.ip",
+            (
+                node_key,
+                series_key,
+                str(entry.get("iface") or "")[:80],
+                str(entry.get("ip") or "")[:45],
+                minute,
+                sample["rx_bps"],
+                sample["tx_bps"],
+            ),
+        )
+
+    if NETWORK_RATE_LAST_PURGE_MINUTE != minute:
+        db.execute("DELETE FROM network_rate_minute WHERE minute < ?", (oldest_minute,))
+        NETWORK_RATE_LAST_PURGE_MINUTE = minute
+    db.commit()
+
+    peaks = {}
+    if series_keys:
+        placeholders = ",".join("?" for _ in series_keys)
+        rows = db.execute(
+            f"SELECT series_key, max(peak_rx_bps) AS peak_rx_bps, "
+            f"max(peak_tx_bps) AS peak_tx_bps, count(*) AS sample_count "
+            f"FROM network_rate_minute WHERE node_key = ? AND minute >= ? "
+            f"AND series_key IN ({placeholders}) GROUP BY series_key",
+            (node_key, oldest_minute, *series_keys),
+        ).fetchall()
+        peaks = {str(row["series_key"]): row for row in rows}
+
+    for entry in entries:
+        row = peaks.get(network_rate_series_key(entry))
+        entry["peak_rx_bps_24h"] = normalize_network_rate(row["peak_rx_bps"] if row else 0)
+        entry["peak_tx_bps_24h"] = normalize_network_rate(row["peak_tx_bps"] if row else 0)
+        entry["rate_samples_24h"] = int(row["sample_count"] if row else 0)
+    return entries
 
 
 def traffic_stats_total(stats, field):
@@ -3792,6 +3967,37 @@ def rich_table(headers, rows, caption="", footer=""):
     return "".join(parts)
 
 
+def format_mbit_rate(value):
+    mbps = normalize_network_rate(value) / 1_000_000
+    if mbps >= 100:
+        return f"{mbps:.0f}"
+    if mbps >= 10:
+        return f"{mbps:.1f}".rstrip("0").rstrip(".")
+    return f"{mbps:.2f}".rstrip("0").rstrip(".") or "0"
+
+
+def peak_rate_table_text(entry):
+    if not isinstance(entry, dict) or normalize_traffic_counter(entry.get("rate_samples_24h")) <= 0:
+        return "-"
+    upload = format_mbit_rate(entry.get("peak_tx_bps_24h"))
+    download = format_mbit_rate(entry.get("peak_rx_bps_24h"))
+    return f"{upload} | {download} Mbit/s"
+
+
+def node_peak_rate_table_text(node):
+    entries = [
+        entry for entry in node_ip_stats(node)
+        if normalize_traffic_counter(entry.get("rate_samples_24h")) > 0
+    ]
+    if not entries:
+        return "-"
+    return peak_rate_table_text({
+        "peak_tx_bps_24h": max(normalize_network_rate(entry.get("peak_tx_bps_24h")) for entry in entries),
+        "peak_rx_bps_24h": max(normalize_network_rate(entry.get("peak_rx_bps_24h")) for entry in entries),
+        "rate_samples_24h": sum(normalize_traffic_counter(entry.get("rate_samples_24h")) for entry in entries),
+    })
+
+
 def wrong_sni_table_text(node):
     total = int(node.get("scan_wrong_sni_total") or 0)
     if total <= 0:
@@ -3851,6 +4057,7 @@ def rich_wl_rows(nodes, ts):
                 (today, "right"),
                 (yesterday, "right"),
                 (month, "right"),
+                (peak_rate_table_text(entry), "right"),
             ])
             if index == 0:
                 row.extend([
@@ -3906,7 +4113,7 @@ def aggregate_wl_rich_message():
         return "<h3>Статистика обходов</h3><p>Нет данных от машин.</p>"
     nodes.sort(key=node_natural_sort_key)
     other_nodes.sort(key=wl_other_node_sort_key)
-    headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "SNI", "Статус"]
+    headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "Пик ↑/↓ (24ч)", "SNI", "Статус"]
     parts = [
         "<h3>Статистика обходов</h3>",
         rich_table(headers, rich_wl_rows(nodes, ts), footer=rich_traffic_total_text(nodes)),
@@ -3956,29 +4163,50 @@ def remna_table_text(node):
 def rich_bl_rows(nodes, ts):
     rows = []
     for node in nodes:
-        error = clean_display_text(node.get("error") or "")
+        traffic_rows = node_ip_stats(node)
+        if not traffic_rows:
+            traffic_rows = [normalized_traffic_entry(node, node.get("iface"), node.get("ip"))]
+        rowspan = len(traffic_rows)
+        node_error = clean_display_text(node.get("error") or "")
         metrics_ok = bool(node.get("metrics_ok"))
-        if error:
-            today = "ошибка"
-            yesterday = "-"
-            month = "ошибка"
-        else:
-            today = format_bytes(node.get("day_total", 0))
-            yesterday = format_bytes(node.get("yesterday_total", 0))
-            month = format_bytes(node.get("month_total", 0))
         ram = f"{int(node.get('ram_percent', 0) or 0)}%" if metrics_ok else "-"
         cpu = format_percent(node.get("cpu_percent", 0)) if metrics_ok else "-"
-        rows.append([
-            (node_display_name(node, "unknown").replace("№", "#"), "left"),
-            (str(node.get("ip") or "-"), "left"),
-            (today, "right"),
-            (yesterday, "right"),
-            (month, "right"),
-            (ram, "right"),
-            (cpu, "right"),
-            (remna_table_text(node), "left"),
-            (node_status_text(node, ts), "center"),
-        ])
+        status = node_status_text(node, ts)
+        if status == "OK" and any(clean_display_text(entry.get("error") or "") for entry in traffic_rows):
+            status = "WARN"
+        shared = {"rowspan": rowspan, "valign": "middle"}
+        for index, entry in enumerate(traffic_rows):
+            entry_error = node_error or clean_display_text(entry.get("error") or "")
+            if entry_error:
+                today = "ошибка"
+                yesterday = "-"
+                month = "ошибка"
+            else:
+                today = format_bytes(entry.get("day_total", 0))
+                yesterday = format_bytes(entry.get("yesterday_total", 0))
+                month = format_bytes(entry.get("month_total", 0))
+            row = []
+            if index == 0:
+                row.append({
+                    **shared,
+                    "value": node_display_name(node, "unknown").replace("№", "#"),
+                    "align": "left",
+                })
+            row.extend([
+                (str(entry.get("ip") or "-"), "left"),
+                (today, "right"),
+                (yesterday, "right"),
+                (month, "right"),
+                (peak_rate_table_text(entry), "right"),
+            ])
+            if index == 0:
+                row.extend([
+                    {**shared, "value": ram, "align": "right"},
+                    {**shared, "value": cpu, "align": "right"},
+                    {**shared, "value": remna_table_text(node), "align": "left"},
+                    {**shared, "value": status, "align": "center"},
+                ])
+            rows.append(row)
     return rows
 
 
@@ -4010,7 +4238,7 @@ def bl_nodes_rich_section(group_name, group_nodes, ts=None):
     if not group_nodes:
         return f"<h4>{rich_text(group_name)}</h4><p>Нет машин в группе.</p>"
     ts = now_ts() if ts is None else int(ts)
-    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "RAM", "CPU", "Remnawave", "Статус"]
+    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "Пик ↑/↓ (24ч)", "RAM", "CPU", "Remnawave", "Статус"]
     parts = [
         f"<h4>{rich_text(group_name)}</h4>",
         rich_table(headers, rich_bl_rows(group_nodes, ts), footer=rich_traffic_total_text(group_nodes)),
@@ -6255,6 +6483,22 @@ def update_node(payload, remote_ip=""):
                 schedule_nodes_save()
             was_offline = False
         else:
+            try:
+                enrich_network_rate_stats(record_key, record["ip_stats"], old.get("ip_stats"), current)
+            except Exception as exc:
+                log(f"network rate sample failed node={record_key}: {exc}")
+                try:
+                    network_rate_db().rollback()
+                except Exception:
+                    pass
+            record["peak_rx_bps_24h"] = max(
+                (normalize_network_rate(entry.get("peak_rx_bps_24h")) for entry in record["ip_stats"]),
+                default=0,
+            )
+            record["peak_tx_bps_24h"] = max(
+                (normalize_network_rate(entry.get("peak_tx_bps_24h")) for entry in record["ip_stats"]),
+                default=0,
+            )
             was_offline = bool(old.get("offline_alerted")) and bool(old.get("offline_confirmed", True))
             if node_stats_disabled(record):
                 if was_offline:
@@ -7433,6 +7677,12 @@ def clear_collector_runtime_stats():
             db.execute(f"DELETE FROM {table}")
         db.execute("DELETE FROM ip_limit_meta WHERE key = ?", ("remna_top_alert_last",))
         save_ip_limit_state()
+
+        rate_db = network_rate_db()
+        row = rate_db.execute("SELECT COUNT(*) AS value FROM network_rate_minute").fetchone()
+        cleared["network_rate_minutes"] = int(row["value"] if row else 0)
+        rate_db.execute("DELETE FROM network_rate_minute")
+        rate_db.commit()
     return cleared
 
 
@@ -7445,6 +7695,7 @@ def clean_all_cleared_message(cleared):
         detail_line("Падения", cleared.get("falls", 0)),
         detail_line("Remnawave ноды", cleared.get("remna_nodes", 0)),
         detail_line("IP-limit runtime", ip_rows),
+        detail_line("Минутные пики скорости", cleared.get("network_rate_minutes", 0)),
         "",
         "<i>Настройки групп, rename, SNI и лимиты пользователей не трогал.</i>",
     ])
@@ -9013,6 +9264,7 @@ def main():
     if not SECRET:
         raise SystemExit("KTO_COLLECTOR_SECRET is empty")
     os.makedirs(STATE_DIR, exist_ok=True)
+    init_network_rate_db()
     load_nodes()
     load_falls()
     load_ssh_allowed_ips()
