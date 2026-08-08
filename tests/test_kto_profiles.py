@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v283"', KTO)
-        self.assertIn('PUSH_BUILD="v283"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v283"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v283"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v283"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v283"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v283"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v284"', KTO)
+        self.assertIn('PUSH_BUILD="v284"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v284"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v284"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v284"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v284"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v284"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -403,17 +403,21 @@ select_test_source_ipv4 </dev/null
         menu = function_body(KTO, "menu")
         runner = function_body(KTO, "run_btop_for_ip")
         writer = function_body(KTO, "write_btop_interface_config")
+        launcher = function_body(KTO, "run_btop_with_config")
         main = function_body(KTO, "main")
 
         self.assertIn('labels+=("btop")', menu)
         self.assertIn('actions+=("btop")', menu)
-        self.assertIn('btop) run_btop_for_ip', menu)
+        self.assertIn('btop) run_btop_for_ip || true', menu)
         self.assertIn('require_whitelist_mode', runner)
         self.assertIn('select_test_source_ipv4 "$requested_ip"', runner)
         self.assertIn('source_interface="$TEST_SOURCE_INTERFACE"', runner)
         self.assertIn('apt_install_with_update_if_missing btop', runner)
         self.assertIn('write_btop_interface_config "$user_config" "$temp_config" "$source_interface"', runner)
-        self.assertIn('btop --config "$temp_config"', runner)
+        self.assertIn('run_btop_with_config "$temp_config" "$temp_dir"', runner)
+        self.assertIn('btop --config "$config_file"', launcher)
+        self.assertIn('btop -c "$config_file"', launcher)
+        self.assertIn('XDG_CONFIG_HOME="$isolated_config_home" btop', launcher)
         self.assertIn('btop|btop-ip|monitor-ip) run_btop_for_ip "${2:-}"', main)
         self.assertIn('net_iface =', writer)
         self.assertIn('shown_boxes =', writer)
@@ -428,7 +432,8 @@ source_config=$(mktemp)
 original=$(mktemp)
 output_config=$(mktemp)
 minimal_config=$(mktemp)
-trap 'rm -f "$source_config" "$original" "$output_config" "$minimal_config"' EXIT
+events=$(mktemp)
+trap 'rm -f "$source_config" "$original" "$output_config" "$minimal_config" "$events"' EXIT
 cat > "$source_config" <<'EOF'
 color_theme = "Default"
 shown_boxes = "cpu mem proc"
@@ -446,6 +451,32 @@ write_btop_interface_config /missing/btop.conf "$minimal_config" wan3
 grep -Fqx 'shown_boxes = "cpu mem net proc"' "$minimal_config"
 grep -Fqx 'net_iface = "wan3"' "$minimal_config"
 ! write_btop_interface_config "$source_config" "$minimal_config" 'bad interface'
+
+btop() {
+    if [[ "${1:-}" == "--help" ]]; then
+        case "$btop_test_mode" in
+            long) printf '%s\n' '  -c, --config <file>  Path to config file' ;;
+            short) printf '%s\n' '  -c FILE  Path to configuration file' ;;
+            legacy) printf '%s\n' '  -h  Show help' ;;
+        esac
+        return 0
+    fi
+    printf 'arg1=%s|arg2=%s|xdg=%s\n' "${1:-}" "${2:-}" "${XDG_CONFIG_HOME:-}" >> "$events"
+}
+
+btop_test_mode=long
+run_btop_with_config /tmp/kto-btop.conf /tmp/kto-btop-xdg
+grep -Fqx 'arg1=--config|arg2=/tmp/kto-btop.conf|xdg=' "$events"
+
+: > "$events"
+btop_test_mode=short
+run_btop_with_config /tmp/kto-btop.conf /tmp/kto-btop-xdg
+grep -Fqx 'arg1=-c|arg2=/tmp/kto-btop.conf|xdg=' "$events"
+
+: > "$events"
+btop_test_mode=legacy
+run_btop_with_config /tmp/kto-btop.conf /tmp/kto-btop-xdg
+grep -Fqx 'arg1=|arg2=|xdg=/tmp/kto-btop-xdg' "$events"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -456,6 +487,7 @@ grep -Fqx 'net_iface = "wan3"' "$minimal_config"
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("regexp escape sequence", result.stderr)
 
     def test_dpi_detector_is_one_shot_hardened_and_source_routed(self):
         menu = function_body(KTO, "menu")

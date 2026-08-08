@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v283"
+SCRIPT_BUILD="v284"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -1570,8 +1570,8 @@ write_btop_interface_config() {
             /^[[:space:]]*shown_boxes[[:space:]]*=/ {
                 if (!boxes_written) {
                     line = $0
-                    if (line !~ /(^|[[:space:]\"])net([[:space:]\"]|$)/) {
-                        if (!sub(/\"[[:space:]]*$/, " net\"", line)) {
+                    if (line !~ /(^|[[:space:]"])net([[:space:]"]|$)/) {
+                        if (!sub(/"[[:space:]]*$/, " net\"", line)) {
                             line = "shown_boxes = \"cpu mem net proc\""
                         }
                     }
@@ -1600,6 +1600,19 @@ EOF
         fail "Не удалось подготовить временный btop config"
         return 1
     }
+}
+
+run_btop_with_config() {
+    local config_file="$1" isolated_config_home="$2" help_text
+
+    help_text="$(btop --help 2>&1 || true)"
+    if grep -Eq -- '(^|[[:space:],])--config([=[:space:]]|$)' <<< "$help_text"; then
+        btop --config "$config_file"
+    elif grep -Eiq -- '(^|[[:space:]])-c([,[:space:]]|$).*(config|configuration)' <<< "$help_text"; then
+        btop -c "$config_file"
+    else
+        XDG_CONFIG_HOME="$isolated_config_home" btop
+    fi
 }
 
 run_btop_for_ip() {
@@ -1634,10 +1647,11 @@ run_btop_for_ip() {
     config_home="${XDG_CONFIG_HOME:-${HOME:-/root}/.config}"
     user_config="${config_home}/btop/btop.conf"
     temp_dir="$(mktemp -d)"
-    temp_config="${temp_dir}/btop.conf"
+    mkdir -p "${temp_dir}/btop"
+    temp_config="${temp_dir}/btop/btop.conf"
     if ! write_btop_interface_config "$user_config" "$temp_config" "$source_interface"; then
         rm -f "$temp_config"
-        rmdir "$temp_dir" 2>/dev/null || true
+        rmdir "${temp_dir}/btop" "$temp_dir" 2>/dev/null || true
         return 1
     fi
 
@@ -1656,9 +1670,9 @@ run_btop_for_ip() {
     fi
     echo "Выход из btop: q"
 
-    btop --config "$temp_config" || rc=$?
+    run_btop_with_config "$temp_config" "$temp_dir" || rc=$?
     rm -f "$temp_config"
-    rmdir "$temp_dir" 2>/dev/null || true
+    rmdir "${temp_dir}/btop" "$temp_dir" 2>/dev/null || true
     if (( rc != 0 && rc != 130 )); then
         fail "btop завершился с кодом ${rc}"
         return "$rc"
@@ -9653,7 +9667,7 @@ menu() {
         speedtest-ru) speedtest_ru ;;
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
-        btop) run_btop_for_ip ;;
+        btop) run_btop_for_ip || true ;;
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
         haproxy-update) update_haproxy_existing_config ;;
