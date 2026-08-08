@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import queue
 import re
@@ -23,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v286"
+COLLECTOR_BUILD = "v287"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1393,6 +1394,17 @@ def init_network_rate_db():
             ON network_rate_minute(minute);
         CREATE INDEX IF NOT EXISTS idx_network_rate_minute_node
             ON network_rate_minute(node_key, minute);
+        CREATE TABLE IF NOT EXISTS cpu_minute (
+            node_key TEXT NOT NULL,
+            minute INTEGER NOT NULL,
+            sample_sum REAL NOT NULL DEFAULT 0,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (node_key, minute)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cpu_minute_time
+            ON cpu_minute(minute);
+        CREATE INDEX IF NOT EXISTS idx_cpu_minute_node
+            ON cpu_minute(node_key, minute);
     """)
     db.commit()
 
@@ -1943,6 +1955,16 @@ def format_percent(value):
     if value >= 10:
         return f"{value:.0f}%"
     return f"{value:.1f}%"
+
+
+def normalize_cpu_percent(value):
+    try:
+        value = float(value)
+    except Exception:
+        return 0.0
+    if not math.isfinite(value) or value < 0:
+        return 0.0
+    return min(value, 100_000.0)
 
 
 def format_age(seconds):
@@ -3435,8 +3457,17 @@ def calculate_network_rate_sample(entry, previous):
     }
 
 
-def enrich_network_rate_stats(node_key, entries, previous_entries, current):
+def purge_metric_history(db, minute):
     global NETWORK_RATE_LAST_PURGE_MINUTE
+    if NETWORK_RATE_LAST_PURGE_MINUTE == minute:
+        return
+    oldest_minute = minute - NETWORK_RATE_RETENTION_SEC + NETWORK_RATE_BUCKET_SEC
+    db.execute("DELETE FROM network_rate_minute WHERE minute < ?", (oldest_minute,))
+    db.execute("DELETE FROM cpu_minute WHERE minute < ?", (oldest_minute,))
+    NETWORK_RATE_LAST_PURGE_MINUTE = minute
+
+
+def enrich_network_rate_stats(node_key, entries, previous_entries, current):
     node_key = str(node_key or "").strip()[:200]
     if not node_key or not isinstance(entries, list):
         return entries
@@ -3486,9 +3517,7 @@ def enrich_network_rate_stats(node_key, entries, previous_entries, current):
             ),
         )
 
-    if NETWORK_RATE_LAST_PURGE_MINUTE != minute:
-        db.execute("DELETE FROM network_rate_minute WHERE minute < ?", (oldest_minute,))
-        NETWORK_RATE_LAST_PURGE_MINUTE = minute
+    purge_metric_history(db, minute)
     db.commit()
 
     peaks = {}
@@ -3509,6 +3538,35 @@ def enrich_network_rate_stats(node_key, entries, previous_entries, current):
         entry["peak_tx_bps_24h"] = normalize_network_rate(row["peak_tx_bps"] if row else 0)
         entry["rate_samples_24h"] = int(row["sample_count"] if row else 0)
     return entries
+
+
+def enrich_cpu_average(node_key, cpu_percent, metrics_ok, current):
+    node_key = str(node_key or "").strip()[:200]
+    if not node_key:
+        return 0.0, 0
+    minute = (int(current) // NETWORK_RATE_BUCKET_SEC) * NETWORK_RATE_BUCKET_SEC
+    oldest_minute = minute - NETWORK_RATE_RETENTION_SEC + NETWORK_RATE_BUCKET_SEC
+    db = network_rate_db()
+    if metrics_ok:
+        sample = normalize_cpu_percent(cpu_percent)
+        db.execute(
+            "INSERT INTO cpu_minute(node_key, minute, sample_sum, sample_count) VALUES(?, ?, ?, 1) "
+            "ON CONFLICT(node_key, minute) DO UPDATE SET "
+            "sample_sum = cpu_minute.sample_sum + excluded.sample_sum, "
+            "sample_count = cpu_minute.sample_count + 1",
+            (node_key, minute, sample),
+        )
+    purge_metric_history(db, minute)
+    db.commit()
+    row = db.execute(
+        "SELECT avg(sample_sum / sample_count) AS avg_cpu, "
+        "sum(sample_count) AS sample_count FROM cpu_minute "
+        "WHERE node_key = ? AND minute >= ? AND sample_count > 0",
+        (node_key, oldest_minute),
+    ).fetchone()
+    if not row or row["avg_cpu"] is None:
+        return 0.0, 0
+    return normalize_cpu_percent(row["avg_cpu"]), int(row["sample_count"] or 0)
 
 
 def traffic_stats_total(stats, field):
@@ -4003,6 +4061,12 @@ def node_peak_rate_table_text(node):
     })
 
 
+def cpu_average_table_text(node):
+    if not isinstance(node, dict) or int(node.get("cpu_samples_24h") or 0) <= 0:
+        return "-"
+    return format_percent(normalize_cpu_percent(node.get("cpu_avg_24h")))
+
+
 def wrong_sni_table_text(node):
     total = int(node.get("scan_wrong_sni_total") or 0)
     if total <= 0:
@@ -4032,6 +4096,7 @@ def rich_wl_rows(nodes, ts):
             traffic_rows = [normalized_traffic_entry(node, node.get("iface"), node.get("ip"))]
         rowspan = len(traffic_rows)
         node_error = clean_display_text(node.get("error") or "")
+        cpu_average = cpu_average_table_text(node)
         sni = "-" if node_error else wrong_sni_table_text(node)
         status = node_status_text(node, ts)
         if status == "OK" and any(clean_display_text(entry.get("error") or "") for entry in traffic_rows):
@@ -4066,6 +4131,7 @@ def rich_wl_rows(nodes, ts):
             ])
             if index == 0:
                 row.extend([
+                    {**shared, "value": cpu_average, "align": "right"},
                     {**shared, "value": sni, "align": "left"},
                     {**shared, "value": status, "align": "center"},
                 ])
@@ -4118,7 +4184,7 @@ def aggregate_wl_rich_message():
         return "<h3>Статистика обходов</h3><p>Нет данных от машин.</p>"
     nodes.sort(key=node_natural_sort_key)
     other_nodes.sort(key=wl_other_node_sort_key)
-    headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "Пик ↑/↓ (24ч)", "SNI", "Статус"]
+    headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "Пик ↑/↓ (24ч)", "CPU ср. (24ч)", "SNI", "Статус"]
     parts = [
         "<h3>Статистика обходов</h3>",
         rich_table(headers, rich_wl_rows(nodes, ts), footer=rich_traffic_total_text(nodes)),
@@ -4176,6 +4242,7 @@ def rich_bl_rows(nodes, ts):
         metrics_ok = bool(node.get("metrics_ok"))
         ram = f"{int(node.get('ram_percent', 0) or 0)}%" if metrics_ok else "-"
         cpu = format_percent(node.get("cpu_percent", 0)) if metrics_ok else "-"
+        cpu_average = cpu_average_table_text(node)
         status = node_status_text(node, ts)
         if status == "OK" and any(clean_display_text(entry.get("error") or "") for entry in traffic_rows):
             status = "WARN"
@@ -4208,6 +4275,7 @@ def rich_bl_rows(nodes, ts):
                 row.extend([
                     {**shared, "value": ram, "align": "right"},
                     {**shared, "value": cpu, "align": "right"},
+                    {**shared, "value": cpu_average, "align": "right"},
                     {**shared, "value": remna_table_text(node), "align": "left"},
                     {**shared, "value": status, "align": "center"},
                 ])
@@ -4243,7 +4311,7 @@ def bl_nodes_rich_section(group_name, group_nodes, ts=None):
     if not group_nodes:
         return f"<h4>{rich_text(group_name)}</h4><p>Нет машин в группе.</p>"
     ts = now_ts() if ts is None else int(ts)
-    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "Пик ↑/↓ (24ч)", "RAM", "CPU", "Remnawave", "Статус"]
+    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "Пик ↑/↓ (24ч)", "RAM", "CPU", "CPU ср. (24ч)", "Remnawave", "Статус"]
     parts = [
         f"<h4>{rich_text(group_name)}</h4>",
         rich_table(headers, rich_bl_rows(group_nodes, ts), footer=rich_traffic_total_text(group_nodes)),
@@ -6560,7 +6628,7 @@ def update_node(payload, remote_ip=""):
         "ram_total": int(payload.get("ram_total") or 0),
         "ram_used": int(payload.get("ram_used") or 0),
         "ram_percent": int(payload.get("ram_percent") or 0),
-        "cpu_percent": float(payload.get("cpu_percent") or 0),
+        "cpu_percent": normalize_cpu_percent(payload.get("cpu_percent")),
         "metrics_ok": bool(payload.get("metrics_ok")),
         "push_interval_sec": max(0, min(3600, push_interval_sec)),
         "haproxy_allowed_sni": normalize_sni_list(payload.get("haproxy_allowed_sni")),
@@ -6606,6 +6674,23 @@ def update_node(payload, remote_ip=""):
                     network_rate_db().rollback()
                 except Exception:
                     pass
+            try:
+                cpu_average, cpu_samples = enrich_cpu_average(
+                    record_key,
+                    record["cpu_percent"],
+                    record["metrics_ok"],
+                    current,
+                )
+                record["cpu_avg_24h"] = cpu_average
+                record["cpu_samples_24h"] = cpu_samples
+            except Exception as exc:
+                log(f"cpu average sample failed node={record_key}: {exc}")
+                try:
+                    network_rate_db().rollback()
+                except Exception:
+                    pass
+                record["cpu_avg_24h"] = normalize_cpu_percent(old.get("cpu_avg_24h"))
+                record["cpu_samples_24h"] = int(old.get("cpu_samples_24h") or 0)
             record["peak_rx_bps_24h"] = max(
                 (normalize_network_rate(entry.get("peak_rx_bps_24h")) for entry in record["ip_stats"]),
                 default=0,
@@ -7797,6 +7882,9 @@ def clear_collector_runtime_stats():
         row = rate_db.execute("SELECT COUNT(*) AS value FROM network_rate_minute").fetchone()
         cleared["network_rate_minutes"] = int(row["value"] if row else 0)
         rate_db.execute("DELETE FROM network_rate_minute")
+        row = rate_db.execute("SELECT COUNT(*) AS value FROM cpu_minute").fetchone()
+        cleared["cpu_minutes"] = int(row["value"] if row else 0)
+        rate_db.execute("DELETE FROM cpu_minute")
         rate_db.commit()
     return cleared
 
@@ -7811,6 +7899,7 @@ def clean_all_cleared_message(cleared):
         detail_line("Remnawave ноды", cleared.get("remna_nodes", 0)),
         detail_line("IP-limit runtime", ip_rows),
         detail_line("Минутные пики скорости", cleared.get("network_rate_minutes", 0)),
+        detail_line("Минутные CPU-семплы", cleared.get("cpu_minutes", 0)),
         "",
         "<i>Настройки групп, rename, SNI и лимиты пользователей не трогал.</i>",
     ])

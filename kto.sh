@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v286"
+SCRIPT_BUILD="v287"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -7974,6 +7974,142 @@ prepare_haproxy_multi_ip_config() {
     return 1
 }
 
+HAPROXY_PIN_WILDCARDS=0
+HAPROXY_PIN_PREVIEW=""
+
+build_haproxy_source_pinned_routes() {
+    local routes_file="$1" output_file="$2"
+    local port target_pool sni source_ip server_maxconn listen_ip target_ip key default_ip
+    local -A exact_endpoints=() emitted_endpoints=()
+
+    HAPROXY_PIN_WILDCARDS=0
+    HAPROXY_PIN_PREVIEW=""
+    default_ip="$(haproxy_default_source_ip)"
+    : > "$output_file"
+
+    while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        listen_ip="$(haproxy_route_listen_ip "$listen_ip")" || {
+            rm -f "$output_file"
+            fail "Некорректный входной IP у маршрута на порту ${port}"
+            return 1
+        }
+        [[ "$listen_ip" != "*" ]] || continue
+        key="${listen_ip}|${port}"
+        if [[ -n "${exact_endpoints[$key]+x}" ]]; then
+            rm -f "$output_file"
+            fail "В конфиге повторяется HAProxy listener ${listen_ip}:${port}"
+            return 1
+        fi
+        exact_endpoints[$key]=1
+    done < "$routes_file"
+
+    while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}" 2>/dev/null || true)"
+        server_maxconn="$(normalize_haproxy_server_maxconn "${server_maxconn:-default}" 2>/dev/null || true)"
+        listen_ip="$(haproxy_route_listen_ip "$listen_ip" 2>/dev/null || true)"
+        if [[ -z "$source_ip" || -z "$server_maxconn" || -z "$listen_ip" ]]; then
+            rm -f "$output_file"
+            fail "Некорректный HAProxy-маршрут на порту ${port}"
+            return 1
+        fi
+
+        if [[ "$listen_ip" == "*" ]]; then
+            target_ip="$source_ip"
+            [[ "$target_ip" != "default" ]] || target_ip="$default_ip"
+            if ! validate_ipv4 "$target_ip" || ! haproxy_input_ip_available "$target_ip"; then
+                rm -f "$output_file"
+                fail "Нельзя перенести *:${port}: выходной IP ${target_ip:-не определён} не найден на машине"
+                return 1
+            fi
+            key="${target_ip}|${port}"
+            if [[ -n "${exact_endpoints[$key]+x}" || -n "${emitted_endpoints[$key]+x}" ]]; then
+                rm -f "$output_file"
+                fail "Нельзя перенести *:${port}: точечный listener ${target_ip}:${port} уже существует"
+                return 1
+            fi
+            listen_ip="$target_ip"
+            HAPROXY_PIN_WILDCARDS=$(( HAPROXY_PIN_WILDCARDS + 1 ))
+            HAPROXY_PIN_PREVIEW+="${HAPROXY_PIN_PREVIEW:+$'\n'}*:${port} -> ${listen_ip}:${port}"
+        fi
+
+        key="${listen_ip}|${port}"
+        if [[ -n "${emitted_endpoints[$key]+x}" ]]; then
+            rm -f "$output_file"
+            fail "В candidate повторяется HAProxy listener ${listen_ip}:${port}"
+            return 1
+        fi
+        emitted_endpoints[$key]=1
+        print_haproxy_route "$port" "$target_pool" "$sni" \
+            "$source_ip" "$server_maxconn" "$listen_ip" >> "$output_file" || {
+            rm -f "$output_file"
+            fail "Не удалось собрать точечный маршрут ${listen_ip}:${port}"
+            return 1
+        }
+    done < "$routes_file"
+
+    [[ -s "$output_file" ]] || {
+        fail "HAProxy маршруты не найдены"
+        return 1
+    }
+}
+
+pin_haproxy_wildcards_to_source_ips() {
+    local routes_file="$1" next_file preview_file parsed_file answer
+
+    ensure_haproxy_package || return 1
+    next_file="$(mktemp)"
+    preview_file="$(mktemp)"
+    parsed_file="$(mktemp)"
+    if ! build_haproxy_source_pinned_routes "$routes_file" "$next_file"; then
+        rm -f "$next_file" "$preview_file" "$parsed_file"
+        return 1
+    fi
+    if (( HAPROXY_PIN_WILDCARDS == 0 )); then
+        rm -f "$next_file" "$preview_file" "$parsed_file"
+        ok "FULL-биндов нет: все HAProxy listener уже точечные"
+        return 0
+    fi
+    if ! render_haproxy_routes_config "$next_file" "$preview_file" ||
+        ! "${SUDO[@]}" haproxy -c -f "$preview_file" >> "$LOG_FILE" 2>&1; then
+        rm -f "$next_file" "$preview_file" "$parsed_file"
+        fail "Точечный HAProxy candidate не прошёл проверку. Текущий config не изменён."
+        return 1
+    fi
+    extract_haproxy_routes "$preview_file" > "$parsed_file"
+    if ! cmp -s "$next_file" "$parsed_file"; then
+        rm -f "$next_file" "$preview_file" "$parsed_file"
+        fail "Round-trip проверка точечного HAProxy candidate не прошла."
+        return 1
+    fi
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ FULL -> ТОЧЕЧНЫЕ БИНДЫ ]${NC}"
+    printf ' %s\n' "${HAPROXY_PIN_PREVIEW//$'\n'/$'\n '}"
+    echo
+    warn "Каждый FULL listener будет закреплён за его настроенным выходным IP."
+    warn "Перед применением создаётся backup; при ошибке запуска вернётся предыдущий config."
+    echo -ne "${YELLOW}Перенести ${HAPROXY_PIN_WILDCARDS} FULL-биндов? [y/N]:${NC} "
+    read -r answer
+    if [[ "${answer,,}" != "y" && "${answer,,}" != "yes" && "${answer,,}" != "д" && "${answer,,}" != "да" ]]; then
+        rm -f "$next_file" "$preview_file" "$parsed_file"
+        warn "Изменения отменены"
+        return 0
+    fi
+
+    if apply_haproxy_routes_config "$next_file"; then
+        sync_haproxy_firewall "$next_file" "$routes_file"
+        mv "$next_file" "$routes_file"
+        rm -f "$preview_file" "$parsed_file"
+        ok "FULL-бинды перенесены на точечные IP:порт"
+        check_haproxy_bindings "$routes_file" || true
+        return 0
+    fi
+    rm -f "$next_file" "$preview_file" "$parsed_file"
+    return 1
+}
+
 restore_haproxy_backup() {
     local routes_file="$1" choice answer selected index status current_copy current_routes restored_routes
     local -a backups=()
@@ -8111,6 +8247,7 @@ haproxy_menu() {
         echo -e "10) Проверить и подготовить config для отдельных IP:порт"
         echo -e "11) Восстановить HAProxy backup"
         echo -e "12) Проверить бинды"
+        echo -e "13) Перенести все FULL-бинды на выходные IP"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -8133,6 +8270,7 @@ haproxy_menu() {
             10) prepare_haproxy_multi_ip_config "$routes_file" || true ;;
             11) restore_haproxy_backup "$routes_file" || true ;;
             12) check_haproxy_bindings "$routes_file" || true ;;
+            13) pin_haproxy_wildcards_to_source_ips "$routes_file" || true ;;
             0)
                 rm -f "$routes_file"
                 return 0

@@ -261,7 +261,7 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertIn("185.141.227.93", rich)
         self.assertNotIn("185.141.227.94", rich)
         self.assertIn(
-            f'colspan="8"><b>Общий трафик: {collector.format_bytes(3300)}</b></td>',
+            f'colspan="9"><b>Общий трафик: {collector.format_bytes(3300)}</b></td>',
             rich,
         )
 
@@ -310,6 +310,41 @@ class CollectorRegressionTests(unittest.TestCase):
         finally:
             collector.now_ts = original_now
 
+    def test_cpu_average_uses_minute_buckets_and_rolls_over_after_24_hours(self):
+        node_uuid = str(uuid.uuid4())
+        base_time = 1_800_000_000
+        original_now = collector.now_ts
+
+        def cpu_payload(value):
+            payload = self.payload("Обход №9", node_uuid, "wl")
+            payload["cpu_percent"] = value
+            return payload
+
+        try:
+            collector.now_ts = lambda: base_time
+            first = collector.update_node(cpu_payload(20), "203.0.113.90")
+            self.assertEqual(20.0, first["cpu_avg_24h"])
+            self.assertEqual(1, first["cpu_samples_24h"])
+
+            collector.now_ts = lambda: base_time + 10
+            same_minute = collector.update_node(cpu_payload(40), "203.0.113.90")
+            self.assertEqual(30.0, same_minute["cpu_avg_24h"])
+            self.assertEqual(2, same_minute["cpu_samples_24h"])
+
+            collector.now_ts = lambda: base_time + 60
+            next_minute = collector.update_node(cpu_payload(60), "203.0.113.90")
+            self.assertEqual(45.0, next_minute["cpu_avg_24h"])
+            rich = collector.aggregate_wl_rich_message()
+            self.assertIn("CPU ср. (24ч)", rich)
+            self.assertIn("45%", rich)
+
+            collector.now_ts = lambda: base_time + collector.NETWORK_RATE_RETENTION_SEC + 61
+            expired = collector.update_node(cpu_payload(80), "203.0.113.90")
+            self.assertEqual(80.0, expired["cpu_avg_24h"])
+            self.assertEqual(1, expired["cpu_samples_24h"])
+        finally:
+            collector.now_ts = original_now
+
     def test_bl_rich_report_groups_additional_ip_rows(self):
         payload = self.payload("Германия", str(uuid.uuid4()), "bl")
         payload["ip_stats"] = [
@@ -323,7 +358,8 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertIn('valign="middle" rowspan="2">Германия</td>', rich)
         self.assertIn("203.0.113.31", rich)
         self.assertIn("203.0.113.32", rich)
-        self.assertIn('colspan="10"', rich)
+        self.assertIn("CPU ср. (24ч)", rich)
+        self.assertIn('colspan="11"', rich)
 
     def test_rich_tables_show_separate_centered_traffic_totals(self):
         exact_payload = self.payload("Обход №2", str(uuid.uuid4()), "wl")
@@ -342,15 +378,15 @@ class CollectorRegressionTests(unittest.TestCase):
 
         self.assertEqual(2, wl_rich.count("Общий трафик:"))
         self.assertIn(
-            f'align="center" colspan="8"><b>Общий трафик: {collector.format_bytes(300)}</b>',
+            f'align="center" colspan="9"><b>Общий трафик: {collector.format_bytes(300)}</b>',
             wl_rich,
         )
         self.assertIn(
-            f'align="center" colspan="8"><b>Общий трафик: {collector.format_bytes(900)}</b>',
+            f'align="center" colspan="9"><b>Общий трафик: {collector.format_bytes(900)}</b>',
             wl_rich,
         )
         self.assertIn(
-            f'align="center" colspan="10"><b>Общий трафик: {collector.format_bytes(3000)}</b>',
+            f'align="center" colspan="11"><b>Общий трафик: {collector.format_bytes(3000)}</b>',
             bl_rich,
         )
         self.assertNotIn("Объем трафика:", wl_rich + bl_rich)

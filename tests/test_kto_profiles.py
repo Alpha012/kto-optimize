@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v286"', KTO)
-        self.assertIn('PUSH_BUILD="v286"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v286"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v286"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v286"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v286"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v286"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v287"', KTO)
+        self.assertIn('PUSH_BUILD="v287"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v287"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v287"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v287"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v287"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v287"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -1048,12 +1048,14 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('10) Проверить и подготовить config для отдельных IP:порт', haproxy_menu)
         self.assertIn('11) Восстановить HAProxy backup', haproxy_menu)
         self.assertIn('12) Проверить бинды', haproxy_menu)
+        self.assertIn('13) Перенести все FULL-бинды на выходные IP', haproxy_menu)
         self.assertIn('add_haproxy_source_route "$routes_file"', haproxy_menu)
         self.assertIn('replace_all_haproxy_sni "$routes_file"', haproxy_menu)
         self.assertIn('haproxy_bandwidth_menu', haproxy_menu)
         self.assertIn('prepare_haproxy_multi_ip_config "$routes_file"', haproxy_menu)
         self.assertIn('restore_haproxy_backup "$routes_file"', haproxy_menu)
         self.assertIn('check_haproxy_bindings "$routes_file"', haproxy_menu)
+        self.assertIn('pin_haproxy_wildcards_to_source_ips "$routes_file"', haproxy_menu)
         self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
 
     def test_haproxy_route_list_uses_compact_input_backend_sni_format(self):
@@ -2124,6 +2126,66 @@ cmp -s "$routes" "$applied"
 [[ "$HAPROXY_PREPARE_ROUTES_AFTER" == 2 ]]
 printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n443\t5.34.179.144:443\tother.example.com\tdefault\tdefault\t217.19.122.48\n' > "$conflict"
 ! build_haproxy_multi_ip_routes "$conflict" "$conflict_out"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_full_binds_pin_to_each_route_source_ip_transactionally(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+root=$(mktemp -d)
+routes="$root/routes"
+snapshot="$root/snapshot"
+candidate="$root/candidate"
+applied="$root/applied"
+config="$root/haproxy.cfg"
+collision="$root/collision"
+collision_out="$root/collision.out"
+trap 'rm -rf "$root"' EXIT
+LOG_FILE="$root/kto.log"
+HAPROXY_CONFIG_FILE="$config"
+printf '443\t144.31.128.40:443\tbase.example.com\tdefault\n8443\t5.34.179.144:443\tbridge.example.com\t217.19.122.48\t10000\n8444\t5.34.179.145:443\texact.example.com\t185.141.227.93\tdefault\t185.141.227.93\n' > "$routes"
+cp "$routes" "$snapshot"
+haproxy_default_source_ip() { printf '78.159.250.112\n'; }
+list_haproxy_input_ips() {
+    printf '78.159.250.112\tens3\n217.19.122.48\twan2\n185.141.227.93\twan3\n'
+}
+ensure_haproxy_package() { return 0; }
+haproxy() { return 0; }
+apply_haproxy_routes_config() { cp "$1" "$applied"; return 0; }
+sync_haproxy_firewall() { return 0; }
+check_haproxy_bindings() { return 0; }
+
+build_haproxy_source_pinned_routes "$routes" "$candidate"
+grep -Fqx $'443\t144.31.128.40:443\tbase.example.com\tdefault\tdefault\t78.159.250.112' "$candidate"
+grep -Fqx $'8443\t5.34.179.144:443\tbridge.example.com\t217.19.122.48\t10000\t217.19.122.48' "$candidate"
+grep -Fqx $'8444\t5.34.179.145:443\texact.example.com\t185.141.227.93\tdefault\t185.141.227.93' "$candidate"
+[[ "$HAPROXY_PIN_WILDCARDS" == 2 ]]
+grep -Fq '*:443 -> 78.159.250.112:443' <<< "$HAPROXY_PIN_PREVIEW"
+grep -Fq '*:8443 -> 217.19.122.48:8443' <<< "$HAPROXY_PIN_PREVIEW"
+
+pin_haproxy_wildcards_to_source_ips "$routes" <<< 'n'
+cmp -s "$routes" "$snapshot"
+[[ ! -e "$applied" ]]
+pin_haproxy_wildcards_to_source_ips "$routes" <<< 'y'
+cmp -s "$routes" "$applied"
+grep -Fqx $'443\t144.31.128.40:443\tbase.example.com\tdefault\tdefault\t78.159.250.112' "$routes"
+grep -Fqx $'8443\t5.34.179.144:443\tbridge.example.com\t217.19.122.48\t10000\t217.19.122.48' "$routes"
+
+printf '443\t144.31.128.40:443\tbase.example.com\tdefault\n443\t5.34.179.144:443\texact.example.com\tdefault\tdefault\t78.159.250.112\n' > "$collision"
+! build_haproxy_source_pinned_routes "$collision" "$collision_out"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
