@@ -32,6 +32,11 @@ class CollectorRegressionTests(unittest.TestCase):
         self.state = tempfile.TemporaryDirectory()
         collector.STATE_DIR = self.state.name
         collector.NODES_FILE = os.path.join(self.state.name, "nodes.json")
+        collector.FALLS_FILE = os.path.join(self.state.name, "falls.json")
+        collector.SNI_ALLOW_FILE = os.path.join(self.state.name, "sni_allow.json")
+        collector.NODE_NAMES_FILE = os.path.join(self.state.name, "node_names.json")
+        collector.BL_GROUPS_FILE = os.path.join(self.state.name, "bl_groups.json")
+        collector.IP_LIMIT_FILE = os.path.join(self.state.name, "ip_limit.json")
         collector.UPDATE_STATE_FILE = os.path.join(self.state.name, "update_state.json")
         collector.ALERTS_OFF_FILE = os.path.join(self.state.name, "connection_alerts_off.json")
         collector.IP_LIMIT_DB_FILE = os.path.join(self.state.name, "ip_limit.sqlite")
@@ -99,6 +104,54 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.update_node(self.payload("Тест", first, "bl"), "203.0.113.30")
         collector.update_node(self.payload("Тест", second, "bl"), "203.0.113.30")
         self.assertEqual(2, len(collector.NODES))
+
+    def test_rename_is_scoped_by_uuid_and_repairs_shared_hostname_leak(self):
+        identities = [
+            ("Обход №1", str(uuid.uuid4()), "203.0.113.31"),
+            ("Обход №2", str(uuid.uuid4()), "203.0.113.32"),
+            ("Обход №3", str(uuid.uuid4()), "203.0.113.33"),
+        ]
+        for name, node_uuid, address in identities:
+            payload = self.payload(name, node_uuid, "wl")
+            payload["hostname"] = "kto"
+            collector.update_node(payload, address)
+
+        first = collector.find_node("Обход №1")
+        collector.set_node_name_override(first, "Обход №10")
+        self.assertEqual("Обход №10", collector.node_display_name(collector.find_node("Обход №1")))
+        self.assertEqual("Обход №2", collector.node_display_name(collector.find_node("Обход №2")))
+        self.assertEqual("Обход №3", collector.node_display_name(collector.find_node("Обход №3")))
+
+        first_state = next(iter(collector.NODE_NAME_STATE["nodes"].values()))
+        first_state["aliases"].extend(["kto", "Обход №2"])
+        collector.save_node_name_state()
+        collector.NODE_NAME_STATE = {"nodes": {}, "pending": {}}
+        collector.load_node_name_state()
+        loaded_aliases = next(iter(collector.NODE_NAME_STATE["nodes"].values()))["aliases"]
+        self.assertNotIn("kto", loaded_aliases)
+        self.assertNotIn(collector.canonical_node_key("Обход №2"), loaded_aliases)
+
+        second = collector.find_node("Обход №2")
+        collector.set_node_name_override(second, "Обход №20")
+        self.assertEqual(2, len(collector.NODE_NAME_STATE["nodes"]))
+        self.assertEqual("Обход №10", collector.node_display_name(collector.find_node("Обход №1")))
+        self.assertEqual("Обход №20", collector.node_display_name(collector.find_node("Обход №2")))
+        self.assertEqual("Обход №3", collector.node_display_name(collector.find_node("Обход №3")))
+
+        leaked = self.payload("Обход №10", identities[2][1], "wl")
+        leaked["id"] = "Обход №3"
+        leaked["hostname"] = "kto"
+        repaired = collector.update_node(leaked, identities[2][2])
+        self.assertEqual("Обход №3", repaired["name"])
+        self.assertEqual("Обход №3", collector.node_name_sync_value(repaired, "Обход №10"))
+
+        repaired["name"] = "Обход №20"
+        self.assertEqual(1, collector.repair_loaded_node_names())
+        self.assertEqual("Обход №3", repaired["name"])
+
+        rich = collector.aggregate_wl_rich_message()
+        for name in ("Обход #10", "Обход #20", "Обход #3"):
+            self.assertEqual(1, rich.count(name))
 
     def test_nodes_state_recovers_from_last_valid_backup(self):
         collector.NODES = {"first": {"name": "Первая"}}

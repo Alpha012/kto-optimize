@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v285"
+COLLECTOR_BUILD = "v286"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -686,6 +686,11 @@ def load_node_name_state():
                 alias = canonical_node_key(alias)
                 if alias and alias != name_key:
                     aliases.add(alias)
+            key_uuid = normalize_node_uuid(key[5:]) if key.casefold().startswith("uuid_") else ""
+            if key_uuid:
+                # Old builds stored hostname/name aliases beside UUID. Shared
+                # hostnames made a single rename apply to unrelated machines.
+                aliases = {target}
             aliases.discard("")
             clean_item = {
                 "name": name,
@@ -3807,7 +3812,7 @@ def live_node_count(nodes, ts):
 def node_sort_text(node):
     if not isinstance(node, dict):
         return ""
-    return clean_display_text(node.get("name") or node.get("id") or node.get("hostname") or "")
+    return node_display_name(node, "")
 
 
 def node_natural_sort_key(node):
@@ -4289,19 +4294,55 @@ def node_base_aliases(node):
     return aliases
 
 
+def node_name_identity_aliases(node):
+    if not isinstance(node, dict):
+        return node_base_aliases(node)
+    node_uuid = normalize_node_uuid(node.get("node_uuid"))
+    if not node_uuid:
+        return node_base_aliases(node)
+    return {
+        canonical_node_key(node_uuid),
+        canonical_node_key(f"uuid_{node_uuid}"),
+    }
+
+
+def node_name_state_target(key, item):
+    if isinstance(item, dict):
+        return canonical_node_key(item.get("target") or key)
+    return canonical_node_key(key)
+
+
+def exact_node_name_override_unlocked(node):
+    target = canonical_node_key(node_record_key(node))
+    if not target:
+        return ""
+    matches = []
+    for key, item in NODE_NAME_STATE.setdefault("nodes", {}).items():
+        if not isinstance(item, dict):
+            continue
+        if target not in (node_name_state_target(key, item), canonical_node_key(key)):
+            continue
+        name = clean_display_text(item.get("name") or "")
+        if name:
+            matches.append((int(item.get("updated_at") or 0), name))
+    if not matches:
+        return ""
+    return max(matches, key=lambda row: row[0])[1]
+
+
 def node_name_override_for_node(node):
     aliases = node_base_aliases(node)
     if not aliases:
         return ""
-    target = canonical_node_key(node_record_key(node))
     with LOCK:
         nodes = NODE_NAME_STATE.setdefault("nodes", {})
-        if target:
-            for item in nodes.values():
-                if isinstance(item, dict) and canonical_node_key(item.get("target") or "") == target:
-                    name = clean_display_text(item.get("name") or "")
-                    if name:
-                        return name
+        exact = exact_node_name_override_unlocked(node)
+        if exact:
+            return exact
+        # UUID is the authoritative identity. Falling back to hostname/name here
+        # lets one common hostname (for example "kto") rename every modern node.
+        if isinstance(node, dict) and normalize_node_uuid(node.get("node_uuid")):
+            return ""
         for key in aliases:
             item = nodes.get(key)
             if isinstance(item, dict):
@@ -4321,11 +4362,60 @@ def node_name_override_for_node(node):
     return ""
 
 
+def node_name_recovery_value(node, reported_name=None):
+    if not isinstance(node, dict) or not normalize_node_uuid(node.get("node_uuid")):
+        return ""
+    if node_name_override_for_node(node):
+        return ""
+    reported = clean_display_text(node.get("name") if reported_name is None else reported_name)
+    reported_key = canonical_node_key(reported)
+    if not reported_key:
+        return ""
+    target = canonical_node_key(node_record_key(node))
+    foreign_override = False
+    with LOCK:
+        for key, item in NODE_NAME_STATE.setdefault("nodes", {}).items():
+            if not isinstance(item, dict) or canonical_node_key(item.get("name") or "") != reported_key:
+                continue
+            if target not in (node_name_state_target(key, item), canonical_node_key(key)):
+                foreign_override = True
+                break
+    if not foreign_override:
+        return ""
+    for field in ("id", "hostname"):
+        candidate = clean_display_text(node.get(field) or "")[:120]
+        candidate_key = canonical_node_key(candidate)
+        if candidate_key and candidate_key != reported_key and candidate_key not in ("unknown", "localhost", "none", "null"):
+            return candidate
+    return ""
+
+
+def node_name_sync_value(node, reported_name=None):
+    return node_name_override_for_node(node) or node_name_recovery_value(node, reported_name)
+
+
 def node_display_name(node, fallback="unknown"):
-    override = node_name_override_for_node(node)
-    if override:
-        return override
+    synced_name = node_name_sync_value(node)
+    if synced_name:
+        return synced_name
     return clean_display_text(node.get("name") or node.get("id") or node.get("hostname") or fallback)
+
+
+def repair_loaded_node_names():
+    repaired = 0
+    with LOCK:
+        for node in NODES.values():
+            if not isinstance(node, dict):
+                continue
+            recovered = node_name_recovery_value(node)
+            if recovered and recovered != clean_display_text(node.get("name") or ""):
+                node["name"] = recovered
+                repaired += 1
+        if repaired:
+            save_nodes()
+    if repaired:
+        log(f"repaired leaked rename on {repaired} node(s)")
+    return repaired
 
 
 def node_display_ip(node):
@@ -4778,27 +4868,45 @@ def set_node_name_override(node, new_name):
     new_name = normalize_node_name(new_name)
     old_aliases = node_base_aliases(node)
     old_key = node_record_key(node) or node_canonical_key(node)
+    previous_name = node_display_name(node, old_key)
     new_key = canonical_node_key(new_name)
     if not old_key or not new_key:
         raise ValueError("empty node key")
-    aliases = set(old_aliases)
-    aliases.add(canonical_node_key(old_key))
+    target_key = canonical_node_key(old_key)
+    stable_identity = node_name_identity_aliases(node)
+    node_uuid = normalize_node_uuid(node.get("node_uuid"))
+    aliases = set(stable_identity if node_uuid else old_aliases)
+    if node_uuid:
+        for value in (node.get("id"), node.get("name"), previous_name):
+            alias = canonical_node_key(value)
+            if alias:
+                aliases.add(alias)
+    aliases.add(target_key)
     aliases.discard(new_key)
+    stored_aliases = set(stable_identity if node_uuid else aliases)
+    stored_aliases.discard(new_key)
     with LOCK:
         for key, item in list(NODE_NAME_STATE.setdefault("nodes", {}).items()):
             item_aliases = {canonical_node_key(value) for value in (item.get("aliases") or [])} if isinstance(item, dict) else {canonical_node_key(key)}
-            if aliases.intersection(item_aliases) or canonical_node_key(key) in aliases or (isinstance(item, dict) and canonical_node_key(item.get("target") or "") == canonical_node_key(old_key)):
+            same_target = target_key in (node_name_state_target(key, item), canonical_node_key(key))
+            legacy_match = not node_uuid and (
+                aliases.intersection(item_aliases) or canonical_node_key(key) in aliases
+            )
+            if same_target or legacy_match:
                 NODE_NAME_STATE["nodes"].pop(key, None)
         NODE_NAME_STATE.setdefault("nodes", {})[old_key] = {
             "name": new_name,
-            "aliases": sorted(aliases, key=natural_sort_key),
-            "target": canonical_node_key(old_key),
+            "aliases": sorted(stored_aliases, key=natural_sort_key),
+            "target": target_key,
             "updated_at": now_ts(),
         }
         save_node_name_state()
 
         for key, item in SNI_STATE.setdefault("nodes", {}).items():
-            if isinstance(item, dict) and (canonical_node_key(key) in aliases or canonical_node_key(item.get("name")) in aliases):
+            if isinstance(item, dict) and (
+                canonical_node_key(key) in {canonical_node_key(node.get("name")), canonical_node_key(node.get("id"))}
+                or canonical_node_key(item.get("name")) == canonical_node_key(previous_name)
+            ):
                 item["name"] = new_name[:120]
         save_sni_state()
 
@@ -6408,9 +6516,16 @@ def update_node(payload, remote_ip=""):
     node_kind = str(payload.get("node_kind") or "").strip().lower()
     if node_kind not in ("wl", "bl"):
         node_kind = ""
-    override_name = node_name_override_for_node({"id": raw_id, "name": node_name, "hostname": hostname_value, "ip": remote_ip_value})
-    if override_name:
-        node_name = override_name
+    identity = {
+        "id": raw_id,
+        "name": node_name,
+        "node_uuid": node_uuid,
+        "hostname": hostname_value,
+        "ip": remote_ip_value,
+    }
+    synced_name = node_name_sync_value(identity, node_name)
+    if synced_name:
+        node_name = synced_name
     if not node_id:
         raise ValueError("id/name is required")
     current = now_ts()
@@ -6682,9 +6797,9 @@ class Handler(BaseHTTPRequestHandler):
             haproxy_target = haproxy_target_override_for_node(node)
             if haproxy_target:
                 response["haproxy_target"] = haproxy_target
-            node_name_override = node_name_override_for_node(node)
-            if node_name_override:
-                response["node_name"] = node_name_override
+            node_name_sync = node_name_sync_value(node, payload.get("name"))
+            if node_name_sync:
+                response["node_name"] = node_name_sync
             desired_interval = desired_push_interval_sec(node)
             if desired_interval > 0:
                 response["push_interval_sec"] = desired_interval
@@ -9270,6 +9385,7 @@ def main():
     load_ssh_allowed_ips()
     load_sni_state()
     load_node_name_state()
+    repair_loaded_node_names()
     load_bl_group_state()
     load_stats_off_state()
     load_alerts_off_state()
