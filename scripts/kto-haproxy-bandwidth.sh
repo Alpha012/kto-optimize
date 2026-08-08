@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-HAPROXY_BANDWIDTH_BUILD="v284"
+HAPROXY_BANDWIDTH_BUILD="v285"
 LIMITS_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
 HAPROXY_CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 STATE_FILE="${KTO_HAPROXY_BANDWIDTH_STATE:-/run/kto-haproxy-bandwidth.state}"

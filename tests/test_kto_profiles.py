@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v284"', KTO)
-        self.assertIn('PUSH_BUILD="v284"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v284"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v284"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v284"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v284"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v284"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v285"', KTO)
+        self.assertIn('PUSH_BUILD="v285"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v285"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v285"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v285"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v285"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v285"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -1068,10 +1068,9 @@ trap 'rm -f "$routes"' EXIT
 printf '443\t144.31.128.40:443\t*.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\tbridge.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
 haproxy_default_source_ip() { printf '78.159.245.250\n'; }
 output=$(print_haproxy_routes "$routes")
-grep -Fq '78.159.245.250:443 -> 144.31.128.40:443 | SNI: *.rog-self.co.uk' <<< "$output"
-grep -Fq '217.19.122.48:8443 -> 5.34.179.144:443 | SNI: bridge.example.com' <<< "$output"
+grep -Fq '*:443 -> 144.31.128.40:443 | SNI: *.rog-self.co.uk | Выход: 78.159.245.250 (default)' <<< "$output"
+grep -Fq '217.19.122.48:8443 -> 5.34.179.144:443 | SNI: bridge.example.com | Выход: 217.19.122.48' <<< "$output"
 ! grep -Fq 'Вход:' <<< "$output"
-! grep -Fq 'Выход:' <<< "$output"
 ! grep -Fq '/tcp' <<< "$output"
 '''
         result = subprocess.run(
@@ -1962,6 +1961,51 @@ fi
 cmp -s "$routes" "$routes.before"
 grep -q 'Нельзя удалить последний HAProxy-маршрут' "$output"
 rm -f "$routes.before"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_pool_cli_supports_exact_listener_and_wildcard_migration(self):
+        cli = function_body(KTO, "set_haproxy_pool_route_cli")
+        migration = function_body(KTO, "retarget_haproxy_wildcard_route")
+
+        self.assertIn("[--listen-ip IP]", cli)
+        self.assertIn('--listen-ip)', cli)
+        self.assertIn('--listen-ip=*)', cli)
+        self.assertIn(
+            'retarget_haproxy_wildcard_route "$routes_file" "$port" "$listen_ip"',
+            cli,
+        )
+        self.assertIn('"$server_maxconn" "$target_pool" "$listen_ip"', cli)
+        self.assertIn('current_listen="$listen_ip"', migration)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+config=$(mktemp)
+trap 'rm -f "$routes" "$config"' EXIT
+pool='31.59.140.66:7443,31.77.154.79:7443'
+printf '443\t144.31.128.40:443\t*.rog-self.co.uk\tdefault\n9449\t%s\tdex-yandex.sbs *.dex-yandex.sbs\t78.159.240.211\t10000\n' "$pool" > "$routes"
+before_443=$(grep $'^443\t' "$routes")
+retarget_haproxy_wildcard_route "$routes" 9449 78.159.240.211
+[[ "$(grep $'^443\t' "$routes")" == "$before_443" ]]
+grep -Fqx $'9449\t31.59.140.66:7443,31.77.154.79:7443\tdex-yandex.sbs *.dex-yandex.sbs\t78.159.240.211\t10000\t78.159.240.211' "$routes"
+! haproxy_route_file_has_endpoint "$routes" 9449 '*'
+haproxy_route_file_has_endpoint "$routes" 9449 78.159.240.211
+render_haproxy_routes_config "$routes" "$config"
+grep -Fqx '    bind 78.159.240.211:9449 backlog 65535' "$config"
+grep -Fqx '    server xray1 31.59.140.66:7443 check weight 10 maxconn 10000 source 78.159.240.211' "$config"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

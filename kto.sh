@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v284"
+SCRIPT_BUILD="v285"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -6855,24 +6855,20 @@ configure_haproxy_backend() {
 
 print_haproxy_routes() {
     local routes_file="$1" port target_pool sni source_ip server_maxconn listen_ip
-    local default_ip display_ip target_label pool_count
-    default_ip="$(haproxy_default_source_ip)"
+    local source_label target_label pool_count
     echo -e "${BOLD}${PURPLE}[ МАРШРУТЫ ]${NC}"
     while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip; do
         [[ -n "$port" ]] || continue
         listen_ip="$(haproxy_route_listen_ip "$listen_ip")"
-        display_ip="$listen_ip"
-        if [[ "$listen_ip" == "*" ]] && validate_ipv4 "$default_ip"; then
-            display_ip="$default_ip"
-        fi
+        source_label="$(haproxy_source_label "${source_ip:-default}")"
         pool_count="$(haproxy_target_pool_count "$target_pool" 2>/dev/null || printf '0')"
         if (( pool_count > 1 )); then
             target_label="пул: ${pool_count} backend"
         else
             target_label="$target_pool"
         fi
-        printf ' %s:%s -> %s | SNI: %s\n' \
-            "$display_ip" "$port" "$target_label" "$sni"
+        printf ' %s:%s -> %s | SNI: %s | Выход: %s\n' \
+            "$listen_ip" "$port" "$target_label" "$sni" "$source_label"
     done < "$routes_file"
 }
 
@@ -7256,6 +7252,41 @@ set_haproxy_pool_route() {
     return 1
 }
 
+retarget_haproxy_wildcard_route() {
+    local routes_file="$1" port="$2" listen_ip="$3"
+    local current_port current_pool current_sni current_source current_maxconn current_listen
+    local next_file moved=0
+
+    listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
+    [[ -n "$listen_ip" && "$listen_ip" != "*" ]] || {
+        fail "Для переноса wildcard нужен конкретный входной IP"
+        return 1
+    }
+    if haproxy_route_file_has_endpoint "$routes_file" "$port" "$listen_ip"; then
+        fail "Маршрут ${listen_ip}:${port} уже существует"
+        return 1
+    fi
+
+    next_file="$(mktemp)"
+    while IFS=$'\t' read -r current_port current_pool current_sni current_source current_maxconn current_listen; do
+        [[ -n "$current_port" ]] || continue
+        current_listen="$(haproxy_route_listen_ip "$current_listen")"
+        if [[ "$current_port" == "$port" && "$current_listen" == "*" ]]; then
+            current_listen="$listen_ip"
+            moved=1
+        fi
+        print_haproxy_route "$current_port" "$current_pool" "$current_sni" \
+            "${current_source:-default}" "${current_maxconn:-default}" "$current_listen" >> "$next_file"
+    done < "$routes_file"
+
+    if (( moved == 0 )); then
+        rm -f "$next_file"
+        return 0
+    fi
+    mv "$next_file" "$routes_file"
+    stage "Переношу wildcard *:${port} на ${listen_ip}:${port}"
+}
+
 add_haproxy_pool_route() {
     local routes_file="$1" listen_ip default_port port source_ip allowed_sni server_maxconn raw_targets target_pool
 
@@ -7282,13 +7313,40 @@ set_haproxy_pool_route_cli() {
     require_haproxy_mode
     need_root
     local port="${1:-}" source_ip="${2:-}" allowed_sni="${3:-}" server_maxconn="${4:-}"
-    local routes_file target target_pool=""
-    shift $(( $# >= 4 ? 4 : $# ))
+    local routes_file target target_pool="" listen_ip="*" normalized_listen_ip
+    local listen_ip_explicit=0
 
-    if [[ -z "$port" || -z "$source_ip" || -z "$allowed_sni" || -z "$server_maxconn" || $# -lt 2 ]]; then
-        fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI MAXCONN BACKEND1 BACKEND2 [...]"
+    if (( $# < 4 )) || [[ -z "$port" || -z "$source_ip" || -z "$allowed_sni" || -z "$server_maxconn" ]]; then
+        fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI MAXCONN [--listen-ip IP] BACKEND1 BACKEND2 [...]"
         return 1
     fi
+    shift 4
+    case "${1:-}" in
+        --listen-ip)
+            (( $# >= 2 )) || {
+                fail "После --listen-ip нужен конкретный локальный IPv4"
+                return 1
+            }
+            listen_ip="$2"
+            listen_ip_explicit=1
+            shift 2
+            ;;
+        --listen-ip=*)
+            listen_ip="${1#*=}"
+            listen_ip_explicit=1
+            shift
+            ;;
+    esac
+    if (( $# < 2 )); then
+        fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI MAXCONN [--listen-ip IP] BACKEND1 BACKEND2 [...]"
+        return 1
+    fi
+    normalized_listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
+    [[ -n "$normalized_listen_ip" ]] || {
+        fail "Некорректный входной IP HAProxy: ${listen_ip:-пусто}"
+        return 1
+    }
+    listen_ip="$normalized_listen_ip"
     for target in "$@"; do
         target_pool+="${target_pool:+,}${target}"
     done
@@ -7304,7 +7362,15 @@ set_haproxy_pool_route_cli() {
         fail "Текущий HAProxy config не распознан. Конфиг не изменён."
         return 1
     fi
-    if set_haproxy_pool_route "$routes_file" "$port" "$source_ip" "$allowed_sni" "$server_maxconn" "$target_pool"; then
+    if (( listen_ip_explicit == 1 )) && [[ "$listen_ip" != "*" ]] &&
+        haproxy_route_file_has_endpoint "$routes_file" "$port" "*"; then
+        if ! retarget_haproxy_wildcard_route "$routes_file" "$port" "$listen_ip"; then
+            rm -f "$routes_file"
+            return 1
+        fi
+    fi
+    if set_haproxy_pool_route "$routes_file" "$port" "$source_ip" "$allowed_sni" \
+        "$server_maxconn" "$target_pool" "$listen_ip"; then
         rm -f "$routes_file"
         return 0
     fi
