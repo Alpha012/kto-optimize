@@ -260,9 +260,25 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertIn("217.19.122.109", rich)
         self.assertIn("185.141.227.93", rich)
         self.assertNotIn("185.141.227.94", rich)
+        self.assertLess(rich.index("185.141.227.93"), rich.index("217.19.122.109"))
         self.assertIn(
             f'colspan="9"><b>Общий трафик: {collector.format_bytes(3300)}</b></td>',
             rich,
+        )
+
+    def test_ip_rows_sort_by_today_then_month_then_yesterday_traffic(self):
+        node = {
+            "ip_stats": [
+                {"iface": "wan1", "ip": "203.0.113.10", "day_total": 100, "month_total": 100, "yesterday_total": 500},
+                {"iface": "wan2", "ip": "203.0.113.11", "day_total": 100, "month_total": 200, "yesterday_total": 100},
+                {"iface": "wan3", "ip": "203.0.113.12", "day_total": 200, "month_total": 50, "yesterday_total": 50},
+                {"iface": "wan4", "ip": "203.0.113.13", "day_total": 0, "month_total": 900, "yesterday_total": 900},
+            ]
+        }
+        ordered = [entry["ip"] for entry in collector.node_ip_stats_by_traffic(node)]
+        self.assertEqual(
+            ["203.0.113.12", "203.0.113.11", "203.0.113.10", "203.0.113.13"],
+            ordered,
         )
 
     def test_network_peak_is_per_ip_and_rolls_over_after_24_hours(self):
@@ -358,6 +374,7 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertIn('valign="middle" rowspan="2">Германия</td>', rich)
         self.assertIn("203.0.113.31", rich)
         self.assertIn("203.0.113.32", rich)
+        self.assertLess(rich.index("203.0.113.32"), rich.index("203.0.113.31"))
         self.assertIn("CPU ср. (24ч)", rich)
         self.assertIn('colspan="11"', rich)
 

@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v287"
+COLLECTOR_BUILD = "v288"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3424,6 +3424,19 @@ def node_ip_stats(node):
     return normalize_ip_stats(node.get("ip_stats"), node.get("ip"), node.get("iface"), node)
 
 
+def node_ip_stats_by_traffic(node):
+    return sorted(
+        node_ip_stats(node),
+        key=lambda entry: (
+            -normalize_traffic_counter(entry.get("day_total")),
+            -normalize_traffic_counter(entry.get("month_total")),
+            -normalize_traffic_counter(entry.get("yesterday_total")),
+            natural_sort_key(entry.get("iface") or ""),
+            natural_sort_key(entry.get("ip") or ""),
+        ),
+    )
+
+
 def network_rate_series_key(entry):
     if not isinstance(entry, dict):
         return ""
@@ -4091,7 +4104,7 @@ def node_status_text(node, ts):
 def rich_wl_rows(nodes, ts):
     rows = []
     for node in nodes:
-        traffic_rows = node_ip_stats(node)
+        traffic_rows = node_ip_stats_by_traffic(node)
         if not traffic_rows:
             traffic_rows = [normalized_traffic_entry(node, node.get("iface"), node.get("ip"))]
         rowspan = len(traffic_rows)
@@ -4234,7 +4247,7 @@ def remna_table_text(node):
 def rich_bl_rows(nodes, ts):
     rows = []
     for node in nodes:
-        traffic_rows = node_ip_stats(node)
+        traffic_rows = node_ip_stats_by_traffic(node)
         if not traffic_rows:
             traffic_rows = [normalized_traffic_entry(node, node.get("iface"), node.get("ip"))]
         rowspan = len(traffic_rows)
