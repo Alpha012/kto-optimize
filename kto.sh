@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v282"
+SCRIPT_BUILD="v283"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -1546,6 +1546,124 @@ select_test_source_ipv4() {
         fi
         fail "Неверный выбор"
     done
+}
+
+write_btop_interface_config() {
+    local source_config="$1" output_config="$2" interface="$3"
+
+    if [[ ! "$interface" =~ ^[[:alnum:]_.:-]{1,15}$ ]]; then
+        fail "Некорректное имя сетевого интерфейса: ${interface:-пусто}"
+        return 1
+    fi
+
+    if [[ -r "$source_config" && -s "$source_config" ]]; then
+        awk -v interface="$interface" '
+            BEGIN {
+                iface_written = 0
+                boxes_written = 0
+            }
+            /^[[:space:]]*net_iface[[:space:]]*=/ {
+                if (!iface_written) print "net_iface = \"" interface "\""
+                iface_written = 1
+                next
+            }
+            /^[[:space:]]*shown_boxes[[:space:]]*=/ {
+                if (!boxes_written) {
+                    line = $0
+                    if (line !~ /(^|[[:space:]\"])net([[:space:]\"]|$)/) {
+                        if (!sub(/\"[[:space:]]*$/, " net\"", line)) {
+                            line = "shown_boxes = \"cpu mem net proc\""
+                        }
+                    }
+                    print line
+                }
+                boxes_written = 1
+                next
+            }
+            { print }
+            END {
+                if (!boxes_written) print "shown_boxes = \"cpu mem net proc\""
+                if (!iface_written) print "net_iface = \"" interface "\""
+            }
+        ' "$source_config" > "$output_config"
+    else
+        cat > "$output_config" <<EOF
+# Temporary kto btop config. The user's btop config is not modified.
+shown_boxes = "cpu mem net proc"
+net_iface = "${interface}"
+net_auto = true
+net_sync = true
+EOF
+    fi
+
+    [[ -s "$output_config" ]] || {
+        fail "Не удалось подготовить временный btop config"
+        return 1
+    }
+}
+
+run_btop_for_ip() {
+    header
+    require_whitelist_mode
+    need_root
+    local requested_ip="${1:-}" source_ip source_interface config_home user_config
+    local temp_dir temp_config rc=0 interface_ips interface_ip_count
+
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        fail "btop нужно запускать из интерактивного терминала"
+        return 1
+    fi
+    select_test_source_ipv4 "$requested_ip" || return 1
+    source_ip="$TEST_SOURCE_IP"
+    source_interface="$TEST_SOURCE_INTERFACE"
+    if [[ ! "$source_interface" =~ ^[[:alnum:]_.:-]{1,15}$ ]] ||
+        ! ip link show dev "$source_interface" >/dev/null 2>&1; then
+        fail "Интерфейс ${source_interface:-пусто} для IP ${source_ip} больше не доступен"
+        return 1
+    fi
+
+    if ! command_exists btop; then
+        stage "Устанавливаю btop"
+        must "Установка btop" apt_install_with_update_if_missing btop || return 1
+    fi
+    command_exists btop || {
+        fail "btop установлен, но команда не найдена в PATH"
+        return 1
+    }
+
+    config_home="${XDG_CONFIG_HOME:-${HOME:-/root}/.config}"
+    user_config="${config_home}/btop/btop.conf"
+    temp_dir="$(mktemp -d)"
+    temp_config="${temp_dir}/btop.conf"
+    if ! write_btop_interface_config "$user_config" "$temp_config" "$source_interface"; then
+        rm -f "$temp_config"
+        rmdir "$temp_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    interface_ips="$(list_test_source_ipv4s |
+        awk -F '\t' -v interface="$source_interface" '$2 == interface { print $1 }' |
+        sort -uV | paste -sd ',' -)"
+    interface_ips="${interface_ips//,/, }"
+    interface_ip_count="$(awk -F ',' 'NF && $1 != "" { print NF; next } { print 0 }' <<< "${interface_ips//, /,}")"
+
+    echo
+    ok "btop: ${source_ip} через ${source_interface}"
+    if (( interface_ip_count > 1 )); then
+        warn "На ${source_interface} несколько IP: ${interface_ips}. btop покажет их общий трафик по интерфейсу."
+    else
+        echo "Сетевой график закреплён за интерфейсом ${source_interface}."
+    fi
+    echo "Выход из btop: q"
+
+    btop --config "$temp_config" || rc=$?
+    rm -f "$temp_config"
+    rmdir "$temp_dir" 2>/dev/null || true
+    if (( rc != 0 && rc != 130 )); then
+        fail "btop завершился с кодом ${rc}"
+        return "$rc"
+    fi
+    return 0
 }
 
 haproxy_additional_source_ip_available() {
@@ -9474,6 +9592,8 @@ menu() {
         actions+=("ssl")
     fi
     if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        labels+=("btop")
+        actions+=("btop")
         labels+=("HAProxy")
         actions+=("haproxy")
         if mobile443_lte_configured; then
@@ -9533,6 +9653,7 @@ menu() {
         speedtest-ru) speedtest_ru ;;
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
+        btop) run_btop_for_ip ;;
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
         haproxy-update) update_haproxy_existing_config ;;
@@ -9574,6 +9695,7 @@ main() {
         speedtest-ru|speedtestru|bench-ru|benchru) speedtest_ru "${2:-}" ;;
         ipcheck-place) ipcheck_place "${2:-}" ;;
         ipcheck-region) ipcheck_region "${2:-}" ;;
+        btop|btop-ip|monitor-ip) run_btop_for_ip "${2:-}" ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
         haproxy-update|update-haproxy|haproxy-refresh) update_haproxy_existing_config ;;

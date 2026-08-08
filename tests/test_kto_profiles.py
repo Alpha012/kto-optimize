@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v282"', KTO)
-        self.assertIn('PUSH_BUILD="v282"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v282"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v282"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v282"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v282"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v282"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v283"', KTO)
+        self.assertIn('PUSH_BUILD="v283"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v283"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v283"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v283"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v283"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v283"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -388,6 +388,64 @@ list_test_source_ipv4s() { printf '198.51.100.10\tens3\tосновной\n'; }
 select_test_source_ipv4 </dev/null
 [[ "$TEST_SOURCE_IP" == 198.51.100.10 ]]
 [[ "$TEST_SOURCE_INTERFACE" == ens3 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_whitelist_btop_selects_ip_and_uses_temporary_interface_config(self):
+        menu = function_body(KTO, "menu")
+        runner = function_body(KTO, "run_btop_for_ip")
+        writer = function_body(KTO, "write_btop_interface_config")
+        main = function_body(KTO, "main")
+
+        self.assertIn('labels+=("btop")', menu)
+        self.assertIn('actions+=("btop")', menu)
+        self.assertIn('btop) run_btop_for_ip', menu)
+        self.assertIn('require_whitelist_mode', runner)
+        self.assertIn('select_test_source_ipv4 "$requested_ip"', runner)
+        self.assertIn('source_interface="$TEST_SOURCE_INTERFACE"', runner)
+        self.assertIn('apt_install_with_update_if_missing btop', runner)
+        self.assertIn('write_btop_interface_config "$user_config" "$temp_config" "$source_interface"', runner)
+        self.assertIn('btop --config "$temp_config"', runner)
+        self.assertIn('btop|btop-ip|monitor-ip) run_btop_for_ip "${2:-}"', main)
+        self.assertIn('net_iface =', writer)
+        self.assertIn('shown_boxes =', writer)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+source_config=$(mktemp)
+original=$(mktemp)
+output_config=$(mktemp)
+minimal_config=$(mktemp)
+trap 'rm -f "$source_config" "$original" "$output_config" "$minimal_config"' EXIT
+cat > "$source_config" <<'EOF'
+color_theme = "Default"
+shown_boxes = "cpu mem proc"
+net_iface = "ens3"
+net_auto = true
+EOF
+cp "$source_config" "$original"
+write_btop_interface_config "$source_config" "$output_config" wan2
+cmp -s "$source_config" "$original"
+grep -Fqx 'shown_boxes = "cpu mem proc net"' "$output_config"
+grep -Fqx 'net_iface = "wan2"' "$output_config"
+[[ "$(grep -c '^shown_boxes[[:space:]]*=' "$output_config")" == 1 ]]
+[[ "$(grep -c '^net_iface[[:space:]]*=' "$output_config")" == 1 ]]
+write_btop_interface_config /missing/btop.conf "$minimal_config" wan3
+grep -Fqx 'shown_boxes = "cpu mem net proc"' "$minimal_config"
+grep -Fqx 'net_iface = "wan3"' "$minimal_config"
+! write_btop_interface_config "$source_config" "$minimal_config" 'bad interface'
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
