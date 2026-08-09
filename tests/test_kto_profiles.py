@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v290"', KTO)
-        self.assertIn('PUSH_BUILD="v290"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v290"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v290"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v290"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v290"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v290"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v291"', KTO)
+        self.assertIn('PUSH_BUILD="v291"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v291"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v291"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v291"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v291"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v291"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -2261,10 +2261,13 @@ applied="$root/applied"
 config="$root/haproxy.cfg"
 collision="$root/collision"
 collision_out="$root/collision.out"
+semantic_a="$root/semantic-a"
+semantic_b="$root/semantic-b"
+semantic_bad="$root/semantic-bad"
 trap 'rm -rf "$root"' EXIT
 LOG_FILE="$root/kto.log"
 HAPROXY_CONFIG_FILE="$config"
-printf '443\t144.31.128.40:443\tbase.example.com\tdefault\n8443\t5.34.179.144:443\tbridge.example.com\t217.19.122.48\t10000\n8444\t5.34.179.145:443\texact.example.com\t185.141.227.93\tdefault\t185.141.227.93\n' > "$routes"
+printf '8443\t5.34.179.144:443\t*.bridge.example.com bridge.example.com\t217.19.122.48\t10000\n443\t144.31.128.40:443\tbase.example.com\tdefault\n8444\t5.34.179.145:443\texact.example.com\t185.141.227.93\tdefault\t185.141.227.93\n' > "$routes"
 cp "$routes" "$snapshot"
 haproxy_default_source_ip() { printf '78.159.250.112\n'; }
 list_haproxy_input_ips() {
@@ -2278,7 +2281,7 @@ check_haproxy_bindings() { return 0; }
 
 build_haproxy_source_pinned_routes "$routes" "$candidate"
 grep -Fqx $'443\t144.31.128.40:443\tbase.example.com\tdefault\tdefault\t78.159.250.112' "$candidate"
-grep -Fqx $'8443\t5.34.179.144:443\tbridge.example.com\t217.19.122.48\t10000\t217.19.122.48' "$candidate"
+grep -Fqx $'8443\t5.34.179.144:443\t*.bridge.example.com bridge.example.com\t217.19.122.48\t10000\t217.19.122.48' "$candidate"
 grep -Fqx $'8444\t5.34.179.145:443\texact.example.com\t185.141.227.93\tdefault\t185.141.227.93' "$candidate"
 [[ "$HAPROXY_PIN_WILDCARDS" == 2 ]]
 grep -Fq '*:443 -> 78.159.250.112:443' <<< "$HAPROXY_PIN_PREVIEW"
@@ -2290,10 +2293,16 @@ cmp -s "$routes" "$snapshot"
 pin_haproxy_wildcards_to_source_ips "$routes" <<< 'y'
 cmp -s "$routes" "$applied"
 grep -Fqx $'443\t144.31.128.40:443\tbase.example.com\tdefault\tdefault\t78.159.250.112' "$routes"
-grep -Fqx $'8443\t5.34.179.144:443\tbridge.example.com\t217.19.122.48\t10000\t217.19.122.48' "$routes"
+grep -Fqx $'8443\t5.34.179.144:443\t*.bridge.example.com bridge.example.com\t217.19.122.48\t10000\t217.19.122.48' "$routes"
 
 printf '443\t144.31.128.40:443\tbase.example.com\tdefault\n443\t5.34.179.144:443\texact.example.com\tdefault\tdefault\t78.159.250.112\n' > "$collision"
 ! build_haproxy_source_pinned_routes "$collision" "$collision_out"
+
+printf '9449\t31.59.140.66:7443,31.77.154.79:7443\t*.dev-yandex.sbs dev-yandex.sbs\t37.18.15.124\t10000\t37.18.15.124\n443\t144.31.128.40:443\tbase.example.com\tdefault\tdefault\t78.159.250.112\n' > "$semantic_a"
+printf '443\t144.31.128.40:443\tbase.example.com\tdefault\tdefault\t78.159.250.112\n9449\t31.59.140.66:7443,31.77.154.79:7443\tdev-yandex.sbs *.dev-yandex.sbs\t37.18.15.124\t10000\t37.18.15.124\n' > "$semantic_b"
+printf '443\t144.31.128.41:443\tbase.example.com\tdefault\tdefault\t78.159.250.112\n9449\t31.59.140.66:7443,31.77.154.79:7443\tdev-yandex.sbs *.dev-yandex.sbs\t37.18.15.124\t10000\t37.18.15.124\n' > "$semantic_bad"
+haproxy_routes_round_trip_equal "$semantic_a" "$semantic_b"
+! haproxy_routes_round_trip_equal "$semantic_a" "$semantic_bad"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

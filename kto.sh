@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v290"
+SCRIPT_BUILD="v291"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5749,6 +5749,59 @@ reload_haproxy_gracefully() {
     return 1
 }
 
+canonicalize_haproxy_routes() {
+    local routes_file="$1"
+    local port target_pool sni source_ip server_maxconn listen_ip
+    local normalized_target_pool normalized_sni normalized_source_ip normalized_server_maxconn normalized_listen_ip
+    local canonical_sni route_line normalized_routes=""
+
+    [[ -s "$routes_file" ]] || return 1
+    while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip; do
+        [[ "$port" =~ ^[0-9]+$ ]] || return 1
+        port=$((10#$port))
+        (( port >= 1 && port <= 65535 )) || return 1
+        normalized_target_pool="$(normalize_haproxy_target_pool "$target_pool" 2>/dev/null || true)"
+        normalized_sni="$(normalize_haproxy_sni_list "$sni" 2>/dev/null || true)"
+        normalized_source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}" 2>/dev/null || true)"
+        normalized_server_maxconn="$(normalize_haproxy_server_maxconn "${server_maxconn:-default}" 2>/dev/null || true)"
+        normalized_listen_ip="$(normalize_haproxy_listen_ip "${listen_ip:-*}" 2>/dev/null || true)"
+        [[ -n "$normalized_target_pool" && -n "$normalized_sni" && -n "$normalized_source_ip" && -n "$normalized_server_maxconn" && -n "$normalized_listen_ip" ]] || return 1
+        canonical_sni="$(printf '%s\n' "$normalized_sni" | tr ' ' '\n' | awk 'NF' | LC_ALL=C sort -u | paste -sd' ' -)"
+        [[ -n "$canonical_sni" ]] || return 1
+        printf -v route_line '%s\t%s\t%s\t%s\t%s\t%s' \
+            "$port" "$normalized_target_pool" "$canonical_sni" \
+            "$normalized_source_ip" "$normalized_server_maxconn" "$normalized_listen_ip"
+        normalized_routes+="${route_line}"$'\n'
+    done < "$routes_file"
+    [[ -n "$normalized_routes" ]] || return 1
+    printf '%s' "$normalized_routes" |
+        LC_ALL=C sort -s -t $'\t' -k1,1n -k6,6 -k2,2 -k3,3 -k4,4 -k5,5
+}
+
+haproxy_routes_round_trip_equal() {
+    local expected_file="$1" parsed_file="$2" expected_normalized parsed_normalized log_file
+    local rc=1
+
+    expected_normalized="$(mktemp)"
+    parsed_normalized="$(mktemp)"
+    log_file="${LOG_FILE:-/tmp/kto-tune.log}"
+    if canonicalize_haproxy_routes "$expected_file" > "$expected_normalized" &&
+        canonicalize_haproxy_routes "$parsed_file" > "$parsed_normalized"; then
+        if cmp -s "$expected_normalized" "$parsed_normalized"; then
+            rc=0
+        else
+            {
+                echo "=== HAProxy semantic round-trip mismatch ==="
+                diff -u "$expected_normalized" "$parsed_normalized" || true
+            } >> "$log_file" 2>/dev/null || true
+        fi
+    else
+        echo "HAProxy semantic round-trip normalization failed" >> "$log_file" 2>/dev/null || true
+    fi
+    rm -f "$expected_normalized" "$parsed_normalized"
+    return "$rc"
+}
+
 extract_haproxy_routes() {
     local config="${1:-/etc/haproxy/haproxy.cfg}"
     local raw port target_pool sni source_ip server_maxconn listen_ip
@@ -7995,7 +8048,7 @@ prepare_haproxy_multi_ip_config() {
         return 1
     fi
     extract_haproxy_routes "$preview_file" > "$parsed_file"
-    if ! cmp -s "$next_file" "$parsed_file"; then
+    if ! haproxy_routes_round_trip_equal "$next_file" "$parsed_file"; then
         rm -f "$next_file" "$preview_file" "$parsed_file"
         fail "Round-trip проверка HAProxy config не прошла. Текущий config не изменён."
         return 1
@@ -8156,7 +8209,7 @@ pin_haproxy_wildcards_to_source_ips() {
         return 1
     fi
     extract_haproxy_routes "$preview_file" > "$parsed_file"
-    if ! cmp -s "$next_file" "$parsed_file"; then
+    if ! haproxy_routes_round_trip_equal "$next_file" "$parsed_file"; then
         rm -f "$next_file" "$preview_file" "$parsed_file"
         fail "Round-trip проверка точечного HAProxy candidate не прошла."
         return 1
