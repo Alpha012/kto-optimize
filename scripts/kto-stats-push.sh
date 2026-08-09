@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v289"
+PUSH_BUILD="v290"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
@@ -379,6 +379,45 @@ ufw_ssh_rule_exists() {
     ufw status 2>/dev/null | awk -v rule="$rule" -v ip="$ip" '$0 ~ /ALLOW/ && $1 == rule && $3 == ip {found=1} END{exit found ? 0 : 1}'
 }
 
+ufw_ssh_open_rule_numbers() {
+    local ssh_port="$1"
+    ufw status numbered 2>/dev/null | awk -v port="$ssh_port" -v tcp="${ssh_port}/tcp" '
+        $0 ~ /ALLOW/ && $0 ~ /Anywhere/ {
+            number = $0
+            sub(/^[[:space:]]*\[[[:space:]]*/, "", number)
+            sub(/\].*$/, "", number)
+            gsub(/[[:space:]]/, "", number)
+            if (number !~ /^[0-9]+$/) next
+
+            target = $0
+            sub(/^[^]]*\][[:space:]]*/, "", target)
+            sub(/[[:space:]]+ALLOW.*/, "", target)
+            gsub(/[[:space:]]/, "", target)
+            is_port = (target == tcp || target == tcp "(v6)" || target == port || target == port "(v6)")
+            is_service = (port == "22" && (target == "ssh" || target == "ssh(v6)" || target == "OpenSSH" || target == "OpenSSH(v6)"))
+            if (is_port || is_service) print number
+        }
+    ' | sort -rn
+}
+
+ufw_ssh_open_rule_exists() {
+    local ssh_port="$1"
+    [[ -n "$(ufw_ssh_open_rule_numbers "$ssh_port" | head -n 1)" ]]
+}
+
+remove_ufw_ssh_open_rules() {
+    local ssh_port="$1" number removed=0
+    local numbers=()
+    mapfile -t numbers < <(ufw_ssh_open_rule_numbers "$ssh_port")
+    for number in "${numbers[@]}"; do
+        [[ "$number" =~ ^[0-9]+$ ]] || continue
+        if ufw --force delete "$number" >/dev/null 2>&1; then
+            removed=$(( removed + 1 ))
+        fi
+    done
+    printf '%s\n' "$removed"
+}
+
 collector_ssh_allowed_ips() {
     local response="$1" ip
     while read -r ip; do
@@ -462,6 +501,46 @@ apply_collector_ssh_ips() {
 
     if (( applied > 0 )); then
         echo "push ${PUSH_BUILD}: applied ssh ip rules=${applied}"
+    fi
+}
+
+apply_collector_ssh_firewall_mode() {
+    local response="$1" desired ssh_port removed=0
+
+    [[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    desired="$(printf '%s' "$response" | jq -r '
+        if (.ssh_firewall_open | type) == "boolean" then
+            if .ssh_firewall_open then "open" else "whitelist" end
+        else
+            "unchanged"
+        end
+    ' 2>/dev/null || echo unchanged)"
+    [[ "$desired" != "unchanged" ]] || return 0
+    if ! ufw_active; then
+        echo "push ${PUSH_BUILD}: ssh firewall mode=${desired} skipped, ufw inactive" >&2
+        return 0
+    fi
+
+    ssh_port="$(detect_ssh_port)"
+    if [[ "$desired" == "open" ]]; then
+        if ! ufw_ssh_open_rule_exists "$ssh_port"; then
+            if ufw insert 1 allow proto tcp to any port "$ssh_port" comment 'kto-ssh-open' >/dev/null 2>&1; then
+                echo "push ${PUSH_BUILD}: ssh firewall opened port=${ssh_port}"
+            else
+                echo "push ${PUSH_BUILD}: failed to open ssh firewall port=${ssh_port}" >&2
+            fi
+        fi
+        return 0
+    fi
+
+    if ufw_ssh_open_rule_exists "$ssh_port"; then
+        removed="$(remove_ufw_ssh_open_rules "$ssh_port")"
+        if ufw_ssh_open_rule_exists "$ssh_port"; then
+            echo "push ${PUSH_BUILD}: failed to restore ssh whitelist port=${ssh_port}" >&2
+        else
+            echo "push ${PUSH_BUILD}: ssh whitelist restored port=${ssh_port} removed=${removed}"
+        fi
     fi
 }
 
@@ -2478,6 +2557,7 @@ if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
         ip_limit_extra=" ip_events=${ip_limit_events_count}"
     fi
     apply_collector_ssh_ips "$response"
+    apply_collector_ssh_firewall_mode "$response"
     apply_collector_haproxy_config "$response"
     apply_collector_node_name_config "$response"
     apply_collector_ip_limit_config "$response"

@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v289"
+COLLECTOR_BUILD = "v290"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -320,6 +320,7 @@ FALLS_FILE = os.path.join(STATE_DIR, "falls.json")
 OFFSET_FILE = os.path.join(STATE_DIR, "telegram_offset")
 DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
 SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
+SSH_FIREWALL_FILE = os.path.join(STATE_DIR, "ssh_firewall.json")
 SNI_ALLOW_FILE = os.path.join(STATE_DIR, "sni_allow.json")
 NODE_NAMES_FILE = os.path.join(STATE_DIR, "node_names.json")
 BL_GROUPS_FILE = os.path.join(STATE_DIR, "bl_groups.json")
@@ -335,6 +336,7 @@ LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
 SSH_ALLOWED_IPS = []
+SSH_FIREWALL_STATE = {"nodes": {}}
 SNI_STATE = {"nodes": {}, "pending": {}}
 NODE_NAME_STATE = {"nodes": {}, "pending": {}}
 BL_GROUP_STATE = {"groups": {}, "pending": {}}
@@ -598,6 +600,39 @@ def ssh_allowed_ips_snapshot():
 
 def ssh_allowed_ips_for_node(node):
     return ssh_allowed_ips_snapshot() if node_is_wl(node) else []
+
+
+def load_ssh_firewall_state():
+    global SSH_FIREWALL_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(SSH_FIREWALL_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        raw_nodes = loaded.get("nodes") if isinstance(loaded, dict) else {}
+        if not isinstance(raw_nodes, dict):
+            raw_nodes = {}
+        clean_nodes = {}
+        for key, item in raw_nodes.items():
+            if not isinstance(item, dict) or not bool(item.get("open", True)):
+                continue
+            node_key = canonical_node_key(key)
+            if not node_key:
+                continue
+            name = clean_display_text(item.get("name") or node_key)[:120] or node_key
+            record_key = canonical_node_key(item.get("record_key") or node_key)
+            clean_nodes[node_key] = {
+                "name": name,
+                "record_key": record_key or node_key,
+                "open": True,
+                "updated_at": int(item.get("updated_at") or 0),
+            }
+        SSH_FIREWALL_STATE = {"nodes": clean_nodes}
+    except Exception:
+        SSH_FIREWALL_STATE = {"nodes": {}}
+
+
+def save_ssh_firewall_state():
+    atomic_write(SSH_FIREWALL_FILE, json.dumps(SSH_FIREWALL_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def normalize_sni(value):
@@ -5474,6 +5509,10 @@ def node_connection_alerts_disabled(node):
     return node_in_record_state(node, ALERTS_OFF_STATE)
 
 
+def ssh_firewall_open_for_node(node):
+    return bool(node_is_wl(node) and node_in_record_state(node, SSH_FIREWALL_STATE))
+
+
 def current_bl_nodes():
     with LOCK:
         nodes = [dict(node) for node in dedupe_nodes(NODES.values()) if not node_is_wl(node) and not node_stats_disabled(node)]
@@ -6918,6 +6957,7 @@ class Handler(BaseHTTPRequestHandler):
                 "id": node["id"],
                 "last_seen": node["last_seen"],
                 "ssh_allowed_ips": ssh_allowed_ips_for_node(node),
+                "ssh_firewall_open": ssh_firewall_open_for_node(node),
                 "ip_limit_blocks": [],
                 "ip_limit_clear_blocks": True,
             }
@@ -8364,6 +8404,126 @@ def handle_push_notifications(text, enabled):
     send_message("\n".join(lines))
 
 
+def set_ssh_firewall_mode(queries, opened):
+    changed = []
+    already = []
+    missing = []
+    ambiguous = []
+    unsupported = []
+    ts = now_ts()
+    with LOCK:
+        nodes_state = SSH_FIREWALL_STATE.setdefault("nodes", {})
+        for query in queries:
+            matches = find_nodes(query)
+            if not matches:
+                missing.append(query)
+                continue
+            if len(matches) > 1:
+                ambiguous.append(query)
+                continue
+            node = matches[0]
+            node_key = node_record_key(node) or node_canonical_key(node)
+            exact_key = canonical_node_key(node_key)
+            node_name = node_display_name(node, node_key)
+            if not node_key or not exact_key:
+                missing.append(query)
+                continue
+            if not node_is_wl(node):
+                unsupported.append(node_name)
+                continue
+            is_open = ssh_firewall_open_for_node(node)
+            if opened:
+                if is_open:
+                    already.append(node_name)
+                    continue
+                nodes_state[node_key] = {
+                    "name": node_name[:120],
+                    "record_key": exact_key,
+                    "open": True,
+                    "updated_at": ts,
+                }
+                changed.append(node_name)
+                continue
+
+            removed = False
+            for key, item in list(nodes_state.items()):
+                item_keys = {canonical_node_key(key)}
+                if isinstance(item, dict):
+                    item_keys.add(canonical_node_key(item.get("record_key")))
+                item_keys.discard("")
+                if exact_key in item_keys:
+                    nodes_state.pop(key, None)
+                    removed = True
+            if removed:
+                changed.append(node_name)
+            else:
+                already.append(node_name)
+        if changed:
+            save_ssh_firewall_state()
+    return {
+        "changed": changed,
+        "already": already,
+        "missing": missing,
+        "ambiguous": ambiguous,
+        "unsupported": unsupported,
+    }
+
+
+def handle_ssh_firewall(text, opened):
+    queries = stats_toggle_queries(text)
+    command = "/ssh_firewall_off" if opened else "/ssh_firewall_on"
+    if not queries:
+        send_message(
+            f"<b>Пример:</b> <code>{command} Обход №1</code>\n"
+            "Можно списком, каждая машина с новой строки."
+        )
+        return
+
+    result = set_ssh_firewall_mode(queries, opened)
+    title = "SSH-фильтр отключён" if opened else "SSH-фильтр включён"
+    lines = [f"<b>{title}</b>", ALERT_SEPARATOR]
+    if result["changed"]:
+        lines += [
+            "<b>Изменено:</b>",
+            "<blockquote>" + "\n".join(html.escape(name) for name in result["changed"]) + "</blockquote>",
+        ]
+    if result["already"]:
+        lines += [
+            "",
+            "<b>Уже было так:</b>",
+            "<blockquote>" + "\n".join(html.escape(name) for name in result["already"]) + "</blockquote>",
+        ]
+    if result["missing"]:
+        lines += [
+            "",
+            "<b>Не нашёл:</b>",
+            "<blockquote>" + "\n".join(html.escape(name) for name in result["missing"][:30]) + "</blockquote>",
+        ]
+    if result["ambiguous"]:
+        lines += [
+            "",
+            "<b>Несколько совпадений:</b>",
+            "<blockquote>" + "\n".join(html.escape(name) for name in result["ambiguous"][:30]) + "</blockquote>",
+        ]
+    if result["unsupported"]:
+        lines += [
+            "",
+            "<b>Не обходы:</b>",
+            "<blockquote>" + "\n".join(html.escape(name) for name in result["unsupported"][:30]) + "</blockquote>",
+        ]
+    if opened:
+        lines += [
+            "",
+            "<i>При ближайшем push SSH откроется для любого IP. UFW, остальные порты и Fail2ban продолжат работать.</i>",
+        ]
+    else:
+        lines += [
+            "",
+            "<i>При ближайшем push SSH снова останется только для базового списка и IP из /add_ip.</i>",
+        ]
+    send_message("\n".join(lines))
+
+
 def connection_alerts_off_names():
     with LOCK:
         names = []
@@ -9307,6 +9467,8 @@ BOT_HELP_SECTIONS = (
     ("Машины и уведомления", (
         ("/disable_push <машина|список>", "Отключить только lost/restored уведомления."),
         ("/enable_push <машина|список>", "Включить lost/restored уведомления обратно."),
+        ("/ssh_firewall_off <машина|список>", "Открыть SSH обхода для любого IP."),
+        ("/ssh_firewall_on <машина|список>", "Вернуть SSH whitelist на обходе."),
         ("/delete <машина>", "Удалить машину и её падения из collector."),
         ("/rename <машина>", "Переименовать машину через ответное сообщение."),
         ("/add_ip <IPv4>", "Добавить IP в SSH whitelist обходов."),
@@ -9454,6 +9616,10 @@ def bot_loop():
                     handle_push_notifications(text, enabled=False)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/enable_push":
                     handle_push_notifications(text, enabled=True)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ssh_firewall_off":
+                    handle_ssh_firewall(text, opened=True)
+                elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/ssh_firewall_on":
+                    handle_ssh_firewall(text, opened=False)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/statsrevoke":
                     handle_statsrevoke(text)
                 elif chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/delete":
@@ -9525,6 +9691,7 @@ def main():
     load_nodes()
     load_falls()
     load_ssh_allowed_ips()
+    load_ssh_firewall_state()
     load_sni_state()
     load_node_name_state()
     repair_loaded_node_names()

@@ -39,6 +39,7 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.IP_LIMIT_FILE = os.path.join(self.state.name, "ip_limit.json")
         collector.UPDATE_STATE_FILE = os.path.join(self.state.name, "update_state.json")
         collector.SSH_ALLOW_FILE = os.path.join(self.state.name, "ssh_allow_ips.json")
+        collector.SSH_FIREWALL_FILE = os.path.join(self.state.name, "ssh_firewall.json")
         collector.ALERTS_OFF_FILE = os.path.join(self.state.name, "connection_alerts_off.json")
         collector.IP_LIMIT_DB_FILE = os.path.join(self.state.name, "ip_limit.sqlite")
         collector.NETWORK_RATE_DB_FILE = os.path.join(self.state.name, "network_rate.sqlite")
@@ -56,6 +57,7 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.NODE_NAME_STATE = {"nodes": {}, "pending": {}}
         collector.STATS_OFF_STATE = {"nodes": {}}
         collector.ALERTS_OFF_STATE = {"nodes": {}}
+        collector.SSH_FIREWALL_STATE = {"nodes": {}}
         collector.BL_GROUP_STATE = {"groups": {}, "pending": {}}
         collector.UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
         collector.IP_NOTE_STATE = {"notes": {}, "pending": {}}
@@ -185,6 +187,28 @@ class CollectorRegressionTests(unittest.TestCase):
             [],
             collector.ssh_allowed_ips_for_node(self.payload("Нода", str(uuid.uuid4()), "bl")),
         )
+
+    def test_ssh_firewall_mode_is_wl_only_and_follows_node_uuid(self):
+        node_uuid = str(uuid.uuid4())
+        collector.update_node(self.payload("Обход №1", node_uuid, "wl"), "203.0.113.50")
+        result = collector.set_ssh_firewall_mode(["Обход №1"], opened=True)
+        self.assertEqual(["Обход №1"], result["changed"])
+        self.assertTrue(collector.ssh_firewall_open_for_node(collector.find_node("Обход №1")))
+
+        collector.SSH_FIREWALL_STATE = {"nodes": {}}
+        collector.load_ssh_firewall_state()
+        renamed = self.payload("Обход №20", node_uuid, "wl")
+        collector.update_node(renamed, "203.0.113.50")
+        self.assertTrue(collector.ssh_firewall_open_for_node(collector.find_node("Обход №20")))
+
+        result = collector.set_ssh_firewall_mode(["Обход №20"], opened=False)
+        self.assertEqual(["Обход №20"], result["changed"])
+        self.assertFalse(collector.ssh_firewall_open_for_node(collector.find_node("Обход №20")))
+
+        collector.update_node(self.payload("Германия", str(uuid.uuid4()), "bl"), "203.0.113.51")
+        result = collector.set_ssh_firewall_mode(["Германия"], opened=True)
+        self.assertEqual(["Германия"], result["unsupported"])
+        self.assertFalse(collector.ssh_firewall_open_for_node(collector.find_node("Германия")))
 
     def test_parse_ipv4_list_deduplicates_and_rejects_bad_values(self):
         self.assertEqual(
@@ -683,6 +707,7 @@ class CollectorRegressionTests(unittest.TestCase):
             payload = json.loads(response_body)
             self.assertTrue(payload["ok"])
             self.assertEqual([], payload["ssh_allowed_ips"])
+            self.assertFalse(payload["ssh_firewall_open"])
             self.assertEqual([], payload["ip_limit_blocks"])
             self.assertTrue(payload["ip_limit_clear_blocks"])
             self.assertTrue(payload["ip_limit_enabled"])

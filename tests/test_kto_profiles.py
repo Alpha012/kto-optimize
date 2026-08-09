@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v289"', KTO)
-        self.assertIn('PUSH_BUILD="v289"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v289"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v289"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v289"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v289"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v289"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v290"', KTO)
+        self.assertIn('PUSH_BUILD="v290"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v290"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v290"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v290"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v290"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v290"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -1495,6 +1495,7 @@ NODE_PROFILE=hysteria2
         fail2ban = function_body(KTO, "opt_fail2ban")
         push_apply = function_body(PUSH, "apply_collector_ssh_ips")
         push_sync = function_body(PUSH, "sync_fail2ban_ssh_allowlist")
+        push_mode = function_body(PUSH, "apply_collector_ssh_firewall_mode")
 
         self.assertIn('ufw insert 1 allow proto tcp from "$ip"', apply_rules)
         self.assertIn("write_whitelist_fail2ban_allowlist", fail2ban)
@@ -1504,6 +1505,11 @@ NODE_PROFILE=hysteria2
         self.assertIn('ufw insert 1 allow proto tcp from "$ip"', push_apply)
         self.assertIn("fail2ban-client set sshd addignoreip", push_sync)
         self.assertIn("fail2ban-client set sshd unbanip", push_sync)
+        self.assertIn('[[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0', push_mode)
+        self.assertIn("ssh_firewall_open", push_mode)
+        self.assertIn("kto-ssh-open", push_mode)
+        self.assertIn("/ssh_firewall_off", COLLECTOR)
+        self.assertIn("/ssh_firewall_on", COLLECTOR)
 
         bash = bash_executable()
         if bash is None:
@@ -1513,23 +1519,50 @@ NODE_PROFILE=hysteria2
             [
                 "set -Eeuo pipefail",
                 function_body(PUSH, "validate_ipv4"),
+                function_body(PUSH, "ufw_ssh_open_rule_numbers"),
+                function_body(PUSH, "ufw_ssh_open_rule_exists"),
+                function_body(PUSH, "remove_ufw_ssh_open_rules"),
                 function_body(PUSH, "collector_ssh_allowed_ips"),
                 function_body(PUSH, "ufw_kto_ssh_allowed_ips"),
                 function_body(PUSH, "sync_fail2ban_ssh_allowlist"),
                 function_body(PUSH, "apply_collector_ssh_ips"),
+                function_body(PUSH, "apply_collector_ssh_firewall_mode"),
                 r'''
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
 events="$root/events"
+open_state="$root/open"
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="$root/allowlist.local"
 KTO_PUSH_NODE_KIND=wl
 PUSH_BUILD=vtest
 
-jq() { printf '%s\n' 85.192.48.122 203.0.113.77; }
+jq() {
+    input="$(cat)"
+    if [[ "$*" == *ssh_firewall_open* ]]; then
+        case "$input" in
+            *'"ssh_firewall_open":true'*) printf 'open\n' ;;
+            *'"ssh_firewall_open":false'*) printf 'whitelist\n' ;;
+            *) printf 'unchanged\n' ;;
+        esac
+    else
+        printf '%s\n' 85.192.48.122 203.0.113.77
+    fi
+}
 ufw_active() { return 0; }
 detect_ssh_port() { printf '22\n'; }
 ufw_ssh_rule_exists() { return 1; }
-ufw() { printf 'ufw %s\n' "$*" >> "$events"; }
+ufw() {
+    if [[ "${1:-}" == "status" && "${2:-}" == "numbered" ]]; then
+        [[ ! -e "$open_state" ]] || printf '[ 1] 22/tcp ALLOW IN Anywhere # kto-ssh-open\n'
+        return 0
+    fi
+    printf 'ufw %s\n' "$*" >> "$events"
+    if [[ "$*" == *"comment kto-ssh-open"* ]]; then
+        : > "$open_state"
+    elif [[ "${1:-}" == "--force" && "${2:-}" == "delete" && "${3:-}" == "1" ]]; then
+        rm -f "$open_state"
+    fi
+}
 systemctl() { [[ "${1:-}" == "is-active" ]]; }
 fail2ban-client() { printf 'f2b %s\n' "$*" >> "$events"; }
 
@@ -1539,9 +1572,17 @@ grep -q '^f2b set sshd addignoreip 203.0.113.77$' "$events"
 grep -q '^f2b set sshd unbanip 203.0.113.77$' "$events"
 grep -q '^ignoreip = 127.0.0.1/8 ::1 203.0.113.77 85.192.48.122$' "$KTO_FAIL2BAN_SSH_ALLOWLIST_CONF"
 
+apply_collector_ssh_firewall_mode '{"ssh_firewall_open":true}'
+[[ -e "$open_state" ]]
+grep -q '^ufw insert 1 allow proto tcp to any port 22 comment kto-ssh-open$' "$events"
+apply_collector_ssh_firewall_mode '{"ssh_firewall_open":false}'
+[[ ! -e "$open_state" ]]
+grep -q '^ufw --force delete 1$' "$events"
+
 before="$(wc -l < "$events")"
 KTO_PUSH_NODE_KIND=bl
 apply_collector_ssh_ips '{}'
+apply_collector_ssh_firewall_mode '{"ssh_firewall_open":true}'
 after="$(wc -l < "$events")"
 [[ "$before" == "$after" ]]
 ''',
