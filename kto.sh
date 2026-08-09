@@ -7,13 +7,14 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v288"
+SCRIPT_BUILD="v289"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
 WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.93.9.35 185.31.243.221 94.247.129.92 83.228.242.53 167.254.243.181 5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"
 WHITELIST_SSH_ALLOWED_IPS="${KTO_WHITELIST_SSH_ALLOWED_IPS:-$WHITELIST_SSH_ALLOWED_IPS_DEFAULT}"
 WHITELIST_SSH_KEEP_CURRENT="${KTO_WHITELIST_SSH_KEEP_CURRENT:-1}"
+FAIL2BAN_SSH_ALLOWLIST_CONF="/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local"
 MOBILE443_DIR="/opt/mobile443"
 MOBILE443_CONFIG="${MOBILE443_DIR}/config.conf"
 MOBILE443_MANAGER="/usr/local/sbin/kto-mobile443"
@@ -1799,6 +1800,20 @@ current_ssh_client_ip() {
     validate_ipv4 "$ip" && echo "$ip"
 }
 
+existing_kto_ssh_allowed_ips() {
+    command_exists ufw || return 0
+    "${SUDO[@]}" ufw status 2>/dev/null | awk '
+        /ALLOW/ && /# kto-ssh/ {
+            for (i = 3; i <= NF; i++) {
+                if ($i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+                    print $i
+                    break
+                }
+            }
+        }
+    '
+}
+
 whitelist_ssh_allowed_ips() {
     local raw current ip
     raw="${WHITELIST_SSH_ALLOWED_IPS//,/ }"
@@ -1806,6 +1821,10 @@ whitelist_ssh_allowed_ips() {
     for ip in $raw; do
         validate_ipv4 "$ip" && echo "$ip"
     done
+
+    while read -r ip; do
+        validate_ipv4 "$ip" && echo "$ip"
+    done < <(existing_kto_ssh_allowed_ips)
 
     if [[ "$WHITELIST_SSH_KEEP_CURRENT" != "0" ]]; then
         current="$(current_ssh_client_ip || true)"
@@ -1817,14 +1836,39 @@ whitelist_ssh_allowed_ips() {
 
 apply_whitelist_ssh_rules() {
     local ssh_port="$1"
-    local ip
+    local ip attempt allowed_ips
+
+    allowed_ips="$(whitelist_ssh_allowed_ips | sort -u)"
 
     cmd "${SUDO[@]}" ufw --force delete allow "${ssh_port}/tcp" || true
     cmd "${SUDO[@]}" ufw --force delete allow ssh || true
     cmd "${SUDO[@]}" ufw --force delete allow OpenSSH || true
     while read -r ip; do
         [[ -n "$ip" ]] || continue
-        cmd "${SUDO[@]}" ufw allow proto tcp from "$ip" to any port "$ssh_port" comment 'kto-ssh' || true
+        for (( attempt = 0; attempt < 16; attempt++ )); do
+            "${SUDO[@]}" ufw --force delete allow proto tcp from "$ip" to any port "$ssh_port" >/dev/null 2>&1 || break
+        done
+        cmd "${SUDO[@]}" ufw insert 1 allow proto tcp from "$ip" to any port "$ssh_port" comment 'kto-ssh' || true
+    done <<< "$allowed_ips"
+}
+
+write_whitelist_fail2ban_allowlist() {
+    local ignore_ips
+    ignore_ips="$(whitelist_ssh_allowed_ips | sort -u | paste -sd' ' -)"
+    write_root_file "$FAIL2BAN_SSH_ALLOWLIST_CONF" <<EOF
+[sshd]
+ignoreip = 127.0.0.1/8 ::1${ignore_ips:+ $ignore_ips}
+EOF
+}
+
+unban_whitelist_ssh_ips() {
+    local ip
+    command_exists fail2ban-client || return 0
+    "${SUDO[@]}" systemctl is-active --quiet fail2ban 2>/dev/null || return 0
+    while read -r ip; do
+        [[ -n "$ip" ]] || continue
+        "${SUDO[@]}" fail2ban-client set sshd addignoreip "$ip" >/dev/null 2>&1 || true
+        "${SUDO[@]}" fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1 || true
     done < <(whitelist_ssh_allowed_ips | sort -u)
 }
 
@@ -2209,10 +2253,11 @@ set -Eeuo pipefail
 
 URL="${ANTISCANNER_URL}"
 TEMP_FILE="\$(mktemp)"
+TRUSTED_FILE="\$(mktemp)"
 LOG="/var/log/antiscanner_update.log"
 
 cleanup() {
-    rm -f "\$TEMP_FILE"
+    rm -f "\$TEMP_FILE" "\$TRUSTED_FILE"
 }
 trap cleanup EXIT
 
@@ -2220,6 +2265,19 @@ if ! command -v ufw >/dev/null 2>&1; then
     echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] ufw not found" >> "\$LOG"
     exit 1
 fi
+
+SSH_PORT="\$(sshd -T 2>/dev/null | awk '/^port / {print \$2; exit}' || true)"
+SSH_PORT="\${SSH_PORT:-22}"
+ufw status 2>/dev/null | awk '
+    /ALLOW/ && /# kto-ssh/ {
+        for (i = 3; i <= NF; i++) {
+            if (\$i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}\$/) {
+                print \$i
+                break
+            }
+        }
+    }
+' | sort -u > "\$TRUSTED_FILE"
 
 if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
     for rules_file in /etc/ufw/user.rules /etc/ufw/user6.rules; do
@@ -2234,6 +2292,14 @@ if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
             ufw insert 1 deny from "\$subnet" comment 'AntiScanner-Block' >/dev/null 2>&1 || true
         fi
     done < "\$TEMP_FILE"
+
+    while IFS= read -r trusted_ip; do
+        [[ "\$trusted_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]] || continue
+        for _ in {1..16}; do
+            ufw --force delete allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" >/dev/null 2>&1 || break
+        done
+        ufw insert 1 allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 || true
+    done < "\$TRUSTED_FILE"
 
     ufw reload >/dev/null 2>&1 || true
     echo "\$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] AntiScanner updated via ufw" >> "\$LOG"
@@ -2820,7 +2886,16 @@ bantime = 1h
 findtime = 10m
 maxretry = 5
 EOF
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        write_whitelist_fail2ban_allowlist
+    elif "${SUDO[@]}" test -f "$FAIL2BAN_SSH_ALLOWLIST_CONF" 2>/dev/null; then
+        cmd "${SUDO[@]}" rm -f "$FAIL2BAN_SSH_ALLOWLIST_CONF"
+    fi
     cmd "${SUDO[@]}" systemctl enable --now fail2ban || true
+    cmd "${SUDO[@]}" systemctl restart fail2ban || true
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        unban_whitelist_ssh_ips
+    fi
 }
 
 opt_zram() {
@@ -3565,6 +3640,9 @@ system_check_fail2ban() {
     package_installed fail2ban || missing+=("package")
     [[ "$(service_ok fail2ban)" == "1" ]] || missing+=("service")
     [[ "$(file_ok /etc/fail2ban/jail.d/99-kto-sshd.conf)" == "1" ]] || missing+=("jail")
+    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+        [[ "$(file_ok "$FAIL2BAN_SSH_ALLOWLIST_CONF")" == "1" ]] || missing+=("ssh allowlist")
+    fi
 
     if (( ${#missing[@]} == 0 )); then
         system_check_row ok "fail2ban" "ssh guard"
@@ -8438,10 +8516,10 @@ install_stats_collector() {
     require_panel_mode
     need_root
 
-    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec scan_alert_delta expected_nodes daily_report_time existing_config=0
+    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec scan_alert_delta expected_nodes daily_report_time ssh_base_allowed_ips existing_config=0
     local ip_limit_enabled ip_limit_source ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_drop_enabled ip_limit_penalty_sec
     local remna_api_url remna_api_token remna_api_cache_sec remna_api_insecure remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
-    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_bl_stale safe_bl_offline_confirm safe_bl_stale_fallback safe_bl_push_interval safe_scan_alert_delta safe_expected safe_tz safe_daily
+    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_bl_stale safe_bl_offline_confirm safe_bl_stale_fallback safe_bl_push_interval safe_scan_alert_delta safe_expected safe_tz safe_daily safe_ssh_base_allowed_ips
     local safe_ip_limit_enabled safe_ip_limit_source safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_scan_sec safe_ip_limit_alert_threshold safe_ip_limit_alert_top safe_ip_limit_enforce_enabled safe_ip_limit_drop_enabled safe_ip_limit_penalty_sec
     local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_remna_api_insecure safe_remna_node_alert_enabled safe_remna_node_poll_sec safe_remna_offline_guard_enabled safe_remna_offline_state_max_age_sec safe_remna_offline_log_grace_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
 
@@ -8463,6 +8541,7 @@ install_stats_collector() {
         scan_alert_delta="$(config_get KTO_COLLECTOR_SCAN_ALERT_DELTA "$STATS_COLLECTOR_CONFIG")"
         expected_nodes="$(config_get KTO_COLLECTOR_EXPECTED_NODES "$STATS_COLLECTOR_CONFIG")"
         daily_report_time="$(config_get KTO_COLLECTOR_DAILY_REPORT_TIME "$STATS_COLLECTOR_CONFIG")"
+        ssh_base_allowed_ips="$(config_get KTO_COLLECTOR_SSH_BASE_ALLOWED_IPS "$STATS_COLLECTOR_CONFIG")"
         ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
         ip_limit_source="$(config_get KTO_COLLECTOR_IP_LIMIT_SOURCE "$STATS_COLLECTOR_CONFIG")"
         ip_limit_max_ips="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_IPS "$STATS_COLLECTOR_CONFIG")"
@@ -8511,6 +8590,7 @@ install_stats_collector() {
         push_miss_alert_cooldown="${push_miss_alert_cooldown:-$STATS_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT}"
         scan_alert_delta="${scan_alert_delta:-$STATS_COLLECTOR_SCAN_ALERT_DELTA_DEFAULT}"
         expected_nodes="${expected_nodes:-$STATS_EXPECTED_NODES_DEFAULT}"
+        ssh_base_allowed_ips="${ssh_base_allowed_ips:-$WHITELIST_SSH_ALLOWED_IPS}"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
         ip_limit_source="${ip_limit_source:-$IP_LIMIT_SOURCE_DEFAULT}"
         ip_limit_max_ips="${ip_limit_max_ips:-$IP_LIMIT_MAX_IPS_DEFAULT}"
@@ -8556,6 +8636,7 @@ install_stats_collector() {
         scan_alert_delta="$STATS_COLLECTOR_SCAN_ALERT_DELTA_DEFAULT"
         expected_nodes="$(ask_int "Ожидаемое кол-во обходов" "$STATS_EXPECTED_NODES_DEFAULT" 1 9999)"
         daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
+        ssh_base_allowed_ips="$WHITELIST_SSH_ALLOWED_IPS"
         ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
         ip_limit_source="$IP_LIMIT_SOURCE_DEFAULT"
         ip_limit_max_ips="$IP_LIMIT_MAX_IPS_DEFAULT"
@@ -8583,6 +8664,9 @@ install_stats_collector() {
     fi
     if [[ -n "${KTO_COLLECTOR_REMNA_API_URL:-}" ]]; then
         remna_api_url="$KTO_COLLECTOR_REMNA_API_URL"
+    fi
+    if [[ -n "${KTO_COLLECTOR_SSH_BASE_ALLOWED_IPS:-}" ]]; then
+        ssh_base_allowed_ips="$KTO_COLLECTOR_SSH_BASE_ALLOWED_IPS"
     fi
     if [[ -n "${KTO_COLLECTOR_REMNA_API_TOKEN:-}" ]]; then
         remna_api_token="$KTO_COLLECTOR_REMNA_API_TOKEN"
@@ -8697,6 +8781,7 @@ install_stats_collector() {
     safe_expected="$(escape_config_value "$expected_nodes")"
     safe_tz="$(escape_config_value "$STATS_COLLECTOR_TZ_DEFAULT")"
     safe_daily="$(escape_config_value "$daily_report_time")"
+    safe_ssh_base_allowed_ips="$(escape_config_value "$ssh_base_allowed_ips")"
     safe_ip_limit_enabled="$(escape_config_value "$ip_limit_enabled")"
     safe_ip_limit_source="$(escape_config_value "$ip_limit_source")"
     safe_ip_limit_max_ips="$(escape_config_value "$ip_limit_max_ips")"
@@ -8749,6 +8834,7 @@ KTO_COLLECTOR_SCAN_ALERT_DELTA="$safe_scan_alert_delta"
 KTO_COLLECTOR_EXPECTED_NODES="$safe_expected"
 KTO_COLLECTOR_TZ="$safe_tz"
 KTO_COLLECTOR_DAILY_REPORT_TIME="$safe_daily"
+KTO_COLLECTOR_SSH_BASE_ALLOWED_IPS="$safe_ssh_base_allowed_ips"
 KTO_COLLECTOR_IP_LIMIT_ENABLED="$safe_ip_limit_enabled"
 KTO_COLLECTOR_IP_LIMIT_SOURCE="$safe_ip_limit_source"
 KTO_COLLECTOR_IP_LIMIT_MAX_IPS="$safe_ip_limit_max_ips"

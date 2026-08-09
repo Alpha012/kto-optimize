@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v288"
+PUSH_BUILD="v289"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
 
 push_error_trap() {
     local rc="$?" line="${BASH_LINENO[0]:-?}" command="${BASH_COMMAND:-unknown}"
@@ -378,23 +379,86 @@ ufw_ssh_rule_exists() {
     ufw status 2>/dev/null | awk -v rule="$rule" -v ip="$ip" '$0 ~ /ALLOW/ && $1 == rule && $3 == ip {found=1} END{exit found ? 0 : 1}'
 }
 
+collector_ssh_allowed_ips() {
+    local response="$1" ip
+    while read -r ip; do
+        [[ -n "$ip" ]] || continue
+        validate_ipv4 "$ip" && printf '%s\n' "$ip"
+    done < <(printf '%s' "$response" | jq -r '.ssh_allowed_ips[]? // empty' 2>/dev/null || true)
+}
+
+ufw_kto_ssh_allowed_ips() {
+    command -v ufw >/dev/null 2>&1 || return 0
+    ufw status 2>/dev/null | awk '
+        /ALLOW/ && /# kto-ssh/ {
+            for (i = 3; i <= NF; i++) {
+                if ($i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+                    print $i
+                    break
+                }
+            }
+        }
+    '
+}
+
+sync_fail2ban_ssh_allowlist() {
+    local response="$1" ips ignore_line tmp changed=0 ip
+    [[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    ips="$({ collector_ssh_allowed_ips "$response"; ufw_kto_ssh_allowed_ips; } | sort -u)"
+    ignore_line="$(printf '%s\n' "$ips" | awk 'NF' | paste -sd' ' -)"
+    tmp="$(mktemp 2>/dev/null || true)"
+    [[ -n "$tmp" ]] || return 0
+    {
+        printf '[sshd]\n'
+        printf 'ignoreip = 127.0.0.1/8 ::1'
+        [[ -z "$ignore_line" ]] || printf ' %s' "$ignore_line"
+        printf '\n'
+    } > "$tmp"
+
+    if ! cmp -s "$tmp" "$KTO_FAIL2BAN_SSH_ALLOWLIST_CONF" 2>/dev/null; then
+        if mkdir -p "$(dirname "$KTO_FAIL2BAN_SSH_ALLOWLIST_CONF")" 2>/dev/null &&
+            install -m 0644 "$tmp" "$KTO_FAIL2BAN_SSH_ALLOWLIST_CONF" 2>/dev/null; then
+            changed=1
+        fi
+    fi
+    rm -f "$tmp"
+
+    if (( changed == 1 )) && command -v fail2ban-client >/dev/null 2>&1 &&
+        systemctl is-active --quiet fail2ban 2>/dev/null; then
+        fail2ban-client reload sshd >/dev/null 2>&1 || true
+        while read -r ip; do
+            [[ -n "$ip" ]] || continue
+            fail2ban-client set sshd addignoreip "$ip" >/dev/null 2>&1 || true
+            fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1 || true
+        done <<< "$ips"
+        echo "push ${PUSH_BUILD}: ssh allowlist synced with fail2ban"
+    fi
+    return 0
+}
+
 apply_collector_ssh_ips() {
     local response="$1"
     local ssh_port rule ip applied=0
 
+    [[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
-    ufw_active || return 0
 
     ssh_port="$(detect_ssh_port)"
     rule="${ssh_port}/tcp"
-    while read -r ip; do
-        [[ -n "$ip" ]] || continue
-        validate_ipv4 "$ip" || continue
-        if ! ufw_ssh_rule_exists "$rule" "$ip"; then
-            ufw allow proto tcp from "$ip" to any port "$ssh_port" comment 'kto-ssh' >/dev/null 2>&1 || true
-            applied=$(( applied + 1 ))
-        fi
-    done < <(printf '%s' "$response" | jq -r '.ssh_allowed_ips[]? // empty' 2>/dev/null || true)
+    if ufw_active; then
+        while read -r ip; do
+            [[ -n "$ip" ]] || continue
+            if ! ufw_ssh_rule_exists "$rule" "$ip"; then
+                if ufw insert 1 allow proto tcp from "$ip" to any port "$ssh_port" comment 'kto-ssh' >/dev/null 2>&1; then
+                    applied=$(( applied + 1 ))
+                fi
+            fi
+        done < <(collector_ssh_allowed_ips "$response")
+    fi
+
+    sync_fail2ban_ssh_allowlist "$response"
 
     if (( applied > 0 )); then
         echo "push ${PUSH_BUILD}: applied ssh ip rules=${applied}"

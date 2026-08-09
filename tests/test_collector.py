@@ -38,6 +38,7 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.BL_GROUPS_FILE = os.path.join(self.state.name, "bl_groups.json")
         collector.IP_LIMIT_FILE = os.path.join(self.state.name, "ip_limit.json")
         collector.UPDATE_STATE_FILE = os.path.join(self.state.name, "update_state.json")
+        collector.SSH_ALLOW_FILE = os.path.join(self.state.name, "ssh_allow_ips.json")
         collector.ALERTS_OFF_FILE = os.path.join(self.state.name, "connection_alerts_off.json")
         collector.IP_LIMIT_DB_FILE = os.path.join(self.state.name, "ip_limit.sqlite")
         collector.NETWORK_RATE_DB_FILE = os.path.join(self.state.name, "network_rate.sqlite")
@@ -60,6 +61,8 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.IP_NOTE_STATE = {"notes": {}, "pending": {}}
         collector.AUTH_NONCES = {}
         collector.NODES_DIRTY = False
+        collector.SSH_ALLOWED_IPS = []
+        collector.SSH_BASE_ALLOWED_IPS = list(collector.SSH_BASE_ALLOWED_IPS_DEFAULT)
         collector.init_ip_limit_db()
         collector.init_network_rate_db()
         self.original_enqueue = collector.enqueue_event
@@ -166,6 +169,28 @@ class CollectorRegressionTests(unittest.TestCase):
     def test_explicit_node_kind_wins_over_name_heuristic(self):
         self.assertFalse(collector.node_is_wl(self.payload("Обход №1", str(uuid.uuid4()), "bl")))
         self.assertTrue(collector.node_is_wl(self.payload("Обычная машина", str(uuid.uuid4()), "wl")))
+
+    def test_ssh_snapshot_combines_base_and_telegram_ips(self):
+        collector.SSH_BASE_ALLOWED_IPS = ["203.0.113.10", "203.0.113.20"]
+        collector.SSH_ALLOWED_IPS = ["198.51.100.7", "203.0.113.10"]
+        self.assertEqual(
+            ["198.51.100.7", "203.0.113.10", "203.0.113.20"],
+            collector.ssh_allowed_ips_snapshot(),
+        )
+        self.assertEqual(
+            collector.ssh_allowed_ips_snapshot(),
+            collector.ssh_allowed_ips_for_node(self.payload("Обход", str(uuid.uuid4()), "wl")),
+        )
+        self.assertEqual(
+            [],
+            collector.ssh_allowed_ips_for_node(self.payload("Нода", str(uuid.uuid4()), "bl")),
+        )
+
+    def test_parse_ipv4_list_deduplicates_and_rejects_bad_values(self):
+        self.assertEqual(
+            ["192.0.2.2", "192.0.2.10"],
+            collector.parse_ipv4_list("192.0.2.10, bad; 192.0.2.2 192.0.2.10 2001:db8::1"),
+        )
 
     def test_wl_other_nodes_sort_resell_then_private_then_the_rest(self):
         names = [
@@ -657,6 +682,7 @@ class CollectorRegressionTests(unittest.TestCase):
             self.assertEqual(expected, response_signature)
             payload = json.loads(response_body)
             self.assertTrue(payload["ok"])
+            self.assertEqual([], payload["ssh_allowed_ips"])
             self.assertEqual([], payload["ip_limit_blocks"])
             self.assertTrue(payload["ip_limit_clear_blocks"])
             self.assertTrue(payload["ip_limit_enabled"])

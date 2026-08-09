@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v288"', KTO)
-        self.assertIn('PUSH_BUILD="v288"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v288"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v288"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v288"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v288"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v288"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v289"', KTO)
+        self.assertIn('PUSH_BUILD="v289"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v289"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v289"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v289"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v289"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v289"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)
@@ -1489,6 +1489,73 @@ NODE_PROFILE=hysteria2
             '5.34.176.116 5.34.178.234 84.38.185.15 193.23.195.222"',
             KTO,
         )
+
+    def test_ssh_allowlist_is_prioritized_and_ignored_by_fail2ban(self):
+        apply_rules = function_body(KTO, "apply_whitelist_ssh_rules")
+        fail2ban = function_body(KTO, "opt_fail2ban")
+        push_apply = function_body(PUSH, "apply_collector_ssh_ips")
+        push_sync = function_body(PUSH, "sync_fail2ban_ssh_allowlist")
+
+        self.assertIn('ufw insert 1 allow proto tcp from "$ip"', apply_rules)
+        self.assertIn("write_whitelist_fail2ban_allowlist", fail2ban)
+        self.assertIn("unban_whitelist_ssh_ips", fail2ban)
+        self.assertIn("ufw insert 1 allow proto tcp from \"\\$trusted_ip\"", KTO)
+        self.assertIn('[[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0', push_apply)
+        self.assertIn('ufw insert 1 allow proto tcp from "$ip"', push_apply)
+        self.assertIn("fail2ban-client set sshd addignoreip", push_sync)
+        self.assertIn("fail2ban-client set sshd unbanip", push_sync)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = "\n".join(
+            [
+                "set -Eeuo pipefail",
+                function_body(PUSH, "validate_ipv4"),
+                function_body(PUSH, "collector_ssh_allowed_ips"),
+                function_body(PUSH, "ufw_kto_ssh_allowed_ips"),
+                function_body(PUSH, "sync_fail2ban_ssh_allowlist"),
+                function_body(PUSH, "apply_collector_ssh_ips"),
+                r'''
+root="$(mktemp -d)"
+trap 'rm -rf "$root"' EXIT
+events="$root/events"
+KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="$root/allowlist.local"
+KTO_PUSH_NODE_KIND=wl
+PUSH_BUILD=vtest
+
+jq() { printf '%s\n' 85.192.48.122 203.0.113.77; }
+ufw_active() { return 0; }
+detect_ssh_port() { printf '22\n'; }
+ufw_ssh_rule_exists() { return 1; }
+ufw() { printf 'ufw %s\n' "$*" >> "$events"; }
+systemctl() { [[ "${1:-}" == "is-active" ]]; }
+fail2ban-client() { printf 'f2b %s\n' "$*" >> "$events"; }
+
+apply_collector_ssh_ips '{}'
+grep -q '^ufw insert 1 allow proto tcp from 85.192.48.122 to any port 22 comment kto-ssh$' "$events"
+grep -q '^f2b set sshd addignoreip 203.0.113.77$' "$events"
+grep -q '^f2b set sshd unbanip 203.0.113.77$' "$events"
+grep -q '^ignoreip = 127.0.0.1/8 ::1 203.0.113.77 85.192.48.122$' "$KTO_FAIL2BAN_SSH_ALLOWLIST_CONF"
+
+before="$(wc -l < "$events")"
+KTO_PUSH_NODE_KIND=bl
+apply_collector_ssh_ips '{}'
+after="$(wc -l < "$events")"
+[[ "$before" == "$after" ]]
+''',
+            ]
+        )
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_haproxy_updates_are_transactional_and_preserve_routes(self):
         apply_routes = function_body(KTO, "apply_haproxy_routes_config")

@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v288"
+COLLECTOR_BUILD = "v289"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -53,6 +53,39 @@ def load_config(path):
 
 
 cfg = load_config(CONFIG)
+SSH_BASE_ALLOWED_IPS_DEFAULT = (
+    "85.192.48.122",
+    "46.28.64.183",
+    "146.19.248.67",
+    "85.93.9.35",
+    "185.31.243.221",
+    "94.247.129.92",
+    "83.228.242.53",
+    "167.254.243.181",
+    "5.34.176.116",
+    "5.34.178.234",
+    "84.38.185.15",
+    "193.23.195.222",
+)
+
+
+def parse_ipv4_list(value):
+    result = set()
+    for item in re.split(r"[\s,;]+", str(value or "").strip()):
+        if not item:
+            continue
+        try:
+            address = ipaddress.ip_address(item)
+        except ValueError:
+            continue
+        if address.version == 4:
+            result.add(str(address))
+    return sorted(result, key=lambda item: tuple(int(part) for part in item.split(".")))
+
+
+SSH_BASE_ALLOWED_IPS = parse_ipv4_list(
+    cfg.get("KTO_COLLECTOR_SSH_BASE_ALLOWED_IPS", " ".join(SSH_BASE_ALLOWED_IPS_DEFAULT))
+)
 RAW_BASE = cfg.get("KTO_RAW_BASE", "https://raw.githubusercontent.com/Alpha012/kto-optimize/main").rstrip("/")
 ALLOW_INSECURE_UPDATE_URL = str(cfg.get("KTO_ALLOW_INSECURE_UPDATE_URL", "0")).lower() in ("1", "yes", "true", "on", "enabled")
 LISTEN_HOST = cfg.get("KTO_COLLECTOR_LISTEN_HOST", "0.0.0.0")
@@ -557,7 +590,14 @@ def add_ssh_allowed_ip(ip):
 
 def ssh_allowed_ips_snapshot():
     with LOCK:
-        return list(SSH_ALLOWED_IPS)
+        return sorted(
+            set(SSH_BASE_ALLOWED_IPS) | set(SSH_ALLOWED_IPS),
+            key=lambda value: tuple(int(part) for part in value.split(".")),
+        )
+
+
+def ssh_allowed_ips_for_node(node):
+    return ssh_allowed_ips_snapshot() if node_is_wl(node) else []
 
 
 def normalize_sni(value):
@@ -6877,7 +6917,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "id": node["id"],
                 "last_seen": node["last_seen"],
-                "ssh_allowed_ips": ssh_allowed_ips_snapshot(),
+                "ssh_allowed_ips": ssh_allowed_ips_for_node(node),
                 "ip_limit_blocks": [],
                 "ip_limit_clear_blocks": True,
             }
