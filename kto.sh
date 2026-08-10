@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v291"
+SCRIPT_BUILD="v292"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -68,6 +68,8 @@ STATS_COLLECTOR_SERVICE="kto-stats-collector.service"
 STATS_COLLECTOR_STATE_DIR="/var/lib/kto-stats-collector"
 STATS_PUSH_CONFIG="/etc/kto-stats-push.conf"
 STATS_PUSH_SCRIPT="/usr/local/bin/kto-stats-push"
+STATS_PUSH_HAPROXY_HELPER="/usr/local/lib/kto/kto.sh"
+STATS_PUSH_TIMEOUT_DROPIN="/etc/systemd/system/kto-stats-push.service.d/99-kto-timeout.conf"
 STATS_PUSH_SERVICE="kto-stats-push.service"
 STATS_PUSH_TIMER="kto-stats-push.timer"
 STATS_COLLECTOR_PORT_DEFAULT="${KTO_STATS_COLLECTOR_PORT_DEFAULT:-1337}"
@@ -5939,6 +5941,175 @@ extract_haproxy_routes() {
     printf '%s' "$normalized_routes" | sort -s -t $'\t' -k1,1n
 }
 
+haproxy_remote_report_json() {
+    local routes_file
+
+    command_exists jq || {
+        echo '[]'
+        return 1
+    }
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+    if [[ ! -s "$routes_file" ]]; then
+        rm -f "$routes_file"
+        echo '[]'
+        return 0
+    fi
+    jq -Rn '
+        [inputs
+        | select(length > 0)
+        | split("\t")
+        | {
+            port: (.[0] | tonumber),
+            targets: (.[1] | split(",") | map(select(length > 0))),
+            sni: (.[2] | split(" ") | map(select(length > 0)) | sort),
+            source_ip: (.[3] // "default"),
+            server_maxconn: ((.[4] // "default") | if test("^[0-9]+$") then tonumber else "default" end),
+            listen_ip: (.[5] // "*")
+          }]
+    ' < "$routes_file"
+    rm -f "$routes_file"
+}
+
+haproxy_remote_apply_json() {
+    local input_file routes_file previous_routes_file canonical_current canonical_wanted
+    local port target_pool sni source_ip server_maxconn listen_ip normalized route_count target_count sni_count
+    local old_listen_ip
+
+    command_exists jq || {
+        fail "jq не найден: удалённое управление HAProxy недоступно"
+        return 1
+    }
+    need_root
+    input_file="$(mktemp)"
+    routes_file="$(mktemp)"
+    previous_routes_file="$(mktemp)"
+    canonical_current="$(mktemp)"
+    canonical_wanted="$(mktemp)"
+    cat > "$input_file"
+
+    if "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null &&
+        ! "${SUDO[@]}" grep -Fq '# Managed by kto. Edit routes through the HAProxy menu.' "$HAPROXY_CONFIG_FILE" 2>/dev/null; then
+        rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+        fail "Текущий HAProxy config не управляется kto; удалённая перезапись заблокирована"
+        return 1
+    fi
+
+    if ! jq -e '
+        type == "array" and
+        length >= 1 and length <= 128 and
+        all(.[];
+            type == "object" and
+            ((.targets | type) == "array") and (.targets | length >= 1 and length <= 64) and
+            ((.sni | type) == "array") and (.sni | length >= 1 and length <= 64)
+        )
+    ' "$input_file" >/dev/null 2>&1; then
+        rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+        fail "Collector прислал некорректный список HAProxy-маршрутов"
+        return 1
+    fi
+
+    while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip; do
+        [[ "$port" =~ ^[0-9]+$ ]] || {
+            rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+            fail "Некорректный входной HAProxy-порт"
+            return 1
+        }
+        port=$((10#$port))
+        (( port >= 1 && port <= 65535 )) || {
+            rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+            fail "HAProxy-порт вне диапазона: $port"
+            return 1
+        }
+        normalized="$(normalize_haproxy_target_pool "$target_pool" 2>/dev/null || true)"
+        [[ -n "$normalized" ]] || {
+            rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+            fail "Некорректный backend у ${listen_ip:-*}:${port}"
+            return 1
+        }
+        target_pool="$normalized"
+        target_count="$(haproxy_target_pool_count "$target_pool" 2>/dev/null || echo 0)"
+        (( target_count >= 1 && target_count <= 64 )) || {
+            rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+            fail "Слишком большой backend-пул у ${listen_ip:-*}:${port}"
+            return 1
+        }
+        sni="$(normalize_haproxy_sni_list "$sni" 2>/dev/null || true)"
+        [[ -n "$sni" ]] || {
+            rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+            fail "Некорректный SNI у ${listen_ip:-*}:${port}"
+            return 1
+        }
+        sni_count="$(tr ' ' '\n' <<< "$sni" | awk 'NF { count++ } END { print count + 0 }')"
+        (( sni_count >= 1 && sni_count <= 64 )) || {
+            rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+            fail "Слишком большой SNI allow-list у ${listen_ip:-*}:${port}"
+            return 1
+        }
+        source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}" 2>/dev/null || true)"
+        server_maxconn="$(normalize_haproxy_server_maxconn "${server_maxconn:-default}" 2>/dev/null || true)"
+        listen_ip="$(normalize_haproxy_listen_ip "${listen_ip:-*}" 2>/dev/null || true)"
+        [[ -n "$source_ip" && -n "$server_maxconn" && -n "$listen_ip" ]] || {
+            rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+            fail "Некорректные параметры HAProxy-маршрута"
+            return 1
+        }
+        if [[ "$listen_ip" != "*" ]] && ! haproxy_input_ip_available "$listen_ip"; then
+            rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+            fail "Входной IP ${listen_ip} не настроен на этой машине"
+            return 1
+        fi
+        if [[ "$source_ip" != "default" ]]; then
+            if ! haproxy_input_ip_available "$source_ip" || ! ip -4 route get 1.1.1.1 from "$source_ip" >/dev/null 2>&1; then
+                rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+                fail "Для выходного IP ${source_ip} нет рабочего source-route"
+                return 1
+            fi
+        fi
+        print_haproxy_route "$port" "$target_pool" "$sni" "$source_ip" "$server_maxconn" "$listen_ip" >> "$routes_file"
+    done < <(jq -r '
+        .[]
+        | [
+            (.port // "" | tostring),
+            ((.targets // []) | map(tostring) | join(",")),
+            ((.sni // []) | map(tostring) | join(" ")),
+            (.source_ip // "default" | tostring),
+            (.server_maxconn // "default" | tostring),
+            (.listen_ip // "*" | tostring)
+          ]
+        | @tsv
+    ' "$input_file")
+
+    route_count="$(haproxy_route_count "$routes_file")"
+    if (( route_count < 1 || route_count > 128 )) || ! canonicalize_haproxy_routes "$routes_file" > "$canonical_wanted"; then
+        rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+        fail "Семантическая проверка HAProxy-маршрутов не прошла"
+        return 1
+    fi
+
+    extract_haproxy_routes > "$previous_routes_file"
+    if [[ -s "$previous_routes_file" ]] && canonicalize_haproxy_routes "$previous_routes_file" > "$canonical_current" &&
+        cmp -s "$canonical_current" "$canonical_wanted"; then
+        rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+        printf '{"ok":true,"changed":false,"routes":%s}\n' "$route_count"
+        return 0
+    fi
+
+    if ! apply_haproxy_routes_config "$routes_file"; then
+        rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+        return 1
+    fi
+    sync_haproxy_firewall "$routes_file" "$previous_routes_file"
+    while IFS=$'\t' read -r _ _ _ _ _ old_listen_ip; do
+        old_listen_ip="$(normalize_haproxy_listen_ip "${old_listen_ip:-*}" 2>/dev/null || true)"
+        [[ -n "$old_listen_ip" && "$old_listen_ip" != "*" ]] || continue
+        cleanup_haproxy_bandwidth_after_route_delete "$routes_file" "$old_listen_ip" || true
+    done < "$previous_routes_file"
+
+    rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+    printf '{"ok":true,"changed":true,"routes":%s}\n' "$route_count"
+}
+
 extract_haproxy_backend_target() {
     extract_haproxy_routes | awk -F '\t' 'NR == 1 { split($2, targets, ","); print targets[1]; exit }'
 }
@@ -9207,6 +9378,11 @@ stats_collector_alerts_menu() {
 
 write_stats_push_script() {
     install_asset_file scripts/kto-stats-push.sh "$STATS_PUSH_SCRIPT" 0755
+    if ! "${SUDO[@]}" mkdir -p "$(dirname "$STATS_PUSH_HAPROXY_HELPER")" >> "$LOG_FILE" 2>&1; then
+        fail "Не удалось создать каталог HAProxy helper"
+        return 1
+    fi
+    install_asset_file kto.sh "$STATS_PUSH_HAPROXY_HELPER" 0755
 }
 
 write_stats_push_service() {
@@ -9220,6 +9396,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=${STATS_PUSH_SCRIPT}
+TimeoutStartSec=360
 EOF
 
     write_root_file "/etc/systemd/system/${STATS_PUSH_TIMER}" <<EOF
@@ -9494,6 +9671,7 @@ stats_push_delete_client() {
     local had_push=0
     if "${SUDO[@]}" test -e "$STATS_PUSH_CONFIG" 2>/dev/null \
         || "${SUDO[@]}" test -e "$STATS_PUSH_SCRIPT" 2>/dev/null \
+        || "${SUDO[@]}" test -e "$STATS_PUSH_HAPROXY_HELPER" 2>/dev/null \
         || "${SUDO[@]}" systemctl cat "$STATS_PUSH_TIMER" >/dev/null 2>&1 \
         || "${SUDO[@]}" systemctl cat "$STATS_PUSH_SERVICE" >/dev/null 2>&1; then
         had_push=1
@@ -9504,6 +9682,8 @@ stats_push_delete_client() {
     cmd "${SUDO[@]}" rm -f \
         "$STATS_PUSH_CONFIG" \
         "$STATS_PUSH_SCRIPT" \
+        "$STATS_PUSH_HAPROXY_HELPER" \
+        "$STATS_PUSH_TIMEOUT_DROPIN" \
         "/etc/systemd/system/${STATS_PUSH_TIMER}" \
         "/etc/systemd/system/${STATS_PUSH_SERVICE}"
     cmd "${SUDO[@]}" rm -rf /var/lib/kto-stats-push
@@ -10023,8 +10203,19 @@ menu() {
 }
 
 main() {
+    if [[ "${1:-}" == "haproxy-remote-report" ]]; then
+        haproxy_remote_report_json
+        return
+    fi
     init_log
     ensure_utf8_locale
+    case "${1:-}" in
+        haproxy-remote-apply)
+            load_machine_mode
+            haproxy_remote_apply_json
+            return
+            ;;
+    esac
     migrate_superseded_kto_state
     ensure_machine_mode
 

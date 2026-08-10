@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v291"
+PUSH_BUILD="v292"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
@@ -55,6 +55,9 @@ KTO_TUNING_SYSCTL_CONF="${KTO_TUNING_SYSCTL_CONF:-/etc/sysctl.d/99-kto-tuning.co
 KTO_LIMITS_CONF="${KTO_LIMITS_CONF:-/etc/security/limits.d/99-kto-limits.conf}"
 KTO_SYSTEMD_LIMITS_CONF="${KTO_SYSTEMD_LIMITS_CONF:-/etc/systemd/system.conf.d/99-kto-limits.conf}"
 KTO_USER_LIMITS_CONF="${KTO_USER_LIMITS_CONF:-/etc/systemd/user.conf.d/99-kto-limits.conf}"
+KTO_HAPROXY_HELPER="${KTO_HAPROXY_HELPER:-/usr/local/lib/kto/kto.sh}"
+KTO_HAPROXY_APPLY_STATE="${KTO_HAPROXY_APPLY_STATE:-/var/lib/kto-stats-push/haproxy_apply.json}"
+KTO_PUSH_TIMEOUT_DROPIN="${KTO_PUSH_TIMEOUT_DROPIN:-/etc/systemd/system/kto-stats-push.service.d/99-kto-timeout.conf}"
 
 if command -v flock >/dev/null 2>&1; then
     exec 9>/run/kto-stats-push.lock
@@ -87,6 +90,10 @@ scan_wrong_sni_top='[]'
 scan_wrong_sni_names='[]'
 haproxy_allowed_sni='[]'
 haproxy_backend_target=''
+haproxy_routes='[]'
+haproxy_routes_supported=false
+haproxy_routes_managed=false
+haproxy_apply_result='{}'
 ip_limit_events='[]'
 ip_limit_events_count=0
 update_result='{}'
@@ -582,6 +589,174 @@ haproxy_base_server_name() {
             exit
         }
     ' "$config" 2>/dev/null || true
+}
+
+ensure_push_service_timeout() {
+    local tmp
+    if [[ -r "$KTO_PUSH_TIMEOUT_DROPIN" ]] && grep -Fqx 'TimeoutStartSec=360' "$KTO_PUSH_TIMEOUT_DROPIN" 2>/dev/null; then
+        return 0
+    fi
+    tmp="$(mktemp)"
+    printf '[Service]\nTimeoutStartSec=360\n' > "$tmp"
+    if mkdir -p "$(dirname "$KTO_PUSH_TIMEOUT_DROPIN")" 2>/dev/null &&
+        install -m 0644 "$tmp" "$KTO_PUSH_TIMEOUT_DROPIN" 2>/dev/null; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    rm -f "$tmp"
+}
+
+ensure_haproxy_helper() {
+    local raw_base tmp helper_size helper_build
+
+    if [[ -x "$KTO_HAPROXY_HELPER" ]] &&
+        grep -Fqx "SCRIPT_BUILD=\"${PUSH_BUILD}\"" "$KTO_HAPROXY_HELPER" 2>/dev/null &&
+        grep -Fq 'haproxy-remote-apply)' "$KTO_HAPROXY_HELPER" 2>/dev/null; then
+        ensure_push_service_timeout
+        return 0
+    fi
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v bash >/dev/null 2>&1 || return 1
+    raw_base="${KTO_UPDATE_RAW_BASE%/}"
+    if [[ ! "$raw_base" =~ ^https:// ]] && [[ "$KTO_ALLOW_INSECURE_UPDATE_URL" != "1" ]]; then
+        echo "push ${PUSH_BUILD}: insecure HAProxy helper URL rejected" >&2
+        return 1
+    fi
+    tmp="$(mktemp)"
+    if ! curl -fsSL --connect-timeout 8 --max-time 30 "${raw_base}/kto.sh" -o "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        echo "push ${PUSH_BUILD}: HAProxy helper download failed" >&2
+        return 1
+    fi
+    helper_size="$(wc -c < "$tmp" 2>/dev/null || echo 0)"
+    if [[ ! "$helper_size" =~ ^[0-9]+$ ]] || (( helper_size < 100000 || helper_size > 2097152 )) ||
+        [[ "$(head -n 1 "$tmp" 2>/dev/null || true)" != "#!/usr/bin/env bash" ]] ||
+        ! bash -n "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        echo "push ${PUSH_BUILD}: downloaded HAProxy helper is invalid" >&2
+        return 1
+    fi
+    helper_build="$(awk -F= '$1 == "SCRIPT_BUILD" { gsub(/"/, "", $2); print $2; exit }' "$tmp" 2>/dev/null || true)"
+    if [[ "$helper_build" != "$PUSH_BUILD" ]] || ! grep -Fq 'haproxy-remote-apply)' "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        echo "push ${PUSH_BUILD}: HAProxy helper build mismatch (${helper_build:-unknown})" >&2
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$KTO_HAPROXY_HELPER")" 2>/dev/null ||
+        ! install -m 0755 "$tmp" "$KTO_HAPROXY_HELPER" 2>/dev/null; then
+        rm -f "$tmp"
+        echo "push ${PUSH_BUILD}: HAProxy helper install failed" >&2
+        return 1
+    fi
+    rm -f "$tmp"
+    ensure_push_service_timeout
+    echo "push ${PUSH_BUILD}: HAProxy helper installed"
+}
+
+read_haproxy_routes() {
+    local reported
+
+    haproxy_routes='[]'
+    haproxy_routes_supported=false
+    haproxy_routes_managed=false
+    command -v jq >/dev/null 2>&1 || return 0
+    ensure_haproxy_helper || return 0
+    if ! reported="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-remote-report 2>/dev/null)"; then
+        echo "push ${PUSH_BUILD}: HAProxy route report failed" >&2
+        return 0
+    fi
+    if ! printf '%s' "$reported" | jq -e 'type == "array" and length <= 128' >/dev/null 2>&1; then
+        echo "push ${PUSH_BUILD}: HAProxy route report is invalid" >&2
+        return 0
+    fi
+    haproxy_routes="$(printf '%s' "$reported" | jq -c 'map(.sni = ((.sni // []) | sort)) | sort_by(.listen_ip, .port)' 2>/dev/null || echo '[]')"
+    haproxy_routes_supported=true
+    if [[ ! -s /etc/haproxy/haproxy.cfg ]] || grep -Fq '# Managed by kto. Edit routes through the HAProxy menu.' /etc/haproxy/haproxy.cfg 2>/dev/null; then
+        haproxy_routes_managed=true
+    fi
+}
+
+load_haproxy_apply_result() {
+    haproxy_apply_result='{}'
+    [[ -r "$KTO_HAPROXY_APPLY_STATE" ]] || return 0
+    if jq -e 'type == "object"' "$KTO_HAPROXY_APPLY_STATE" >/dev/null 2>&1; then
+        haproxy_apply_result="$(jq -c '.' "$KTO_HAPROXY_APPLY_STATE" 2>/dev/null || echo '{}')"
+    fi
+}
+
+write_haproxy_apply_result() {
+    local status="$1" message="${2:-}" route_count="${3:-0}" tmp
+
+    message="${message//$'\n'/ }"
+    message="${message:0:500}"
+    [[ "$route_count" =~ ^[0-9]+$ ]] || route_count=0
+    mkdir -p "$(dirname "$KTO_HAPROXY_APPLY_STATE")" 2>/dev/null || true
+    tmp="${KTO_HAPROXY_APPLY_STATE}.$$"
+    if jq -n -c \
+        --arg status "$status" \
+        --arg message "$message" \
+        --arg build "$PUSH_BUILD" \
+        --argjson routes "$route_count" \
+        --argjson updated_at "$(date +%s)" \
+        '{status: $status, message: $message, build: $build, routes: $routes, updated_at: $updated_at}' > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$KTO_HAPROXY_APPLY_STATE" 2>/dev/null || rm -f "$tmp"
+        load_haproxy_apply_result
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+}
+
+collector_has_haproxy_routes() {
+    printf '%s' "$1" | jq -e 'has("haproxy_routes") and (.haproxy_routes | type == "array")' >/dev/null 2>&1
+}
+
+apply_collector_haproxy_routes() {
+    local response="$1" desired current after route_count output_file message
+
+    collector_has_haproxy_routes "$response" || return 0
+    desired="$(printf '%s' "$response" | jq -c '
+        .haproxy_routes
+        | map({
+            port: .port,
+            targets: .targets,
+            sni: ((.sni // []) | sort),
+            source_ip: (.source_ip // "default"),
+            server_maxconn: (.server_maxconn // "default"),
+            listen_ip: (.listen_ip // "*")
+          })
+        | sort_by(.listen_ip, .port)
+    ' 2>/dev/null || true)"
+    if [[ -z "$desired" ]] || ! printf '%s' "$desired" | jq -e 'type == "array" and length >= 1 and length <= 128' >/dev/null 2>&1; then
+        write_haproxy_apply_result "error" "collector sent invalid route list" 0
+        echo "push ${PUSH_BUILD}: invalid HAProxy routes from collector" >&2
+        return 0
+    fi
+    route_count="$(printf '%s' "$desired" | jq -r 'length' 2>/dev/null || echo 0)"
+    if ! ensure_haproxy_helper; then
+        write_haproxy_apply_result "error" "HAProxy helper unavailable" "$route_count"
+        return 0
+    fi
+    current="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-remote-report 2>/dev/null | jq -c 'map(.sni = ((.sni // []) | sort)) | sort_by(.listen_ip, .port)' 2>/dev/null || echo '[]')"
+    if [[ "$(printf '%s' "$current" | jq -cS '.' 2>/dev/null || true)" == "$(printf '%s' "$desired" | jq -cS '.' 2>/dev/null || true)" ]]; then
+        return 0
+    fi
+
+    output_file="$(mktemp)"
+    if printf '%s' "$desired" | timeout 300 "$KTO_HAPROXY_HELPER" haproxy-remote-apply > "$output_file" 2>&1; then
+        after="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-remote-report 2>/dev/null | jq -c 'map(.sni = ((.sni // []) | sort)) | sort_by(.listen_ip, .port)' 2>/dev/null || echo '[]')"
+        if [[ "$(printf '%s' "$after" | jq -cS '.' 2>/dev/null || true)" == "$(printf '%s' "$desired" | jq -cS '.' 2>/dev/null || true)" ]]; then
+            write_haproxy_apply_result "ok" "routes applied" "$route_count"
+            echo "push ${PUSH_BUILD}: HAProxy routes applied count=${route_count}"
+            rm -f "$output_file"
+            return 0
+        fi
+        message="route verification failed after apply"
+    else
+        message="$(tail -n 1 "$output_file" 2>/dev/null | tr -d '\r' || true)"
+        message="${message:-HAProxy apply failed}"
+    fi
+    write_haproxy_apply_result "error" "$message" "$route_count"
+    echo "push ${PUSH_BUILD}: HAProxy routes apply failed: ${message}" >&2
+    rm -f "$output_file"
 }
 
 read_haproxy_allowed_sni() {
@@ -1857,7 +2032,9 @@ apply_push_delete_task() {
         /etc/kto-stats-push.conf \
         /etc/systemd/system/kto-stats-push.timer \
         /etc/systemd/system/kto-stats-push.service \
-        /usr/local/bin/kto-stats-push
+        /usr/local/bin/kto-stats-push \
+        "$KTO_HAPROXY_HELPER" \
+        "$KTO_PUSH_TIMEOUT_DROPIN"
     rm -rf /var/lib/kto-stats-push
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed kto-stats-push.timer kto-stats-push.service >/dev/null 2>&1 || true
@@ -2339,6 +2516,8 @@ fi
 read_haproxy_scan_stats
 read_haproxy_allowed_sni
 read_haproxy_backend_target
+read_haproxy_routes
+load_haproxy_apply_result
 read_remna_diagnostics
 read_ip_limit_events
 read_update_result
@@ -2427,6 +2606,10 @@ if ! payload="$(jq -n \
     --argjson scan_wrong_sni_names "$scan_wrong_sni_names" \
     --argjson haproxy_allowed_sni "$haproxy_allowed_sni" \
     --arg haproxy_backend_target "$haproxy_backend_target" \
+    --argjson haproxy_routes "$haproxy_routes" \
+    --argjson haproxy_routes_supported "$haproxy_routes_supported" \
+    --argjson haproxy_routes_managed "$haproxy_routes_managed" \
+    --argjson haproxy_apply_result "$haproxy_apply_result" \
     --arg remna_status "$remna_status" \
     --argjson remna_restarts "$remna_restarts" \
     --argjson remna_error_count "$remna_error_count" \
@@ -2466,6 +2649,10 @@ if ! payload="$(jq -n \
         scan_wrong_sni_names: $scan_wrong_sni_names,
         haproxy_allowed_sni: $haproxy_allowed_sni,
         haproxy_backend_target: $haproxy_backend_target,
+        haproxy_routes: $haproxy_routes,
+        haproxy_routes_supported: $haproxy_routes_supported,
+        haproxy_routes_managed: $haproxy_routes_managed,
+        haproxy_apply_result: $haproxy_apply_result,
         remna: {
             status: $remna_status,
             restarts: $remna_restarts,
@@ -2558,7 +2745,11 @@ if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
     fi
     apply_collector_ssh_ips "$response"
     apply_collector_ssh_firewall_mode "$response"
-    apply_collector_haproxy_config "$response"
+    if collector_has_haproxy_routes "$response"; then
+        apply_collector_haproxy_routes "$response"
+    else
+        apply_collector_haproxy_config "$response"
+    fi
     apply_collector_node_name_config "$response"
     apply_collector_ip_limit_config "$response"
     apply_collector_push_interval "$response"

@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v291"
+COLLECTOR_BUILD = "v292"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -322,6 +322,7 @@ DAILY_FILE = os.path.join(STATE_DIR, "daily_report_date")
 SSH_ALLOW_FILE = os.path.join(STATE_DIR, "ssh_allow_ips.json")
 SSH_FIREWALL_FILE = os.path.join(STATE_DIR, "ssh_firewall.json")
 SNI_ALLOW_FILE = os.path.join(STATE_DIR, "sni_allow.json")
+HAPROXY_CONTROL_FILE = os.path.join(STATE_DIR, "haproxy_control.json")
 NODE_NAMES_FILE = os.path.join(STATE_DIR, "node_names.json")
 BL_GROUPS_FILE = os.path.join(STATE_DIR, "bl_groups.json")
 STATS_OFF_FILE = os.path.join(STATE_DIR, "stats_off.json")
@@ -338,6 +339,7 @@ FALLS = {}
 SSH_ALLOWED_IPS = []
 SSH_FIREWALL_STATE = {"nodes": {}}
 SNI_STATE = {"nodes": {}, "pending": {}}
+HAPROXY_STATE = {"nodes": {}, "sessions": {}, "pending": {}}
 NODE_NAME_STATE = {"nodes": {}, "pending": {}}
 BL_GROUP_STATE = {"groups": {}, "pending": {}}
 STATS_OFF_STATE = {"nodes": {}}
@@ -356,6 +358,10 @@ AUTH_NONCE_LAST_PURGE = 0
 ALERT_SEPARATOR = "➖" * 9
 IP_NOTE_MAX_LENGTH = 160
 IP_NOTE_PENDING_TTL = 600
+HAPROXY_SESSION_TTL = 1800
+HAPROXY_MAX_ROUTES = 128
+HAPROXY_MAX_TARGETS = 64
+HAPROXY_MAX_SNI = 64
 NETWORK_RATE_BUCKET_SEC = 60
 NETWORK_RATE_RETENTION_SEC = 24 * 60 * 60
 NETWORK_RATE_MAX_SAMPLE_MS = 5 * 60 * 1000
@@ -674,6 +680,141 @@ def normalize_sni_list(values):
     return sorted(result, key=natural_sort_key)
 
 
+def normalize_haproxy_targets(values):
+    if isinstance(values, str):
+        raw_values = re.split(r"[\s,;]+", values)
+    elif isinstance(values, list):
+        raw_values = values
+    else:
+        raise ValueError("bad haproxy targets")
+    result = []
+    for value in raw_values:
+        if value is None or str(value).strip() == "":
+            continue
+        target = normalize_haproxy_target(value)
+        if target not in result:
+            result.append(target)
+    if not result or len(result) > HAPROXY_MAX_TARGETS:
+        raise ValueError("bad haproxy target count")
+    return result
+
+
+def normalize_haproxy_listen_ip(value):
+    value = str(value or "*").strip().lower()
+    if value in ("", "*", "any", "all", "default", "0.0.0.0"):
+        return "*"
+    return normalize_ip(value)
+
+
+def normalize_haproxy_source_ip(value):
+    value = str(value or "default").strip().lower()
+    if value in ("", "auto", "default"):
+        return "default"
+    return normalize_ip(value)
+
+
+def normalize_haproxy_server_maxconn(value):
+    value = str(value if value is not None else "default").strip().lower()
+    if value in ("", "0", "auto", "default", "none"):
+        return "default"
+    if not value.isdigit():
+        raise ValueError("bad haproxy maxconn")
+    number = int(value)
+    if number < 1 or number > 10_000_000:
+        raise ValueError("bad haproxy maxconn")
+    return number
+
+
+def normalize_haproxy_route(value):
+    if not isinstance(value, dict):
+        raise ValueError("bad haproxy route")
+    port_text = str(value.get("port") or "").strip()
+    if not port_text.isdigit():
+        raise ValueError("bad haproxy route port")
+    port = int(port_text)
+    if port < 1 or port > 65535:
+        raise ValueError("bad haproxy route port")
+    targets = normalize_haproxy_targets(value.get("targets"))
+    sni = normalize_sni_list(value.get("sni"))
+    if not sni or len(sni) > HAPROXY_MAX_SNI:
+        raise ValueError("bad haproxy sni count")
+    return {
+        "listen_ip": normalize_haproxy_listen_ip(value.get("listen_ip")),
+        "port": port,
+        "targets": targets,
+        "sni": sni,
+        "source_ip": normalize_haproxy_source_ip(value.get("source_ip")),
+        "server_maxconn": normalize_haproxy_server_maxconn(value.get("server_maxconn")),
+    }
+
+
+def haproxy_route_sort_key(route):
+    listen_ip = str(route.get("listen_ip") or "*")
+    ip_key = (-1,) if listen_ip == "*" else tuple(int(part) for part in listen_ip.split("."))
+    return (ip_key, int(route.get("port") or 0), tuple(route.get("targets") or []))
+
+
+def normalize_haproxy_routes(values, strict=False):
+    if not isinstance(values, list):
+        if strict:
+            raise ValueError("bad haproxy routes")
+        return []
+    if len(values) > HAPROXY_MAX_ROUTES:
+        if strict:
+            raise ValueError("too many haproxy routes")
+        values = values[:HAPROXY_MAX_ROUTES]
+    result = []
+    seen_endpoints = set()
+    ports_with_wildcard = set()
+    ports_with_exact = set()
+    for value in values:
+        try:
+            route = normalize_haproxy_route(value)
+            endpoint = (route["listen_ip"], route["port"])
+            if endpoint in seen_endpoints:
+                raise ValueError("duplicate haproxy endpoint")
+            if route["listen_ip"] == "*":
+                if route["port"] in ports_with_exact:
+                    raise ValueError("wildcard haproxy conflict")
+                ports_with_wildcard.add(route["port"])
+            else:
+                if route["port"] in ports_with_wildcard:
+                    raise ValueError("wildcard haproxy conflict")
+                ports_with_exact.add(route["port"])
+            seen_endpoints.add(endpoint)
+            result.append(route)
+        except Exception:
+            if strict:
+                raise
+    return sorted(result, key=haproxy_route_sort_key)
+
+
+def haproxy_routes_equal(left, right):
+    return normalize_haproxy_routes(left) == normalize_haproxy_routes(right)
+
+
+def normalize_haproxy_apply_result(value):
+    if not isinstance(value, dict):
+        return {}
+    status = str(value.get("status") or "").strip().lower()
+    if status not in ("ok", "error"):
+        return {}
+    try:
+        routes = max(0, min(int(value.get("routes") or 0), HAPROXY_MAX_ROUTES))
+        updated_at = max(0, int(value.get("updated_at") or 0))
+    except Exception:
+        routes = 0
+        updated_at = 0
+    message = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value.get("message") or ""))
+    return {
+        "status": status,
+        "message": clean_display_text(message)[:500],
+        "build": clean_display_text(value.get("build") or "")[:40],
+        "routes": routes,
+        "updated_at": updated_at,
+    }
+
+
 def load_sni_state():
     global SNI_STATE
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -710,6 +851,63 @@ def load_sni_state():
 
 def save_sni_state():
     atomic_write(SNI_ALLOW_FILE, json.dumps(SNI_STATE, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def load_haproxy_state():
+    global HAPROXY_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(HAPROXY_CONTROL_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+    except Exception:
+        loaded = {}
+    raw_nodes = loaded.get("nodes") if isinstance(loaded, dict) else {}
+    raw_sessions = loaded.get("sessions") if isinstance(loaded, dict) else {}
+    raw_pending = loaded.get("pending") if isinstance(loaded, dict) else {}
+    clean_nodes = {}
+    clean_sessions = {}
+    clean_pending = {}
+    current = now_ts()
+    if isinstance(raw_nodes, dict):
+        for key, item in raw_nodes.items():
+            if not isinstance(item, dict):
+                continue
+            node_key = str(key or "").strip()[:200]
+            routes = normalize_haproxy_routes(item.get("routes"))
+            if not node_key or not routes:
+                continue
+            clean_nodes[node_key] = {
+                "name": clean_display_text(item.get("name") or node_key)[:120],
+                "routes": routes,
+                "updated_at": int(item.get("updated_at") or 0),
+            }
+    if isinstance(raw_sessions, dict):
+        for token, item in raw_sessions.items():
+            if not re.fullmatch(r"[0-9a-f]{8,16}", str(token or "")) or not isinstance(item, dict):
+                continue
+            created_at = int(item.get("created_at") or 0)
+            if current - created_at > HAPROXY_SESSION_TTL:
+                continue
+            clean_sessions[str(token)] = {
+                "node_key": str(item.get("node_key") or "")[:200],
+                "node_name": clean_display_text(item.get("node_name") or "")[:120],
+                "selected_ip": str(item.get("selected_ip") or "")[:64],
+                "chat_id": str(item.get("chat_id") or "")[:64],
+                "message_id": str(item.get("message_id") or "")[:64],
+                "created_at": created_at,
+            }
+    if isinstance(raw_pending, dict):
+        for key, item in raw_pending.items():
+            if not isinstance(item, dict):
+                continue
+            created_at = int(item.get("created_at") or 0)
+            if current - created_at <= HAPROXY_SESSION_TTL:
+                clean_pending[str(key)[:160]] = item
+    HAPROXY_STATE = {"nodes": clean_nodes, "sessions": clean_sessions, "pending": clean_pending}
+
+
+def save_haproxy_state():
+    atomic_write(HAPROXY_CONTROL_FILE, json.dumps(HAPROXY_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def normalize_node_name(value):
@@ -4802,6 +5000,334 @@ def haproxy_command_intro(node, target, target_source, values, sni_source):
     return "\n".join(lines)
 
 
+def haproxy_state_key(node):
+    return str(node_record_key(node) or node_canonical_key(node) or "").strip()
+
+
+def haproxy_state_item_for_node(node):
+    key = haproxy_state_key(node)
+    aliases = node_alias_keys(node)
+    with LOCK:
+        nodes = HAPROXY_STATE.setdefault("nodes", {})
+        item = nodes.get(key)
+        if isinstance(item, dict):
+            return dict(item)
+        for stored_key, stored_item in nodes.items():
+            if canonical_node_key(stored_key) in aliases and isinstance(stored_item, dict):
+                return dict(stored_item)
+    return None
+
+
+def reported_haproxy_routes_for_node(node):
+    if not isinstance(node, dict):
+        return []
+    return normalize_haproxy_routes(node.get("haproxy_routes"))
+
+
+def desired_haproxy_routes_for_node(node):
+    item = haproxy_state_item_for_node(node)
+    if not isinstance(item, dict):
+        return None
+    routes = normalize_haproxy_routes(item.get("routes"))
+    return routes or None
+
+
+def effective_haproxy_routes_for_node(node):
+    desired = desired_haproxy_routes_for_node(node)
+    if desired is not None:
+        return desired, "telegram"
+    return reported_haproxy_routes_for_node(node), "node"
+
+
+def set_haproxy_routes_for_node(node, routes):
+    routes = normalize_haproxy_routes(routes, strict=True)
+    if not routes:
+        raise ValueError("empty haproxy routes")
+    key = haproxy_state_key(node)
+    if not key:
+        raise ValueError("empty node key")
+    aliases = node_alias_keys(node)
+    with LOCK:
+        nodes = HAPROXY_STATE.setdefault("nodes", {})
+        for stored_key in list(nodes):
+            if stored_key != key and canonical_node_key(stored_key) in aliases:
+                del nodes[stored_key]
+        nodes[key] = {
+            "name": node_display_name(node, key)[:120],
+            "routes": routes,
+            "updated_at": now_ts(),
+        }
+        save_haproxy_state()
+    return routes
+
+
+def cleanup_haproxy_sessions_unlocked(current=None):
+    current = int(current or now_ts())
+    changed = False
+    sessions = HAPROXY_STATE.setdefault("sessions", {})
+    for token, item in list(sessions.items()):
+        if not isinstance(item, dict) or current - int(item.get("created_at") or 0) > HAPROXY_SESSION_TTL:
+            del sessions[token]
+            changed = True
+    pending = HAPROXY_STATE.setdefault("pending", {})
+    for key, item in list(pending.items()):
+        if not isinstance(item, dict) or current - int(item.get("created_at") or 0) > HAPROXY_SESSION_TTL:
+            del pending[key]
+            changed = True
+    return changed
+
+
+def create_haproxy_session(node, chat_id, message_id=""):
+    with LOCK:
+        cleanup_haproxy_sessions_unlocked()
+        token = ""
+        while not token or token in HAPROXY_STATE.setdefault("sessions", {}):
+            token = uuid.uuid4().hex[:10]
+        HAPROXY_STATE["sessions"][token] = {
+            "node_key": haproxy_state_key(node),
+            "node_name": node_display_name(node),
+            "selected_ip": "",
+            "chat_id": str(chat_id),
+            "message_id": str(message_id or ""),
+            "created_at": now_ts(),
+        }
+        save_haproxy_state()
+    return token
+
+
+def get_haproxy_session(token):
+    token = str(token or "")
+    with LOCK:
+        changed = cleanup_haproxy_sessions_unlocked()
+        item = HAPROXY_STATE.setdefault("sessions", {}).get(token)
+        if changed:
+            save_haproxy_state()
+        return dict(item) if isinstance(item, dict) else None
+
+
+def update_haproxy_session(token, **changes):
+    with LOCK:
+        item = HAPROXY_STATE.setdefault("sessions", {}).get(str(token or ""))
+        if not isinstance(item, dict):
+            return None
+        for key in ("selected_ip", "chat_id", "message_id"):
+            if key in changes:
+                item[key] = str(changes[key] or "")[:64]
+        item["created_at"] = now_ts()
+        save_haproxy_state()
+        return dict(item)
+
+
+def set_pending_haproxy(chat_id, from_id, action, token, **extra):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = {
+            "action": str(action),
+            "token": str(token),
+            "created_at": now_ts(),
+        }
+        item.update(extra)
+        HAPROXY_STATE.setdefault("pending", {})[key] = item
+        save_haproxy_state()
+
+
+def peek_pending_haproxy(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        changed = cleanup_haproxy_sessions_unlocked()
+        item = HAPROXY_STATE.setdefault("pending", {}).get(key)
+        if changed:
+            save_haproxy_state()
+        return dict(item) if isinstance(item, dict) else None
+
+
+def pop_pending_haproxy(chat_id, from_id):
+    key = pending_key(chat_id, from_id)
+    with LOCK:
+        item = HAPROXY_STATE.setdefault("pending", {}).pop(key, None)
+        if item is not None:
+            save_haproxy_state()
+        return dict(item) if isinstance(item, dict) else None
+
+
+def haproxy_session_node(session):
+    if not isinstance(session, dict):
+        return None
+    return find_node(session.get("node_key")) or find_node(session.get("node_name"))
+
+
+def haproxy_node_ips(node, routes):
+    result = []
+    if any(route.get("listen_ip") == "*" for route in routes):
+        result.append("*")
+    for entry in node_ip_stats(node):
+        ip_text = normalize_ipv4_text(entry.get("ip"))
+        if ip_text and ip_text not in result:
+            result.append(ip_text)
+    fallback = normalize_ipv4_text(node.get("ip"))
+    if fallback and fallback not in result:
+        result.append(fallback)
+    for route in routes:
+        listen_ip = route.get("listen_ip")
+        if valid_ipv4(listen_ip) and listen_ip not in result:
+            result.append(listen_ip)
+    return result
+
+
+def haproxy_routes_for_ip(routes, listen_ip):
+    return [route for route in routes if route.get("listen_ip") == listen_ip]
+
+
+def haproxy_route_for_endpoint(routes, listen_ip, port):
+    for route in routes:
+        if route.get("listen_ip") == listen_ip and int(route.get("port") or 0) == int(port):
+            return route
+    return None
+
+
+def haproxy_apply_status_text(node, desired, reported):
+    if desired is None:
+        return "текущий config машины"
+    if haproxy_routes_equal(desired, reported):
+        return "применено"
+    result = node.get("haproxy_apply_result") if isinstance(node.get("haproxy_apply_result"), dict) else {}
+    desired_item = haproxy_state_item_for_node(node) or {}
+    if str(result.get("status") or "").lower() == "error" and int(result.get("updated_at") or 0) >= int(desired_item.get("updated_at") or 0):
+        message = clean_display_text(result.get("message") or "ошибка применения")[:120]
+        return f"ошибка: {message}"
+    return "ожидает ближайший push"
+
+
+def haproxy_ip_selector_payload(node, token):
+    routes, source = effective_haproxy_routes_for_node(node)
+    reported = reported_haproxy_routes_for_node(node)
+    desired = routes if source == "telegram" else None
+    ips = haproxy_node_ips(node, routes)
+    status = haproxy_apply_status_text(node, desired, reported)
+    lines = [
+        "<b>HAProxy</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", node_display_name(node)),
+        detail_line("Статус", status),
+        "",
+        "<b>Выбери входной IP:</b>",
+    ]
+    if not ips:
+        lines += ["", "<i>Машина пока не прислала ни одного IPv4.</i>"]
+    buttons = []
+    for ip_text in ips:
+        count = len(haproxy_routes_for_ip(routes, ip_text))
+        label = "Все IP (*)" if ip_text == "*" else ip_text
+        buttons.append({"text": f"{label} · {count}", "callback_data": f"hpx:i:{token}:{ip_text}"})
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([{"text": "Обновить", "callback_data": f"hpx:r:{token}"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def haproxy_target_summary(route):
+    targets = list(route.get("targets") or [])
+    if len(targets) == 1:
+        return targets[0]
+    return f"пул {len(targets)} backend ({targets[0]})" if targets else "-"
+
+
+def haproxy_selected_ip_payload(node, token, selected_ip):
+    routes, source = effective_haproxy_routes_for_node(node)
+    reported = reported_haproxy_routes_for_node(node)
+    desired = routes if source == "telegram" else None
+    selected_routes = haproxy_routes_for_ip(routes, selected_ip)
+    label = "Все IP (*)" if selected_ip == "*" else selected_ip
+    lines = [
+        "<b>HAProxy маршруты</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", node_display_name(node)),
+        detail_line("Входной IP", label),
+        detail_line("Статус", haproxy_apply_status_text(node, desired, reported)),
+        "",
+    ]
+    if not selected_routes:
+        lines.append("<i>На этом IP маршрутов пока нет.</i>")
+    else:
+        lines.append("<b>Маршруты:</b>")
+        route_lines = []
+        for route in selected_routes:
+            sni_values = list(route.get("sni") or [])
+            sni_text = " ".join(sni_values[:3])
+            if len(sni_values) > 3:
+                sni_text += f" +{len(sni_values) - 3}"
+            source_ip = route.get("source_ip") or "default"
+            route_lines.append(
+                f"<b>{int(route['port'])}/tcp</b> → {html.escape(haproxy_target_summary(route))}\n"
+                f"SNI: <code>{html.escape(sni_text)}</code>\n"
+                f"Выход: <code>{html.escape(str(source_ip))}</code>"
+            )
+        lines.append("<blockquote>" + "\n\n".join(route_lines) + "</blockquote>")
+    rows = []
+    if selected_routes:
+        rows.append([
+            {"text": "Изменить маршрут", "callback_data": f"hpx:e:{token}"},
+            {"text": "Удалить маршрут", "callback_data": f"hpx:d:{token}"},
+        ])
+    rows.append([{"text": "Добавить порт", "callback_data": f"hpx:a:{token}"}])
+    rows.append([
+        {"text": "К списку IP", "callback_data": f"hpx:b:{token}"},
+        {"text": "Обновить", "callback_data": f"hpx:r:{token}"},
+    ])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def haproxy_route_selector_payload(node, token, selected_ip, action):
+    routes, _ = effective_haproxy_routes_for_node(node)
+    selected_routes = haproxy_routes_for_ip(routes, selected_ip)
+    title = "Какой маршрут изменить?" if action == "edit" else "Какой маршрут удалить?"
+    lines = [
+        f"<b>{title}</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", node_display_name(node)),
+        detail_line("Входной IP", "Все IP (*)" if selected_ip == "*" else selected_ip),
+    ]
+    callback_action = "x" if action == "edit" else "q"
+    buttons = [
+        {"text": f"{int(route['port'])}/tcp", "callback_data": f"hpx:{callback_action}:{token}:{int(route['port'])}"}
+        for route in selected_routes
+    ]
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([{"text": "Назад", "callback_data": f"hpx:s:{token}"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def edit_haproxy_session_message(token, text, reply_markup=None):
+    session = get_haproxy_session(token)
+    if not session:
+        return False
+    if edit_message_text(session.get("chat_id"), session.get("message_id"), text, reply_markup=reply_markup):
+        return True
+    sent = send_message(text, reply_markup=reply_markup)
+    if isinstance(sent, dict):
+        update_haproxy_session(token, message_id=sent.get("message_id"), chat_id=(sent.get("chat") or {}).get("id"))
+        return True
+    return False
+
+
+def show_haproxy_ip_selector(token):
+    session = get_haproxy_session(token)
+    node = haproxy_session_node(session)
+    if not session or node is None:
+        return False
+    body, markup = haproxy_ip_selector_payload(node, token)
+    return edit_haproxy_session_message(token, body, markup)
+
+
+def show_haproxy_selected_ip(token):
+    session = get_haproxy_session(token)
+    node = haproxy_session_node(session)
+    selected_ip = str((session or {}).get("selected_ip") or "")
+    if not session or node is None or not selected_ip:
+        return False
+    body, markup = haproxy_selected_ip_payload(node, token, selected_ip)
+    return edit_haproxy_session_message(token, body, markup)
+
+
 def handle_haproxy_command(text, chat_id, from_id):
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -4816,10 +5342,35 @@ def handle_haproxy_command(text, chat_id, from_id):
             f"Сначала проверь название через <code>/stats</code>."
         )
         return
-    values, sni_source = effective_sni_for_node(node)
-    target, target_source = effective_haproxy_target_for_node(node)
-    set_pending_sni(chat_id, from_id, "haproxy_target", node)
-    send_message(haproxy_command_intro(node, target, target_source, values, sni_source))
+    if not bool(node.get("haproxy_routes_supported")):
+        send_message(
+            "<b>Нужен новый push на машине</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n\n"
+            "Обнови push через <code>/update_collector_wl</code> или <code>/update_collector_bl</code>, "
+            "дождись следующего push и повтори команду."
+        )
+        return
+    if not bool(node.get("haproxy_routes_managed")):
+        send_message(
+            "<b>Удалённое изменение заблокировано</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n\n"
+            "Текущий <code>haproxy.cfg</code> не помечен как управляемый kto. "
+            "Я не буду целиком перезаписывать сторонний config. Сначала импортируй или пересоздай его через HAProxy-меню на машине."
+        )
+        return
+    pop_pending_haproxy(chat_id, from_id)
+    pop_pending_sni(chat_id, from_id)
+    token = create_haproxy_session(node, chat_id)
+    body, markup = haproxy_ip_selector_payload(node, token)
+    sent = send_message(body, reply_markup=markup)
+    if isinstance(sent, dict):
+        update_haproxy_session(
+            token,
+            chat_id=(sent.get("chat") or {}).get("id") or chat_id,
+            message_id=sent.get("message_id"),
+        )
 
 
 def handle_sni_command(text, action, chat_id, from_id):
@@ -4942,6 +5493,326 @@ def handle_pending_sni(chat_id, from_id, text):
         f"{sni_list_text(updated)}\n"
         "<i>Машина применит список при ближайшем push.</i>"
     )
+    return True
+
+
+def parse_haproxy_sni_input(value):
+    raw_values = [item for item in re.split(r"[\s,;]+", str(value or "").strip()) if item]
+    if not raw_values or len(raw_values) > HAPROXY_MAX_SNI:
+        raise ValueError("bad sni count")
+    result = []
+    for value in raw_values:
+        item = normalize_sni(value)
+        if item not in result:
+            result.append(item)
+    return sorted(result, key=natural_sort_key)
+
+
+def haproxy_targets_prompt(node, token, route=None, adding=False):
+    selected_ip = (get_haproxy_session(token) or {}).get("selected_ip") or "*"
+    lines = [
+        "<b>Новый backend</b>" if not adding else "<b>Backend нового маршрута</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", node_display_name(node)),
+        detail_line("Вход", f"{selected_ip}:{int((route or {}).get('port') or 0)}"),
+    ]
+    if route:
+        lines += [
+            "",
+            "<b>Сейчас:</b>",
+            "<blockquote>" + "\n".join(f"<code>{html.escape(item)}</code>" for item in route.get("targets") or []) + "</blockquote>",
+        ]
+    lines += [
+        "",
+        "Ответь одним или несколькими backend: <code>IP:порт</code>.",
+        "Для пула перечисли их через пробел, запятую или с новой строки.",
+    ]
+    if route:
+        lines.append("Ответ <code>=</code> оставит backend без изменений.")
+    lines.append("Отмена: <code>/cancel</code>")
+    return "\n".join(lines)
+
+
+def haproxy_sni_prompt(node, token, route=None, adding=False):
+    selected_ip = (get_haproxy_session(token) or {}).get("selected_ip") or "*"
+    lines = [
+        "<b>SNI нового маршрута</b>" if adding else "<b>Новый SNI allow-list</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", node_display_name(node)),
+        detail_line("Вход", f"{selected_ip}:{int((route or {}).get('port') or 0)}"),
+    ]
+    if route:
+        lines += ["", "<b>Сейчас:</b>", sni_list_text(route.get("sni") or [])]
+    lines += [
+        "",
+        "Ответь SNI через пробел, запятую или с новой строки.",
+        "Поддомены поддерживаются: <code>*.example.com</code>.",
+    ]
+    if route:
+        lines.append("Ответ <code>=</code> оставит SNI без изменений.")
+    lines.append("Отмена: <code>/cancel</code>")
+    return "\n".join(lines)
+
+
+def haproxy_pending_context(chat_id, from_id):
+    pending = peek_pending_haproxy(chat_id, from_id)
+    if not pending:
+        return None, None, None
+    session = get_haproxy_session(pending.get("token"))
+    node = haproxy_session_node(session)
+    if not session or node is None:
+        pop_pending_haproxy(chat_id, from_id)
+        return pending, None, None
+    return pending, session, node
+
+
+def handle_pending_haproxy(chat_id, from_id, text):
+    pending, session, node = haproxy_pending_context(chat_id, from_id)
+    if not pending:
+        return False
+    token = pending.get("token")
+    if not session or node is None:
+        send_message("<b>HAProxy-сессия устарела.</b>\n\nЗапусти <code>/haproxy</code> заново.")
+        return True
+    action = str(pending.get("action") or "")
+    selected_ip = str(session.get("selected_ip") or "")
+    routes, _ = effective_haproxy_routes_for_node(node)
+    if action == "add_port":
+        port_text = str(text or "").strip()
+        if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+            edit_haproxy_session_message(
+                token,
+                "<b>Не понял порт.</b>\n\nОтветь числом от <code>1</code> до <code>65535</code>.\nОтмена: <code>/cancel</code>",
+            )
+            return True
+        port = int(port_text)
+        if haproxy_route_for_endpoint(routes, selected_ip, port):
+            edit_haproxy_session_message(
+                token,
+                f"<b>Маршрут уже существует</b>\n\n{detail_line('Вход', f'{selected_ip}:{port}')}\n"
+                "Выбери другой порт или отмени: <code>/cancel</code>",
+            )
+            return True
+        if selected_ip == "*" and any(int(route.get("port") or 0) == port for route in routes):
+            edit_haproxy_session_message(token, "<b>Этот порт уже занят точечным bind.</b>\n\nWildcard <code>*:порт</code> с ним несовместим.")
+            return True
+        if selected_ip != "*" and haproxy_route_for_endpoint(routes, "*", port):
+            edit_haproxy_session_message(
+                token,
+                "<b>Этот порт занят FULL-bind.</b>\n\nСначала перенеси <code>*:порт</code> на конкретный IP через консольное HAProxy-меню.",
+            )
+            return True
+        route = {"port": port}
+        set_pending_haproxy(chat_id, from_id, "add_targets", token, port=port)
+        edit_haproxy_session_message(token, haproxy_targets_prompt(node, token, route=route, adding=True))
+        return True
+
+    port = int(pending.get("port") or 0)
+    current_route = haproxy_route_for_endpoint(routes, selected_ip, port)
+    if action.startswith("edit_") and current_route is None:
+        pop_pending_haproxy(chat_id, from_id)
+        edit_haproxy_session_message(token, "<b>Маршрут уже изменился.</b>\n\nНажми «Обновить» и выбери его заново.")
+        return True
+
+    if action in ("add_targets", "edit_targets"):
+        if str(text or "").strip() == "=" and current_route is not None:
+            targets = list(current_route.get("targets") or [])
+        else:
+            try:
+                targets = normalize_haproxy_targets(text)
+            except Exception:
+                edit_haproxy_session_message(
+                    token,
+                    "<b>Не понял backend.</b>\n\nПример: <code>1.2.3.4:443</code>\n"
+                    "Пул: <code>1.2.3.4:443 5.6.7.8:443</code>\nОтмена: <code>/cancel</code>",
+                )
+                return True
+        next_action = "add_sni" if action == "add_targets" else "edit_sni"
+        set_pending_haproxy(chat_id, from_id, next_action, token, port=port, targets=targets)
+        route_for_prompt = current_route or {"port": port}
+        edit_haproxy_session_message(
+            token,
+            haproxy_sni_prompt(node, token, route=route_for_prompt, adding=action == "add_targets"),
+        )
+        return True
+
+    if action not in ("add_sni", "edit_sni"):
+        pop_pending_haproxy(chat_id, from_id)
+        return False
+    if str(text or "").strip() == "=" and current_route is not None:
+        sni = list(current_route.get("sni") or [])
+    else:
+        try:
+            sni = parse_haproxy_sni_input(text)
+        except Exception:
+            edit_haproxy_session_message(
+                token,
+                "<b>Не понял SNI.</b>\n\nПример: <code>example.com *.example.net</code>\nОтмена: <code>/cancel</code>",
+            )
+            return True
+    targets = normalize_haproxy_targets(pending.get("targets"))
+    updated = [dict(route) for route in routes]
+    if action == "edit_sni":
+        for index, route in enumerate(updated):
+            if route.get("listen_ip") == selected_ip and int(route.get("port") or 0) == port:
+                changed_route = dict(route)
+                changed_route["targets"] = targets
+                changed_route["sni"] = sni
+                updated[index] = changed_route
+                break
+        else:
+            pop_pending_haproxy(chat_id, from_id)
+            edit_haproxy_session_message(token, "<b>Маршрут уже исчез.</b>\n\nНажми «Обновить».")
+            return True
+    else:
+        updated.append({
+            "listen_ip": selected_ip,
+            "port": port,
+            "targets": targets,
+            "sni": sni,
+            "source_ip": selected_ip if selected_ip != "*" else "default",
+            "server_maxconn": "default",
+        })
+    try:
+        set_haproxy_routes_for_node(node, updated)
+    except Exception as exc:
+        log(f"haproxy route save failed node={haproxy_state_key(node)}: {exc}")
+        edit_haproxy_session_message(token, "<b>Маршрут не сохранён.</b>\n\nПроверка нашла конфликт входного IP или порта.")
+        return True
+    pop_pending_haproxy(chat_id, from_id)
+    show_haproxy_selected_ip(token)
+    return True
+
+
+def handle_haproxy_callback(callback):
+    callback_id = str(callback.get("id") or "")
+    data = str(callback.get("data") or "")
+    if not data.startswith("hpx:"):
+        return False
+    from_id = str((callback.get("from") or {}).get("id") or "")
+    message = callback.get("message") or {}
+    chat_id = str((message.get("chat") or {}).get("id") or CHAT_ID)
+    message_id = str(message.get("message_id") or "")
+    if chat_id != str(CHAT_ID) or from_id != ALLOWED_USER_ID:
+        answer_callback(callback_id, "нет доступа")
+        return True
+    parts = data.split(":", 3)
+    if len(parts) < 3:
+        answer_callback(callback_id)
+        return True
+    action = parts[1]
+    token = parts[2]
+    value = parts[3] if len(parts) == 4 else ""
+    session = get_haproxy_session(token)
+    node = haproxy_session_node(session)
+    if not session or node is None:
+        answer_callback(callback_id, "меню устарело")
+        return True
+    update_haproxy_session(token, chat_id=chat_id, message_id=message_id)
+    routes, _ = effective_haproxy_routes_for_node(node)
+    selected_ip = str(session.get("selected_ip") or "")
+
+    if action == "i":
+        if value not in haproxy_node_ips(node, routes):
+            answer_callback(callback_id, "IP больше не найден")
+            show_haproxy_ip_selector(token)
+            return True
+        pop_pending_haproxy(chat_id, from_id)
+        update_haproxy_session(token, selected_ip=value)
+        answer_callback(callback_id, "маршруты")
+        show_haproxy_selected_ip(token)
+        return True
+    if action == "b":
+        pop_pending_haproxy(chat_id, from_id)
+        update_haproxy_session(token, selected_ip="")
+        answer_callback(callback_id, "список IP")
+        show_haproxy_ip_selector(token)
+        return True
+    if action == "r":
+        answer_callback(callback_id, "обновляю")
+        if selected_ip:
+            show_haproxy_selected_ip(token)
+        else:
+            show_haproxy_ip_selector(token)
+        return True
+    if action == "s":
+        answer_callback(callback_id)
+        show_haproxy_selected_ip(token)
+        return True
+    if not selected_ip:
+        answer_callback(callback_id, "сначала выбери IP")
+        show_haproxy_ip_selector(token)
+        return True
+    selected_routes = haproxy_routes_for_ip(routes, selected_ip)
+    if action in ("e", "d"):
+        if not selected_routes:
+            answer_callback(callback_id, "маршрутов нет")
+            return True
+        answer_callback(callback_id)
+        body, markup = haproxy_route_selector_payload(node, token, selected_ip, "edit" if action == "e" else "delete")
+        edit_haproxy_session_message(token, body, markup)
+        return True
+    if action == "a":
+        set_pending_haproxy(chat_id, from_id, "add_port", token)
+        answer_callback(callback_id, "жду порт")
+        edit_haproxy_session_message(
+            token,
+            "<b>Новый HAProxy-порт</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n"
+            f"{detail_line('Входной IP', 'Все IP (*)' if selected_ip == '*' else selected_ip)}\n\n"
+            "Ответь номером порта, например: <code>8443</code>\n"
+            "Отмена: <code>/cancel</code>",
+        )
+        return True
+    if action in ("x", "q", "y"):
+        if not value.isdigit():
+            answer_callback(callback_id, "неверный порт")
+            return True
+        port = int(value)
+        route = haproxy_route_for_endpoint(routes, selected_ip, port)
+        if route is None:
+            answer_callback(callback_id, "маршрут уже изменился")
+            show_haproxy_selected_ip(token)
+            return True
+        if action == "x":
+            set_pending_haproxy(chat_id, from_id, "edit_targets", token, port=port)
+            answer_callback(callback_id, "жду backend")
+            edit_haproxy_session_message(token, haproxy_targets_prompt(node, token, route=route))
+            return True
+        if action == "q":
+            answer_callback(callback_id)
+            body = (
+                "<b>Удалить HAProxy-маршрут?</b>\n"
+                f"{ALERT_SEPARATOR}\n"
+                f"{detail_line('Вход', f'{selected_ip}:{port}')}\n"
+                f"{detail_line('Backend', haproxy_target_summary(route))}\n\n"
+                "Конфиг применится с проверкой и автоматическим откатом при ошибке."
+            )
+            markup = {"inline_keyboard": [[
+                {"text": "Удалить", "callback_data": f"hpx:y:{token}:{port}"},
+                {"text": "Отмена", "callback_data": f"hpx:s:{token}"},
+            ]]}
+            edit_haproxy_session_message(token, body, markup)
+            return True
+        if len(routes) <= 1:
+            answer_callback(callback_id, "последний маршрут удалять нельзя")
+            show_haproxy_selected_ip(token)
+            return True
+        updated = [
+            item for item in routes
+            if not (item.get("listen_ip") == selected_ip and int(item.get("port") or 0) == port)
+        ]
+        try:
+            set_haproxy_routes_for_node(node, updated)
+        except Exception:
+            answer_callback(callback_id, "удаление не сохранено")
+            return True
+        pop_pending_haproxy(chat_id, from_id)
+        answer_callback(callback_id, "маршрут удалён")
+        show_haproxy_selected_ip(token)
+        return True
+    answer_callback(callback_id)
     return True
 
 
@@ -6697,6 +7568,8 @@ def update_node(payload, remote_ip=""):
         push_interval_sec = 0
     iface_value = clean_display_text(payload.get("iface") or "").strip()[:80]
     ip_stats = normalize_ip_stats(payload.get("ip_stats"), remote_ip_value, iface_value, payload)
+    haproxy_routes_supported = bool(payload.get("haproxy_routes_supported")) and isinstance(payload.get("haproxy_routes"), list)
+    haproxy_routes = normalize_haproxy_routes(payload.get("haproxy_routes")) if haproxy_routes_supported else []
     record = {
         "id": node_id,
         "name": node_name or node_id,
@@ -6725,6 +7598,10 @@ def update_node(payload, remote_ip=""):
         "push_interval_sec": max(0, min(3600, push_interval_sec)),
         "haproxy_allowed_sni": normalize_sni_list(payload.get("haproxy_allowed_sni")),
         "haproxy_backend_target": normalize_haproxy_target_or_empty(payload.get("haproxy_backend_target")),
+        "haproxy_routes_supported": haproxy_routes_supported,
+        "haproxy_routes_managed": bool(payload.get("haproxy_routes_managed")) if haproxy_routes_supported else False,
+        "haproxy_routes": haproxy_routes,
+        "haproxy_apply_result": normalize_haproxy_apply_result(payload.get("haproxy_apply_result")),
         "scan_wrong_sni_total": int(payload.get("scan_wrong_sni_total") or 0),
         "scan_wrong_sni_sources": int(payload.get("scan_wrong_sni_sources") or 0),
         "scan_wrong_sni_top": normalize_scan_top(payload.get("scan_wrong_sni_top")),
@@ -6748,6 +7625,12 @@ def update_node(payload, remote_ip=""):
                 ):
                     old = existing_node
                     break
+        if old and not record.get("haproxy_routes_supported") and old.get("haproxy_routes_supported"):
+            record["haproxy_routes_supported"] = True
+            record["haproxy_routes_managed"] = bool(old.get("haproxy_routes_managed"))
+            record["haproxy_routes"] = normalize_haproxy_routes(old.get("haproxy_routes"))
+        if old and not record.get("haproxy_apply_result") and isinstance(old.get("haproxy_apply_result"), dict):
+            record["haproxy_apply_result"] = dict(old.get("haproxy_apply_result"))
         removed = []
         if suppress_runtime_stats:
             for existing_id, existing_node in list(NODES.items()):
@@ -6969,12 +7852,16 @@ class Handler(BaseHTTPRequestHandler):
                 response["ip_limit_enabled"] = bool(ip_policy.get("enabled"))
             else:
                 response["ip_limit_enabled"] = bool(IP_LIMIT_ENABLED)
-            sni_override = sni_override_for_node(node)
-            if sni_override is not None:
-                response["allowed_sni"] = sni_override
-            haproxy_target = haproxy_target_override_for_node(node)
-            if haproxy_target:
-                response["haproxy_target"] = haproxy_target
+            desired_haproxy_routes = desired_haproxy_routes_for_node(node)
+            if desired_haproxy_routes is not None:
+                response["haproxy_routes"] = desired_haproxy_routes
+            else:
+                sni_override = sni_override_for_node(node)
+                if sni_override is not None:
+                    response["allowed_sni"] = sni_override
+                haproxy_target = haproxy_target_override_for_node(node)
+                if haproxy_target:
+                    response["haproxy_target"] = haproxy_target
             node_name_sync = node_name_sync_value(node, payload.get("name"))
             if node_name_sync:
                 response["node_name"] = node_name_sync
@@ -9472,7 +10359,7 @@ BOT_HELP_SECTIONS = (
         ("/delete <машина>", "Удалить машину и её падения из collector."),
         ("/rename <машина>", "Переименовать машину через ответное сообщение."),
         ("/add_ip <IPv4>", "Добавить IP в SSH whitelist обходов."),
-        ("/haproxy <машина>", "Изменить backend и SNI HAProxy через диалог."),
+        ("/haproxy <машина>", "Управлять маршрутами HAProxy по входным IP и портам."),
         ("/allow_sni <машина>", "Добавить SNI в allow-list машины."),
         ("/delete_sni <машина>", "Удалить SNI из allow-list машины."),
     )),
@@ -9556,6 +10443,8 @@ def bot_loop():
                 save_offset(offset)
                 callback = item.get("callback_query")
                 if isinstance(callback, dict):
+                    if handle_haproxy_callback(callback):
+                        continue
                     if handle_update_callback(callback):
                         continue
                     if handle_bl_group_callback(callback):
@@ -9570,6 +10459,7 @@ def bot_loop():
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/cancel":
                     pop_pending_ip_note(chat_id, from_id)
                     pop_pending_ip_limit(chat_id, from_id)
+                    pop_pending_haproxy(chat_id, from_id)
                     pop_pending_sni(chat_id, from_id)
                     pop_pending_rename(chat_id, from_id)
                     pop_pending_bl_group(chat_id, from_id)
@@ -9585,6 +10475,8 @@ def bot_loop():
                     pop_pending_ip_note(chat_id, from_id)
                 if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and not command.startswith("/"):
                     if handle_pending_ip_note(chat_id, from_id, text):
+                        continue
+                    if handle_pending_haproxy(chat_id, from_id, text):
                         continue
                     if handle_pending_update_node_list(chat_id, from_id, text):
                         continue
@@ -9693,6 +10585,7 @@ def main():
     load_ssh_allowed_ips()
     load_ssh_firewall_state()
     load_sni_state()
+    load_haproxy_state()
     load_node_name_state()
     repair_loaded_node_names()
     load_bl_group_state()
