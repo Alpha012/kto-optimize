@@ -78,6 +78,46 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertEqual(rows[0][1]["text"], "10.0.0.3 · 0")
         self.assertEqual(rows[1][0]["text"], "10.0.0.4 · 0")
 
+    def test_ip_buttons_sort_by_route_count_then_numeric_address(self):
+        node = dict(
+            self.node,
+            ip_stats=[
+                {"ip": "78.159.245.250", "iface": "ens3"},
+                {"ip": "217.19.122.39", "iface": "wan2"},
+                {"ip": "5.34.176.116", "iface": "wan3"},
+                {"ip": "37.18.15.228", "iface": "wan4"},
+                {"ip": "3.3.3.3", "iface": "wan5"},
+                {"ip": "10.0.0.3", "iface": "wan6"},
+                {"ip": "10.0.0.4", "iface": "wan7"},
+            ],
+            haproxy_routes=[
+                *self.node["haproxy_routes"],
+                {
+                    "listen_ip": "217.19.122.39",
+                    "port": 443,
+                    "targets": ["3.3.3.3:443"],
+                    "sni": ["one.example.com"],
+                    "source_ip": "217.19.122.39",
+                    "server_maxconn": "default",
+                },
+            ],
+        )
+        _body, markup = self.collector.haproxy_ip_selector_payload(node, self.token)
+        labels = [button["text"] for row in markup["inline_keyboard"][:-1] for button in row]
+        self.assertEqual(
+            labels,
+            [
+                "10.0.0.2 · 2",
+                "217.19.122.39 · 1",
+                "3.3.3.3 · 0",
+                "5.34.176.116 · 0",
+                "10.0.0.3 · 0",
+                "10.0.0.4 · 0",
+                "37.18.15.228 · 0",
+                "78.159.245.250 · 0",
+            ],
+        )
+
     def test_route_state_follows_uuid_after_rename(self):
         routes = self.collector.reported_haproxy_routes_for_node(self.node)
         self.collector.set_haproxy_routes_for_node(self.node, routes)

@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v292"', KTO)
-        self.assertIn('PUSH_BUILD="v292"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v292"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v292"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v292"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v292"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v292"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v293"', KTO)
+        self.assertIn('PUSH_BUILD="v293"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v293"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v293"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v293"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v293"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v293"', HAPROXY_BANDWIDTH)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)

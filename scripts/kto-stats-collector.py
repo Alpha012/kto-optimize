@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v292"
+COLLECTOR_BUILD = "v293"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -5171,7 +5171,22 @@ def haproxy_node_ips(node, routes):
         listen_ip = route.get("listen_ip")
         if valid_ipv4(listen_ip) and listen_ip not in result:
             result.append(listen_ip)
-    return result
+    route_counts = {}
+    for route in routes:
+        listen_ip = str(route.get("listen_ip") or "")
+        route_counts[listen_ip] = route_counts.get(listen_ip, 0) + 1
+
+    def sort_key(ip_text):
+        route_count = route_counts.get(ip_text, 0)
+        if ip_text == "*":
+            return (-route_count, -1)
+        try:
+            numeric_ip = int(ipaddress.ip_address(ip_text))
+        except ValueError:
+            numeric_ip = (1 << 32)
+        return (-route_count, numeric_ip)
+
+    return sorted(result, key=sort_key)
 
 
 def haproxy_routes_for_ip(routes, listen_ip):
