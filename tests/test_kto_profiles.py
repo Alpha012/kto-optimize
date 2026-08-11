@@ -40,13 +40,23 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v293"', KTO)
-        self.assertIn('PUSH_BUILD="v293"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v293"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v293"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v293"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v293"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v293"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v294"', KTO)
+        self.assertIn('PUSH_BUILD="v294"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v294"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v294"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v294"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v294"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v294"', HAPROXY_BANDWIDTH)
+
+    def test_remote_haproxy_bandwidth_control_is_transactional(self):
+        report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
+        apply_limits = function_body(KTO, "haproxy_bandwidth_remote_apply_json")
+        self.assertIn('load_haproxy_bandwidth_config "$limits_file"', report)
+        self.assertIn('length <= 64', apply_limits)
+        self.assertIn('haproxy_input_ip_available "$ip"', apply_limits)
+        self.assertIn('commit_haproxy_bandwidth_config "$previous_file" "$next_file" "$had_config"', apply_limits)
+        self.assertIn('haproxy-bandwidth-remote-report', KTO)
+        self.assertIn('haproxy-bandwidth-remote-apply', KTO)
 
     def test_stats_push_discovers_and_reports_per_interface_traffic(self):
         self.assertIn("list_public_ipv4_interfaces()", PUSH)

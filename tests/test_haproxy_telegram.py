@@ -40,6 +40,10 @@ class TelegramHaproxyTests(unittest.TestCase):
             ],
             "haproxy_routes_supported": True,
             "haproxy_routes_managed": True,
+            "haproxy_bandwidth_supported": True,
+            "haproxy_bandwidth_limits": [
+                {"ip": "10.0.0.2", "rate_mbit": 2000},
+            ],
             "haproxy_routes": [
                 {
                     "listen_ip": "10.0.0.2",
@@ -77,6 +81,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertEqual(rows[0][0]["text"], "10.0.0.2 · 2")
         self.assertEqual(rows[0][1]["text"], "10.0.0.3 · 0")
         self.assertEqual(rows[1][0]["text"], "10.0.0.4 · 0")
+        self.assertTrue(any(button["text"] == "FULL → точечные бинды" for row in rows for button in row))
 
     def test_ip_buttons_sort_by_route_count_then_numeric_address(self):
         node = dict(
@@ -103,7 +108,12 @@ class TelegramHaproxyTests(unittest.TestCase):
             ],
         )
         _body, markup = self.collector.haproxy_ip_selector_payload(node, self.token)
-        labels = [button["text"] for row in markup["inline_keyboard"][:-1] for button in row]
+        labels = [
+            button["text"]
+            for row in markup["inline_keyboard"]
+            for button in row
+            if button["callback_data"].startswith("hpx:i:")
+        ]
         self.assertEqual(
             labels,
             [
@@ -123,6 +133,96 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.collector.set_haproxy_routes_for_node(self.node, routes)
         renamed = dict(self.node, id="New name", name="New name")
         self.assertEqual(self.collector.desired_haproxy_routes_for_node(renamed), routes)
+
+    def test_bandwidth_change_preserves_routes_and_other_limits(self):
+        self.collector.set_pending_haproxy(
+            self.chat_id,
+            self.from_id,
+            "bandwidth_rate",
+            self.token,
+        )
+        self.assertTrue(self.collector.handle_pending_haproxy(self.chat_id, self.from_id, "1500"))
+        limits = self.collector.desired_haproxy_bandwidth_limits_for_node(self.node)
+        self.assertEqual(limits, [{"ip": "10.0.0.2", "rate_mbit": 1500}])
+        self.assertIsNone(self.collector.desired_haproxy_routes_for_node(self.node))
+
+        routes = self.collector.reported_haproxy_routes_for_node(self.node)
+        self.collector.set_haproxy_routes_for_node(self.node, routes)
+        self.assertEqual(self.collector.desired_haproxy_bandwidth_limits_for_node(self.node), limits)
+        self.assertEqual(self.collector.desired_haproxy_routes_for_node(self.node), routes)
+
+    def test_zero_bandwidth_removes_only_selected_ip_limit(self):
+        self.node["haproxy_bandwidth_limits"] = [
+            {"ip": "10.0.0.2", "rate_mbit": 2000},
+            {"ip": "10.0.0.3", "rate_mbit": 3000},
+        ]
+        self.collector.NODES[self.collector.node_record_key(self.node)] = dict(self.node)
+        self.collector.set_pending_haproxy(self.chat_id, self.from_id, "bandwidth_rate", self.token)
+        self.collector.handle_pending_haproxy(self.chat_id, self.from_id, "0")
+        self.assertEqual(
+            self.collector.desired_haproxy_bandwidth_limits_for_node(self.node),
+            [{"ip": "10.0.0.3", "rate_mbit": 3000}],
+        )
+
+    def test_empty_bandwidth_desire_survives_state_reload(self):
+        self.collector.set_haproxy_bandwidth_limits_for_node(self.node, [])
+        self.collector.HAPROXY_STATE = {"nodes": {}, "sessions": {}, "pending": {}}
+        self.collector.load_haproxy_state()
+        self.assertEqual(self.collector.desired_haproxy_bandwidth_limits_for_node(self.node), [])
+
+    def test_selected_ip_shows_bandwidth_and_control_button(self):
+        body, markup = self.collector.haproxy_selected_ip_payload(self.node, self.token, "10.0.0.2")
+        self.assertIn("2000 Mbit/s на RX и TX", body)
+        self.assertTrue(any(button["text"] == "Изменить скорость" for row in markup["inline_keyboard"] for button in row))
+
+    def test_full_binds_pin_to_route_source_or_primary_ip(self):
+        wildcard_routes = [
+            {
+                "listen_ip": "*",
+                "port": 443,
+                "targets": ["1.1.1.1:443"],
+                "sni": ["one.example.com"],
+                "source_ip": "10.0.0.3",
+                "server_maxconn": "default",
+            },
+            {
+                "listen_ip": "*",
+                "port": 8443,
+                "targets": ["2.2.2.2:443"],
+                "sni": ["two.example.com"],
+                "source_ip": "default",
+                "server_maxconn": 10000,
+            },
+        ]
+        pinned, preview = self.collector.build_haproxy_source_pinned_routes(self.node, wildcard_routes)
+        self.assertEqual(preview, [(443, "10.0.0.3"), (8443, "10.0.0.2")])
+        self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(pinned, "10.0.0.3", 443))
+        self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(pinned, "10.0.0.2", 8443))
+
+    def test_full_bind_confirm_callback_saves_exact_routes(self):
+        wildcard = dict(
+            self.node,
+            haproxy_routes=[
+                {
+                    "listen_ip": "*",
+                    "port": 443,
+                    "targets": ["1.1.1.1:443"],
+                    "sni": ["one.example.com"],
+                    "source_ip": "10.0.0.3",
+                    "server_maxconn": "default",
+                }
+            ],
+        )
+        self.collector.NODES[self.collector.node_record_key(wildcard)] = wildcard
+        callback = {
+            "id": "callback-pin",
+            "data": f"hpx:z:{self.token}",
+            "from": {"id": self.from_id},
+            "message": {"message_id": 77, "chat": {"id": self.chat_id}},
+        }
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        routes = self.collector.desired_haproxy_routes_for_node(wildcard)
+        self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(routes, "10.0.0.3", 443))
 
     def test_edit_targets_additional_port_only(self):
         self.collector.set_pending_haproxy(
@@ -212,9 +312,13 @@ class HaproxyTransportContractTests(unittest.TestCase):
         self.assertIn("read_haproxy_routes", push)
         self.assertIn("haproxy_routes: $haproxy_routes", push)
         self.assertIn("apply_collector_haproxy_routes", push)
+        self.assertIn("apply_collector_haproxy_bandwidth_limits", push)
+        self.assertIn("haproxy_bandwidth_limits: $haproxy_bandwidth_limits", push)
         self.assertIn("haproxy-remote-apply", kto)
+        self.assertIn("haproxy-bandwidth-remote-apply", kto)
         self.assertIn('apply_haproxy_routes_config "$routes_file"', kto)
         self.assertIn('response["haproxy_routes"] = desired_haproxy_routes', collector)
+        self.assertIn('response["haproxy_bandwidth_limits"] = desired_haproxy_bandwidth', collector)
 
 
 if __name__ == "__main__":

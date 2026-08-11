@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v293"
+SCRIPT_BUILD="v294"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -6110,6 +6110,109 @@ haproxy_remote_apply_json() {
     printf '{"ok":true,"changed":true,"routes":%s}\n' "$route_count"
 }
 
+haproxy_bandwidth_remote_report_json() {
+    local limits_file
+
+    command_exists jq || {
+        echo '[]'
+        return 1
+    }
+    limits_file="$(mktemp)"
+    if ! load_haproxy_bandwidth_config "$limits_file"; then
+        rm -f "$limits_file"
+        echo '[]'
+        return 1
+    fi
+    jq -Rn '
+        [inputs
+        | select(length > 0)
+        | split("\t")
+        | {ip: .[0], rate_mbit: (.[1] | tonumber)}]
+        | sort_by(.ip | split(".") | map(tonumber))
+    ' < "$limits_file"
+    rm -f "$limits_file"
+}
+
+haproxy_bandwidth_remote_apply_json() {
+    local input_file previous_file next_file had_config=0 ip rate extra limit_count
+    local -A seen=()
+
+    command_exists jq || {
+        fail "jq не найден: удалённое управление скоростью HAProxy недоступно"
+        return 1
+    }
+    need_root
+    input_file="$(mktemp)"
+    previous_file="$(mktemp)"
+    next_file="$(mktemp)"
+    cat > "$input_file"
+
+    if ! jq -e '
+        type == "array" and length <= 64 and
+        all(.[];
+            type == "object" and
+            ((.ip | type) == "string") and
+            ((.rate_mbit | type) == "number") and
+            (.rate_mbit == (.rate_mbit | floor)) and
+            (.rate_mbit >= 1 and .rate_mbit <= 100000)
+        )
+    ' "$input_file" >/dev/null 2>&1; then
+        rm -f "$input_file" "$previous_file" "$next_file"
+        fail "Collector прислал некорректные лимиты скорости HAProxy"
+        return 1
+    fi
+
+    : > "$next_file"
+    while IFS=$'\t' read -r ip rate extra; do
+        if [[ -n "${extra:-}" ]] || ! validate_ipv4 "$ip" || ! validate_haproxy_bandwidth_rate "$rate"; then
+            rm -f "$input_file" "$previous_file" "$next_file"
+            fail "Некорректный лимит скорости для ${ip:-пустого IP}"
+            return 1
+        fi
+        if [[ -n "${seen[$ip]+x}" ]]; then
+            rm -f "$input_file" "$previous_file" "$next_file"
+            fail "Для ${ip} прислано несколько лимитов скорости"
+            return 1
+        fi
+        if ! haproxy_input_ip_available "$ip"; then
+            rm -f "$input_file" "$previous_file" "$next_file"
+            fail "Входной IP ${ip} не найден на локальных интерфейсах"
+            return 1
+        fi
+        rate=$((10#$rate))
+        seen[$ip]="$rate"
+        printf '%s\t%s\n' "$ip" "$rate" >> "$next_file"
+    done < <(jq -r '.[] | [(.ip | tostring), (.rate_mbit | tostring)] | @tsv' "$input_file")
+    sort -t $'\t' -k1,1V -o "$next_file" "$next_file"
+    limit_count="$(awk 'NF { count++ } END { print count + 0 }' "$next_file")"
+
+    if ! "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null; then
+        rm -f "$input_file" "$previous_file" "$next_file"
+        fail "HAProxy ещё не настроен"
+        return 1
+    fi
+    ensure_haproxy_bandwidth_manager || {
+        rm -f "$input_file" "$previous_file" "$next_file"
+        return 1
+    }
+    "${SUDO[@]}" test -e "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null && had_config=1
+    if ! load_haproxy_bandwidth_config "$previous_file"; then
+        rm -f "$input_file" "$previous_file" "$next_file"
+        return 1
+    fi
+    if cmp -s "$previous_file" "$next_file"; then
+        rm -f "$input_file" "$previous_file" "$next_file"
+        printf '{"ok":true,"changed":false,"limits":%s}\n' "$limit_count"
+        return 0
+    fi
+    if ! commit_haproxy_bandwidth_config "$previous_file" "$next_file" "$had_config"; then
+        rm -f "$input_file" "$previous_file" "$next_file"
+        return 1
+    fi
+    rm -f "$input_file" "$previous_file" "$next_file"
+    printf '{"ok":true,"changed":true,"limits":%s}\n' "$limit_count"
+}
+
 extract_haproxy_backend_target() {
     extract_haproxy_routes | awk -F '\t' 'NR == 1 { split($2, targets, ","); print targets[1]; exit }'
 }
@@ -10207,12 +10310,21 @@ main() {
         haproxy_remote_report_json
         return
     fi
+    if [[ "${1:-}" == "haproxy-bandwidth-remote-report" ]]; then
+        haproxy_bandwidth_remote_report_json
+        return
+    fi
     init_log
     ensure_utf8_locale
     case "${1:-}" in
         haproxy-remote-apply)
             load_machine_mode
             haproxy_remote_apply_json
+            return
+            ;;
+        haproxy-bandwidth-remote-apply)
+            load_machine_mode
+            haproxy_bandwidth_remote_apply_json
             return
             ;;
     esac

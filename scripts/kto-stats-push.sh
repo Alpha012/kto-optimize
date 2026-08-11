@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v293"
+PUSH_BUILD="v294"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
@@ -57,6 +57,7 @@ KTO_SYSTEMD_LIMITS_CONF="${KTO_SYSTEMD_LIMITS_CONF:-/etc/systemd/system.conf.d/9
 KTO_USER_LIMITS_CONF="${KTO_USER_LIMITS_CONF:-/etc/systemd/user.conf.d/99-kto-limits.conf}"
 KTO_HAPROXY_HELPER="${KTO_HAPROXY_HELPER:-/usr/local/lib/kto/kto.sh}"
 KTO_HAPROXY_APPLY_STATE="${KTO_HAPROXY_APPLY_STATE:-/var/lib/kto-stats-push/haproxy_apply.json}"
+KTO_HAPROXY_BANDWIDTH_APPLY_STATE="${KTO_HAPROXY_BANDWIDTH_APPLY_STATE:-/var/lib/kto-stats-push/haproxy_bandwidth_apply.json}"
 KTO_PUSH_TIMEOUT_DROPIN="${KTO_PUSH_TIMEOUT_DROPIN:-/etc/systemd/system/kto-stats-push.service.d/99-kto-timeout.conf}"
 
 if command -v flock >/dev/null 2>&1; then
@@ -94,6 +95,9 @@ haproxy_routes='[]'
 haproxy_routes_supported=false
 haproxy_routes_managed=false
 haproxy_apply_result='{}'
+haproxy_bandwidth_limits='[]'
+haproxy_bandwidth_supported=false
+haproxy_bandwidth_apply_result='{}'
 ip_limit_events='[]'
 ip_limit_events_count=0
 update_result='{}'
@@ -610,7 +614,8 @@ ensure_haproxy_helper() {
 
     if [[ -x "$KTO_HAPROXY_HELPER" ]] &&
         grep -Fqx "SCRIPT_BUILD=\"${PUSH_BUILD}\"" "$KTO_HAPROXY_HELPER" 2>/dev/null &&
-        grep -Fq 'haproxy-remote-apply)' "$KTO_HAPROXY_HELPER" 2>/dev/null; then
+        grep -Fq 'haproxy-remote-apply)' "$KTO_HAPROXY_HELPER" 2>/dev/null &&
+        grep -Fq 'haproxy-bandwidth-remote-apply)' "$KTO_HAPROXY_HELPER" 2>/dev/null; then
         ensure_push_service_timeout
         return 0
     fi
@@ -636,7 +641,9 @@ ensure_haproxy_helper() {
         return 1
     fi
     helper_build="$(awk -F= '$1 == "SCRIPT_BUILD" { gsub(/"/, "", $2); print $2; exit }' "$tmp" 2>/dev/null || true)"
-    if [[ "$helper_build" != "$PUSH_BUILD" ]] || ! grep -Fq 'haproxy-remote-apply)' "$tmp" 2>/dev/null; then
+    if [[ "$helper_build" != "$PUSH_BUILD" ]] ||
+        ! grep -Fq 'haproxy-remote-apply)' "$tmp" 2>/dev/null ||
+        ! grep -Fq 'haproxy-bandwidth-remote-apply)' "$tmp" 2>/dev/null; then
         rm -f "$tmp"
         echo "push ${PUSH_BUILD}: HAProxy helper build mismatch (${helper_build:-unknown})" >&2
         return 1
@@ -756,6 +763,120 @@ apply_collector_haproxy_routes() {
     fi
     write_haproxy_apply_result "error" "$message" "$route_count"
     echo "push ${PUSH_BUILD}: HAProxy routes apply failed: ${message}" >&2
+    rm -f "$output_file"
+}
+
+read_haproxy_bandwidth_limits() {
+    local reported
+
+    haproxy_bandwidth_limits='[]'
+    haproxy_bandwidth_supported=false
+    [[ "$haproxy_routes_supported" == "true" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    ensure_haproxy_helper || return 0
+    if ! reported="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-bandwidth-remote-report 2>/dev/null)"; then
+        echo "push ${PUSH_BUILD}: HAProxy bandwidth report failed" >&2
+        return 0
+    fi
+    if ! printf '%s' "$reported" | jq -e '
+        type == "array" and length <= 64 and
+        all(.[];
+            type == "object" and
+            ((.ip | type) == "string") and
+            ((.rate_mbit | type) == "number") and
+            (.rate_mbit == (.rate_mbit | floor)) and
+            (.rate_mbit >= 1 and .rate_mbit <= 100000)
+        )
+    ' >/dev/null 2>&1; then
+        echo "push ${PUSH_BUILD}: HAProxy bandwidth report is invalid" >&2
+        return 0
+    fi
+    haproxy_bandwidth_limits="$(printf '%s' "$reported" | jq -c 'sort_by(.ip | split(".") | map(tonumber))' 2>/dev/null || echo '[]')"
+    haproxy_bandwidth_supported=true
+}
+
+load_haproxy_bandwidth_apply_result() {
+    haproxy_bandwidth_apply_result='{}'
+    [[ -r "$KTO_HAPROXY_BANDWIDTH_APPLY_STATE" ]] || return 0
+    if jq -e 'type == "object"' "$KTO_HAPROXY_BANDWIDTH_APPLY_STATE" >/dev/null 2>&1; then
+        haproxy_bandwidth_apply_result="$(jq -c '.' "$KTO_HAPROXY_BANDWIDTH_APPLY_STATE" 2>/dev/null || echo '{}')"
+    fi
+}
+
+write_haproxy_bandwidth_apply_result() {
+    local status="$1" message="${2:-}" limit_count="${3:-0}" tmp
+
+    message="${message//$'\n'/ }"
+    message="${message:0:500}"
+    [[ "$limit_count" =~ ^[0-9]+$ ]] || limit_count=0
+    mkdir -p "$(dirname "$KTO_HAPROXY_BANDWIDTH_APPLY_STATE")" 2>/dev/null || true
+    tmp="${KTO_HAPROXY_BANDWIDTH_APPLY_STATE}.$$"
+    if jq -n -c \
+        --arg status "$status" \
+        --arg message "$message" \
+        --arg build "$PUSH_BUILD" \
+        --argjson limits "$limit_count" \
+        --argjson updated_at "$(date +%s)" \
+        '{status: $status, message: $message, build: $build, limits: $limits, updated_at: $updated_at}' > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$KTO_HAPROXY_BANDWIDTH_APPLY_STATE" 2>/dev/null || rm -f "$tmp"
+        load_haproxy_bandwidth_apply_result
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+}
+
+collector_has_haproxy_bandwidth_limits() {
+    printf '%s' "$1" | jq -e 'has("haproxy_bandwidth_limits") and (.haproxy_bandwidth_limits | type == "array")' >/dev/null 2>&1
+}
+
+apply_collector_haproxy_bandwidth_limits() {
+    local response="$1" desired current after limit_count output_file message
+
+    collector_has_haproxy_bandwidth_limits "$response" || return 0
+    desired="$(printf '%s' "$response" | jq -c '
+        .haproxy_bandwidth_limits
+        | map({ip: (.ip | tostring), rate_mbit: .rate_mbit})
+        | sort_by(.ip | split(".") | map(tonumber))
+    ' 2>/dev/null || true)"
+    if [[ -z "$desired" ]] || ! printf '%s' "$desired" | jq -e '
+        type == "array" and length <= 64 and
+        all(.[];
+            ((.ip | type) == "string") and
+            ((.rate_mbit | type) == "number") and
+            (.rate_mbit == (.rate_mbit | floor)) and
+            (.rate_mbit >= 1 and .rate_mbit <= 100000)
+        )
+    ' >/dev/null 2>&1; then
+        write_haproxy_bandwidth_apply_result "error" "collector sent invalid bandwidth limits" 0
+        echo "push ${PUSH_BUILD}: invalid HAProxy bandwidth limits from collector" >&2
+        return 0
+    fi
+    limit_count="$(printf '%s' "$desired" | jq -r 'length' 2>/dev/null || echo 0)"
+    if ! ensure_haproxy_helper; then
+        write_haproxy_bandwidth_apply_result "error" "HAProxy helper unavailable" "$limit_count"
+        return 0
+    fi
+    current="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-bandwidth-remote-report 2>/dev/null | jq -c 'sort_by(.ip | split(".") | map(tonumber))' 2>/dev/null || echo '[]')"
+    if [[ "$(printf '%s' "$current" | jq -cS '.' 2>/dev/null || true)" == "$(printf '%s' "$desired" | jq -cS '.' 2>/dev/null || true)" ]]; then
+        return 0
+    fi
+
+    output_file="$(mktemp)"
+    if printf '%s' "$desired" | timeout 300 "$KTO_HAPROXY_HELPER" haproxy-bandwidth-remote-apply > "$output_file" 2>&1; then
+        after="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-bandwidth-remote-report 2>/dev/null | jq -c 'sort_by(.ip | split(".") | map(tonumber))' 2>/dev/null || echo '[]')"
+        if [[ "$(printf '%s' "$after" | jq -cS '.' 2>/dev/null || true)" == "$(printf '%s' "$desired" | jq -cS '.' 2>/dev/null || true)" ]]; then
+            write_haproxy_bandwidth_apply_result "ok" "bandwidth limits applied" "$limit_count"
+            echo "push ${PUSH_BUILD}: HAProxy bandwidth limits applied count=${limit_count}"
+            rm -f "$output_file"
+            return 0
+        fi
+        message="bandwidth verification failed after apply"
+    else
+        message="$(tail -n 1 "$output_file" 2>/dev/null | tr -d '\r' || true)"
+        message="${message:-HAProxy bandwidth apply failed}"
+    fi
+    write_haproxy_bandwidth_apply_result "error" "$message" "$limit_count"
+    echo "push ${PUSH_BUILD}: HAProxy bandwidth apply failed: ${message}" >&2
     rm -f "$output_file"
 }
 
@@ -2518,6 +2639,8 @@ read_haproxy_allowed_sni
 read_haproxy_backend_target
 read_haproxy_routes
 load_haproxy_apply_result
+read_haproxy_bandwidth_limits
+load_haproxy_bandwidth_apply_result
 read_remna_diagnostics
 read_ip_limit_events
 read_update_result
@@ -2610,6 +2733,9 @@ if ! payload="$(jq -n \
     --argjson haproxy_routes_supported "$haproxy_routes_supported" \
     --argjson haproxy_routes_managed "$haproxy_routes_managed" \
     --argjson haproxy_apply_result "$haproxy_apply_result" \
+    --argjson haproxy_bandwidth_limits "$haproxy_bandwidth_limits" \
+    --argjson haproxy_bandwidth_supported "$haproxy_bandwidth_supported" \
+    --argjson haproxy_bandwidth_apply_result "$haproxy_bandwidth_apply_result" \
     --arg remna_status "$remna_status" \
     --argjson remna_restarts "$remna_restarts" \
     --argjson remna_error_count "$remna_error_count" \
@@ -2653,6 +2779,9 @@ if ! payload="$(jq -n \
         haproxy_routes_supported: $haproxy_routes_supported,
         haproxy_routes_managed: $haproxy_routes_managed,
         haproxy_apply_result: $haproxy_apply_result,
+        haproxy_bandwidth_limits: $haproxy_bandwidth_limits,
+        haproxy_bandwidth_supported: $haproxy_bandwidth_supported,
+        haproxy_bandwidth_apply_result: $haproxy_bandwidth_apply_result,
         remna: {
             status: $remna_status,
             restarts: $remna_restarts,
@@ -2750,6 +2879,7 @@ if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
     else
         apply_collector_haproxy_config "$response"
     fi
+    apply_collector_haproxy_bandwidth_limits "$response"
     apply_collector_node_name_config "$response"
     apply_collector_ip_limit_config "$response"
     apply_collector_push_interval "$response"
