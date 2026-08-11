@@ -264,6 +264,146 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertIn("2000 Mbit/s на RX и TX", body)
         self.assertTrue(any(button["text"] == "Изменить скорость" for row in markup["inline_keyboard"] for button in row))
 
+    def test_each_route_has_direct_button_and_full_editor(self):
+        body, markup = self.collector.haproxy_selected_ip_payload(self.node, self.token, "10.0.0.2")
+        self.assertIn("Выбери маршрут для настройки", body)
+        route_buttons = [
+            button
+            for row in markup["inline_keyboard"]
+            for button in row
+            if button["callback_data"].startswith("hpx:v:")
+        ]
+        self.assertEqual([button["text"] for button in route_buttons], ["443/tcp", "8443/tcp"])
+
+        editor_body, editor_markup = self.collector.haproxy_route_editor_payload(
+            self.node,
+            self.token,
+            "10.0.0.2",
+            8443,
+        )
+        self.assertIn("10.0.0.2:8443/tcp", editor_body)
+        labels = {button["text"] for row in editor_markup["inline_keyboard"] for button in row}
+        self.assertTrue(
+            {"Backend", "SNI", "Входной IP", "Входной порт", "Выходной IP", "Maxconn", "Удалить маршрут"}.issubset(labels)
+        )
+
+    def test_backend_only_edit_preserves_sni_and_endpoint(self):
+        self.collector.set_pending_haproxy(
+            self.chat_id,
+            self.from_id,
+            "route_targets",
+            self.token,
+            listen_ip="10.0.0.2",
+            port=8443,
+        )
+        self.assertTrue(self.collector.handle_pending_haproxy(self.chat_id, self.from_id, "3.3.3.3:443 4.4.4.4:7443"))
+        routes = self.collector.desired_haproxy_routes_for_node(self.node)
+        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443)
+        base = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 443)
+        self.assertEqual(changed["targets"], ["3.3.3.3:443", "4.4.4.4:7443"])
+        self.assertEqual(changed["sni"], ["extra.example.com"])
+        self.assertEqual(base["targets"], ["1.1.1.1:443"])
+
+    def test_route_backend_button_targets_clicked_port(self):
+        callback = {
+            "id": "edit-backend",
+            "data": f"hpx:k:{self.token}:8443",
+            "from": {"id": self.from_id},
+            "message": {"message_id": 77, "chat": {"id": self.chat_id}},
+        }
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        pending = self.collector.peek_pending_haproxy(self.chat_id, self.from_id)
+        self.assertEqual(pending["action"], "route_targets")
+        self.assertEqual(pending["listen_ip"], "10.0.0.2")
+        self.assertEqual(pending["port"], 8443)
+
+    def test_sni_only_edit_preserves_backend(self):
+        self.collector.set_pending_haproxy(
+            self.chat_id,
+            self.from_id,
+            "route_sni",
+            self.token,
+            listen_ip="10.0.0.2",
+            port=8443,
+        )
+        self.assertTrue(self.collector.handle_pending_haproxy(self.chat_id, self.from_id, "new.example.com *.new.example.com"))
+        routes = self.collector.desired_haproxy_routes_for_node(self.node)
+        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443)
+        self.assertEqual(changed["targets"], ["2.2.2.2:443"])
+        self.assertEqual(changed["sni"], ["*.new.example.com", "new.example.com"])
+
+    def test_route_port_edit_moves_only_selected_endpoint(self):
+        self.collector.set_pending_haproxy(
+            self.chat_id,
+            self.from_id,
+            "route_port",
+            self.token,
+            listen_ip="10.0.0.2",
+            port=8443,
+        )
+        self.assertTrue(self.collector.handle_pending_haproxy(self.chat_id, self.from_id, "9443"))
+        routes = self.collector.desired_haproxy_routes_for_node(self.node)
+        self.assertIsNone(self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443))
+        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 9443)
+        self.assertEqual(changed["targets"], ["2.2.2.2:443"])
+        self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 443))
+
+    def test_route_port_conflict_keeps_original_route(self):
+        self.collector.set_pending_haproxy(
+            self.chat_id,
+            self.from_id,
+            "route_port",
+            self.token,
+            listen_ip="10.0.0.2",
+            port=8443,
+        )
+        self.assertTrue(self.collector.handle_pending_haproxy(self.chat_id, self.from_id, "443"))
+        self.assertIsNone(self.collector.desired_haproxy_routes_for_node(self.node))
+        pending = self.collector.peek_pending_haproxy(self.chat_id, self.from_id)
+        self.assertEqual(pending["action"], "route_port")
+
+    def test_route_input_ip_button_moves_bind_and_keeps_output(self):
+        callback = {
+            "id": "move-input",
+            "data": f"hpx:h:{self.token}:8443|10.0.0.3",
+            "from": {"id": self.from_id},
+            "message": {"message_id": 77, "chat": {"id": self.chat_id}},
+        }
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        routes = self.collector.desired_haproxy_routes_for_node(self.node)
+        self.assertIsNone(self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443))
+        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.3", 8443)
+        self.assertEqual(changed["source_ip"], "10.0.0.2")
+        self.assertEqual(self.collector.get_haproxy_session(self.token)["selected_ip"], "10.0.0.3")
+
+    def test_route_output_ip_button_changes_only_source(self):
+        callback = {
+            "id": "move-output",
+            "data": f"hpx:u:{self.token}:8443|10.0.0.3",
+            "from": {"id": self.from_id},
+            "message": {"message_id": 77, "chat": {"id": self.chat_id}},
+        }
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        routes = self.collector.desired_haproxy_routes_for_node(self.node)
+        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443)
+        self.assertEqual(changed["source_ip"], "10.0.0.3")
+        self.assertEqual(changed["targets"], ["2.2.2.2:443"])
+
+    def test_route_maxconn_edit_preserves_route(self):
+        self.collector.set_pending_haproxy(
+            self.chat_id,
+            self.from_id,
+            "route_maxconn",
+            self.token,
+            listen_ip="10.0.0.2",
+            port=8443,
+        )
+        self.assertTrue(self.collector.handle_pending_haproxy(self.chat_id, self.from_id, "25000"))
+        routes = self.collector.desired_haproxy_routes_for_node(self.node)
+        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443)
+        self.assertEqual(changed["server_maxconn"], 25000)
+        self.assertEqual(changed["sni"], ["extra.example.com"])
+
     def test_full_binds_pin_to_route_source_or_primary_ip(self):
         wildcard_routes = [
             {

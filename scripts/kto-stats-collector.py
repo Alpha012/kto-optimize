@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v295"
+COLLECTOR_BUILD = "v296"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -5372,6 +5372,17 @@ def haproxy_route_for_endpoint(routes, listen_ip, port):
     return None
 
 
+def replace_haproxy_route(routes, current_listen_ip, current_port, **changes):
+    updated = [dict(route) for route in routes]
+    for index, route in enumerate(updated):
+        if route.get("listen_ip") == current_listen_ip and int(route.get("port") or 0) == int(current_port):
+            changed = dict(route)
+            changed.update(changes)
+            updated[index] = changed
+            return updated, changed
+    raise ValueError("haproxy route not found")
+
+
 def haproxy_apply_status_text(node, desired, reported):
     if desired is None:
         return "текущий config машины"
@@ -5534,6 +5545,113 @@ def haproxy_target_summary(route):
     return f"пул {len(targets)} backend ({targets[0]})" if targets else "-"
 
 
+def haproxy_route_values_block(values, limit=8, max_chars=900):
+    items = [str(value) for value in values or []]
+    lines = []
+    used_chars = 0
+    for value in items:
+        escaped = html.escape(value)
+        if len(lines) >= limit or (lines and used_chars + len(escaped) > max_chars):
+            break
+        lines.append(f"<code>{escaped}</code>")
+        used_chars += len(escaped)
+    if len(items) > len(lines):
+        lines.append(f"и ещё {len(items) - len(lines)}")
+    return "<blockquote>" + "\n".join(lines or ["-"]) + "</blockquote>"
+
+
+def haproxy_route_editor_payload(node, token, selected_ip, port):
+    routes, source = effective_haproxy_routes_for_node(node)
+    reported = reported_haproxy_routes_for_node(node)
+    desired = routes if source == "telegram" else None
+    route = haproxy_route_for_endpoint(routes, selected_ip, port)
+    if route is None:
+        return None, None
+    listen_label = "Все IP (*)" if selected_ip == "*" else selected_ip
+    maxconn = route.get("server_maxconn")
+    maxconn_text = "автоматически" if maxconn == "default" else str(maxconn)
+    lines = [
+        "<b>HAProxy маршрут</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", node_display_name(node)),
+        detail_line("Вход", f"{listen_label}:{int(route['port'])}/tcp"),
+        detail_line("Выходной IP", route.get("source_ip") or "default"),
+        detail_line("Maxconn", maxconn_text),
+        detail_line("Статус", haproxy_apply_status_text(node, desired, reported)),
+        "",
+        "<b>Backend:</b>",
+        haproxy_route_values_block(route.get("targets") or []),
+        "<b>SNI:</b>",
+        haproxy_route_values_block(route.get("sni") or []),
+    ]
+    rows = [
+        [
+            {"text": "Backend", "callback_data": f"hpx:k:{token}:{int(route['port'])}"},
+            {"text": "SNI", "callback_data": f"hpx:c:{token}:{int(route['port'])}"},
+        ],
+        [
+            {"text": "Входной IP", "callback_data": f"hpx:o:{token}:{int(route['port'])}"},
+            {"text": "Входной порт", "callback_data": f"hpx:w:{token}:{int(route['port'])}"},
+        ],
+        [
+            {"text": "Выходной IP", "callback_data": f"hpx:f:{token}:{int(route['port'])}"},
+            {"text": "Maxconn", "callback_data": f"hpx:j:{token}:{int(route['port'])}"},
+        ],
+        [{"text": "Удалить маршрут", "callback_data": f"hpx:q:{token}:{int(route['port'])}"}],
+        [
+            {"text": "К маршрутам", "callback_data": f"hpx:s:{token}"},
+            {"text": "Обновить", "callback_data": f"hpx:v:{token}:{int(route['port'])}"},
+        ],
+    ]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def haproxy_route_ip_choices(node, route, field):
+    values = []
+    if field == "listen_ip":
+        values.append("*")
+        current = str(route.get("listen_ip") or "*")
+    else:
+        values.append("default")
+        current = str(route.get("source_ip") or "default")
+    routes, _ = effective_haproxy_routes_for_node(node)
+    for ip_text in haproxy_node_ips(node, routes):
+        if valid_ipv4(ip_text) and ip_text not in values:
+            values.append(ip_text)
+    if (valid_ipv4(current) or current in ("*", "default")) and current not in values:
+        values.append(current)
+    return values
+
+
+def haproxy_route_ip_selector_payload(node, token, route, field):
+    is_listen = field == "listen_ip"
+    current = str(route.get(field) or ("*" if is_listen else "default"))
+    title = "Новый входной IP" if is_listen else "Новый выходной IP"
+    current_label = "Все IP (*)" if current == "*" else "Системный default" if current == "default" else current
+    lines = [
+        f"<b>{title}</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машина", node_display_name(node)),
+        detail_line("Маршрут", f"{route.get('listen_ip')}:{int(route['port'])}/tcp"),
+        detail_line("Сейчас", current_label),
+        "",
+        "<b>Выбери IP:</b>",
+    ]
+    callback_action = "h" if is_listen else "u"
+    buttons = []
+    for value in haproxy_route_ip_choices(node, route, field):
+        label = "Все IP (*)" if value == "*" else "Системный default" if value == "default" else value
+        if value == current:
+            label += " · сейчас"
+        buttons.append({
+            "text": label,
+            "callback_data": f"hpx:{callback_action}:{token}:{int(route['port'])}|{value}",
+        })
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([{"text": "Назад", "callback_data": f"hpx:v:{token}:{int(route['port'])}"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
 def haproxy_selected_ip_payload(node, token, selected_ip):
     routes, source = effective_haproxy_routes_for_node(node)
     reported = reported_haproxy_routes_for_node(node)
@@ -5577,12 +5695,14 @@ def haproxy_selected_ip_payload(node, token, selected_ip):
                 f"Выход: <code>{html.escape(str(source_ip))}</code>"
             )
         lines.append("<blockquote>" + "\n\n".join(route_lines) + "</blockquote>")
+        lines += ["", "<b>Выбери маршрут для настройки:</b>"]
     rows = []
     if selected_routes:
-        rows.append([
-            {"text": "Изменить маршрут", "callback_data": f"hpx:e:{token}"},
-            {"text": "Удалить маршрут", "callback_data": f"hpx:d:{token}"},
-        ])
+        route_buttons = [
+            {"text": f"{int(route['port'])}/tcp", "callback_data": f"hpx:v:{token}:{int(route['port'])}"}
+            for route in selected_routes
+        ]
+        rows += [route_buttons[index:index + 2] for index in range(0, len(route_buttons), 2)]
     rows.append([{"text": "Добавить порт", "callback_data": f"hpx:a:{token}"}])
     if selected_ip != "*" and bool(node.get("haproxy_bandwidth_supported")):
         speed_button = "Изменить скорость" if bandwidth_rate else "Ограничить скорость"
@@ -5653,6 +5773,18 @@ def show_haproxy_selected_ip(token):
     if not session or node is None or not selected_ip:
         return False
     body, markup = haproxy_selected_ip_payload(node, token, selected_ip)
+    return edit_haproxy_session_message(token, body, markup)
+
+
+def show_haproxy_route_editor(token, port):
+    session = get_haproxy_session(token)
+    node = haproxy_session_node(session)
+    selected_ip = str((session or {}).get("selected_ip") or "")
+    if not session or node is None or not selected_ip:
+        return False
+    body, markup = haproxy_route_editor_payload(node, token, selected_ip, port)
+    if body is None:
+        return show_haproxy_selected_ip(token)
     return edit_haproxy_session_message(token, body, markup)
 
 
@@ -5982,7 +6114,74 @@ def handle_pending_haproxy(chat_id, from_id, text):
         return True
 
     port = int(pending.get("port") or 0)
-    current_route = haproxy_route_for_endpoint(routes, selected_ip, port)
+    pending_listen_ip = str(pending.get("listen_ip") or selected_ip)
+    current_route = haproxy_route_for_endpoint(routes, pending_listen_ip, port)
+    route_field_actions = {"route_targets", "route_sni", "route_port", "route_maxconn"}
+    if action in route_field_actions:
+        if current_route is None:
+            pop_pending_haproxy(chat_id, from_id)
+            edit_haproxy_session_message(token, "<b>Маршрут уже изменился.</b>\n\nВернись к списку и выбери его заново.")
+            return True
+        raw_text = str(text or "").strip()
+        changes = {}
+        if action == "route_targets":
+            if raw_text == "=":
+                changes["targets"] = list(current_route.get("targets") or [])
+            else:
+                try:
+                    changes["targets"] = normalize_haproxy_targets(raw_text)
+                except Exception:
+                    edit_haproxy_session_message(
+                        token,
+                        "<b>Не понял backend.</b>\n\nПример: <code>1.2.3.4:443</code>\n"
+                        "Пул: <code>1.2.3.4:443 5.6.7.8:443</code>\nОтмена: <code>/cancel</code>",
+                    )
+                    return True
+        elif action == "route_sni":
+            if raw_text == "=":
+                changes["sni"] = list(current_route.get("sni") or [])
+            else:
+                try:
+                    changes["sni"] = parse_haproxy_sni_input(raw_text)
+                except Exception:
+                    edit_haproxy_session_message(
+                        token,
+                        "<b>Не понял SNI.</b>\n\nПример: <code>example.com *.example.net</code>\nОтмена: <code>/cancel</code>",
+                    )
+                    return True
+        elif action == "route_port":
+            if not raw_text.isdigit() or not 1 <= int(raw_text) <= 65535:
+                edit_haproxy_session_message(
+                    token,
+                    "<b>Не понял порт.</b>\n\nОтветь числом от <code>1</code> до <code>65535</code>.\nОтмена: <code>/cancel</code>",
+                )
+                return True
+            changes["port"] = int(raw_text)
+        else:
+            try:
+                changes["server_maxconn"] = normalize_haproxy_server_maxconn(raw_text)
+            except Exception:
+                edit_haproxy_session_message(
+                    token,
+                    "<b>Не понял maxconn.</b>\n\nОтветь числом от <code>1</code> до <code>10000000</code>.\n"
+                    "<code>0</code> или <code>default</code> включит автоматическое значение.\nОтмена: <code>/cancel</code>",
+                )
+                return True
+        try:
+            updated, changed_route = replace_haproxy_route(routes, pending_listen_ip, port, **changes)
+            set_haproxy_routes_for_node(node, updated)
+        except Exception as exc:
+            log(f"haproxy route field save failed node={haproxy_state_key(node)}: {exc}")
+            edit_haproxy_session_message(
+                token,
+                "<b>Маршрут не изменён.</b>\n\nПроверка нашла конфликт входного IP или порта. Введи другое значение или отмени: <code>/cancel</code>",
+            )
+            return True
+        pop_pending_haproxy(chat_id, from_id)
+        update_haproxy_session(token, selected_ip=str(changed_route.get("listen_ip") or pending_listen_ip))
+        show_haproxy_route_editor(token, int(changed_route.get("port") or port))
+        return True
+
     if action.startswith("edit_") and current_route is None:
         pop_pending_haproxy(chat_id, from_id)
         edit_haproxy_session_message(token, "<b>Маршрут уже изменился.</b>\n\nНажми «Обновить» и выбери его заново.")
@@ -6221,6 +6420,106 @@ def handle_haproxy_callback(callback):
         show_haproxy_ip_selector(token)
         return True
     selected_routes = haproxy_routes_for_ip(routes, selected_ip)
+    if action in ("h", "u"):
+        route_value = value.split("|", 1)
+        if len(route_value) != 2 or not route_value[0].isdigit():
+            answer_callback(callback_id, "неверный маршрут")
+            return True
+        port = int(route_value[0])
+        route = haproxy_route_for_endpoint(routes, selected_ip, port)
+        if route is None:
+            answer_callback(callback_id, "маршрут уже изменился")
+            show_haproxy_selected_ip(token)
+            return True
+        field = "listen_ip" if action == "h" else "source_ip"
+        try:
+            new_value = normalize_haproxy_listen_ip(route_value[1]) if action == "h" else normalize_haproxy_source_ip(route_value[1])
+        except Exception:
+            answer_callback(callback_id, "неверный IP")
+            return True
+        if new_value not in haproxy_route_ip_choices(node, route, field):
+            answer_callback(callback_id, "этого IP нет на машине")
+            return True
+        if new_value == route.get(field):
+            answer_callback(callback_id, "без изменений")
+            show_haproxy_route_editor(token, port)
+            return True
+        try:
+            updated, changed_route = replace_haproxy_route(routes, selected_ip, port, **{field: new_value})
+            set_haproxy_routes_for_node(node, updated)
+        except Exception as exc:
+            log(f"haproxy route ip save failed node={haproxy_state_key(node)}: {exc}")
+            answer_callback(callback_id, "IP или порт уже занят")
+            return True
+        pop_pending_haproxy(chat_id, from_id)
+        if action == "h":
+            selected_ip = str(changed_route.get("listen_ip") or selected_ip)
+            update_haproxy_session(token, selected_ip=selected_ip)
+        answer_callback(callback_id, "ожидает ближайший push")
+        show_haproxy_route_editor(token, int(changed_route.get("port") or port))
+        return True
+    if action in ("v", "k", "c", "o", "w", "f", "j"):
+        if not value.isdigit():
+            answer_callback(callback_id, "неверный порт")
+            return True
+        port = int(value)
+        route = haproxy_route_for_endpoint(routes, selected_ip, port)
+        if route is None:
+            answer_callback(callback_id, "маршрут уже изменился")
+            show_haproxy_selected_ip(token)
+            return True
+        pop_pending_haproxy(chat_id, from_id)
+        if action == "v":
+            answer_callback(callback_id, "маршрут")
+            show_haproxy_route_editor(token, port)
+            return True
+        if action == "k":
+            set_pending_haproxy(chat_id, from_id, "route_targets", token, listen_ip=selected_ip, port=port)
+            answer_callback(callback_id, "жду backend")
+            edit_haproxy_session_message(token, haproxy_targets_prompt(node, token, route=route))
+            return True
+        if action == "c":
+            set_pending_haproxy(chat_id, from_id, "route_sni", token, listen_ip=selected_ip, port=port)
+            answer_callback(callback_id, "жду SNI")
+            edit_haproxy_session_message(token, haproxy_sni_prompt(node, token, route=route))
+            return True
+        if action in ("o", "f"):
+            answer_callback(callback_id)
+            body, markup = haproxy_route_ip_selector_payload(
+                node,
+                token,
+                route,
+                "listen_ip" if action == "o" else "source_ip",
+            )
+            edit_haproxy_session_message(token, body, markup)
+            return True
+        if action == "w":
+            set_pending_haproxy(chat_id, from_id, "route_port", token, listen_ip=selected_ip, port=port)
+            answer_callback(callback_id, "жду порт")
+            edit_haproxy_session_message(
+                token,
+                "<b>Новый входной порт</b>\n"
+                f"{ALERT_SEPARATOR}\n"
+                f"{detail_line('Машина', node_display_name(node))}\n"
+                f"{detail_line('Сейчас', f'{selected_ip}:{port}/tcp')}\n\n"
+                "Ответь числом от <code>1</code> до <code>65535</code>.\nОтмена: <code>/cancel</code>",
+            )
+            return True
+        set_pending_haproxy(chat_id, from_id, "route_maxconn", token, listen_ip=selected_ip, port=port)
+        answer_callback(callback_id, "жду maxconn")
+        current_maxconn = route.get("server_maxconn")
+        current_maxconn_text = "автоматически" if current_maxconn == "default" else str(current_maxconn)
+        edit_haproxy_session_message(
+            token,
+            "<b>Новый maxconn</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n"
+            f"{detail_line('Маршрут', f'{selected_ip}:{port}/tcp')}\n"
+            f"{detail_line('Сейчас', current_maxconn_text)}\n\n"
+            "Ответь числом от <code>1</code> до <code>10000000</code>.\n"
+            "<code>0</code> или <code>default</code> включит автоматическое значение.\nОтмена: <code>/cancel</code>",
+        )
+        return True
     if action == "l":
         if selected_ip == "*" or not valid_ipv4(selected_ip) or not bool(node.get("haproxy_bandwidth_supported")):
             answer_callback(callback_id, "выбери конкретный IPv4")
