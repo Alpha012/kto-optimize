@@ -34,10 +34,12 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.NODES_FILE = os.path.join(self.state.name, "nodes.json")
         collector.FALLS_FILE = os.path.join(self.state.name, "falls.json")
         collector.SNI_ALLOW_FILE = os.path.join(self.state.name, "sni_allow.json")
+        collector.HAPROXY_CONTROL_FILE = os.path.join(self.state.name, "haproxy_control.json")
         collector.NODE_NAMES_FILE = os.path.join(self.state.name, "node_names.json")
         collector.BL_GROUPS_FILE = os.path.join(self.state.name, "bl_groups.json")
         collector.IP_LIMIT_FILE = os.path.join(self.state.name, "ip_limit.json")
         collector.UPDATE_STATE_FILE = os.path.join(self.state.name, "update_state.json")
+        collector.REMOTE_CONTROL_FILE = os.path.join(self.state.name, "remote_control.json")
         collector.SSH_ALLOW_FILE = os.path.join(self.state.name, "ssh_allow_ips.json")
         collector.SSH_FIREWALL_FILE = os.path.join(self.state.name, "ssh_firewall.json")
         collector.ALERTS_OFF_FILE = os.path.join(self.state.name, "connection_alerts_off.json")
@@ -54,6 +56,7 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.NODES = {}
         collector.FALLS = {}
         collector.SNI_STATE = {"nodes": {}, "pending": {}}
+        collector.HAPROXY_STATE = {"nodes": {}, "sessions": {}, "pending": {}}
         collector.NODE_NAME_STATE = {"nodes": {}, "pending": {}}
         collector.STATS_OFF_STATE = {"nodes": {}}
         collector.ALERTS_OFF_STATE = {"nodes": {}}
@@ -61,6 +64,7 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.BL_GROUP_STATE = {"groups": {}, "pending": {}}
         collector.UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
         collector.IP_NOTE_STATE = {"notes": {}, "pending": {}}
+        collector.REMOTE_CONTROL_STATE = {"paused": False, "paused_at": 0, "paused_by": ""}
         collector.AUTH_NONCES = {}
         collector.NODES_DIRTY = False
         collector.SSH_ALLOWED_IPS = []
@@ -589,6 +593,85 @@ class CollectorRegressionTests(unittest.TestCase):
         second = collector.queue_update_task("test", local_required=False)
         self.assertNotEqual(first["id"], second["id"])
 
+    def test_panel_and_empty_snapshot_updates_never_dispatch_to_nodes(self):
+        node = collector.update_node(
+            self.payload("Германия", str(uuid.uuid4()), "bl"),
+            "203.0.113.39",
+        )
+        node["push_build"] = "v307"
+
+        collector.queue_update_task("test", scope="panel", local_required=True)
+        self.assertIsNone(collector.update_task_for_node(node))
+
+        collector.queue_update_task("test", scope="all", targets={}, local_required=False)
+        self.assertIsNone(collector.update_task_for_node(node))
+
+        live = collector.queue_update_task(
+            "test",
+            action="push_delete",
+            scope="live",
+            targets={},
+            local_required=False,
+            live_targets=True,
+        )
+        task = collector.update_task_for_node(node)
+        self.assertEqual(live["id"], task["id"])
+        self.assertEqual("push_delete", task["action"])
+
+    def test_push_pause_discards_remote_queues_and_persists_stats_only_mode(self):
+        node = collector.update_node(
+            self.payload("Обход №1", str(uuid.uuid4()), "wl"),
+            "203.0.113.41",
+        )
+        node_key = collector.node_record_key(node)
+        collector.HAPROXY_STATE = {
+            "nodes": {node_key: {"name": "Обход №1", "routes": []}},
+            "sessions": {"session": {"created_at": int(time.time())}},
+            "pending": {"chat:user": {"created_at": int(time.time())}},
+        }
+        collector.SNI_STATE = {
+            "nodes": {node_key: {"name": "Обход №1", "allowed": ["example.com"]}},
+            "pending": {"chat:user": {"created_at": int(time.time())}},
+        }
+        collector.NODE_NAME_STATE = {
+            "nodes": {node_key: {"name": "Сохранённое имя", "aliases": [], "updated_at": 1}},
+            "pending": {"chat:user": {"action": "rename", "created_at": int(time.time())}},
+        }
+        collector.UPDATE_STATE = {
+            "current": {"id": "job", "targets": {node_key: "Обход №1"}},
+            "results": {node_key: {"id": "job", "status": "running"}},
+            "local": {"id": "job", "status": "running"},
+            "retry_tokens": {"token": {"key": node_key}},
+            "pending": {"chat:user": {"action": "update_node_list", "created_at": int(time.time())}},
+        }
+        collector.ip_limit_db().execute(
+            "INSERT INTO ip_limit_pending(key, action, user, created_at) VALUES(?, ?, ?, ?)",
+            ("chat:user", "set_ip_limit", "3", int(time.time())),
+        )
+        collector.ip_limit_db().commit()
+
+        cleared = collector.pause_remote_commands("tester")
+
+        self.assertTrue(collector.remote_commands_paused())
+        self.assertGreater(cleared["total"], 0)
+        self.assertEqual({}, collector.HAPROXY_STATE["nodes"])
+        self.assertEqual({}, collector.HAPROXY_STATE["sessions"])
+        self.assertEqual({}, collector.SNI_STATE["nodes"])
+        self.assertEqual({}, collector.UPDATE_STATE["current"])
+        self.assertEqual({}, collector.UPDATE_STATE["results"])
+        self.assertEqual({}, collector.NODE_NAME_STATE["pending"])
+        self.assertEqual("Сохранённое имя", collector.NODE_NAME_STATE["nodes"][node_key]["name"])
+        self.assertEqual(1, len(collector.NODES))
+        self.assertEqual(0, collector.ip_limit_db().execute("SELECT COUNT(*) FROM ip_limit_pending").fetchone()[0])
+
+        collector.REMOTE_CONTROL_STATE = {"paused": False, "paused_at": 0, "paused_by": ""}
+        collector.load_remote_control_state()
+        self.assertTrue(collector.remote_commands_paused())
+        self.assertTrue(collector.resume_remote_commands("tester"))
+        self.assertFalse(collector.remote_commands_paused())
+        self.assertEqual({}, collector.HAPROXY_STATE["nodes"])
+        self.assertEqual({}, collector.UPDATE_STATE["current"])
+
     def test_stale_update_result_cannot_replace_current_job(self):
         node_uuid = str(uuid.uuid4())
         node = collector.update_node(self.payload("Германия", node_uuid, "bl"), "203.0.113.40")
@@ -711,6 +794,62 @@ class CollectorRegressionTests(unittest.TestCase):
             self.assertEqual([], payload["ip_limit_blocks"])
             self.assertTrue(payload["ip_limit_clear_blocks"])
             self.assertTrue(payload["ip_limit_enabled"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_stats_only_push_response_contains_no_remote_commands(self):
+        collector.REMOTE_CONTROL_STATE = {
+            "paused": True,
+            "paused_at": int(time.time()),
+            "paused_by": "tester",
+        }
+        body = json.dumps(
+            self.payload("Stats only", str(uuid.uuid4()), "bl"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        timestamp = int(time.time())
+        nonce = uuid.uuid4().hex
+        signature = collector.hmac_sha256_hex(
+            collector.SECRET,
+            collector.request_signature_payload(timestamp, nonce, body),
+        )
+        server = collector.CollectorHTTPServer(("127.0.0.1", 0), collector.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/push",
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-KTO-Timestamp": str(timestamp),
+                    "X-KTO-Nonce": nonce,
+                    "X-KTO-Signature": signature,
+                },
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["remote_commands_paused"])
+            self.assertEqual([], payload["ip_limit_blocks"])
+            self.assertTrue(payload["ip_limit_clear_blocks"])
+            for field in (
+                "ssh_allowed_ips",
+                "ssh_firewall_open",
+                "ip_limit_enabled",
+                "haproxy_routes",
+                "haproxy_bandwidth_limits",
+                "allowed_sni",
+                "haproxy_target",
+                "node_name",
+                "push_interval_sec",
+                "update_task",
+            ):
+                self.assertNotIn(field, payload)
+            self.assertIsNotNone(collector.find_node("Stats only"))
         finally:
             server.shutdown()
             server.server_close()

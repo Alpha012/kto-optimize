@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v306"
+COLLECTOR_BUILD = "v307"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -333,6 +333,7 @@ IP_LIMIT_DB_FILE = os.path.join(STATE_DIR, "ip_limit.sqlite")
 NETWORK_RATE_DB_FILE = os.path.join(STATE_DIR, "network_rate.sqlite")
 IP_NOTES_FILE = os.path.join(STATE_DIR, "ip_notes.json")
 UPDATE_STATE_FILE = os.path.join(STATE_DIR, "update_state.json")
+REMOTE_CONTROL_FILE = os.path.join(STATE_DIR, "remote_control.json")
 LOCK = threading.RLock()
 NODES = {}
 FALLS = {}
@@ -347,6 +348,7 @@ ALERTS_OFF_STATE = {"nodes": {}}
 REMNA_NODE_STATE = {"nodes": {}}
 UPDATE_STATE = {"current": {}, "results": {}, "local": {}, "retry_tokens": {}, "pending": {}}
 IP_NOTE_STATE = {"notes": {}, "pending": {}}
+REMOTE_CONTROL_STATE = {"paused": False, "paused_at": 0, "paused_by": ""}
 IP_LIMIT_DB = None
 NETWORK_RATE_DB = None
 NETWORK_RATE_LAST_PURGE_MINUTE = 0
@@ -1584,6 +1586,113 @@ def save_update_state():
     atomic_write(UPDATE_STATE_FILE, json.dumps(UPDATE_STATE, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def load_remote_control_state():
+    global REMOTE_CONTROL_STATE
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(REMOTE_CONTROL_FILE, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if not isinstance(loaded, dict):
+            raise ValueError("bad remote control state")
+        REMOTE_CONTROL_STATE = {
+            "paused": loaded.get("paused") is True,
+            "paused_at": max(0, int(loaded.get("paused_at") or 0)),
+            "paused_by": str(loaded.get("paused_by") or "").strip()[:80],
+        }
+    except Exception:
+        REMOTE_CONTROL_STATE = {"paused": False, "paused_at": 0, "paused_by": ""}
+
+
+def save_remote_control_state():
+    atomic_write(
+        REMOTE_CONTROL_FILE,
+        json.dumps(REMOTE_CONTROL_STATE, ensure_ascii=False, indent=2, sort_keys=True),
+    )
+
+
+def remote_commands_paused():
+    with LOCK:
+        return REMOTE_CONTROL_STATE.get("paused") is True
+
+
+def remote_control_snapshot():
+    with LOCK:
+        return {
+            "paused": REMOTE_CONTROL_STATE.get("paused") is True,
+            "paused_at": max(0, int(REMOTE_CONTROL_STATE.get("paused_at") or 0)),
+            "paused_by": str(REMOTE_CONTROL_STATE.get("paused_by") or "").strip()[:80],
+        }
+
+
+def discard_remote_command_queues_unlocked():
+    haproxy_nodes = HAPROXY_STATE.setdefault("nodes", {})
+    haproxy_sessions = HAPROXY_STATE.setdefault("sessions", {})
+    haproxy_pending = HAPROXY_STATE.setdefault("pending", {})
+    sni_nodes = SNI_STATE.setdefault("nodes", {})
+    sni_pending = SNI_STATE.setdefault("pending", {})
+    rename_pending = NODE_NAME_STATE.setdefault("pending", {})
+    update_current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
+    update_results = UPDATE_STATE.get("results") if isinstance(UPDATE_STATE.get("results"), dict) else {}
+    update_retry = UPDATE_STATE.get("retry_tokens") if isinstance(UPDATE_STATE.get("retry_tokens"), dict) else {}
+    update_pending = UPDATE_STATE.get("pending") if isinstance(UPDATE_STATE.get("pending"), dict) else {}
+
+    counts = {
+        "haproxy": len(haproxy_nodes),
+        "dialogs": len(haproxy_sessions) + len(haproxy_pending) + len(sni_pending) + len(rename_pending) + len(update_pending),
+        "sni": len(sni_nodes),
+        "updates": (1 if str(update_current.get("id") or "") else 0) + len(update_retry),
+        "results": len(update_results),
+        "ip_limit_dialogs": 0,
+    }
+
+    HAPROXY_STATE["nodes"] = {}
+    HAPROXY_STATE["sessions"] = {}
+    HAPROXY_STATE["pending"] = {}
+    SNI_STATE["nodes"] = {}
+    SNI_STATE["pending"] = {}
+    NODE_NAME_STATE["pending"] = {}
+    UPDATE_STATE["current"] = {}
+    UPDATE_STATE["results"] = {}
+    UPDATE_STATE["local"] = {}
+    UPDATE_STATE["retry_tokens"] = {}
+    UPDATE_STATE["pending"] = {}
+
+    db = ip_limit_db()
+    row = db.execute("SELECT COUNT(*) AS value FROM ip_limit_pending").fetchone()
+    counts["ip_limit_dialogs"] = int(row["value"] if row else 0)
+    db.execute("DELETE FROM ip_limit_pending")
+
+    save_haproxy_state()
+    save_sni_state()
+    save_node_name_state()
+    save_update_state()
+    save_ip_limit_state()
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+def pause_remote_commands(requested_by=""):
+    with LOCK:
+        cleared = discard_remote_command_queues_unlocked()
+        REMOTE_CONTROL_STATE.clear()
+        REMOTE_CONTROL_STATE.update({
+            "paused": True,
+            "paused_at": now_ts(),
+            "paused_by": str(requested_by or "").strip()[:80],
+        })
+        save_remote_control_state()
+        return cleared
+
+
+def resume_remote_commands(requested_by=""):
+    with LOCK:
+        was_paused = REMOTE_CONTROL_STATE.get("paused") is True
+        REMOTE_CONTROL_STATE.clear()
+        REMOTE_CONTROL_STATE.update({"paused": False, "paused_at": 0, "paused_by": ""})
+        save_remote_control_state()
+        return was_paused
+
+
 def clean_all_active_unlocked():
     current = UPDATE_STATE.get("current") if isinstance(UPDATE_STATE.get("current"), dict) else {}
     return bool(
@@ -1669,6 +1778,8 @@ def update_target_key_for_node(node, targets):
 
 
 def update_task_for_node(node):
+    if remote_commands_paused():
+        return None
     node_key = node_record_key(node) or node_canonical_key(node)
     if not node_key:
         return None
@@ -1677,7 +1788,13 @@ def update_task_for_node(node):
         job_id = str(current.get("id") or "")
         if not job_id:
             return None
+        scope = str(current.get("scope") or "all").strip().lower()
+        live_targets = bool(current.get("live_targets"))
         targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
+        if scope in ("panel", "collector"):
+            return None
+        if not targets and not live_targets:
+            return None
         target_key = update_target_key_for_node(node, targets)
         if targets and not target_key:
             return None
@@ -1744,7 +1861,11 @@ def process_update_result(raw, node, ts):
         if not current_id or not valid_result:
             log(f"ignored stale update result node={node_key} result={result_id} current={current_id or '-'}")
             return
+        scope = str(current.get("scope") or "all").strip().lower()
+        live_targets = bool(current.get("live_targets"))
         targets = current.get("targets") if isinstance(current.get("targets"), dict) else {}
+        if scope in ("panel", "collector") or (not targets and not live_targets):
+            return
         target_key = update_target_key_for_node(node, targets)
         if targets and not target_key:
             return
@@ -8927,11 +9048,21 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "id": node["id"],
                 "last_seen": node["last_seen"],
+            }
+            if remote_commands_paused():
+                response.update({
+                    "remote_commands_paused": True,
+                    "ip_limit_blocks": [],
+                    "ip_limit_clear_blocks": True,
+                })
+                self.send_json(200, response, auth_context=auth_context)
+                return
+            response.update({
                 "ssh_allowed_ips": ssh_allowed_ips_for_node(node),
                 "ssh_firewall_open": ssh_firewall_open_for_node(node),
                 "ip_limit_blocks": [],
                 "ip_limit_clear_blocks": True,
-            }
+            })
             total_limit = ip_limit_total_limit()
             ip_policy = ip_limit_node_policy(node)
             if total_limit is not None:
@@ -11447,6 +11578,108 @@ def handle_emoji(message):
     send_message("\n".join(lines))
 
 
+REMOTE_MUTATION_COMMANDS = {
+    "/add_ip",
+    "/allow_sni",
+    "/clean_all",
+    "/delete_sni",
+    "/haproxy",
+    "/ip_enable",
+    "/ip_enable_force",
+    "/optimize",
+    "/optimize_status",
+    "/rename",
+    "/ssh_firewall_off",
+    "/ssh_firewall_on",
+    "/update_collector_bl",
+    "/update_collector_full",
+    "/update_collector_wl",
+    "/update_node",
+    "/update_node_list",
+    "/update_nodes",
+}
+
+
+def remote_control_status_message(title="Режим push-команд"):
+    state = remote_control_snapshot()
+    if state.get("paused"):
+        paused_at = int(state.get("paused_at") or 0)
+        paused_text = datetime.fromtimestamp(paused_at).strftime("%d.%m.%Y %H:%M:%S") if paused_at else "-"
+        return "\n".join([
+            f"<b>{html.escape(title)}</b>",
+            ALERT_SEPARATOR,
+            detail_line("Режим", "stats-only"),
+            detail_line("Поставлен", paused_text),
+            "",
+            "<i>Статистика, SLA и алерты продолжают работать. Управляющие команды нодам не выдаются.</i>",
+            "<i>Вернуть управление: <code>/push_resume</code></i>",
+        ])
+    return "\n".join([
+        f"<b>{html.escape(title)}</b>",
+        ALERT_SEPARATOR,
+        detail_line("Режим", "управление включено"),
+        "",
+        "<i>Ноды могут получать только новые команды, созданные после последнего сброса.</i>",
+    ])
+
+
+def handle_push_pause(from_id):
+    cleared = pause_remote_commands(from_id)
+    send_message("\n".join([
+        "<b>Push-команды остановлены</b>",
+        ALERT_SEPARATOR,
+        detail_line("Режим", "stats-only"),
+        detail_line("Очищено записей", cleared.get("total", 0)),
+        detail_line("HAProxy", cleared.get("haproxy", 0)),
+        detail_line("SNI", cleared.get("sni", 0)),
+        detail_line("Update", cleared.get("updates", 0)),
+        detail_line("Диалоги", cleared.get("dialogs", 0) + cleared.get("ip_limit_dialogs", 0)),
+        "",
+        "<i>Push продолжает передавать статистику, но collector не возвращает нодам управляющие поля.</i>",
+        "<i>Уже запущенный на ноде процесс остановить задним числом нельзя. Старая очередь после resume не восстановится.</i>",
+        "<i>Вернуть управление: <code>/push_resume</code></i>",
+    ]))
+
+
+def handle_push_resume(from_id):
+    was_paused = resume_remote_commands(from_id)
+    title = "Push-команды включены" if was_paused else "Push-команды уже включены"
+    send_message("\n".join([
+        f"<b>{title}</b>",
+        ALERT_SEPARATOR,
+        detail_line("Режим", "управление включено"),
+        "",
+        "<i>Очищенная очередь не восстановлена. Ноды получат только команды, созданные после включения.</i>",
+    ]))
+
+
+def handle_paused_remote_callback(callback):
+    if not remote_commands_paused():
+        return False
+    data = str(callback.get("data") or "")
+    if not data.startswith(("hpx:", "upd:")):
+        return False
+    callback_id = str(callback.get("id") or "")
+    from_id = str((callback.get("from") or {}).get("id") or "")
+    message = callback.get("message") or {}
+    chat_id = str((message.get("chat") or {}).get("id") or CHAT_ID)
+    if chat_id != str(CHAT_ID) or from_id != ALLOWED_USER_ID:
+        answer_callback(callback_id, "нет доступа")
+    else:
+        answer_callback(callback_id, "push-команды на паузе")
+    return True
+
+
+def remote_mutation_blocked_message(command):
+    return "\n".join([
+        "<b>Push-команды на паузе</b>",
+        ALERT_SEPARATOR,
+        detail_line("Команда", command or "-"),
+        "",
+        "<i>Статистика продолжает работать. Сначала включи управление: <code>/push_resume</code></i>",
+    ])
+
+
 BOT_HELP_SECTIONS = (
     ("Статистика", (
         ("/help", "Показать все актуальные команды."),
@@ -11473,6 +11706,9 @@ BOT_HELP_SECTIONS = (
         ("/delete_sni <машина>", "Удалить SNI из allow-list машины."),
     )),
     ("Обновление и оптимизация", (
+        ("/push_pause", "Очистить старую очередь и оставить push только для статистики."),
+        ("/push_resume", "Разрешить новые управляющие команды нодам."),
+        ("/push_status", "Показать текущий режим push-команд."),
         ("/update_collector", "Обновить только collector на панели."),
         ("/update_collector_full", "Обновить collector и push на всех машинах."),
         ("/update_collector_wl", "Обновить collector и push только на обходах."),
@@ -11552,6 +11788,8 @@ def bot_loop():
                 save_offset(offset)
                 callback = item.get("callback_query")
                 if isinstance(callback, dict):
+                    if handle_paused_remote_callback(callback):
+                        continue
                     if handle_haproxy_callback(callback):
                         continue
                     if handle_update_callback(callback):
@@ -11574,6 +11812,23 @@ def bot_loop():
                     pop_pending_bl_group(chat_id, from_id)
                     pop_pending_update_node_list(chat_id, from_id)
                     send_message("<b>Отменил.</b>")
+                    continue
+                if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/push_pause":
+                    handle_push_pause(from_id)
+                    continue
+                if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/push_resume":
+                    handle_push_resume(from_id)
+                    continue
+                if chat_id == str(CHAT_ID) and from_id == ALLOWED_USER_ID and command == "/push_status":
+                    send_message(remote_control_status_message())
+                    continue
+                if (
+                    chat_id == str(CHAT_ID)
+                    and from_id == ALLOWED_USER_ID
+                    and remote_commands_paused()
+                    and command in REMOTE_MUTATION_COMMANDS
+                ):
+                    send_message(remote_mutation_blocked_message(command))
                     continue
                 if (
                     chat_id == str(CHAT_ID)
@@ -11702,8 +11957,13 @@ def main():
     load_alerts_off_state()
     load_remna_node_state()
     load_update_state()
+    load_remote_control_state()
     load_ip_note_state()
     load_ip_limit_state()
+    if remote_commands_paused():
+        with LOCK:
+            discarded = discard_remote_command_queues_unlocked()
+        log(f"remote commands paused, discarded={discarded.get('total', 0)}")
     disable_ip_limit_actions_runtime()
     threading.Thread(target=event_worker_loop, daemon=True).start()
     threading.Thread(target=nodes_flush_loop, daemon=True).start()
