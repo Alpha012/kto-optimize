@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v294"
+COLLECTOR_BUILD = "v295"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -364,6 +364,8 @@ HAPROXY_MAX_TARGETS = 64
 HAPROXY_MAX_SNI = 64
 HAPROXY_MAX_BANDWIDTH_LIMITS = 64
 HAPROXY_MAX_BANDWIDTH_MBIT = 100000
+HAPROXY_MACHINE_PAGE_SIZE = 20
+HAPROXY_MAX_MACHINE_CHOICES = 1024
 NETWORK_RATE_BUCKET_SEC = 60
 NETWORK_RATE_RETENTION_SEC = 24 * 60 * 60
 NETWORK_RATE_MAX_SAMPLE_MS = 5 * 60 * 1000
@@ -963,9 +965,22 @@ def load_haproxy_state():
             created_at = int(item.get("created_at") or 0)
             if current - created_at > HAPROXY_SESSION_TTL:
                 continue
+            node_choices = []
+            for value in item.get("node_choices") if isinstance(item.get("node_choices"), list) else []:
+                node_key = str(value or "").strip()[:200]
+                if node_key and node_key not in node_choices:
+                    node_choices.append(node_key)
+                if len(node_choices) >= HAPROXY_MAX_MACHINE_CHOICES:
+                    break
+            try:
+                page = max(0, min(int(item.get("page") or 0), 10000))
+            except Exception:
+                page = 0
             clean_sessions[str(token)] = {
                 "node_key": str(item.get("node_key") or "")[:200],
                 "node_name": clean_display_text(item.get("node_name") or "")[:120],
+                "node_choices": node_choices,
+                "page": page,
                 "selected_ip": str(item.get("selected_ip") or "")[:64],
                 "chat_id": str(item.get("chat_id") or "")[:64],
                 "message_id": str(item.get("message_id") or "")[:64],
@@ -5200,15 +5215,35 @@ def cleanup_haproxy_sessions_unlocked(current=None):
     return changed
 
 
-def create_haproxy_session(node, chat_id, message_id=""):
+def normalize_haproxy_machine_choices(values):
+    result = []
+    for value in values if isinstance(values, (list, tuple)) else []:
+        node_key = node_record_key(value) if isinstance(value, dict) else str(value or "").strip()
+        node_key = str(node_key or "")[:200]
+        if node_key and node_key not in result:
+            result.append(node_key)
+        if len(result) >= HAPROXY_MAX_MACHINE_CHOICES:
+            break
+    return result
+
+
+def haproxy_machine_nodes():
+    with LOCK:
+        nodes = [dict(node) for node in dedupe_nodes(NODES.values()) if isinstance(node, dict)]
+    return sorted(nodes, key=node_natural_sort_key)
+
+
+def create_haproxy_session(node, chat_id, message_id="", node_choices=None):
     with LOCK:
         cleanup_haproxy_sessions_unlocked()
         token = ""
         while not token or token in HAPROXY_STATE.setdefault("sessions", {}):
             token = uuid.uuid4().hex[:10]
         HAPROXY_STATE["sessions"][token] = {
-            "node_key": haproxy_state_key(node),
-            "node_name": node_display_name(node),
+            "node_key": haproxy_state_key(node) if isinstance(node, dict) else "",
+            "node_name": node_display_name(node) if isinstance(node, dict) else "",
+            "node_choices": normalize_haproxy_machine_choices(node_choices),
+            "page": 0,
             "selected_ip": "",
             "chat_id": str(chat_id),
             "message_id": str(message_id or ""),
@@ -5216,6 +5251,15 @@ def create_haproxy_session(node, chat_id, message_id=""):
         }
         save_haproxy_state()
     return token
+
+
+def create_haproxy_machine_session(chat_id, message_id=""):
+    return create_haproxy_session(
+        None,
+        chat_id,
+        message_id,
+        node_choices=haproxy_machine_nodes(),
+    )
 
 
 def get_haproxy_session(token):
@@ -5233,9 +5277,14 @@ def update_haproxy_session(token, **changes):
         item = HAPROXY_STATE.setdefault("sessions", {}).get(str(token or ""))
         if not isinstance(item, dict):
             return None
-        for key in ("selected_ip", "chat_id", "message_id"):
+        for key, limit in (("node_key", 200), ("node_name", 120), ("selected_ip", 64), ("chat_id", 64), ("message_id", 64)):
             if key in changes:
-                item[key] = str(changes[key] or "")[:64]
+                item[key] = str(changes[key] or "")[:limit]
+        if "page" in changes:
+            try:
+                item["page"] = max(0, min(int(changes["page"] or 0), 10000))
+            except Exception:
+                item["page"] = 0
         item["created_at"] = now_ts()
         save_haproxy_state()
         return dict(item)
@@ -5404,6 +5453,47 @@ def build_haproxy_source_pinned_routes(node, routes):
     return normalize_haproxy_routes(updated, strict=True), preview
 
 
+def haproxy_machine_selector_payload(token, page=None):
+    session = get_haproxy_session(token) or {}
+    choices = normalize_haproxy_machine_choices(session.get("node_choices"))
+    available = []
+    for choice_index, node_key in enumerate(choices):
+        node = find_node(node_key)
+        if node is not None:
+            available.append((choice_index, node))
+    try:
+        requested_page = int(session.get("page") or 0) if page is None else int(page)
+    except Exception:
+        requested_page = 0
+    page_count = max(1, (len(available) + HAPROXY_MACHINE_PAGE_SIZE - 1) // HAPROXY_MACHINE_PAGE_SIZE)
+    current_page = max(0, min(requested_page, page_count - 1))
+    start = current_page * HAPROXY_MACHINE_PAGE_SIZE
+    page_items = available[start:start + HAPROXY_MACHINE_PAGE_SIZE]
+    lines = [
+        "<b>HAProxy</b>",
+        ALERT_SEPARATOR,
+        detail_line("Машин", len(available)),
+        "",
+        "<b>Выбери машину:</b>",
+    ]
+    if not available:
+        lines += ["", "<i>Collector пока не получил данные от машин.</i>"]
+    buttons = []
+    for choice_index, node in page_items:
+        label = node_display_name(node, "Без названия")[:64]
+        buttons.append({"text": label, "callback_data": f"hpx:n:{token}:{choice_index}"})
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    if page_count > 1:
+        navigation = []
+        if current_page > 0:
+            navigation.append({"text": "Назад", "callback_data": f"hpx:g:{token}:{current_page - 1}"})
+        navigation.append({"text": f"{current_page + 1}/{page_count}", "callback_data": f"hpx:g:{token}:{current_page}"})
+        if current_page + 1 < page_count:
+            navigation.append({"text": "Дальше", "callback_data": f"hpx:g:{token}:{current_page + 1}"})
+        rows.append(navigation)
+    return "\n".join(lines), {"inline_keyboard": rows} if rows else None
+
+
 def haproxy_ip_selector_payload(node, token):
     routes, source = effective_haproxy_routes_for_node(node)
     reported = reported_haproxy_routes_for_node(node)
@@ -5429,7 +5519,11 @@ def haproxy_ip_selector_payload(node, token):
         buttons.append({"text": f"{label} · {count}", "callback_data": f"hpx:i:{token}:{ip_text}"})
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
     rows.append([{"text": "FULL → точечные бинды", "callback_data": f"hpx:p:{token}"}])
-    rows.append([{"text": "Обновить", "callback_data": f"hpx:r:{token}"}])
+    footer = []
+    if (get_haproxy_session(token) or {}).get("node_choices"):
+        footer.append({"text": "К списку машин", "callback_data": f"hpx:m:{token}"})
+    footer.append({"text": "Обновить", "callback_data": f"hpx:r:{token}"})
+    rows.append(footer)
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -5533,6 +5627,16 @@ def edit_haproxy_session_message(token, text, reply_markup=None):
     return False
 
 
+def show_haproxy_machine_selector(token, page=None):
+    session = get_haproxy_session(token)
+    if not session:
+        return False
+    if page is not None:
+        session = update_haproxy_session(token, page=page) or session
+    body, markup = haproxy_machine_selector_payload(token, session.get("page") or 0)
+    return edit_haproxy_session_message(token, body, markup)
+
+
 def show_haproxy_ip_selector(token):
     session = get_haproxy_session(token)
     node = haproxy_session_node(session)
@@ -5552,10 +5656,40 @@ def show_haproxy_selected_ip(token):
     return edit_haproxy_session_message(token, body, markup)
 
 
+def haproxy_node_menu_error(node):
+    if not bool(node.get("haproxy_routes_supported")):
+        return (
+            "<b>Нужен новый push на машине</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n\n"
+            "Обнови push через <code>/update_collector_wl</code> или <code>/update_collector_bl</code>, "
+            "дождись следующего push и повтори команду."
+        )
+    if not bool(node.get("haproxy_routes_managed")):
+        return (
+            "<b>Удалённое изменение заблокировано</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n\n"
+            "Текущий <code>haproxy.cfg</code> не помечен как управляемый kto. "
+            "Я не буду целиком перезаписывать сторонний config. Сначала импортируй или пересоздай его через HAProxy-меню на машине."
+        )
+    return ""
+
+
 def handle_haproxy_command(text, chat_id, from_id):
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        send_message("<b>Пример:</b> <code>/haproxy Обход #8</code>")
+        pop_pending_haproxy(chat_id, from_id)
+        pop_pending_sni(chat_id, from_id)
+        token = create_haproxy_machine_session(chat_id)
+        body, markup = haproxy_machine_selector_payload(token)
+        sent = send_message(body, reply_markup=markup)
+        if isinstance(sent, dict):
+            update_haproxy_session(
+                token,
+                chat_id=(sent.get("chat") or {}).get("id") or chat_id,
+                message_id=sent.get("message_id"),
+            )
         return
     query = parts[1].strip()
     node = find_node(query)
@@ -5566,23 +5700,9 @@ def handle_haproxy_command(text, chat_id, from_id):
             f"Сначала проверь название через <code>/stats</code>."
         )
         return
-    if not bool(node.get("haproxy_routes_supported")):
-        send_message(
-            "<b>Нужен новый push на машине</b>\n"
-            f"{ALERT_SEPARATOR}\n"
-            f"{detail_line('Машина', node_display_name(node))}\n\n"
-            "Обнови push через <code>/update_collector_wl</code> или <code>/update_collector_bl</code>, "
-            "дождись следующего push и повтори команду."
-        )
-        return
-    if not bool(node.get("haproxy_routes_managed")):
-        send_message(
-            "<b>Удалённое изменение заблокировано</b>\n"
-            f"{ALERT_SEPARATOR}\n"
-            f"{detail_line('Машина', node_display_name(node))}\n\n"
-            "Текущий <code>haproxy.cfg</code> не помечен как управляемый kto. "
-            "Я не буду целиком перезаписывать сторонний config. Сначала импортируй или пересоздай его через HAProxy-меню на машине."
-        )
+    error_text = haproxy_node_menu_error(node)
+    if error_text:
+        send_message(error_text)
         return
     pop_pending_haproxy(chat_id, from_id)
     pop_pending_sni(chat_id, from_id)
@@ -5958,11 +6078,65 @@ def handle_haproxy_callback(callback):
     token = parts[2]
     value = parts[3] if len(parts) == 4 else ""
     session = get_haproxy_session(token)
-    node = haproxy_session_node(session)
-    if not session or node is None:
+    if not session:
         answer_callback(callback_id, "меню устарело")
         return True
-    update_haproxy_session(token, chat_id=chat_id, message_id=message_id)
+    session = update_haproxy_session(token, chat_id=chat_id, message_id=message_id) or session
+
+    if action == "g":
+        if not value.isdigit():
+            answer_callback(callback_id, "неверная страница")
+            return True
+        answer_callback(callback_id)
+        show_haproxy_machine_selector(token, int(value))
+        return True
+    if action == "m":
+        if not session.get("node_choices"):
+            answer_callback(callback_id, "запусти /haproxy заново")
+            return True
+        pop_pending_haproxy(chat_id, from_id)
+        pop_pending_sni(chat_id, from_id)
+        update_haproxy_session(token, node_key="", node_name="", selected_ip="")
+        answer_callback(callback_id, "список машин")
+        show_haproxy_machine_selector(token)
+        return True
+    if action == "n":
+        choices = normalize_haproxy_machine_choices(session.get("node_choices"))
+        if not value.isdigit() or int(value) >= len(choices):
+            answer_callback(callback_id, "машина больше не найдена")
+            show_haproxy_machine_selector(token)
+            return True
+        node = find_node(choices[int(value)])
+        if node is None:
+            answer_callback(callback_id, "машина больше не найдена")
+            show_haproxy_machine_selector(token)
+            return True
+        pop_pending_haproxy(chat_id, from_id)
+        pop_pending_sni(chat_id, from_id)
+        update_haproxy_session(
+            token,
+            node_key=haproxy_state_key(node),
+            node_name=node_display_name(node),
+            selected_ip="",
+        )
+        error_text = haproxy_node_menu_error(node)
+        if error_text:
+            answer_callback(callback_id, "управление недоступно")
+            markup = {"inline_keyboard": [[{"text": "К списку машин", "callback_data": f"hpx:m:{token}"}]]}
+            edit_haproxy_session_message(token, error_text, markup)
+            return True
+        answer_callback(callback_id, "список IP")
+        show_haproxy_ip_selector(token)
+        return True
+
+    node = haproxy_session_node(session)
+    if node is None:
+        if session.get("node_choices"):
+            answer_callback(callback_id, "сначала выбери машину")
+            show_haproxy_machine_selector(token)
+        else:
+            answer_callback(callback_id, "меню устарело")
+        return True
     routes, _ = effective_haproxy_routes_for_node(node)
     selected_ip = str(session.get("selected_ip") or "")
 
@@ -10695,7 +10869,7 @@ BOT_HELP_SECTIONS = (
         ("/delete <машина>", "Удалить машину и её падения из collector."),
         ("/rename <машина>", "Переименовать машину через ответное сообщение."),
         ("/add_ip <IPv4>", "Добавить IP в SSH whitelist обходов."),
-        ("/haproxy <машина>", "Управлять маршрутами HAProxy по входным IP и портам."),
+        ("/haproxy [машина]", "Выбрать машину кнопкой и управлять маршрутами HAProxy."),
         ("/allow_sni <машина>", "Добавить SNI в allow-list машины."),
         ("/delete_sni <машина>", "Удалить SNI из allow-list машины."),
     )),

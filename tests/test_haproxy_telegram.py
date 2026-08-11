@@ -73,6 +73,95 @@ class TelegramHaproxyTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def make_node(self, name, number, **changes):
+        node = dict(
+            self.node,
+            id=name,
+            name=name,
+            node_uuid=f"12345678-1234-1234-1234-{number:012x}",
+        )
+        node.update(changes)
+        return node
+
+    def test_haproxy_without_name_shows_all_machines_in_two_columns(self):
+        nodes = [
+            self.make_node("Обход №10", 10),
+            self.make_node("Германия", 11),
+            self.make_node("Обход №2", 12),
+        ]
+        self.collector.NODES = {self.collector.node_record_key(node): node for node in nodes}
+        sent = []
+
+        def send_message(body, reply_markup=None):
+            sent.append((body, reply_markup))
+            return {"message_id": 501, "chat": {"id": self.chat_id}}
+
+        self.collector.send_message = send_message
+        self.collector.handle_haproxy_command("/haproxy", self.chat_id, self.from_id)
+
+        self.assertEqual(len(sent), 1)
+        body, markup = sent[0]
+        self.assertIn("Выбери машину", body)
+        machine_rows = [
+            row for row in markup["inline_keyboard"]
+            if row and all(button["callback_data"].startswith("hpx:n:") for button in row)
+        ]
+        self.assertTrue(machine_rows)
+        self.assertTrue(all(1 <= len(row) <= 2 for row in machine_rows))
+        labels = [button["text"] for row in machine_rows for button in row]
+        self.assertEqual(labels, ["Германия", "Обход №2", "Обход №10"])
+        token = machine_rows[0][0]["callback_data"].split(":")[2]
+        session = self.collector.get_haproxy_session(token)
+        self.assertEqual(len(session["node_choices"]), 3)
+        self.assertEqual(session["message_id"], "501")
+
+    def test_machine_button_selects_exact_node_and_opens_ip_menu(self):
+        first = self.make_node("Обход №1", 21)
+        target = self.make_node("Обход №2", 22)
+        self.collector.NODES = {
+            self.collector.node_record_key(first): first,
+            self.collector.node_record_key(target): target,
+        }
+        token = self.collector.create_haproxy_machine_session(self.chat_id, "77")
+        _body, markup = self.collector.haproxy_machine_selector_payload(token)
+        target_button = next(
+            button
+            for row in markup["inline_keyboard"]
+            for button in row
+            if button["text"] == "Обход №2"
+        )
+        shown = []
+        self.collector.show_haproxy_ip_selector = lambda selected_token: shown.append(selected_token) or True
+        callback = {
+            "id": "select-node",
+            "data": target_button["callback_data"],
+            "from": {"id": self.from_id},
+            "message": {"message_id": 77, "chat": {"id": self.chat_id}},
+        }
+
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        session = self.collector.get_haproxy_session(token)
+        self.assertEqual(session["node_key"], self.collector.node_record_key(target))
+        self.assertEqual(session["node_name"], "Обход №2")
+        self.assertEqual(shown, [token])
+        _body, ip_markup = self.collector.haproxy_ip_selector_payload(target, token)
+        self.assertTrue(
+            any(button["text"] == "К списку машин" for row in ip_markup["inline_keyboard"] for button in row)
+        )
+
+    def test_machine_choices_survive_state_reload(self):
+        nodes = [self.make_node("Обход №1", 31), self.make_node("Обход №2", 32)]
+        self.collector.NODES = {self.collector.node_record_key(node): node for node in nodes}
+        token = self.collector.create_haproxy_machine_session(self.chat_id, "88")
+        expected = self.collector.get_haproxy_session(token)["node_choices"]
+
+        self.collector.HAPROXY_STATE = {"nodes": {}, "sessions": {}, "pending": {}}
+        self.collector.load_haproxy_state()
+
+        session = self.collector.get_haproxy_session(token)
+        self.assertEqual(session["node_choices"], expected)
+        self.assertEqual(session["page"], 0)
+
     def test_ip_buttons_are_two_columns_and_include_route_counts(self):
         body, markup = self.collector.haproxy_ip_selector_payload(self.node, self.token)
         self.assertIn("Выбери входной IP", body)
