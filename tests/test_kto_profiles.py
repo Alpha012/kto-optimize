@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v303"', KTO)
-        self.assertIn('PUSH_BUILD="v303"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v303"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v303"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v303"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v303"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v303"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v304"', KTO)
+        self.assertIn('PUSH_BUILD="v304"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v304"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v304"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v304"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v304"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v304"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2031,7 +2031,7 @@ grep -q '^net.ipv4.ip_local_reserved_ports=22,8000-8400,8443,8444$' "$events"
 
     def test_reality_haproxy_firewall_does_not_apply_whitelist_ssh_rules(self):
         firewall = function_body(KTO, "sync_haproxy_firewall")
-        self.assertIn('if [[ "$MACHINE_MODE" == "whitelist" ]]', firewall)
+        self.assertIn('[[ "$MACHINE_MODE" == "whitelist" && "$previous_known" == "0" ]]', firewall)
         self.assertIn('apply_whitelist_ssh_rules "$ssh_port"', firewall)
         self.assertIn('ufw allow "${port}/tcp"', firewall)
         self.assertIn('"$port" == "443" || "$port" == "$NODE_PORT"', firewall)
@@ -2060,6 +2060,42 @@ grep -q 'ufw allow 8443/tcp' "$events"
 ! grep -q 'ssh-filter' "$events"
 ! grep -q 'delete allow 443/tcp' "$events"
 ! grep -q 'delete allow 443/udp' "$events"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_firewall_route_edit_applies_only_port_delta(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+MACHINE_MODE=whitelist
+SUDO=()
+routes=$(mktemp)
+previous=$(mktemp)
+events=$(mktemp)
+trap 'rm -f "$routes" "$previous" "$events"' EXIT
+printf '443\t89.144.8.3:443\ta.example.com\tdefault\n8443\t5.34.179.144:443\tb.example.com\tdefault\n' > "$routes"
+printf '443\t89.144.8.3:443\ta.example.com\tdefault\n8444\t5.34.179.145:443\tc.example.com\tdefault\n' > "$previous"
+command_exists() { [[ "$1" == ufw ]]; }
+ufw_active() { return 0; }
+apply_whitelist_ssh_rules() { printf 'ssh-filter\n' >> "$events"; }
+cmd() { local IFS=' '; printf '%s\n' "$*" >> "$events"; }
+sync_haproxy_firewall "$routes" "$previous"
+grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
+grep -Fqx 'ufw --force delete allow 8444/tcp' "$events"
+! grep -q 'ufw allow 443/tcp' "$events"
+! grep -q 'ssh-filter' "$events"
+[[ "$(wc -l < "$events")" == 2 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -2153,6 +2189,11 @@ expected=$'443\t89.144.8.3:443\tany\tdefault\n8443\t5.34.179.144:443\tstrict.exa
         remote_apply = function_body(KTO, "haproxy_remote_apply_json")
         self.assertIn('if length == 0 then "any" else join(" ") end', remote_apply)
         self.assertIn('(.sni | length <= 64)', remote_apply)
+        self.assertIn('apply_haproxy_routes_config "$routes_file" 1', remote_apply)
+        self.assertIn(
+            'reconcile_haproxy_bandwidth_after_route_change "$routes_file" "$previous_routes_file"',
+            remote_apply,
+        )
         self.assertIn('HAPROXY_SNI_ANY = "any"', COLLECTOR)
         self.assertIn('def parse_haproxy_sni_input(value):\n    return normalize_haproxy_sni_list(value)', COLLECTOR)
         self.assertIn('ответь <code>any</code> или <code>*</code>', COLLECTOR)
@@ -2253,6 +2294,7 @@ sync_haproxy_firewall() { printf 'sync\n' >> "$events"; }
 haproxy_bandwidth_current_rate() { return 0; }
 remove_haproxy_input_bandwidth_limit() { printf 'limit-removed:%s\n' "$1" >> "$events"; }
 reapply_haproxy_bandwidth_limits() { printf 'tc-reapply\n' >> "$events"; }
+require_local_haproxy_bandwidth_manager() { return 0; }
 delete_haproxy_route "$routes" <<< $'2\n2\ny' > "$output" 2>&1
 grep -q 'Выберите входной IP маршрута:' "$output"
 grep -q '217.19.122.48 | портов: 443, 8443, 8444' "$output"
@@ -2302,6 +2344,11 @@ haproxy_bandwidth_current_rate() {
     return 0
 }
 remove_haproxy_input_bandwidth_limit() { printf 'limit-removed:%s:%s\n' "$1" "${2:-latest}" >> "$events"; }
+require_local_haproxy_bandwidth_manager() { return 0; }
+commit_haproxy_bandwidth_config() {
+    cp "$2" "$HAPROXY_BANDWIDTH_CONFIG"
+    printf 'limits-commit\n' >> "$events"
+}
 cp "$routes" "$routes.cancelled"
 delete_haproxy_route "$routes" <<< $'2\nn' > "$output" 2>&1
 cmp -s "$routes" "$routes.cancelled"
@@ -2310,8 +2357,9 @@ rm -f "$routes.cancelled"
 delete_haproxy_route "$routes" <<< $'2\ny' > "$output" 2>&1
 [[ "$(wc -l < "$routes")" == 1 ]]
 grep -Fqx 'route-apply:1' "$events"
-grep -Fqx 'limit-removed:217.19.122.48:local' "$events"
-[[ "$(grep -c '^limit-removed:' "$events")" == 1 ]]
+grep -Fqx 'limits-commit' "$events"
+! grep -q '^217\.19\.122\.48' "$HAPROXY_BANDWIDTH_CONFIG"
+[[ "$(grep -c '^limits-commit$' "$events")" == 1 ]]
 cp "$routes" "$routes.before"
 if delete_haproxy_route "$routes" > "$output" 2>&1; then
     exit 1
@@ -2319,6 +2367,43 @@ fi
 cmp -s "$routes" "$routes.before"
 grep -q 'Нельзя удалить последний HAProxy-маршрут' "$output"
 rm -f "$routes.before"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_route_delete_shared_port_skips_tc_rebuild(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+routes=$(mktemp)
+events=$(mktemp)
+output=$(mktemp)
+export HAPROXY_BANDWIDTH_CONFIG="$routes.limits"
+trap 'rm -f "$routes" "$routes.limits" "$events" "$output"' EXIT
+printf '443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112\n443\t5.34.179.143:443\tb.example.com\tdefault\tdefault\t217.19.122.48\n8444\t5.34.179.145:443\td.example.com\tdefault\tdefault\t217.19.122.48\n' > "$routes"
+printf '217.19.122.48\t2000\n' > "$HAPROXY_BANDWIDTH_CONFIG"
+select_haproxy_route_for_delete() { printf '443\t78.159.250.112\n'; }
+apply_haproxy_routes_config() { printf 'route-apply:%s\n' "${2:-0}" >> "$events"; }
+sync_haproxy_firewall() { printf 'sync\n' >> "$events"; }
+reapply_haproxy_bandwidth_limits() { printf 'tc-reapply\n' >> "$events"; }
+require_local_haproxy_bandwidth_manager() { printf 'manager-check\n' >> "$events"; }
+delete_haproxy_route "$routes" <<< 'y' > "$output" 2>&1
+[[ "$(wc -l < "$routes")" == 2 ]]
+grep -Fqx 'route-apply:1' "$events"
+grep -Fqx 'sync' "$events"
+! grep -q '^tc-reapply$' "$events"
+! grep -q '^manager-check$' "$events"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

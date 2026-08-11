@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v303"
+SCRIPT_BUILD="v304"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -6126,7 +6126,6 @@ haproxy_remote_report_json() {
 haproxy_remote_apply_json() {
     local input_file routes_file previous_routes_file canonical_current canonical_wanted
     local port target_pool sni source_ip server_maxconn listen_ip normalized route_count target_count sni_count
-    local old_listen_ip
 
     command_exists jq || {
         fail "jq не найден: удалённое управление HAProxy недоступно"
@@ -6247,16 +6246,14 @@ haproxy_remote_apply_json() {
         return 0
     fi
 
-    if ! apply_haproxy_routes_config "$routes_file"; then
+    # Route and bandwidth state are reconciled once below. Running the generic
+    # post-apply pass here used to rebuild every tc filter before cleanup.
+    if ! apply_haproxy_routes_config "$routes_file" 1; then
         rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
         return 1
     fi
     sync_haproxy_firewall "$routes_file" "$previous_routes_file"
-    while IFS=$'\t' read -r _ _ _ _ _ old_listen_ip; do
-        old_listen_ip="$(normalize_haproxy_listen_ip "${old_listen_ip:-*}" 2>/dev/null || true)"
-        [[ -n "$old_listen_ip" && "$old_listen_ip" != "*" ]] || continue
-        cleanup_haproxy_bandwidth_after_route_delete "$routes_file" "$old_listen_ip" || true
-    done < "$previous_routes_file"
+    reconcile_haproxy_bandwidth_after_route_change "$routes_file" "$previous_routes_file" || true
 
     rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
     printf '{"ok":true,"changed":true,"routes":%s}\n' "$route_count"
@@ -6410,6 +6407,19 @@ haproxy_route_file_conflicts_endpoint() {
 
 haproxy_route_count() {
     awk -F '\t' 'NF >= 3 { count++ } END { print count + 0 }' "$1"
+}
+
+haproxy_route_ports() {
+    local routes_file="$1"
+    awk -F '\t' '$1 ~ /^[0-9]+$/ { print $1 }' "$routes_file" 2>/dev/null |
+        LC_ALL=C sort -n -u
+}
+
+haproxy_route_port_sets_equal() {
+    local current_routes="$1" previous_routes="$2"
+    cmp -s \
+        <(haproxy_route_ports "$current_routes") \
+        <(haproxy_route_ports "$previous_routes")
 }
 
 reserved_port_list_contains() {
@@ -7389,7 +7399,7 @@ show_haproxy_bandwidth_status_cli() {
 
 sync_haproxy_firewall() {
     local routes_file="${1:-}" previous_routes_file="${2:-}"
-    local ssh_port port target sni source_ip generated_routes=""
+    local ssh_port port target sni source_ip generated_routes="" previous_known=0
     local -A opened_ports=() checked_previous_ports=()
     command_exists ufw || return 0
     ufw_active || return 0
@@ -7399,7 +7409,8 @@ sync_haproxy_firewall() {
         extract_haproxy_routes > "$generated_routes"
         routes_file="$generated_routes"
     fi
-    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+    [[ -n "$previous_routes_file" && -s "$previous_routes_file" ]] && previous_known=1
+    if [[ "$MACHINE_MODE" == "whitelist" && "$previous_known" == "0" ]]; then
         ssh_port="$(detect_ssh_port)"
         apply_whitelist_ssh_rules "$ssh_port"
     fi
@@ -7407,6 +7418,9 @@ sync_haproxy_firewall() {
         [[ "$port" =~ ^[0-9]+$ ]] || continue
         [[ -z "${opened_ports[$port]+x}" ]] || continue
         opened_ports[$port]=1
+        if (( previous_known == 1 )) && haproxy_route_file_has_port "$previous_routes_file" "$port"; then
+            continue
+        fi
         if ! cmd "${SUDO[@]}" ufw allow "${port}/tcp" comment 'kto-haproxy'; then
             cmd "${SUDO[@]}" ufw allow "${port}/tcp" || true
         fi
@@ -7426,7 +7440,7 @@ sync_haproxy_firewall() {
         done < "$previous_routes_file"
     fi
 
-    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+    if [[ "$MACHINE_MODE" == "whitelist" && "$previous_known" == "0" ]]; then
         cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
         if ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
             cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
@@ -8577,27 +8591,54 @@ haproxy_route_file_uses_input_ip() {
     ' "$routes_file"
 }
 
-cleanup_haproxy_bandwidth_after_route_delete() {
-    local routes_file="$1" input_ip="$2" current_rate
-    "${SUDO[@]}" test -s "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null || return 0
+reconcile_haproxy_bandwidth_after_route_change() {
+    local routes_file="$1" previous_routes_file="$2"
+    local previous_limits next_limits ip rate removed_count=0 ports_changed=0
+    local removed_ips=""
 
-    if [[ "$input_ip" != "*" ]] &&
-        ! haproxy_route_file_uses_input_ip "$routes_file" "$input_ip"; then
-        current_rate="$(haproxy_bandwidth_current_rate "$input_ip")"
-        if [[ -n "$current_rate" ]]; then
-            stage "Убираю больше не используемый лимит HAProxy для ${input_ip}"
-            if remove_haproxy_input_bandwidth_limit "$input_ip" local; then
-                return 0
-            fi
-            warn "Маршрут удалён, но лимит ${input_ip} не очистился. Убери его через меню лимитов HAProxy."
-            return 1
-        fi
+    "${SUDO[@]}" test -s "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null || return 0
+    haproxy_route_port_sets_equal "$routes_file" "$previous_routes_file" || ports_changed=1
+
+    previous_limits="$(mktemp)"
+    next_limits="$(mktemp)"
+    if ! load_haproxy_bandwidth_config "$previous_limits"; then
+        rm -f "$previous_limits" "$next_limits"
+        return 1
     fi
 
-    reapply_haproxy_bandwidth_limits || {
-        warn "Маршрут удалён, но локальные tc-фильтры не синхронизировались. Запусти haproxy-limit-status."
+    while IFS=$'\t' read -r ip rate; do
+        [[ -n "$ip" ]] || continue
+        if haproxy_route_file_uses_input_ip "$routes_file" "$ip"; then
+            printf '%s\t%s\n' "$ip" "$rate" >> "$next_limits"
+        else
+            removed_count=$(( removed_count + 1 ))
+            removed_ips+="${removed_ips:+, }${ip}"
+        fi
+    done < "$previous_limits"
+
+    if (( removed_count == 0 && ports_changed == 0 )); then
+        rm -f "$previous_limits" "$next_limits"
+        return 0
+    fi
+    require_local_haproxy_bandwidth_manager || {
+        rm -f "$previous_limits" "$next_limits"
         return 1
     }
+
+    if (( removed_count > 0 )); then
+        if ! commit_haproxy_bandwidth_config "$previous_limits" "$next_limits" 1; then
+            rm -f "$previous_limits" "$next_limits"
+            warn "Маршруты применены, но лимиты HAProxy не синхронизировались. Запусти haproxy-limit-status."
+            return 1
+        fi
+        ok "Удалены лимиты IP без маршрутов: ${removed_ips}"
+    elif ! reapply_haproxy_bandwidth_limits; then
+        rm -f "$previous_limits" "$next_limits"
+        warn "Маршруты применены, но локальные tc-фильтры не синхронизировались. Запусти haproxy-limit-status."
+        return 1
+    fi
+
+    rm -f "$previous_limits" "$next_limits"
 }
 
 delete_haproxy_route() {
@@ -8658,8 +8699,8 @@ delete_haproxy_route() {
     # limit have reached their final state. This prevents two full tc passes.
     if apply_haproxy_routes_config "$next_file" 1; then
         sync_haproxy_firewall "$next_file" "$routes_file"
+        reconcile_haproxy_bandwidth_after_route_change "$next_file" "$routes_file" || true
         mv "$next_file" "$routes_file"
-        cleanup_haproxy_bandwidth_after_route_delete "$routes_file" "$listen_ip" || true
         ok "HAProxy listener ${listen_ip}:${port}/tcp удалён"
         ok "Осталось HAProxy-маршрутов: ${after_count}"
         return 0
