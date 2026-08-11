@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v300"', KTO)
-        self.assertIn('PUSH_BUILD="v300"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v300"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v300"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v300"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v300"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v300"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v301"', KTO)
+        self.assertIn('PUSH_BUILD="v301"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v301"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v301"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v301"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v301"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v301"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2107,6 +2107,53 @@ expected=$'443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\n8443
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_blank_sni_means_any_and_round_trips(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+routes=$(mktemp)
+config=$(mktemp)
+trap 'rm -f "$routes" "$config"' EXIT
+printf '443\t89.144.8.3:443\tany\tdefault\n8443\t5.34.179.144:443\tstrict.example.com\tdefault\n' > "$routes"
+render_haproxy_routes_config "$routes" "$config"
+any_block=$(awk '$1 == "frontend" { active = ($2 == "vless_in") } active { print } active && $1 == "default_backend" { exit }' "$config")
+strict_block=$(awk '$1 == "frontend" { active = ($2 == "vless_in_8443") } active { print } active && $1 == "default_backend" { exit }' "$config")
+grep -Fq '# kto-sni-mode any' <<< "$any_block"
+grep -Fq 'tcp-request content accept if clienthello' <<< "$any_block"
+! grep -Fq 'allowed_sni' <<< "$any_block"
+! grep -Fq 'track-sc' <<< "$any_block"
+grep -Fq '# kto-sni-mode allow-list' <<< "$strict_block"
+grep -Fq 'acl allowed_sni req.ssl_sni -i strict.example.com' <<< "$strict_block"
+actual=$(extract_haproxy_routes "$config")
+expected=$'443\t89.144.8.3:443\tany\tdefault\n8443\t5.34.179.144:443\tstrict.example.com\tdefault'
+[[ "$actual" == "$expected" ]]
+[[ "$(normalize_haproxy_sni_list '')" == any ]]
+[[ "$(normalize_haproxy_sni_list '*')" == any ]]
+! normalize_haproxy_sni_list 'any strict.example.com'
+[[ "$(print_haproxy_route 9443 1.2.3.4:443 '' default)" == $'9443\t1.2.3.4:443\tany\tdefault' ]]
+[[ "$(ask_haproxy_sni_list SNI old.example.com <<< '')" == any ]]
+[[ "$(ask_haproxy_sni_list SNI old.example.com <<< '=')" == old.example.com ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        remote_apply = function_body(KTO, "haproxy_remote_apply_json")
+        self.assertIn('if length == 0 then "any" else join(" ") end', remote_apply)
+        self.assertIn('(.sni | length <= 64)', remote_apply)
+        self.assertIn('HAPROXY_SNI_ANY = "any"', COLLECTOR)
+        self.assertIn('def parse_haproxy_sni_input(value):\n    return normalize_haproxy_sni_list(value)', COLLECTOR)
+        self.assertIn('ответь <code>any</code> или <code>*</code>', COLLECTOR)
 
     def test_haproxy_same_port_on_distinct_input_ips_round_trip(self):
         bash = bash_executable()

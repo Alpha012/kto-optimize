@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v300"
+SCRIPT_BUILD="v301"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -1447,6 +1447,7 @@ print_haproxy_route() {
     local port="$1" target_pool="$2" sni="$3" source_ip="${4:-default}"
     local server_maxconn="${5:-default}" listen_ip="${6:-*}"
 
+    sni="$(normalize_haproxy_sni_list "$sni")" || return 1
     source_ip="$(normalize_haproxy_source_ip "$source_ip")" || return 1
     server_maxconn="$(normalize_haproxy_server_maxconn "$server_maxconn")" || return 1
     listen_ip="$(normalize_haproxy_listen_ip "$listen_ip")" || return 1
@@ -1780,6 +1781,10 @@ normalize_haproxy_sni_list() {
     local raw="${1:-}" token base existing
     local -a tokens=() normalized=()
 
+    raw="$(trim_whitespace "$raw")"
+    case "${raw,,}" in
+        ""|\*|any|all) printf 'any\n'; return 0 ;;
+    esac
     raw="${raw//,/ }"
     raw="${raw//;/ }"
     IFS=' ' read -r -a tokens <<< "$raw"
@@ -1787,6 +1792,9 @@ normalize_haproxy_sni_list() {
         token="${token,,}"
         token="${token%.}"
         [[ -n "$token" ]] || continue
+        case "$token" in
+            \*|any|all) return 1 ;;
+        esac
         base="$token"
         if [[ "$base" == \*.* ]]; then
             base="${base#*.}"
@@ -1803,11 +1811,22 @@ normalize_haproxy_sni_list() {
     printf '%s\n' "${normalized[*]}"
 }
 
+haproxy_sni_label() {
+    local normalized
+    normalized="$(normalize_haproxy_sni_list "${1:-}" 2>/dev/null || true)"
+    if [[ "$normalized" == any ]]; then
+        printf 'любой\n'
+    else
+        printf '%s\n' "${normalized:-некорректный}"
+    fi
+}
+
 render_haproxy_sni_acl_lines() {
     local raw="${1:-}" normalized token
     local -a values=() exact_values=() wildcard_suffixes=()
 
     normalized="$(normalize_haproxy_sni_list "$raw")" || return 1
+    [[ "$normalized" != any ]] || return 0
     IFS=' ' read -r -a values <<< "$normalized"
     for token in "${values[@]}"; do
         if [[ "$token" == \*.* ]]; then
@@ -1957,14 +1976,29 @@ ask_haproxy_target_pool_default() {
 }
 
 ask_haproxy_sni_list() {
-    local prompt="$1" default="${2:-}" value normalized
+    local prompt="$1" default="${2:-}" value normalized normalized_default default_label
+
+    if [[ -n "$default" ]]; then
+        normalized_default="$(normalize_haproxy_sni_list "$default" 2>/dev/null || true)"
+        default_label="$(haproxy_sni_label "$normalized_default")"
+    fi
     while true; do
-        value="$(ask_text "$prompt" "$default")"
+        if [[ -n "$normalized_default" ]]; then
+            printf '%s [сейчас: %s; Enter = любой; = оставить]: ' "$prompt" "$default_label" >&2
+        else
+            printf '%s [Enter = любой]: ' "$prompt" >&2
+        fi
+        read -r value
+        value="${value%$'\r'}"
+        if [[ "$value" == "=" && -n "$normalized_default" ]]; then
+            printf '%s\n' "$normalized_default"
+            return 0
+        fi
         if normalized="$(normalize_haproxy_sni_list "$value")"; then
             echo "$normalized"
             return 0
         fi
-        fail "Некорректный SNI. Примеры: example.com, *.example.com; несколько значений — через пробел."
+        fail "Некорректный SNI. Примеры: example.com, *.example.com; Enter разрешает любой SNI."
     done
 }
 
@@ -5966,6 +6000,10 @@ extract_haproxy_routes() {
             frontend_listen_ip[name] = listen_ip
             next
         }
+        section == "frontend" && $1 == "#" && $2 == "kto-sni-mode" && $3 == "any" {
+            frontend_sni[name] = "any"
+            next
+        }
         section == "frontend" && $1 == "acl" && $2 == "allowed_sni" && $3 == "req.ssl_sni" {
             suffix_match = 0
             for (i = 1; i <= NF; i++) {
@@ -6115,7 +6153,7 @@ haproxy_remote_apply_json() {
         all(.[];
             type == "object" and
             ((.targets | type) == "array") and (.targets | length >= 1 and length <= 64) and
-            ((.sni | type) == "array") and (.sni | length >= 1 and length <= 64)
+            ((.sni | type) == "array") and (.sni | length <= 64)
         )
     ' "$input_file" >/dev/null 2>&1; then
         rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
@@ -6186,7 +6224,7 @@ haproxy_remote_apply_json() {
         | [
             (.port // "" | tostring),
             ((.targets // []) | map(tostring) | join(",")),
-            ((.sni // []) | map(tostring) | join(" ")),
+            ((.sni // []) | map(tostring) | if length == 0 then "any" else join(" ") end),
             (.source_ip // "default" | tostring),
             (.server_maxconn // "default" | tostring),
             (.listen_ip // "*" | tostring)
@@ -6629,10 +6667,20 @@ frontend ${frontend_name}
     stick-table type ip size 100k expire 30m store gpc0,conn_rate(10s)
     tcp-request inspect-delay 5s
     acl clienthello req.ssl_hello_type 1
+EOF
+        if [[ "$allowed_sni" == any ]]; then
+            cat >> "$output_file" <<EOF
+    # kto-sni-mode any
+    tcp-request content accept if clienthello
+    tcp-request content reject if WAIT_END
+EOF
+        else
+            cat >> "$output_file" <<EOF
+    # kto-sni-mode allow-list
     acl has_sni req.ssl_sni -m found
 EOF
-        render_haproxy_sni_acl_lines "$allowed_sni" >> "$output_file"
-        cat >> "$output_file" <<EOF
+            render_haproxy_sni_acl_lines "$allowed_sni" >> "$output_file"
+            cat >> "$output_file" <<EOF
     tcp-request content track-sc0 src if clienthello !allowed_sni
     tcp-request content sc-inc-gpc0(0) if clienthello !allowed_sni
     tcp-request content track-sc1 req.ssl_sni,lower table wrong_sni_names if clienthello has_sni !allowed_sni
@@ -6640,6 +6688,9 @@ EOF
     tcp-request content accept if clienthello allowed_sni
     tcp-request content reject if clienthello !allowed_sni
     tcp-request content reject if WAIT_END
+EOF
+        fi
+        cat >> "$output_file" <<EOF
     default_backend ${backend_name}
 
 backend ${backend_name}
@@ -7409,7 +7460,7 @@ configure_haproxy_backend() {
     if apply_haproxy_routes_config "$routes_file"; then
         sync_haproxy_firewall "$routes_file" "$previous_routes_file"
         ok "HAProxy установлен: ${listen_ip}:${base_port}/tcp -> ${backend_target}"
-        ok "Разрешенный SNI: ${allowed_sni}"
+        ok "Разрешенный SNI: $(haproxy_sni_label "$allowed_sni")"
     else
         rm -f "$routes_file" "$previous_routes_file"
         return 1
@@ -7432,7 +7483,7 @@ print_haproxy_routes() {
             target_label="$target_pool"
         fi
         printf ' %s:%s -> %s | SNI: %s | Выход: %s\n' \
-            "$listen_ip" "$port" "$target_label" "$sni" "$source_label"
+            "$listen_ip" "$port" "$target_label" "$(haproxy_sni_label "$sni")" "$source_label"
     done < "$routes_file"
 }
 
@@ -7864,7 +7915,7 @@ select_haproxy_route_for_delete() {
             target_label="$target_pool"
         fi
         printf ' %d) %s/tcp -> %s | выход %s | SNI: %s\n' \
-            "$(( index + 1 ))" "$port" "$target_label" "$source_label" "$sni" >&2
+            "$(( index + 1 ))" "$port" "$target_label" "$source_label" "$(haproxy_sni_label "$sni")" >&2
     done
     printf ' 0) Назад\n' >&2
 
@@ -8057,7 +8108,7 @@ set_haproxy_pool_route() {
         mv "$next_file" "$routes_file"
         ok "HAProxy пул ${normalized_listen_ip}:${port}/tcp: ${pool_count} backend"
         ok "Входной IP: ${normalized_listen_ip}"
-        ok "SNI: ${normalized_sni}"
+        ok "SNI: $(haproxy_sni_label "$normalized_sni")"
         ok "Исходящий IP: $(haproxy_source_label "$normalized_source_ip")"
         ok "maxconn на backend: ${normalized_maxconn}"
         return 0
@@ -8130,8 +8181,8 @@ set_haproxy_pool_route_cli() {
     local routes_file target target_pool="" listen_ip="*" normalized_listen_ip
     local listen_ip_explicit=0
 
-    if (( $# < 4 )) || [[ -z "$port" || -z "$source_ip" || -z "$allowed_sni" || -z "$server_maxconn" ]]; then
-        fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI MAXCONN [--listen-ip IP] BACKEND1 BACKEND2 [...]"
+    if (( $# < 4 )) || [[ -z "$port" || -z "$source_ip" || -z "$server_maxconn" ]]; then
+        fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI|any MAXCONN [--listen-ip IP] BACKEND1 BACKEND2 [...]"
         return 1
     fi
     shift 4
@@ -8152,7 +8203,7 @@ set_haproxy_pool_route_cli() {
             ;;
     esac
     if (( $# < 2 )); then
-        fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI MAXCONN [--listen-ip IP] BACKEND1 BACKEND2 [...]"
+        fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI|any MAXCONN [--listen-ip IP] BACKEND1 BACKEND2 [...]"
         return 1
     fi
     normalized_listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
@@ -8247,8 +8298,8 @@ collapse_haproxy_pool_cli() {
     local routes_file target target_pool=""
     shift $(( $# >= 5 ? 5 : $# ))
 
-    if [[ -z "$start_port" || -z "$end_port" || -z "$source_ip" || -z "$allowed_sni" || -z "$server_maxconn" || $# -lt 2 ]]; then
-        fail "Использование: haproxy-pool-collapse START_PORT END_PORT SOURCE_IP SNI MAXCONN BACKEND1 BACKEND2 [...]"
+    if [[ -z "$start_port" || -z "$end_port" || -z "$source_ip" || -z "$server_maxconn" || $# -lt 2 ]]; then
+        fail "Использование: haproxy-pool-collapse START_PORT END_PORT SOURCE_IP SNI|any MAXCONN BACKEND1 BACKEND2 [...]"
         return 1
     fi
     for target in "$@"; do
@@ -8355,7 +8406,7 @@ set_haproxy_sequential_routes() {
         mv "$next_file" "$routes_file"
         ok "HAProxy маршруты ${start_port}-${end_port}: ${route_count} backend"
         ok "Входной IP: ${normalized_listen_ip}"
-        ok "SNI: ${normalized_sni}"
+        ok "SNI: $(haproxy_sni_label "$normalized_sni")"
         ok "Исходящий IP: $(haproxy_source_label "$normalized_source_ip")"
         ok "maxconn на backend: ${normalized_maxconn}"
         return 0
@@ -8393,8 +8444,8 @@ set_haproxy_sequential_routes_cli() {
     local routes_file target target_pool=""
     shift $(( $# >= 4 ? 4 : $# ))
 
-    if [[ -z "$start_port" || -z "$source_ip" || -z "$allowed_sni" || -z "$server_maxconn" || $# -lt 1 ]]; then
-        fail "Использование: haproxy-routes-set START_PORT SOURCE_IP SNI MAXCONN BACKEND [...]"
+    if [[ -z "$start_port" || -z "$source_ip" || -z "$server_maxconn" || $# -lt 1 ]]; then
+        fail "Использование: haproxy-routes-set START_PORT SOURCE_IP SNI|any MAXCONN BACKEND [...]"
         return 1
     fi
     for target in "$@"; do
@@ -8507,7 +8558,7 @@ replace_all_haproxy_sni() {
         mv "$next_file" "$routes_file"
         route_count="$(haproxy_route_count "$routes_file")"
         ok "SNI заменён на всех HAProxy-маршрутах: ${route_count}"
-        ok "Разрешенный SNI: ${allowed_sni}"
+        ok "Разрешенный SNI: $(haproxy_sni_label "$allowed_sni")"
         return 0
     fi
     rm -f "$next_file"
@@ -8581,7 +8632,7 @@ delete_haproxy_route() {
 
     echo
     warn "Будет удалён маршрут ${listen_ip}:${port}/tcp -> ${target_label}"
-    printf 'SNI: %s | Выход: %s\n' "$sni" "$(haproxy_source_label "${source_ip:-default}")"
+    printf 'SNI: %s | Выход: %s\n' "$(haproxy_sni_label "$sni")" "$(haproxy_source_label "${source_ip:-default}")"
     echo -ne "${YELLOW}Удалить этот маршрут? [y/N]:${NC} "
     read -r answer
     if [[ "${answer,,}" != "y" && "${answer,,}" != "yes" && "${answer,,}" != "д" && "${answer,,}" != "да" ]]; then

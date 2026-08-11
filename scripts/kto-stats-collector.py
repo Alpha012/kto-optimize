@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v300"
+COLLECTOR_BUILD = "v301"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -362,6 +362,7 @@ HAPROXY_SESSION_TTL = 1800
 HAPROXY_MAX_ROUTES = 128
 HAPROXY_MAX_TARGETS = 64
 HAPROXY_MAX_SNI = 64
+HAPROXY_SNI_ANY = "any"
 HAPROXY_MAX_BANDWIDTH_LIMITS = 64
 HAPROXY_MAX_BANDWIDTH_MBIT = 100000
 HAPROXY_MACHINE_PAGE_SIZE = 20
@@ -684,6 +685,36 @@ def normalize_sni_list(values):
     return sorted(result, key=natural_sort_key)
 
 
+def normalize_haproxy_sni_list(values):
+    if isinstance(values, str):
+        raw_values = re.split(r"[\s,;]+", values.strip()) if values.strip() else []
+    elif isinstance(values, list):
+        raw_values = [value for value in values if str(value or "").strip()]
+    else:
+        raw_values = []
+    if not raw_values:
+        return [HAPROXY_SNI_ANY]
+
+    result = []
+    for value in raw_values:
+        raw = str(value or "").strip().lower()
+        if raw in ("*", "any", "all"):
+            if len(raw_values) != 1:
+                raise ValueError("any sni cannot be mixed with allow-list")
+            return [HAPROXY_SNI_ANY]
+        item = normalize_sni(raw)
+        if item not in result:
+            result.append(item)
+    if not result or len(result) > HAPROXY_MAX_SNI:
+        raise ValueError("bad haproxy sni count")
+    return sorted(result, key=natural_sort_key)
+
+
+def haproxy_sni_display_values(values):
+    normalized = normalize_haproxy_sni_list(values)
+    return ["любой"] if normalized == [HAPROXY_SNI_ANY] else normalized
+
+
 def normalize_haproxy_targets(values):
     if isinstance(values, str):
         raw_values = re.split(r"[\s,;]+", values)
@@ -739,9 +770,9 @@ def normalize_haproxy_route(value):
     if port < 1 or port > 65535:
         raise ValueError("bad haproxy route port")
     targets = normalize_haproxy_targets(value.get("targets"))
-    sni = normalize_sni_list(value.get("sni"))
-    if not sni or len(sni) > HAPROXY_MAX_SNI:
-        raise ValueError("bad haproxy sni count")
+    if "sni" not in value:
+        raise ValueError("missing haproxy sni mode")
+    sni = normalize_haproxy_sni_list(value.get("sni"))
     return {
         "listen_ip": normalize_haproxy_listen_ip(value.get("listen_ip")),
         "port": port,
@@ -5560,6 +5591,10 @@ def haproxy_route_values_block(values, limit=8, max_chars=900):
     return "<blockquote>" + "\n".join(lines or ["-"]) + "</blockquote>"
 
 
+def haproxy_sni_values_block(values):
+    return haproxy_route_values_block(haproxy_sni_display_values(values))
+
+
 def haproxy_route_editor_payload(node, token, selected_ip, port):
     routes, source = effective_haproxy_routes_for_node(node)
     reported = reported_haproxy_routes_for_node(node)
@@ -5582,7 +5617,7 @@ def haproxy_route_editor_payload(node, token, selected_ip, port):
         "<b>Backend:</b>",
         haproxy_route_values_block(route.get("targets") or []),
         "<b>SNI:</b>",
-        haproxy_route_values_block(route.get("sni") or []),
+        haproxy_sni_values_block(route.get("sni") or []),
     ]
     rows = [
         [
@@ -5973,15 +6008,7 @@ def handle_pending_sni(chat_id, from_id, text):
 
 
 def parse_haproxy_sni_input(value):
-    raw_values = [item for item in re.split(r"[\s,;]+", str(value or "").strip()) if item]
-    if not raw_values or len(raw_values) > HAPROXY_MAX_SNI:
-        raise ValueError("bad sni count")
-    result = []
-    for value in raw_values:
-        item = normalize_sni(value)
-        if item not in result:
-            result.append(item)
-    return sorted(result, key=natural_sort_key)
+    return normalize_haproxy_sni_list(value)
 
 
 def haproxy_targets_prompt(node, token, route=None, adding=False):
@@ -6018,11 +6045,12 @@ def haproxy_sni_prompt(node, token, route=None, adding=False):
         detail_line("Вход", f"{selected_ip}:{int((route or {}).get('port') or 0)}"),
     ]
     if route:
-        lines += ["", "<b>Сейчас:</b>", sni_list_text(route.get("sni") or [])]
+        lines += ["", "<b>Сейчас:</b>", haproxy_sni_values_block(route.get("sni") or [])]
     lines += [
         "",
         "Ответь SNI через пробел, запятую или с новой строки.",
         "Поддомены поддерживаются: <code>*.example.com</code>.",
+        "Чтобы пропускать любой SNI, ответь <code>any</code> или <code>*</code>.",
     ]
     if route:
         lines.append("Ответ <code>=</code> оставит SNI без изменений.")
