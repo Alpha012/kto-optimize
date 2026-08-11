@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v297"', KTO)
-        self.assertIn('PUSH_BUILD="v297"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v297"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v297"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v297"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v297"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v297"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v298"', KTO)
+        self.assertIn('PUSH_BUILD="v298"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v298"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v298"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v298"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v298"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v298"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -1719,6 +1719,8 @@ unset KTO_HAPROXY_MAXCONN
         self.assertIn('run_systemctl_bounded 10 --no-block stop haproxy', clean_start)
         self.assertIn('reserve_haproxy_route_ports "$routes_file"', clean_start)
         self.assertIn('wait_for_haproxy_stopped_and_ports_free', clean_start)
+        self.assertIn('wait_for_haproxy_stopped_and_ports_free "$routes_file" 5', clean_start)
+        self.assertIn('deadline=$(( SECONDS + max_wait_sec ))', wait_for_routes)
         self.assertIn('run_systemctl_bounded 10 kill --kill-who=all --signal=KILL', clean_start)
         self.assertIn('run_systemctl_bounded 10 reset-failed haproxy', clean_start)
         self.assertIn('run_systemctl_bounded 10 --no-block start haproxy', clean_start)
@@ -1839,6 +1841,23 @@ after=$(grep -c '^kill:' "$events")
 MODE=connected
 kill_stale_haproxy_route_listeners "$routes" KILL
 grep -q 'ss:-K|state|connected|' "$events"
+
+state_checks=0
+port_checks=0
+SECONDS=0
+sleep() { return 0; }
+haproxy_service_is_stopped() {
+    state_checks=$((state_checks + 1))
+    SECONDS=$((SECONDS + 3))
+    return 1
+}
+haproxy_route_ports_are_free() {
+    port_checks=$((port_checks + 1))
+    return 0
+}
+! wait_for_haproxy_stopped_and_ports_free "$routes" 5
+[[ "$state_checks" == 2 ]]
+[[ "$port_checks" == 0 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

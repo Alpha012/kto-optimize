@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v297"
+SCRIPT_BUILD="v298"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5606,14 +5606,20 @@ haproxy_service_is_stopped() {
 }
 
 wait_for_haproxy_stopped_and_ports_free() {
-    local routes_file="$1" attempts="${2:-20}" attempt
+    local routes_file="$1" max_wait_sec="${2:-5}" deadline
 
-    for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    [[ "$max_wait_sec" =~ ^[0-9]+$ ]] || max_wait_sec=5
+    max_wait_sec=$((10#$max_wait_sec))
+    (( max_wait_sec >= 1 && max_wait_sec <= 30 )) || max_wait_sec=5
+    deadline=$(( SECONDS + max_wait_sec ))
+
+    while :; do
         # Do not dump active HAProxy connection tables while the service is still
         # draining. Busy proxies can have hundreds of thousands of TCP sockets.
         if haproxy_service_is_stopped && haproxy_route_ports_are_free "$routes_file"; then
             return 0
         fi
+        (( SECONDS >= deadline )) && break
         sleep 0.25
     done
     return 1
@@ -5712,11 +5718,16 @@ haproxy_missing_listener_ports() {
 wait_for_haproxy_routes() {
     local routes_file="$1"
     local attempts="${KTO_HAPROXY_STARTUP_ATTEMPTS:-20}"
-    local attempt missing
+    local max_wait_sec="${KTO_HAPROXY_STARTUP_TIMEOUT_SEC:-5}"
+    local attempt missing deadline
 
     [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=20
     attempts=$((10#$attempts))
     (( attempts >= 1 && attempts <= 120 )) || attempts=20
+    [[ "$max_wait_sec" =~ ^[0-9]+$ ]] || max_wait_sec=5
+    max_wait_sec=$((10#$max_wait_sec))
+    (( max_wait_sec >= 1 && max_wait_sec <= 30 )) || max_wait_sec=5
+    deadline=$(( SECONDS + max_wait_sec ))
 
     for (( attempt = 1; attempt <= attempts; attempt++ )); do
         if run_systemctl_bounded 3 is-active --quiet haproxy 2>/dev/null; then
@@ -5725,6 +5736,7 @@ wait_for_haproxy_routes() {
                 return 0
             fi
         fi
+        (( SECONDS >= deadline )) && break
         sleep 0.25
     done
 
@@ -5744,11 +5756,11 @@ start_haproxy_cleanly() {
     reserve_haproxy_route_ports "$routes_file" || return 1
     stage "Останавливаю старый HAProxy"
     run_systemctl_bounded 10 --no-block stop haproxy >> "$LOG_FILE" 2>&1 || true
-    if ! wait_for_haproxy_stopped_and_ports_free "$routes_file" 20; then
+    if ! wait_for_haproxy_stopped_and_ports_free "$routes_file" 5; then
         warn "HAProxy или его порты не освободились за 5 секунд, очищаю зависшие сокеты."
         run_systemctl_bounded 10 kill --kill-who=all --signal=KILL haproxy.service >> "$LOG_FILE" 2>&1 || true
         kill_stale_haproxy_route_listeners "$routes_file" KILL || return 1
-        if ! wait_for_haproxy_stopped_and_ports_free "$routes_file" 20; then
+        if ! wait_for_haproxy_stopped_and_ports_free "$routes_file" 5; then
             report_haproxy_busy_route_ports "$routes_file"
             return 1
         fi
