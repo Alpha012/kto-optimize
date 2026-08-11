@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v305"
+SCRIPT_BUILD="v306"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -6675,6 +6675,7 @@ global
     maxpipes 0
     nosplice
     nbthread ${haproxy_threads}
+    hard-stop-after 5m
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
     tune.ssl.default-dh-param 2048
 
@@ -6685,16 +6686,18 @@ defaults
     option srvtcpka
     option tcp-smart-accept
     option tcp-smart-connect
+    option redispatch
 
-    timeout connect 5s
+    retries 2
+    timeout connect 4s
     timeout client 2h
     timeout server 2h
     timeout tunnel 2h
     timeout client-fin 30s
     timeout server-fin 30s
-    timeout check 5s
+    timeout check 3s
 
-    default-server inter 30s fall 8 rise 3
+    default-server inter 15s fastinter 3s downinter 5s fall 2 rise 2
 
 backend wrong_sni_names
     stick-table type string len 160 size 100k expire 30m store gpc0
@@ -6859,9 +6862,10 @@ list_haproxy_backups() {
 apply_haproxy_routes_config() {
     local routes_file="$1"
     local skip_bandwidth_reapply="${2:-0}"
+    local force_clean_start="${3:-0}"
     local config="$HAPROXY_CONFIG_FILE"
     local tmp_config backup backup_routes had_config=0 haproxy_threads haproxy_maxconn haproxy_nofile route_count activation_ready=1
-    local capacity_updated=0
+    local capacity_updated=0 config_changed=1
 
     HAPROXY_LAST_BACKUP=""
     ensure_haproxy_package
@@ -6889,15 +6893,21 @@ apply_haproxy_routes_config() {
         had_config=1
         "${SUDO[@]}" cat "$config" > "$backup"
         extract_haproxy_routes "$backup" > "$backup_routes"
-        if ! create_haproxy_persistent_backup "before-apply" "$config"; then
-            rm -f "$tmp_config" "$backup" "$backup_routes"
-            return 1
+        if cmp -s "$tmp_config" "$backup"; then
+            config_changed=0
+        else
+            if ! create_haproxy_persistent_backup "before-apply" "$config"; then
+                rm -f "$tmp_config" "$backup" "$backup_routes"
+                return 1
+            fi
+            "${SUDO[@]}" cp -a "$config" "${config}.kto.bak" >> "$LOG_FILE" 2>&1 || true
         fi
-        "${SUDO[@]}" cp -a "$config" "${config}.kto.bak" >> "$LOG_FILE" 2>&1 || true
     fi
 
-    stage "Применяю HAProxy config"
-    "${SUDO[@]}" install -m 0644 "$tmp_config" "$config" >> "$LOG_FILE" 2>&1
+    if (( config_changed == 1 )); then
+        stage "Применяю HAProxy config"
+        "${SUDO[@]}" install -m 0644 "$tmp_config" "$config" >> "$LOG_FILE" 2>&1
+    fi
 
     cmd "${SUDO[@]}" mkdir -p /etc/systemd/system/haproxy.service.d
     haproxy_nofile="$(haproxy_nofile_limit)"
@@ -6924,7 +6934,15 @@ EOF
         fi
     fi
 
-    if (( activation_ready == 0 )) || ! reload_haproxy_gracefully "$routes_file"; then
+    if [[ "$force_clean_start" != "1" ]] &&
+        (( activation_ready == 1 && config_changed == 0 && capacity_updated == 0 )) &&
+        run_systemctl_bounded 3 is-active --quiet haproxy 2>/dev/null &&
+        [[ -z "$(haproxy_missing_listener_ports "$routes_file")" ]]; then
+        ok "HAProxy config уже актуален, reload не требуется"
+    elif (( activation_ready == 1 )) && [[ "$force_clean_start" == "1" ]] &&
+        start_haproxy_cleanly "$routes_file"; then
+        ok "HAProxy запущен заново без старых worker-процессов"
+    elif [[ "$force_clean_start" == "1" ]] || (( activation_ready == 0 )) || ! reload_haproxy_gracefully "$routes_file"; then
         "${SUDO[@]}" cp -a "$config" "${config}.kto.failed" >> "$LOG_FILE" 2>&1 || true
         warn "Неудачный config сохранён: ${config}.kto.failed"
         warn "Новый конфиг не запустился, возвращаю предыдущий."
@@ -7404,6 +7422,35 @@ show_haproxy_bandwidth_status() {
     fi
 }
 
+clear_all_haproxy_bandwidth_limits() {
+    if ! "${SUDO[@]}" test -x "$HAPROXY_BANDWIDTH_MANAGER" 2>/dev/null; then
+        if "${SUDO[@]}" test -e "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null; then
+            fail "Менеджер лимитов отсутствует; config оставлен без изменений"
+            return 1
+        fi
+        ok "Лимиты скорости уже отсутствуют"
+        return 0
+    fi
+    stage "Снимаю все kernel-лимиты HAProxy"
+    if ! run_bounded_command 20 "${SUDO[@]}" "$HAPROXY_BANDWIDTH_MANAGER" clear; then
+        fail "Не удалось очистить kernel-фильтры HAProxy"
+        return 1
+    fi
+    "${SUDO[@]}" rm -f "$HAPROXY_BANDWIDTH_CONFIG" >> "$LOG_FILE" 2>&1 || {
+        fail "Kernel-фильтры сняты, но ${HAPROXY_BANDWIDTH_CONFIG} не удалён"
+        return 1
+    }
+    run_systemctl_bounded 20 disable "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1 || true
+    ok "Все лимиты скорости HAProxy сняты"
+}
+
+clear_all_haproxy_bandwidth_limits_cli() {
+    header
+    require_haproxy_mode
+    need_root
+    clear_all_haproxy_bandwidth_limits
+}
+
 haproxy_bandwidth_menu() {
     local choice
     while true; do
@@ -7414,6 +7461,7 @@ haproxy_bandwidth_menu() {
         echo "2) Убрать лимит с IP"
         echo "3) Переприменить лимиты"
         echo "4) Подробный статус и счётчики"
+        echo "5) Снять все лимиты скорости"
         echo "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -7423,6 +7471,7 @@ haproxy_bandwidth_menu() {
             2) remove_haproxy_input_bandwidth_limit_interactive || true ;;
             3) ensure_haproxy_bandwidth_manager && reapply_haproxy_bandwidth_limits || true ;;
             4) show_haproxy_bandwidth_status || true ;;
+            5) clear_all_haproxy_bandwidth_limits || true ;;
             0) return 0 ;;
             *) fail "Неверный выбор" ;;
         esac
@@ -7673,6 +7722,40 @@ haproxy_diagnostic_row() {
     network_test_row "$name" "$value" "$status"
 }
 
+stabilize_haproxy() {
+    header
+    require_haproxy_mode
+    need_root
+    local routes_file
+
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+    if [[ ! -s "$routes_file" ]]; then
+        rm -f "$routes_file"
+        fail "Текущий HAProxy config не распознан; аварийный restart отменён"
+        return 1
+    fi
+    warn "Все текущие HAProxy-сессии разорвутся один раз и переподключатся."
+    if apply_haproxy_routes_config "$routes_file" 1 1; then
+        rm -f "$routes_file"
+        ok "HAProxy стабилизирован: старые worker-процессы удалены, маршруты сохранены"
+        return 0
+    fi
+    rm -f "$routes_file"
+    return 1
+}
+
+stabilize_haproxy_interactive() {
+    local answer
+    echo -ne "${YELLOW}Чисто перезапустить HAProxy и разорвать текущие сессии один раз? [y/N]:${NC} "
+    read -r answer
+    [[ "${answer,,}" =~ ^(y|yes|д|да)$ ]] || {
+        warn "Стабилизация отменена"
+        return 0
+    }
+    stabilize_haproxy
+}
+
 diagnose_haproxy() {
     header
     require_haproxy_mode
@@ -7683,6 +7766,7 @@ diagnose_haproxy() {
     local exact_inputs=0 bad_inputs=0 explicit_sources=0 bad_sources=0 default_source
     local backend_stats health_report summary_line marker pools pools_down servers servers_up servers_down servers_other
     local detail_line status_output status_summary ufw_status missing_firewall=0 result=0
+    local process_info process_summary process_count=0 process_cpu="0" process_rss_kb=0 process_rss_mb=0
     local -A seen_inputs=() seen_sources=() seen_ports=()
 
     HAPROXY_DIAG_ERRORS=0
@@ -7726,6 +7810,25 @@ diagnose_haproxy() {
         haproxy_diagnostic_row ok "service" "active/running, PID ${main_pid}"
     else
         haproxy_diagnostic_row fail "service" "${active_state:-unknown}/${sub_state:-unknown}, PID ${main_pid:-0}"
+    fi
+
+    process_info="$(run_bounded_command 4 "${SUDO[@]}" ps -C haproxy -o pid=,ppid=,stat=,%cpu=,rss= 2>/dev/null || true)"
+    process_summary="$(awk '
+        NF >= 5 {
+            count++
+            cpu += $4
+            rss += $5
+        }
+        END { printf "%d\t%.1f\t%d\n", count + 0, cpu + 0, rss + 0 }
+    ' <<< "$process_info")"
+    IFS=$'\t' read -r process_count process_cpu process_rss_kb <<< "$process_summary"
+    process_rss_mb=$(( process_rss_kb / 1024 ))
+    if (( process_count > 2 )); then
+        haproxy_diagnostic_row warn "процессы" "${process_count}, включая старые worker; CPU ${process_cpu}%, RAM ${process_rss_mb} MB"
+    elif (( process_count > 0 )); then
+        haproxy_diagnostic_row ok "процессы" "${process_count}; CPU ${process_cpu}%, RAM ${process_rss_mb} MB"
+    else
+        haproxy_diagnostic_row fail "процессы" "не найдены"
     fi
 
     missing="$(haproxy_missing_listener_ports "$routes_file")"
@@ -9285,6 +9388,7 @@ haproxy_menu() {
         echo -e "12) Проверить бинды"
         echo -e "13) Перенести все FULL-бинды на выходные IP"
         echo -e "14) Полная диагностика HAProxy"
+        echo -e "15) Аварийно стабилизировать HAProxy"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -9309,6 +9413,7 @@ haproxy_menu() {
             12) check_haproxy_bindings "$routes_file" || true ;;
             13) pin_haproxy_wildcards_to_source_ips "$routes_file" || true ;;
             14) diagnose_haproxy || true ;;
+            15) stabilize_haproxy_interactive || true ;;
             0)
                 rm -f "$routes_file"
                 return 0
@@ -10997,8 +11102,10 @@ main() {
         haproxy-routes-set|haproxy-set-routes) shift; set_haproxy_sequential_routes_cli "$@" ;;
         haproxy-limit|haproxy-bandwidth-limit) shift; set_haproxy_input_bandwidth_limit_cli "$@" ;;
         haproxy-limit-off|haproxy-bandwidth-off) shift; remove_haproxy_input_bandwidth_limit_cli "$@" ;;
+        haproxy-limit-clear|haproxy-bandwidth-clear) clear_all_haproxy_bandwidth_limits_cli ;;
         haproxy-limit-status|haproxy-bandwidth-status) show_haproxy_bandwidth_status_cli ;;
         haproxy-diagnose|haproxy-diagnostic|haproxy-diag|haproxy-status) diagnose_haproxy || true ;;
+        haproxy-stabilize|haproxy-recover) stabilize_haproxy ;;
         mobile443-lte|lte-only) mobile443_lte_menu ;;
         mobile443-lte-enable|lte-only-enable) enable_mobile443_lte ;;
         mobile443-lte-disable|lte-only-disable) disable_mobile443_lte ;;

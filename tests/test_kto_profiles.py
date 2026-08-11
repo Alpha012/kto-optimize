@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v305"', KTO)
-        self.assertIn('PUSH_BUILD="v305"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v305"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v305"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v305"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v305"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v305"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v306"', KTO)
+        self.assertIn('PUSH_BUILD="v306"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v306"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v306"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v306"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v306"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v306"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -1718,8 +1718,30 @@ after="$(wc -l < "$events")"
         self.assertIn('start_haproxy_cleanly "$backup_routes"', apply_routes)
         self.assertIn('write_root_file_if_changed', apply_routes)
         self.assertIn('capacity_updated == 1', apply_routes)
+        self.assertIn('cmp -s "$tmp_config" "$backup"', apply_routes)
+        self.assertIn('reload не требуется', apply_routes)
+        self.assertIn('force_clean_start', apply_routes)
         self.assertIn('extract_haproxy_routes > "$routes_file"', update)
         self.assertIn('маршруты сохранены', update)
+
+    def test_haproxy_stability_controls_are_bounded_and_preserve_routes(self):
+        render = function_body(KTO, "render_haproxy_routes_config")
+        stabilize = function_body(KTO, "stabilize_haproxy")
+        clear_limits = function_body(KTO, "clear_all_haproxy_bandwidth_limits")
+        diagnose = function_body(KTO, "diagnose_haproxy")
+
+        self.assertIn("hard-stop-after 5m", render)
+        self.assertIn("option redispatch", render)
+        self.assertIn("timeout check 3s", render)
+        self.assertIn("default-server inter 15s fastinter 3s downinter 5s fall 2 rise 2", render)
+        self.assertIn('extract_haproxy_routes > "$routes_file"', stabilize)
+        self.assertIn('apply_haproxy_routes_config "$routes_file" 1 1', stabilize)
+        self.assertIn('run_bounded_command 20', clear_limits)
+        self.assertIn('"$HAPROXY_BANDWIDTH_MANAGER" clear', clear_limits)
+        self.assertIn('rm -f "$HAPROXY_BANDWIDTH_CONFIG"', clear_limits)
+        self.assertIn('ps -C haproxy', diagnose)
+        self.assertIn('haproxy-limit-clear|haproxy-bandwidth-clear', KTO)
+        self.assertIn('haproxy-stabilize|haproxy-recover', KTO)
 
     def test_root_file_writer_reports_only_real_content_changes(self):
         bash = bash_executable()
@@ -2122,7 +2144,9 @@ printf '443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\n8443\t5
 render_haproxy_routes_config "$routes" "$config"
 grep -q '^    maxpipes 0$' "$config"
 grep -q '^    nosplice$' "$config"
-grep -q '^    timeout check 5s$' "$config"
+grep -q '^    hard-stop-after 5m$' "$config"
+grep -q '^    timeout check 3s$' "$config"
+grep -q '^    default-server inter 15s fastinter 3s downinter 5s fall 2 rise 2$' "$config"
 ! grep -q 'option splice-' "$config"
 grep -q '^frontend vless_in$' "$config"
 grep -q '^frontend vless_in_8443$' "$config"

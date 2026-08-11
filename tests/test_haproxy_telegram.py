@@ -242,6 +242,62 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertEqual(self.collector.acknowledge_haproxy_desired_state(self.node), [])
         self.assertEqual(self.collector.desired_haproxy_routes_for_node(self.node), desired)
 
+    def test_failed_route_command_is_paused_until_explicit_retry(self):
+        desired = self.collector.reported_haproxy_routes_for_node(self.node)[:1]
+        desired[0] = dict(desired[0], targets=["9.9.9.9:443"])
+        self.collector.set_haproxy_routes_for_node(self.node, desired)
+        state_before = self.collector.haproxy_state_item_for_node(self.node)
+        failed = dict(
+            self.node,
+            haproxy_apply_result={
+                "status": "error",
+                "message": "reload failed",
+                "build": "v306",
+                "routes": 1,
+                "updated_at": 1,
+                "command_id": state_before["routes_command_id"],
+            },
+        )
+        self.collector.NODES[self.collector.node_record_key(failed)] = failed
+
+        self.assertEqual(self.collector.haproxy_desired_apply_error(failed, "routes"), "reload failed")
+        _body, markup = self.collector.haproxy_ip_selector_payload(failed, self.token)
+        retry_button = next(
+            button
+            for row in markup["inline_keyboard"]
+            for button in row
+            if button["callback_data"].startswith("hpx:R:")
+        )
+        callback = {
+            "id": "retry-routes",
+            "data": retry_button["callback_data"],
+            "from": {"id": self.from_id},
+            "message": {"message_id": 77, "chat": {"id": self.chat_id}},
+        }
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        state_after = self.collector.haproxy_state_item_for_node(failed)
+        self.assertNotEqual(state_after["routes_command_id"], state_before["routes_command_id"])
+        self.assertEqual(self.collector.haproxy_desired_apply_error(failed, "routes"), "")
+
+    def test_stale_apply_error_does_not_block_a_new_route_command(self):
+        stale = dict(
+            self.node,
+            haproxy_apply_result={
+                "status": "error",
+                "message": "old failure",
+                "build": "v305",
+                "routes": 2,
+                "updated_at": 123,
+            },
+        )
+        desired = self.collector.reported_haproxy_routes_for_node(stale)[:1]
+        self.collector.set_haproxy_routes_for_node(stale, desired)
+        self.assertEqual(self.collector.haproxy_desired_apply_error(stale, "routes"), "")
+
+        changed_error = dict(stale["haproxy_apply_result"], updated_at=124)
+        failed = dict(stale, haproxy_apply_result=changed_error)
+        self.assertEqual(self.collector.haproxy_desired_apply_error(failed, "routes"), "old failure")
+
     def test_route_ack_preserves_pending_bandwidth_command(self):
         routes = self.collector.reported_haproxy_routes_for_node(self.node)
         desired_limits = [{"ip": "10.0.0.2", "rate_mbit": 1500}]
@@ -291,6 +347,25 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.collector.HAPROXY_STATE = {"nodes": {}, "sessions": {}, "pending": {}}
         self.collector.load_haproxy_state()
         self.assertEqual(self.collector.desired_haproxy_bandwidth_limits_for_node(self.node), [])
+
+    def test_clear_all_bandwidth_button_preserves_routes(self):
+        edited = []
+        self.collector.edit_haproxy_session_message = lambda *args: edited.append(args) or True
+        callback = {
+            "id": "clear-limits",
+            "data": f"hpx:C:{self.token}",
+            "from": {"id": self.from_id},
+            "message": {"message_id": 77, "chat": {"id": self.chat_id}},
+        }
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        self.assertTrue(edited)
+        self.assertIn("Снять все лимиты скорости", edited[-1][1])
+
+        callback["id"] = "confirm-clear-limits"
+        callback["data"] = f"hpx:D:{self.token}"
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        self.assertEqual(self.collector.desired_haproxy_bandwidth_limits_for_node(self.node), [])
+        self.assertIsNone(self.collector.desired_haproxy_routes_for_node(self.node))
 
     def test_selected_ip_shows_bandwidth_and_control_button(self):
         body, markup = self.collector.haproxy_selected_ip_payload(self.node, self.token, "10.0.0.2")
@@ -620,6 +695,10 @@ class HaproxyTransportContractTests(unittest.TestCase):
         self.assertIn("acknowledge_haproxy_desired_state(node)", collector)
         self.assertIn('response["haproxy_routes"] = desired_haproxy_routes', collector)
         self.assertIn('response["haproxy_bandwidth_limits"] = desired_haproxy_bandwidth', collector)
+        self.assertIn('response["haproxy_routes_command_id"]', collector)
+        self.assertIn('response["haproxy_bandwidth_command_id"]', collector)
+        self.assertIn('"${previous_command_id,,}" == "$command_id"', push)
+        self.assertGreaterEqual(push.count('previous_status" == "error"'), 2)
 
 
 if __name__ == "__main__":

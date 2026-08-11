@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v305"
+COLLECTOR_BUILD = "v306"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -863,6 +863,7 @@ def normalize_haproxy_apply_result(value):
         "build": clean_display_text(value.get("build") or "")[:40],
         "routes": routes,
         "updated_at": updated_at,
+        "command_id": clean_haproxy_command_id(value.get("command_id")),
     }
 
 
@@ -924,7 +925,32 @@ def normalize_haproxy_bandwidth_apply_result(value):
         "build": clean_display_text(value.get("build") or "")[:40],
         "limits": limits,
         "updated_at": updated_at,
+        "command_id": clean_haproxy_command_id(value.get("command_id")),
     }
+
+
+def clean_haproxy_command_id(value):
+    value = str(value or "").strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{16,64}", value) else ""
+
+
+def new_haproxy_command_id():
+    return uuid.uuid4().hex
+
+
+def haproxy_apply_result_fingerprint(value):
+    if not isinstance(value, dict) or str(value.get("status") or "").lower() != "error":
+        return ""
+    normalized = {
+        "status": "error",
+        "message": clean_display_text(value.get("message") or "")[:500],
+        "build": clean_display_text(value.get("build") or "")[:40],
+        "updated_at": max(0, int(value.get("updated_at") or 0)),
+        "command_id": clean_haproxy_command_id(value.get("command_id")),
+    }
+    return hashlib.sha256(
+        json.dumps(normalized, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 def load_sni_state():
@@ -1001,9 +1027,21 @@ def load_haproxy_state():
             }
             if routes:
                 clean_item["routes"] = routes
+                clean_item["routes_command_id"] = (
+                    clean_haproxy_command_id(item.get("routes_command_id")) or new_haproxy_command_id()
+                )
+                clean_item["routes_error_baseline"] = clean_haproxy_command_id(
+                    item.get("routes_error_baseline")
+                )
             if has_bandwidth_limits:
                 clean_item["bandwidth_limits"] = bandwidth_limits
                 clean_item["bandwidth_updated_at"] = int(item.get("bandwidth_updated_at") or 0)
+                clean_item["bandwidth_command_id"] = (
+                    clean_haproxy_command_id(item.get("bandwidth_command_id")) or new_haproxy_command_id()
+                )
+                clean_item["bandwidth_error_baseline"] = clean_haproxy_command_id(
+                    item.get("bandwidth_error_baseline")
+                )
             clean_nodes[node_key] = clean_item
     if isinstance(raw_sessions, dict):
         for token, item in raw_sessions.items():
@@ -5196,6 +5234,8 @@ def set_haproxy_routes_for_node(node, routes):
             "name": node_display_name(node, key)[:120],
             "routes": routes,
             "updated_at": now_ts(),
+            "routes_command_id": new_haproxy_command_id(),
+            "routes_error_baseline": haproxy_apply_result_fingerprint(node.get("haproxy_apply_result")),
         })
         nodes[key] = preserved
         save_haproxy_state()
@@ -5240,6 +5280,10 @@ def set_haproxy_bandwidth_limits_for_node(node, limits):
             "name": node_display_name(node, key)[:120],
             "bandwidth_limits": limits,
             "bandwidth_updated_at": now_ts(),
+            "bandwidth_command_id": new_haproxy_command_id(),
+            "bandwidth_error_baseline": haproxy_apply_result_fingerprint(
+                node.get("haproxy_bandwidth_apply_result")
+            ),
         })
         nodes[key] = preserved
         save_haproxy_state()
@@ -5274,12 +5318,16 @@ def acknowledge_haproxy_desired_state(node):
             if desired_routes and haproxy_routes_equal(desired_routes, reported_routes):
                 item.pop("routes", None)
                 item.pop("updated_at", None)
+                item.pop("routes_command_id", None)
+                item.pop("routes_error_baseline", None)
                 acknowledged.append("routes")
         if bandwidth_supported and "bandwidth_limits" in item:
             desired_limits = normalize_haproxy_bandwidth_limits(item.get("bandwidth_limits"))
             if haproxy_bandwidth_limits_equal(desired_limits, reported_limits):
                 item.pop("bandwidth_limits", None)
                 item.pop("bandwidth_updated_at", None)
+                item.pop("bandwidth_command_id", None)
+                item.pop("bandwidth_error_baseline", None)
                 acknowledged.append("bandwidth")
 
         if not acknowledged:
@@ -5292,6 +5340,75 @@ def acknowledge_haproxy_desired_state(node):
 
     log(f"haproxy command acknowledged node={key or stored_key}: {','.join(acknowledged)}")
     return acknowledged
+
+
+def haproxy_desired_apply_error(node, kind, desired_item=None):
+    item = dict(desired_item) if isinstance(desired_item, dict) else (haproxy_state_item_for_node(node) or {})
+    if kind == "routes":
+        desired_field = "routes"
+        command_field = "routes_command_id"
+        baseline_field = "routes_error_baseline"
+        result = node.get("haproxy_apply_result")
+    elif kind == "bandwidth":
+        desired_field = "bandwidth_limits"
+        command_field = "bandwidth_command_id"
+        baseline_field = "bandwidth_error_baseline"
+        result = node.get("haproxy_bandwidth_apply_result")
+    else:
+        return ""
+    if desired_field not in item or not isinstance(result, dict):
+        return ""
+    if str(result.get("status") or "").lower() != "error":
+        return ""
+    desired_command_id = clean_haproxy_command_id(item.get(command_field))
+    result_command_id = clean_haproxy_command_id(result.get("command_id"))
+    if desired_command_id and result_command_id and desired_command_id != result_command_id:
+        return ""
+    result_fingerprint = haproxy_apply_result_fingerprint(result)
+    if result_fingerprint and result_fingerprint == clean_haproxy_command_id(item.get(baseline_field)):
+        return ""
+    return clean_display_text(result.get("message") or "ошибка применения")[:160]
+
+
+def retry_haproxy_desired_state(node, kind):
+    key = haproxy_state_key(node)
+    aliases = node_alias_keys(node)
+    if kind == "routes":
+        desired_field = "routes"
+        desired_time_field = "updated_at"
+        command_field = "routes_command_id"
+        baseline_field = "routes_error_baseline"
+        result = node.get("haproxy_apply_result")
+    elif kind == "bandwidth":
+        desired_field = "bandwidth_limits"
+        desired_time_field = "bandwidth_updated_at"
+        command_field = "bandwidth_command_id"
+        baseline_field = "bandwidth_error_baseline"
+        result = node.get("haproxy_bandwidth_apply_result")
+    else:
+        return False
+    result_time = int((result or {}).get("updated_at") or 0) if isinstance(result, dict) else 0
+    with LOCK:
+        nodes = HAPROXY_STATE.setdefault("nodes", {})
+        stored_key = key if isinstance(nodes.get(key), dict) else ""
+        if not stored_key:
+            for candidate, value in nodes.items():
+                if canonical_node_key(candidate) in aliases and isinstance(value, dict):
+                    stored_key = candidate
+                    break
+        if not stored_key or desired_field not in nodes[stored_key]:
+            return False
+        item = dict(nodes[stored_key])
+        item[desired_time_field] = max(
+            now_ts(),
+            int(item.get(desired_time_field) or 0) + 1,
+            result_time + 1,
+        )
+        item[command_field] = new_haproxy_command_id()
+        item[baseline_field] = haproxy_apply_result_fingerprint(result)
+        nodes[stored_key] = item
+        save_haproxy_state()
+    return True
 
 
 def cleanup_haproxy_sessions_unlocked(current=None):
@@ -5483,11 +5600,9 @@ def haproxy_apply_status_text(node, desired, reported):
         return "текущий config машины"
     if haproxy_routes_equal(desired, reported):
         return "применено"
-    result = node.get("haproxy_apply_result") if isinstance(node.get("haproxy_apply_result"), dict) else {}
-    desired_item = haproxy_state_item_for_node(node) or {}
-    if str(result.get("status") or "").lower() == "error" and int(result.get("updated_at") or 0) >= int(desired_item.get("updated_at") or 0):
-        message = clean_display_text(result.get("message") or "ошибка применения")[:120]
-        return f"ошибка: {message}"
+    message = haproxy_desired_apply_error(node, "routes")
+    if message:
+        return f"ошибка: {message[:120]}"
     return "ожидает ближайший push"
 
 
@@ -5503,11 +5618,9 @@ def haproxy_bandwidth_apply_status_text(node, desired, reported):
         return "текущий config машины"
     if haproxy_bandwidth_limits_equal(desired, reported):
         return "применено"
-    result = node.get("haproxy_bandwidth_apply_result") if isinstance(node.get("haproxy_bandwidth_apply_result"), dict) else {}
-    desired_item = haproxy_state_item_for_node(node) or {}
-    if str(result.get("status") or "").lower() == "error" and int(result.get("updated_at") or 0) >= int(desired_item.get("bandwidth_updated_at") or 0):
-        message = clean_display_text(result.get("message") or "ошибка применения")[:120]
-        return f"ошибка: {message}"
+    message = haproxy_desired_apply_error(node, "bandwidth")
+    if message:
+        return f"ошибка: {message[:120]}"
     return "ожидает ближайший push"
 
 
@@ -5604,6 +5717,9 @@ def haproxy_ip_selector_payload(node, token):
     routes, source = effective_haproxy_routes_for_node(node)
     reported = reported_haproxy_routes_for_node(node)
     desired = routes if source == "telegram" else None
+    bandwidth_limits, _ = effective_haproxy_bandwidth_limits_for_node(node)
+    routes_error = haproxy_desired_apply_error(node, "routes")
+    bandwidth_error = haproxy_desired_apply_error(node, "bandwidth")
     ips = haproxy_node_ips(node, routes)
     status = haproxy_apply_status_text(node, desired, reported)
     wildcard_count = sum(1 for route in routes if route.get("listen_ip") == "*")
@@ -5625,6 +5741,12 @@ def haproxy_ip_selector_payload(node, token):
         buttons.append({"text": f"{label} · {count}", "callback_data": f"hpx:i:{token}:{ip_text}"})
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
     rows.append([{"text": "FULL → точечные бинды", "callback_data": f"hpx:p:{token}"}])
+    if routes_error:
+        rows.append([{"text": "Повторить применение маршрутов", "callback_data": f"hpx:R:{token}"}])
+    if bandwidth_error:
+        rows.append([{"text": "Повторить применение лимитов", "callback_data": f"hpx:L:{token}"}])
+    if bandwidth_limits:
+        rows.append([{"text": "Снять все лимиты скорости", "callback_data": f"hpx:C:{token}"}])
     footer = []
     if (get_haproxy_session(token) or {}).get("node_choices"):
         footer.append({"text": "К списку машин", "callback_data": f"hpx:m:{token}"})
@@ -6465,6 +6587,44 @@ def handle_haproxy_callback(callback):
             show_haproxy_selected_ip(token)
         else:
             show_haproxy_ip_selector(token)
+        return True
+    if action in ("R", "L"):
+        kind = "routes" if action == "R" else "bandwidth"
+        if retry_haproxy_desired_state(node, kind):
+            answer_callback(callback_id, "повторю при ближайшем push")
+        else:
+            answer_callback(callback_id, "нет команды для повтора")
+        show_haproxy_ip_selector(token)
+        return True
+    if action == "C":
+        limits, _ = effective_haproxy_bandwidth_limits_for_node(node)
+        if not limits:
+            answer_callback(callback_id, "лимитов уже нет")
+            show_haproxy_ip_selector(token)
+            return True
+        answer_callback(callback_id)
+        body = (
+            "<b>Снять все лимиты скорости?</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n"
+            f"{detail_line('Ограниченных IP', len(limits))}\n\n"
+            "Маршруты, backend и SNI не изменятся. При ближайшем push будут удалены только kernel-фильтры скорости."
+        )
+        markup = {"inline_keyboard": [[
+            {"text": "Снять все лимиты", "callback_data": f"hpx:D:{token}"},
+            {"text": "Отмена", "callback_data": f"hpx:r:{token}"},
+        ]]}
+        edit_haproxy_session_message(token, body, markup)
+        return True
+    if action == "D":
+        try:
+            set_haproxy_bandwidth_limits_for_node(node, [])
+        except Exception as exc:
+            log(f"haproxy bandwidth clear failed node={haproxy_state_key(node)}: {exc}")
+            answer_callback(callback_id, "не удалось сохранить")
+            return True
+        answer_callback(callback_id, "лимиты будут сняты")
+        show_haproxy_ip_selector(token)
         return True
     if action == "s":
         answer_callback(callback_id)
@@ -8780,9 +8940,18 @@ class Handler(BaseHTTPRequestHandler):
                 response["ip_limit_enabled"] = bool(ip_policy.get("enabled"))
             else:
                 response["ip_limit_enabled"] = bool(IP_LIMIT_ENABLED)
-            desired_haproxy_routes = desired_haproxy_routes_for_node(node)
+            desired_item = haproxy_state_item_for_node(node) or {}
+            desired_haproxy_routes = (
+                normalize_haproxy_routes(desired_item.get("routes"))
+                if "routes" in desired_item
+                else None
+            )
             if desired_haproxy_routes is not None:
-                response["haproxy_routes"] = desired_haproxy_routes
+                if not haproxy_desired_apply_error(node, "routes", desired_item):
+                    response["haproxy_routes"] = desired_haproxy_routes
+                    response["haproxy_routes_command_id"] = clean_haproxy_command_id(
+                        desired_item.get("routes_command_id")
+                    )
             else:
                 sni_override = sni_override_for_node(node)
                 if sni_override is not None:
@@ -8790,9 +8959,18 @@ class Handler(BaseHTTPRequestHandler):
                 haproxy_target = haproxy_target_override_for_node(node)
                 if haproxy_target:
                     response["haproxy_target"] = haproxy_target
-            desired_haproxy_bandwidth = desired_haproxy_bandwidth_limits_for_node(node)
-            if desired_haproxy_bandwidth is not None:
+            desired_haproxy_bandwidth = (
+                normalize_haproxy_bandwidth_limits(desired_item.get("bandwidth_limits"))
+                if "bandwidth_limits" in desired_item
+                else None
+            )
+            if desired_haproxy_bandwidth is not None and not haproxy_desired_apply_error(
+                node, "bandwidth", desired_item
+            ):
                 response["haproxy_bandwidth_limits"] = desired_haproxy_bandwidth
+                response["haproxy_bandwidth_command_id"] = clean_haproxy_command_id(
+                    desired_item.get("bandwidth_command_id")
+                )
             node_name_sync = node_name_sync_value(node, payload.get("name"))
             if node_name_sync:
                 response["node_name"] = node_name_sync
