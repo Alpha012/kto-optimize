@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v296"
+SCRIPT_BUILD="v297"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -493,6 +493,36 @@ write_root_file_mode() {
 write_root_file() {
     local path="$1"
     write_root_file_mode 0644 "$path"
+}
+
+ROOT_FILE_UPDATED=0
+
+write_root_file_mode_if_changed() {
+    local mode="$1"
+    local path="$2"
+    local tmp rc
+
+    ROOT_FILE_UPDATED=0
+    tmp="$(mktemp)"
+    cat > "$tmp"
+    if command_exists cmp && "${SUDO[@]}" cmp -s "$tmp" "$path" 2>/dev/null; then
+        rm -f "$tmp"
+        return 0
+    fi
+    if "${SUDO[@]}" install -m "$mode" "$tmp" "$path" >> "$LOG_FILE" 2>&1; then
+        ROOT_FILE_UPDATED=1
+        rm -f "$tmp"
+        return 0
+    else
+        rc=$?
+        rm -f "$tmp"
+        return "$rc"
+    fi
+}
+
+write_root_file_if_changed() {
+    local path="$1"
+    write_root_file_mode_if_changed 0644 "$path"
 }
 
 install_asset_file() {
@@ -5506,7 +5536,7 @@ haproxy_tcp_port_owned_by_haproxy() {
     listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
     [[ -n "$listen_ip" ]] || return 1
     command_exists ss || return 1
-    "${SUDO[@]}" ss -H -ltnp 2>/dev/null | awk -v wanted="$wanted" -v wanted_ip="$listen_ip" '
+    "${SUDO[@]}" ss -H -ltnp "( sport = :${wanted} )" 2>/dev/null | awk -v wanted="$wanted" -v wanted_ip="$listen_ip" '
         {
             endpoint = $4
             count = split(endpoint, parts, ":")
@@ -5528,7 +5558,7 @@ haproxy_tcp_port_socket_details() {
     listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
     [[ -n "$listen_ip" ]] || return 1
     command_exists ss || return 1
-    "${SUDO[@]}" ss -H -tanp 2>/dev/null | awk -v wanted="$wanted" -v wanted_ip="$listen_ip" '
+    "${SUDO[@]}" ss -H -tanp "( sport = :${wanted} )" 2>/dev/null | awk -v wanted="$wanted" -v wanted_ip="$listen_ip" '
         {
             endpoint = $4
             count = split(endpoint, parts, ":")
@@ -5562,9 +5592,15 @@ haproxy_route_ports_are_free() {
 }
 
 haproxy_service_is_stopped() {
-    local active_state main_pid
-    active_state="$(run_systemctl_bounded 3 show haproxy -p ActiveState --value 2>/dev/null || true)"
-    main_pid="$(run_systemctl_bounded 3 show haproxy -p MainPID --value 2>/dev/null || true)"
+    local service_state active_state="" main_pid="" key value
+
+    service_state="$(run_systemctl_bounded 3 show haproxy -p ActiveState -p MainPID 2>/dev/null || true)"
+    while IFS='=' read -r key value; do
+        case "$key" in
+            ActiveState) active_state="$value" ;;
+            MainPID) main_pid="$value" ;;
+        esac
+    done <<< "$service_state"
     [[ "$main_pid" == "0" ]] || return 1
     [[ "$active_state" == "inactive" || "$active_state" == "failed" ]]
 }
@@ -5573,7 +5609,9 @@ wait_for_haproxy_stopped_and_ports_free() {
     local routes_file="$1" attempts="${2:-20}" attempt
 
     for (( attempt = 1; attempt <= attempts; attempt++ )); do
-        if haproxy_route_ports_are_free "$routes_file" && haproxy_service_is_stopped; then
+        # Do not dump active HAProxy connection tables while the service is still
+        # draining. Busy proxies can have hundreds of thousands of TCP sockets.
+        if haproxy_service_is_stopped && haproxy_route_ports_are_free "$routes_file"; then
             return 0
         fi
         sleep 0.25
@@ -5638,15 +5676,36 @@ report_haproxy_busy_route_ports() {
 }
 
 haproxy_missing_listener_ports() {
-    local routes_file="$1" port _target _sni _source _maxconn listen_ip
+    local routes_file="$1"
 
-    while IFS=$'\t' read -r port _target _sni _source _maxconn listen_ip; do
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-        listen_ip="$(haproxy_route_listen_ip "$listen_ip")"
-        if ! haproxy_tcp_port_owned_by_haproxy "$port" "$listen_ip"; then
-            printf '%s:%s\n' "$listen_ip" "$port"
-        fi
-    done < "$routes_file"
+    # One listener snapshot is enough for every route. Previously this spawned
+    # one ss process per route on every retry, which was very slow under load.
+    { "${SUDO[@]}" ss -H -ltnp 2>/dev/null || true; } | awk -v routes_file="$routes_file" '
+        {
+            if (tolower($0) !~ /haproxy/) next
+            endpoint = $4
+            count = split(endpoint, parts, ":")
+            port = parts[count]
+            host = endpoint
+            sub(/:[^:]*$/, "", host)
+            gsub(/^\[/, "", host)
+            gsub(/\]$/, "", host)
+            if (host == "" || host == "0.0.0.0" || host == "::") host = "*"
+            listeners[host SUBSEP port] = 1
+        }
+        END {
+            while ((getline route < routes_file) > 0) {
+                field_count = split(route, fields, "\t")
+                route_port = fields[1]
+                if (route_port !~ /^[0-9]+$/) continue
+                listen_ip = (field_count >= 6 && fields[6] != "" ? fields[6] : "*")
+                if (!listeners[listen_ip SUBSEP route_port]) {
+                    print listen_ip ":" route_port
+                }
+            }
+            close(routes_file)
+        }
+    '
     return 0
 }
 
@@ -5660,9 +5719,11 @@ wait_for_haproxy_routes() {
     (( attempts >= 1 && attempts <= 120 )) || attempts=20
 
     for (( attempt = 1; attempt <= attempts; attempt++ )); do
-        missing="$(haproxy_missing_listener_ports "$routes_file")"
-        if [[ -z "$missing" ]] && run_systemctl_bounded 3 is-active --quiet haproxy 2>/dev/null; then
-            return 0
+        if run_systemctl_bounded 3 is-active --quiet haproxy 2>/dev/null; then
+            missing="$(haproxy_missing_listener_ports "$routes_file")"
+            if [[ -z "$missing" ]]; then
+                return 0
+            fi
         fi
         sleep 0.25
     done
@@ -6620,6 +6681,7 @@ apply_haproxy_routes_config() {
     local routes_file="$1"
     local config="$HAPROXY_CONFIG_FILE"
     local tmp_config backup backup_routes had_config=0 haproxy_threads haproxy_maxconn haproxy_nofile route_count activation_ready=1
+    local capacity_updated=0
 
     HAPROXY_LAST_BACKUP=""
     ensure_haproxy_package
@@ -6659,14 +6721,22 @@ apply_haproxy_routes_config() {
 
     cmd "${SUDO[@]}" mkdir -p /etc/systemd/system/haproxy.service.d
     haproxy_nofile="$(haproxy_nofile_limit)"
-    write_root_file /etc/systemd/system/haproxy.service.d/99-kto-capacity.conf <<EOF
+    if write_root_file_if_changed /etc/systemd/system/haproxy.service.d/99-kto-capacity.conf <<EOF
 [Service]
 LimitNOFILE=${haproxy_nofile}
 EOF
-    stage "Обновляю systemd-настройки HAProxy"
-    if ! run_systemctl_bounded 20 daemon-reload >> "$LOG_FILE" 2>&1; then
-        fail "systemd daemon-reload не завершился за 20 секунд"
+    then
+        capacity_updated="$ROOT_FILE_UPDATED"
+    else
+        fail "Не удалось записать systemd-настройки HAProxy"
         activation_ready=0
+    fi
+    if (( activation_ready == 1 && capacity_updated == 1 )); then
+        stage "Обновляю systemd-настройки HAProxy"
+        if ! run_systemctl_bounded 20 daemon-reload >> "$LOG_FILE" 2>&1; then
+            fail "systemd daemon-reload не завершился за 20 секунд"
+            activation_ready=0
+        fi
     fi
     if (( activation_ready == 1 )) && ! run_systemctl_bounded 5 is-enabled --quiet haproxy >> "$LOG_FILE" 2>&1; then
         if ! run_systemctl_bounded 20 enable haproxy >> "$LOG_FILE" 2>&1; then
