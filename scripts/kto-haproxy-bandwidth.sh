@@ -4,15 +4,17 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-HAPROXY_BANDWIDTH_BUILD="v298"
+HAPROXY_BANDWIDTH_BUILD="v299"
 LIMITS_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
 HAPROXY_CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 STATE_FILE="${KTO_HAPROXY_BANDWIDTH_STATE:-/run/kto-haproxy-bandwidth.state}"
 PENDING_STATE="${KTO_HAPROXY_BANDWIDTH_PENDING_STATE:-${STATE_FILE}.pending}"
+READY_FILE="${KTO_HAPROXY_BANDWIDTH_READY:-${STATE_FILE}.ready}"
 LOCK_FILE="${KTO_HAPROXY_BANDWIDTH_LOCK:-/run/kto-haproxy-bandwidth.lock}"
 LOG_FILE="${KTO_HAPROXY_BANDWIDTH_LOG:-/var/log/kto-haproxy-bandwidth.log}"
 ACTION_BASE="${KTO_HAPROXY_BANDWIDTH_ACTION_BASE:-3900000}"
 PREF_BASE="${KTO_HAPROXY_BANDWIDTH_PREF_BASE:-42000}"
+STATE_SCHEMA="2"
 
 ok() { printf '[OK] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -37,7 +39,7 @@ require_root() {
 
 require_commands() {
     local command_name
-    for command_name in awk flock grep install ip sort tc; do
+    for command_name in awk flock grep install ip sha256sum sort tc; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             fail "Не найдена команда: ${command_name}"
             return 1
@@ -108,6 +110,28 @@ haproxy_ports() {
     ' "$HAPROXY_CONFIG" | sort -n -u
 }
 
+desired_state_signature() {
+    local limits_file="$1" ports_file="$2" ip rate interface
+
+    {
+        printf 'schema=%s\n' "$STATE_SCHEMA"
+        printf '[limits]\n'
+        cat "$limits_file"
+        printf '[ports]\n'
+        cat "$ports_file"
+        printf '[interfaces]\n'
+        while IFS=$'\t' read -r ip rate; do
+            interface="$(interface_for_ipv4 "$ip")"
+            printf '%s\t%s\n' "$ip" "$interface"
+        done < "$limits_file"
+    } | sha256sum | awk '{ print $1 }'
+}
+
+saved_state_signature() {
+    local state_file="$1"
+    awk -F '\t' '$1 == "S" { print $2; exit }' "$state_file" 2>/dev/null || true
+}
+
 load_limits() {
     local line_number=0 ip rate extra
     local -A seen=()
@@ -154,6 +178,7 @@ ensure_clsact() {
         return 1
     fi
     tc qdisc add dev "$interface" clsact >> "$LOG_FILE" 2>&1
+    CLSACT_CHANGED=1
 }
 
 tc_logged() {
@@ -191,7 +216,7 @@ delete_police_action_quiet() {
 add_police_filter() {
     local interface="$1" direction="$2" pref="$3" ip="$4" port="$5"
     local action_index="$6" rate="$7" burst="$8" define_action="$9"
-    local flower_error u32_error
+    local flower_error="пропущен после предыдущей ошибки flower" u32_error
     local -a flower_match=() u32_match=() action_args=()
 
     if [[ "$direction" == "ingress" ]]; then
@@ -210,14 +235,18 @@ add_police_filter() {
         action_args=(action police index "$action_index")
     fi
 
-    if tc_logged filter add dev "$interface" "$direction" protocol ip pref "$pref" \
-        flower skip_hw ip_proto tcp "${flower_match[@]}" "${action_args[@]}"; then
-        return 0
-    fi
-    flower_error="$(tc_error_summary)"
-    delete_filter_quiet "$interface" "$direction" "$pref"
-    if (( define_action == 1 )); then
-        delete_police_action_quiet "$action_index"
+    if [[ "${TC_FILTER_MODE:-}" != "u32" ]]; then
+        if tc_logged filter add dev "$interface" "$direction" protocol ip pref "$pref" \
+            flower skip_hw ip_proto tcp "${flower_match[@]}" "${action_args[@]}"; then
+            TC_FILTER_MODE="flower"
+            return 0
+        fi
+        flower_error="$(tc_error_summary)"
+        TC_FILTER_MODE="u32"
+        delete_filter_quiet "$interface" "$direction" "$pref"
+        if (( define_action == 1 )); then
+            delete_police_action_quiet "$action_index"
+        fi
     fi
 
     # cls_flower is optional on some minimal Ubuntu kernels. u32 provides the
@@ -225,6 +254,7 @@ add_police_filter() {
     if tc_logged filter add dev "$interface" "$direction" protocol ip pref "$pref" \
         u32 match ip protocol 6 0xff "${u32_match[@]}" "${action_args[@]}"; then
         TC_FILTER_FALLBACK_USED=1
+        TC_FILTER_MODE="u32"
         return 0
     fi
     u32_error="$(tc_error_summary)"
@@ -254,28 +284,30 @@ cleanup_state_file() {
 clear_limits() {
     cleanup_state_file "$STATE_FILE"
     cleanup_state_file "$PENDING_STATE"
-    rm -f "$STATE_FILE" "$PENDING_STATE"
+    rm -f "$STATE_FILE" "$PENDING_STATE" "$READY_FILE" "${READY_FILE}.pending"
     ok "Kernel-лимиты входных IP HAProxy очищены"
 }
 
 apply_limits() {
     (
-    local limits_file ports_file next_state
+    local limits_file ports_file next_state ready_tmp
     local ip rate interface port action_index ingress_action_index egress_action_index burst pref
-    local filter_count=0 limit_count=0 committed=0
+    local filter_count=0 limit_count=0 committed=0 ports_count expected_filters expected_actions
+    local desired_signature current_signature ready_signature state_filters state_actions actual_filters=0
     local ingress_action_bound=0 egress_action_bound=0
-    local TC_FILTER_FALLBACK_USED=0
+    local TC_FILTER_FALLBACK_USED=0 TC_FILTER_MODE="" CLSACT_CHANGED=0
     local -a interfaces=()
     local -A seen_interfaces=()
 
     limits_file="$(mktemp)"
     ports_file="$(mktemp)"
     next_state="$PENDING_STATE"
+    ready_tmp="${READY_FILE}.pending"
     cleanup_state_file "$next_state"
-    rm -f "$next_state"
+    rm -f "$next_state" "$ready_tmp"
     : > "$next_state"
     chmod 0600 "$next_state" 2>/dev/null || true
-    trap 'rc=$?; trap - EXIT; if (( committed == 0 )); then cleanup_state_file "$next_state"; fi; rm -f "$limits_file" "$ports_file" "$next_state"; exit "$rc"' EXIT
+    trap 'rc=$?; trap - EXIT; if (( committed == 0 )); then cleanup_state_file "$next_state"; fi; rm -f "$limits_file" "$ports_file" "$next_state" "$ready_tmp"; exit "$rc"' EXIT
 
     load_limits > "$limits_file" || return 1
     if [[ ! -s "$limits_file" ]]; then
@@ -304,7 +336,32 @@ apply_limits() {
         ensure_clsact "$interface" || return 1
     done
 
+    desired_signature="$(desired_state_signature "$limits_file" "$ports_file")"
+    current_signature="$(saved_state_signature "$STATE_FILE")"
+    ready_signature="$(cat "$READY_FILE" 2>/dev/null || true)"
+    ports_count="$(wc -l < "$ports_file" | tr -d '[:space:]')"
+    [[ "$ports_count" =~ ^[0-9]+$ ]] || ports_count=0
+    expected_filters=$(( limit_count * ports_count * 2 ))
+    expected_actions=$(( limit_count * 2 ))
+    state_filters="$(awk -F '\t' '$1 == "F" { count++ } END { print count + 0 }' "$STATE_FILE" 2>/dev/null || printf '0')"
+    state_actions="$(awk -F '\t' '$1 == "A" { count++ } END { print count + 0 }' "$STATE_FILE" 2>/dev/null || printf '0')"
+    if (( CLSACT_CHANGED == 0 )) &&
+        [[ -n "$desired_signature" && "$current_signature" == "$desired_signature" &&
+           "$ready_signature" == "$desired_signature" &&
+           "$state_filters" == "$expected_filters" && "$state_actions" == "$expected_actions" ]]; then
+        actual_filters="$(active_filter_count)"
+        [[ "$actual_filters" =~ ^[0-9]+$ ]] || actual_filters=0
+        if (( actual_filters == expected_filters )); then
+            committed=1
+            ok "Лимиты HAProxy уже актуальны: ${limit_count} IP, ${expected_filters} tc-фильтров"
+            return 0
+        fi
+        warn "Состояние tc неполное (${actual_filters}/${expected_filters}), пересобираю лимиты"
+    fi
+
+    rm -f "$READY_FILE"
     cleanup_state_file "$STATE_FILE"
+    printf 'S\t%s\n' "$desired_signature" > "$next_state"
     action_index="$ACTION_BASE"
     pref="$PREF_BASE"
     while IFS=$'\t' read -r ip rate; do
@@ -359,6 +416,8 @@ apply_limits() {
     done < "$limits_file"
 
     install -m 0600 "$next_state" "$STATE_FILE"
+    printf '%s\n' "$desired_signature" > "$ready_tmp"
+    install -m 0600 "$ready_tmp" "$READY_FILE"
     committed=1
     ok "Лимитов входных IP: ${limit_count}"
     ok "HAProxy tc-фильтров: ${filter_count}"
@@ -370,25 +429,42 @@ apply_limits() {
 }
 
 active_filter_count() {
-    local kind interface direction pref action_index output count=0
+    (
+    local kind interface direction pref action_index key snapshot_file count=0 snapshot_index=0
+    local snapshot_dir
+    local -A snapshot_files=()
     [[ -s "$STATE_FILE" ]] || {
         printf '0\n'
         return 0
     }
+    snapshot_dir="$(mktemp -d)"
+    trap 'rm -rf "$snapshot_dir"' EXIT
     while IFS=$'\t' read -r kind interface direction pref action_index; do
         [[ "$kind" == "F" && "$pref" =~ ^[0-9]+$ ]] || continue
-        output="$(tc filter show dev "$interface" "$direction" protocol ip pref "$pref" 2>/dev/null || true)"
-        [[ -n "$output" ]] && count=$(( count + 1 ))
+        key="${interface}|${direction}"
+        snapshot_file="${snapshot_files[$key]:-}"
+        if [[ -z "$snapshot_file" ]]; then
+            snapshot_index=$(( snapshot_index + 1 ))
+            snapshot_file="${snapshot_dir}/${snapshot_index}"
+            tc filter show dev "$interface" "$direction" protocol ip > "$snapshot_file" 2>/dev/null || true
+            snapshot_files[$key]="$snapshot_file"
+        fi
+        if grep -Eq "(^|[[:space:]])pref ${pref}([[:space:]]|$)" "$snapshot_file"; then
+            count=$(( count + 1 ))
+        fi
     done < "$STATE_FILE"
     printf '%s\n' "$count"
+    )
 }
 
 show_status() {
     (
-    local limits_file ip rate interface action_index ingress_action_index egress_action_index
+    local limits_file ports_file ip rate interface action_index ingress_action_index egress_action_index
     local ingress_active egress_active filters expected ports_count limit_count overall="РАБОТАЕТ"
+    local desired_signature current_signature ready_signature
     limits_file="$(mktemp)"
-    trap 'rm -f "$limits_file"' EXIT
+    ports_file="$(mktemp)"
+    trap 'rm -f "$limits_file" "$ports_file"' EXIT
     load_limits > "$limits_file" || return 1
 
     printf '[ ЛИМИТЫ ВХОДНЫХ IP HAPROXY ]\n'
@@ -399,7 +475,8 @@ show_status() {
         return 0
     fi
 
-    ports_count="$(haproxy_ports 2>/dev/null | wc -l | tr -d '[:space:]')"
+    haproxy_ports > "$ports_file" 2>/dev/null || true
+    ports_count="$(wc -l < "$ports_file" | tr -d '[:space:]')"
     [[ "$ports_count" =~ ^[0-9]+$ ]] || ports_count=0
     action_index="$ACTION_BASE"
     while IFS=$'\t' read -r ip rate; do
@@ -441,6 +518,13 @@ show_status() {
     [[ "$limit_count" =~ ^[0-9]+$ ]] || limit_count=0
     expected=$(( ports_count * 2 * limit_count ))
     if (( filters != expected )); then
+        overall="ОШИБКА"
+    fi
+    desired_signature="$(desired_state_signature "$limits_file" "$ports_file")"
+    current_signature="$(saved_state_signature "$STATE_FILE")"
+    ready_signature="$(cat "$READY_FILE" 2>/dev/null || true)"
+    if [[ -z "$desired_signature" || "$current_signature" != "$desired_signature" ||
+          "$ready_signature" != "$desired_signature" ]]; then
         overall="ОШИБКА"
     fi
     printf 'HAProxy-портов: %s\n' "$ports_count"

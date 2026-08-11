@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v298"
+SCRIPT_BUILD="v299"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5578,13 +5578,44 @@ haproxy_tcp_port_socket_details() {
     '
 }
 
+haproxy_tcp_port_has_socket() {
+    local wanted="$1" listen_ip="${2:-*}"
+    local sockets rc=0
+    listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
+    [[ -n "$listen_ip" ]] || return 1
+    command_exists ss || return 1
+    sockets="$(run_bounded_command 3 "${SUDO[@]}" ss -H -tan "( sport = :${wanted} )" 2>/dev/null)" || rc=$?
+    if (( rc != 0 )); then
+        printf 'ss timeout/error while checking %s:%s, rc=%s\n' \
+            "$listen_ip" "$wanted" "$rc" >> "$LOG_FILE" 2>/dev/null || true
+        return 0
+    fi
+    awk -v wanted="$wanted" -v wanted_ip="$listen_ip" '
+            {
+                endpoint = $4
+                count = split(endpoint, parts, ":")
+                port = parts[count]
+                host = endpoint
+                sub(/:[^:]*$/, "", host)
+                gsub(/^\[/, "", host)
+                gsub(/\]$/, "", host)
+                wildcard = (host == "" || host == "*" || host == "0.0.0.0" || host == "::")
+                address_conflicts = (wanted_ip == "*" ? 1 : (wildcard || host == wanted_ip))
+                if (port == wanted && address_conflicts) found = 1
+            }
+            END { exit found ? 0 : 1 }
+        ' <<< "$sockets"
+}
+
 haproxy_route_ports_are_free() {
     local routes_file="$1" port _target _sni _source _maxconn listen_ip
 
     while IFS=$'\t' read -r port _target _sni _source _maxconn listen_ip; do
         [[ "$port" =~ ^[0-9]+$ ]] || continue
         listen_ip="$(haproxy_route_listen_ip "$listen_ip")"
-        if haproxy_tcp_port_socket_details "$port" "$listen_ip" >/dev/null 2>&1; then
+        # Owner lookup (-p) is intentionally avoided here. It becomes very
+        # expensive when the previous HAProxy worker owns many connections.
+        if haproxy_tcp_port_has_socket "$port" "$listen_ip" >/dev/null 2>&1; then
             return 1
         fi
     done < "$routes_file"
@@ -5684,20 +5715,11 @@ report_haproxy_busy_route_ports() {
 haproxy_missing_listener_ports() {
     local routes_file="$1"
 
-    # One listener snapshot is enough for every route. Previously this spawned
-    # one ss process per route on every retry, which was very slow under load.
-    { "${SUDO[@]}" ss -H -ltnp 2>/dev/null || true; } | awk -v routes_file="$routes_file" '
+    # Service state is checked separately, so endpoint verification does not
+    # need ss -p. Resolving process owners can scan every FD of a busy HAProxy.
+    { haproxy_tcp_listener_endpoints 2>/dev/null || true; } | awk -F '\t' -v routes_file="$routes_file" '
         {
-            if (tolower($0) !~ /haproxy/) next
-            endpoint = $4
-            count = split(endpoint, parts, ":")
-            port = parts[count]
-            host = endpoint
-            sub(/:[^:]*$/, "", host)
-            gsub(/^\[/, "", host)
-            gsub(/\]$/, "", host)
-            if (host == "" || host == "0.0.0.0" || host == "::") host = "*"
-            listeners[host SUBSEP port] = 1
+            listeners[$1 SUBSEP $2] = 1
         }
         END {
             while ((getline route < routes_file) > 0) {
@@ -5713,6 +5735,25 @@ haproxy_missing_listener_ports() {
         }
     '
     return 0
+}
+
+haproxy_tcp_listener_endpoints() {
+    command_exists ss || return 1
+    "${SUDO[@]}" ss -H -ltn 2>/dev/null | awk '
+        {
+            endpoint = $4
+            count = split(endpoint, parts, ":")
+            port = parts[count]
+            host = endpoint
+            sub(/:[^:]*$/, "", host)
+            gsub(/^\[/, "", host)
+            gsub(/\]$/, "", host)
+            if (host == "" || host == "0.0.0.0" || host == "::") host = "*"
+            if (port ~ /^[0-9]+$/ && !seen[host SUBSEP port]++) {
+                print host "\t" port
+            }
+        }
+    '
 }
 
 wait_for_haproxy_routes() {
@@ -5788,7 +5829,7 @@ print_haproxy_failure_details() {
         echo "=== HAProxy capacity ==="
         "${SUDO[@]}" grep -E '^[[:space:]]*(maxconn|maxpipes|nosplice|nbthread)[[:space:]]' "$config" 2>&1 || true
         echo "=== HAProxy listeners ==="
-        "${SUDO[@]}" ss -H -ltnp 2>&1 | grep -i haproxy || true
+        run_bounded_command 3 "${SUDO[@]}" ss -H -ltn 2>&1 || true
     })"
 
     printf '\n%s\n' "$details" >> "$LOG_FILE" 2>/dev/null || true
@@ -6542,6 +6583,7 @@ defaults
     timeout tunnel 2h
     timeout client-fin 30s
     timeout server-fin 30s
+    timeout check 5s
 
     default-server inter 30s fall 8 rise 3
 
@@ -6827,8 +6869,9 @@ validate_haproxy_bandwidth_rate() {
 }
 
 install_haproxy_bandwidth_manager() {
+    local unit_updated=0
     install_asset_file scripts/kto-haproxy-bandwidth.sh "$HAPROXY_BANDWIDTH_MANAGER" 0755 || return 1
-    write_root_file "$HAPROXY_BANDWIDTH_UNIT" <<EOF
+    if write_root_file_if_changed "$HAPROXY_BANDWIDTH_UNIT" <<EOF
 [Unit]
 Description=KTO per-input-IP and per-direction HAProxy bandwidth limits
 Wants=network-online.target
@@ -6844,13 +6887,23 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    if ! run_systemctl_bounded 20 daemon-reload >> "$LOG_FILE" 2>&1; then
-        fail "Не удалось обновить systemd для лимитов HAProxy"
+    then
+        unit_updated="$ROOT_FILE_UPDATED"
+    else
+        fail "Не удалось записать systemd unit лимитов HAProxy"
         return 1
     fi
-    if ! run_systemctl_bounded 20 enable "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1; then
-        fail "Не удалось включить автозапуск лимитов HAProxy"
-        return 1
+    if (( unit_updated == 1 )); then
+        if ! run_systemctl_bounded 20 daemon-reload >> "$LOG_FILE" 2>&1; then
+            fail "Не удалось обновить systemd для лимитов HAProxy"
+            return 1
+        fi
+    fi
+    if ! run_systemctl_bounded 5 is-enabled --quiet "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1; then
+        if ! run_systemctl_bounded 20 enable "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1; then
+            fail "Не удалось включить автозапуск лимитов HAProxy"
+            return 1
+        fi
     fi
 }
 
@@ -7072,10 +7125,15 @@ select_configured_haproxy_bandwidth_ip() {
 }
 
 reapply_haproxy_bandwidth_limits() {
+    local timeout_sec="${KTO_HAPROXY_BANDWIDTH_APPLY_TIMEOUT_SEC:-45}"
+
+    [[ "$timeout_sec" =~ ^[0-9]+$ ]] || timeout_sec=45
+    timeout_sec=$((10#$timeout_sec))
+    (( timeout_sec >= 10 && timeout_sec <= 120 )) || timeout_sec=45
     ensure_haproxy_bandwidth_manager || return 1
     stage "Применяю лимиты выбранных входных IP HAProxy"
-    if ! "${SUDO[@]}" "$HAPROXY_BANDWIDTH_MANAGER" apply; then
-        fail "Не удалось применить лимиты входных IP HAProxy"
+    if ! run_bounded_command "$timeout_sec" "${SUDO[@]}" "$HAPROXY_BANDWIDTH_MANAGER" apply; then
+        fail "Не удалось применить лимиты входных IP HAProxy за ${timeout_sec} секунд"
         return 1
     fi
     run_systemctl_bounded 5 reset-failed "$HAPROXY_BANDWIDTH_SERVICE" >> "$LOG_FILE" 2>&1 || true
@@ -7361,12 +7419,18 @@ print_haproxy_routes() {
 
 check_haproxy_bindings() {
     local routes_file="$1" port _target _sni _source _maxconn listen_ip
-    local endpoint scope runtime_status details total=0 ok_count=0 problem_count=0
+    local endpoint scope runtime_status total=0 ok_count=0 problem_count=0 result=0 listeners_file
 
     command_exists ss || {
         fail "ss не найден: проверить runtime-бинды невозможно"
         return 1
     }
+    listeners_file="$(mktemp)"
+    if ! haproxy_tcp_listener_endpoints > "$listeners_file"; then
+        rm -f "$listeners_file"
+        fail "Не удалось получить список TCP listener-ов"
+        return 1
+    fi
 
     echo -e "${BOLD}${PURPLE}[ ПРОВЕРКА БИНДОВ HAPROXY ]${NC}"
     while IFS=$'\t' read -r port _target _sni _source _maxconn listen_ip; do
@@ -7379,22 +7443,17 @@ check_haproxy_bindings() {
             scope="ТОЧЕЧНЫЙ: только IP ${listen_ip}"
         fi
 
-        if haproxy_tcp_port_owned_by_haproxy "$port" "$listen_ip"; then
+        if grep -Fqx -- "${listen_ip}"$'\t'"${port}" "$listeners_file"; then
             runtime_status="OK"
             ok_count=$(( ok_count + 1 ))
-        elif [[ "$listen_ip" != "*" ]] && haproxy_tcp_port_owned_by_haproxy "$port" "*"; then
+        elif [[ "$listen_ip" != "*" ]] && grep -Fqx -- "*"$'\t'"${port}" "$listeners_file"; then
             runtime_status="ОШИБКА: HAProxy реально слушает *:${port} на всех IP"
             problem_count=$(( problem_count + 1 ))
+        elif awk -F '\t' -v wanted="$port" '$2 == wanted { found = 1 } END { exit found ? 0 : 1 }' "$listeners_file"; then
+            runtime_status="ОШИБКА: порт слушается на другом адресе"
+            problem_count=$(( problem_count + 1 ))
         else
-            details="$(haproxy_tcp_port_socket_details "$port" "$listen_ip" 2>/dev/null |
-                awk 'toupper($1) == "LISTEN"' || true)"
-            if [[ -n "$details" ]] && grep -qi haproxy <<< "$details"; then
-                runtime_status="ОШИБКА: HAProxy слушает другой адрес на порту ${port}"
-            elif [[ -n "$details" ]]; then
-                runtime_status="ОШИБКА: порт занят другим процессом"
-            else
-                runtime_status="ОШИБКА: не слушается"
-            fi
+            runtime_status="ОШИБКА: не слушается"
             problem_count=$(( problem_count + 1 ))
         fi
         total=$(( total + 1 ))
@@ -7403,7 +7462,256 @@ check_haproxy_bindings() {
 
     echo
     printf 'Проверено: %s | OK: %s | Проблем: %s\n' "$total" "$ok_count" "$problem_count"
-    (( total > 0 && problem_count == 0 ))
+    (( total > 0 && problem_count == 0 )) || result=1
+    rm -f "$listeners_file"
+    return "$result"
+}
+
+haproxy_backend_health_report() {
+    awk -F ',' '
+        NR == 1 && $0 ~ /^#/ {
+            sub(/^#[[:space:]]*/, "", $1)
+            for (i = 1; i <= NF; i++) column[$i] = i
+            header = 1
+            next
+        }
+        header == 1 {
+            proxy = $(column["pxname"])
+            server = $(column["svname"])
+            status = $(column["status"])
+            check_status = (column["check_status"] ? $(column["check_status"]) : "-")
+            gsub(/\r/, "", status)
+            gsub(/\r/, "", check_status)
+            if (server == "BACKEND") {
+                pools++
+                if (status ~ /^DOWN/) pools_down++
+                next
+            }
+            if (server == "" || server == "FRONTEND") next
+            servers++
+            if (status ~ /^UP/) {
+                servers_up++
+            } else if (status ~ /^DOWN/) {
+                servers_down++
+                if (detail_count < 12) {
+                    detail_count++
+                    details[detail_count] = proxy "/" server "\t" status "\t" check_status
+                }
+            } else {
+                servers_other++
+            }
+        }
+        END {
+            printf "S\t%d\t%d\t%d\t%d\t%d\t%d\n", \
+                pools + 0, pools_down + 0, servers + 0, servers_up + 0, \
+                servers_down + 0, servers_other + 0
+            for (i = 1; i <= detail_count; i++) print "D\t" details[i]
+        }
+    '
+}
+
+HAPROXY_DIAG_ERRORS=0
+HAPROXY_DIAG_WARNINGS=0
+
+haproxy_diagnostic_row() {
+    local status="$1" name="$2" value="$3"
+    case "$status" in
+        fail) HAPROXY_DIAG_ERRORS=$(( HAPROXY_DIAG_ERRORS + 1 )) ;;
+        warn) HAPROXY_DIAG_WARNINGS=$(( HAPROXY_DIAG_WARNINGS + 1 )) ;;
+    esac
+    network_test_row "$name" "$value" "$status"
+}
+
+diagnose_haproxy() {
+    header
+    require_haproxy_mode
+    need_root
+
+    local routes_file config_output config_rc=0 service_info active_state="" sub_state="" main_pid="" nofile=""
+    local key value route_count missing missing_count reserved port _target _sni source_ip _maxconn listen_ip
+    local exact_inputs=0 bad_inputs=0 explicit_sources=0 bad_sources=0 default_source
+    local backend_stats health_report summary_line marker pools pools_down servers servers_up servers_down servers_other
+    local detail_line status_output status_summary ufw_status missing_firewall=0 result=0
+    local -A seen_inputs=() seen_sources=() seen_ports=()
+
+    HAPROXY_DIAG_ERRORS=0
+    HAPROXY_DIAG_WARNINGS=0
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+
+    echo -e "${BOLD}${PURPLE}[ ДИАГНОСТИКА HAPROXY ]${NC}"
+    if [[ ! -s "$HAPROXY_CONFIG_FILE" ]]; then
+        haproxy_diagnostic_row fail "config" "${HAPROXY_CONFIG_FILE} не найден"
+        rm -f "$routes_file"
+        return 1
+    fi
+
+    route_count="$(haproxy_route_count "$routes_file")"
+    if (( route_count > 0 )); then
+        haproxy_diagnostic_row ok "маршруты" "${route_count} распознано"
+    else
+        haproxy_diagnostic_row fail "маршруты" "config не распознан"
+    fi
+
+    config_output="$(run_bounded_command 8 "${SUDO[@]}" haproxy -c -f "$HAPROXY_CONFIG_FILE" 2>&1)" || config_rc=$?
+    if (( config_rc == 0 )); then
+        haproxy_diagnostic_row ok "config check" "валиден"
+    else
+        haproxy_diagnostic_row fail "config check" "haproxy -c: rc=${config_rc}"
+        printf '%s\n' "$config_output" | tail -n 5 | sed 's/^/   /'
+    fi
+
+    service_info="$(run_systemctl_bounded 4 show haproxy \
+        -p ActiveState -p SubState -p MainPID -p LimitNOFILE 2>/dev/null || true)"
+    while IFS='=' read -r key value; do
+        case "$key" in
+            ActiveState) active_state="$value" ;;
+            SubState) sub_state="$value" ;;
+            MainPID) main_pid="$value" ;;
+            LimitNOFILE) nofile="$value" ;;
+        esac
+    done <<< "$service_info"
+    if [[ "$active_state" == "active" && "$sub_state" == "running" && "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+        haproxy_diagnostic_row ok "service" "active/running, PID ${main_pid}"
+    else
+        haproxy_diagnostic_row fail "service" "${active_state:-unknown}/${sub_state:-unknown}, PID ${main_pid:-0}"
+    fi
+
+    missing="$(haproxy_missing_listener_ports "$routes_file")"
+    missing_count="$(awk 'NF { count++ } END { print count + 0 }' <<< "$missing")"
+    if (( route_count > 0 && missing_count == 0 )); then
+        haproxy_diagnostic_row ok "listener-ы" "${route_count}/${route_count} слушаются"
+    else
+        haproxy_diagnostic_row fail "listener-ы" "$(( route_count - missing_count ))/${route_count}; нет: ${missing//$'\n'/, }"
+    fi
+
+    default_source="$(haproxy_default_source_ip)"
+    while IFS=$'\t' read -r port _target _sni source_ip _maxconn listen_ip; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        listen_ip="$(haproxy_route_listen_ip "$listen_ip")"
+        if [[ "$listen_ip" != "*" && -z "${seen_inputs[$listen_ip]+x}" ]]; then
+            seen_inputs[$listen_ip]=1
+            exact_inputs=$(( exact_inputs + 1 ))
+            haproxy_input_ip_available "$listen_ip" || bad_inputs=$(( bad_inputs + 1 ))
+        fi
+        source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}" 2>/dev/null || true)"
+        if [[ "$source_ip" != "default" && -n "$source_ip" && -z "${seen_sources[$source_ip]+x}" ]]; then
+            seen_sources[$source_ip]=1
+            explicit_sources=$(( explicit_sources + 1 ))
+            if ! haproxy_input_ip_available "$source_ip" ||
+                ! ip -4 route get 1.1.1.1 from "$source_ip" >/dev/null 2>&1; then
+                bad_sources=$(( bad_sources + 1 ))
+            fi
+        fi
+        seen_ports[$port]=1
+    done < "$routes_file"
+    if (( bad_inputs == 0 )); then
+        haproxy_diagnostic_row ok "входные IP" "${exact_inputs} точечных, wildcard поддерживается"
+    else
+        haproxy_diagnostic_row fail "входные IP" "не найдены: ${bad_inputs}/${exact_inputs}"
+    fi
+    if validate_ipv4 "$default_source" && (( bad_sources == 0 )); then
+        haproxy_diagnostic_row ok "source routes" "default ${default_source}, дополнительных ${explicit_sources}"
+    else
+        haproxy_diagnostic_row fail "source routes" "default ${default_source:-нет}, ошибок ${bad_sources}/${explicit_sources}"
+    fi
+
+    reserved="$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
+    for port in "${!seen_ports[@]}"; do
+        reserved_port_list_contains "$reserved" "$port" || missing_firewall=$(( missing_firewall + 1 ))
+    done
+    if (( missing_firewall == 0 )); then
+        haproxy_diagnostic_row ok "reserved ports" "все HAProxy-порты исключены из ephemeral"
+    else
+        haproxy_diagnostic_row warn "reserved ports" "не зарезервировано: ${missing_firewall}"
+    fi
+
+    if command_exists socat && [[ -S /run/haproxy/admin.sock ]]; then
+        backend_stats="$(printf 'show stat\n' | run_bounded_command 5 "${SUDO[@]}" \
+            socat -t 3 - UNIX-CONNECT:/run/haproxy/admin.sock 2>/dev/null || true)"
+        health_report="$(haproxy_backend_health_report <<< "$backend_stats")"
+        summary_line="$(grep -m1 $'^S\t' <<< "$health_report" || true)"
+        IFS=$'\t' read -r marker pools pools_down servers servers_up servers_down servers_other <<< "$summary_line"
+        pools="${pools:-0}"; pools_down="${pools_down:-0}"; servers="${servers:-0}"
+        servers_up="${servers_up:-0}"; servers_down="${servers_down:-0}"; servers_other="${servers_other:-0}"
+        if (( pools_down > 0 )); then
+            haproxy_diagnostic_row fail "backend-ы" "пулов DOWN ${pools_down}/${pools}; серверов UP ${servers_up}/${servers}"
+        elif (( servers_down > 0 || servers_other > 0 )); then
+            haproxy_diagnostic_row warn "backend-ы" "UP ${servers_up}/${servers}, DOWN ${servers_down}, прочих ${servers_other}"
+        elif (( servers > 0 )); then
+            haproxy_diagnostic_row ok "backend-ы" "UP ${servers_up}/${servers}, пулов ${pools}"
+        else
+            haproxy_diagnostic_row warn "backend-ы" "stats socket не вернул серверы"
+        fi
+        while IFS=$'\t' read -r marker detail_line value status_summary; do
+            [[ "$marker" == "D" ]] || continue
+            printf '   DOWN %-28s %s | %s\n' "$detail_line" "$value" "$status_summary"
+        done <<< "$health_report"
+    else
+        haproxy_diagnostic_row warn "backend-ы" "stats socket недоступен"
+    fi
+
+    if command_exists ufw; then
+        ufw_status="$(run_bounded_command 5 "${SUDO[@]}" ufw status 2>/dev/null || true)"
+        if grep -q 'Status: active' <<< "$ufw_status"; then
+            missing_firewall=0
+            for port in "${!seen_ports[@]}"; do
+                awk -v rule="${port}/tcp" '$0 ~ /ALLOW/ && $1 == rule { found=1 } END { exit found ? 0 : 1 }' \
+                    <<< "$ufw_status" || missing_firewall=$(( missing_firewall + 1 ))
+            done
+            if (( missing_firewall == 0 )); then
+                haproxy_diagnostic_row ok "firewall" "UFW active, все порты разрешены"
+            else
+                haproxy_diagnostic_row fail "firewall" "нет ALLOW для ${missing_firewall} HAProxy-портов"
+            fi
+        else
+            haproxy_diagnostic_row warn "firewall" "UFW выключен"
+        fi
+    else
+        haproxy_diagnostic_row skip "firewall" "UFW не установлен"
+    fi
+
+    if "${SUDO[@]}" test -s "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null; then
+        if "${SUDO[@]}" test -x "$HAPROXY_BANDWIDTH_MANAGER" 2>/dev/null; then
+            status_output="$(run_bounded_command 12 "${SUDO[@]}" "$HAPROXY_BANDWIDTH_MANAGER" status 2>&1 || true)"
+            status_summary="$(awk '
+                /^(Фильтров:|Итог:)/ {
+                    if (summary != "") summary = summary " | "
+                    summary = summary $0
+                }
+                END { print summary }
+            ' <<< "$status_output")"
+            if grep -Fq 'Итог: РАБОТАЕТ' <<< "$status_output"; then
+                haproxy_diagnostic_row ok "лимиты скорости" "${status_summary:-работают}"
+            else
+                haproxy_diagnostic_row fail "лимиты скорости" "${status_summary:-ошибка проверки}"
+            fi
+        else
+            haproxy_diagnostic_row fail "лимиты скорости" "manager не установлен"
+        fi
+    else
+        haproxy_diagnostic_row skip "лимиты скорости" "не настроены"
+    fi
+
+    value="$(awk '$1 == "maxconn" { print $2; exit }' "$HAPROXY_CONFIG_FILE")"
+    if [[ "$value" =~ ^[1-9][0-9]*$ && "$nofile" =~ ^[1-9][0-9]*$ ]]; then
+        haproxy_diagnostic_row ok "capacity" "maxconn=${value}, nofile=${nofile}"
+    else
+        haproxy_diagnostic_row warn "capacity" "maxconn=${value:-unknown}, nofile=${nofile:-unknown}"
+    fi
+    echo
+    if (( HAPROXY_DIAG_ERRORS > 0 )); then
+        printf '%bИтог: ОШИБКА%b | ошибок: %s | предупреждений: %s\n' \
+            "$RED" "$NC" "$HAPROXY_DIAG_ERRORS" "$HAPROXY_DIAG_WARNINGS"
+        result=1
+    elif (( HAPROXY_DIAG_WARNINGS > 0 )); then
+        printf '%bИтог: РАБОТАЕТ С ПРЕДУПРЕЖДЕНИЯМИ%b | предупреждений: %s\n' \
+            "$YELLOW" "$NC" "$HAPROXY_DIAG_WARNINGS"
+    else
+        printf '%bИтог: РАБОТАЕТ%b\n' "$GREEN" "$NC"
+    fi
+    rm -f "$routes_file"
+    return "$result"
 }
 
 select_haproxy_route() {
@@ -8735,6 +9043,7 @@ haproxy_menu() {
         echo -e "11) Восстановить HAProxy backup"
         echo -e "12) Проверить бинды"
         echo -e "13) Перенести все FULL-бинды на выходные IP"
+        echo -e "14) Полная диагностика HAProxy"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -8758,6 +9067,7 @@ haproxy_menu() {
             11) restore_haproxy_backup "$routes_file" || true ;;
             12) check_haproxy_bindings "$routes_file" || true ;;
             13) pin_haproxy_wildcards_to_source_ips "$routes_file" || true ;;
+            14) diagnose_haproxy || true ;;
             0)
                 rm -f "$routes_file"
                 return 0
@@ -10447,6 +10757,7 @@ main() {
         haproxy-limit|haproxy-bandwidth-limit) shift; set_haproxy_input_bandwidth_limit_cli "$@" ;;
         haproxy-limit-off|haproxy-bandwidth-off) shift; remove_haproxy_input_bandwidth_limit_cli "$@" ;;
         haproxy-limit-status|haproxy-bandwidth-status) show_haproxy_bandwidth_status_cli ;;
+        haproxy-diagnose|haproxy-diagnostic|haproxy-diag|haproxy-status) diagnose_haproxy || true ;;
         mobile443-lte|lte-only) mobile443_lte_menu ;;
         mobile443-lte-enable|lte-only-enable) enable_mobile443_lte ;;
         mobile443-lte-disable|lte-only-disable) disable_mobile443_lte ;;

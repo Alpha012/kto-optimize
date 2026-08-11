@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v298"', KTO)
-        self.assertIn('PUSH_BUILD="v298"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v298"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v298"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v298"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v298"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v298"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v299"', KTO)
+        self.assertIn('PUSH_BUILD="v299"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v299"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v299"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v299"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v299"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v299"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -1059,6 +1059,7 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('11) Восстановить HAProxy backup', haproxy_menu)
         self.assertIn('12) Проверить бинды', haproxy_menu)
         self.assertIn('13) Перенести все FULL-бинды на выходные IP', haproxy_menu)
+        self.assertIn('14) Полная диагностика HAProxy', haproxy_menu)
         self.assertIn('add_haproxy_source_route "$routes_file"', haproxy_menu)
         self.assertIn('replace_all_haproxy_sni "$routes_file"', haproxy_menu)
         self.assertIn('haproxy_bandwidth_menu', haproxy_menu)
@@ -1066,6 +1067,8 @@ grep -q 'через NAT/прокси: 1' <<< "$output"
         self.assertIn('restore_haproxy_backup "$routes_file"', haproxy_menu)
         self.assertIn('check_haproxy_bindings "$routes_file"', haproxy_menu)
         self.assertIn('pin_haproxy_wildcards_to_source_ips "$routes_file"', haproxy_menu)
+        self.assertIn('diagnose_haproxy', haproxy_menu)
+        self.assertIn('haproxy-diagnose|haproxy-diagnostic|haproxy-diag|haproxy-status', KTO)
         self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
 
     def test_haproxy_route_list_uses_compact_input_backend_sni_format(self):
@@ -1106,10 +1109,9 @@ routes=$(mktemp)
 trap 'rm -f "$routes"' EXIT
 printf '443\t144.31.128.40:443\ta.example.com\tdefault\n8443\t5.34.179.144:443\tb.example.com\tdefault\tdefault\t217.19.122.48\n9443\t5.34.179.145:443\tc.example.com\tdefault\tdefault\t185.141.227.93\n' > "$routes"
 command_exists() { [[ "$1" == ss ]]; }
-haproxy_tcp_port_owned_by_haproxy() {
-    [[ "$1|$2" == '443|*' || "$1|$2" == '8443|217.19.122.48' || "$1|$2" == '9443|*' ]]
+haproxy_tcp_listener_endpoints() {
+    printf '*\t443\n217.19.122.48\t8443\n*\t9443\n'
 }
-haproxy_tcp_port_socket_details() { return 1; }
 rc=0
 output=$(check_haproxy_bindings "$routes") || rc=$?
 [[ "$rc" == 1 ]]
@@ -1117,6 +1119,33 @@ grep -Fq '*:443 — FULL: занимает 443/tcp на всех IP | Runtime: O
 grep -Fq '217.19.122.48:8443 — ТОЧЕЧНЫЙ: только IP 217.19.122.48 | Runtime: OK' <<< "$output"
 grep -Fq '185.141.227.93:9443 — ТОЧЕЧНЫЙ: только IP 185.141.227.93 | Runtime: ОШИБКА: HAProxy реально слушает *:9443 на всех IP' <<< "$output"
 grep -Fq 'Проверено: 3 | OK: 2 | Проблем: 1' <<< "$output"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_backend_diagnostic_parses_dynamic_stats_header(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+report=$(haproxy_backend_health_report <<'EOF'
+# pxname,svname,status,check_status
+vless_pool,BACKEND,UP,
+vless_pool,xray1,UP,L4OK
+vless_pool,xray2,DOWN,L4TOUT
+EOF
+)
+grep -Fq $'S\t1\t0\t2\t1\t1\t0' <<< "$report"
+grep -Fq $'D\tvless_pool/xray2\tDOWN\tL4TOUT' <<< "$report"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -1149,7 +1178,9 @@ grep -Fq 'Проверено: 3 | OK: 2 | Проблем: 1' <<< "$output"
         self.assertIn('"$egress_action_index" "$rate" "$burst"', apply_limits)
         self.assertIn("trap 'rc=$?; trap - EXIT;", apply_limits)
         self.assertNotIn("RETURN", apply_limits)
-        self.assertIn('tc filter show dev "$interface" "$direction" protocol ip pref "$pref"', active_filters)
+        self.assertIn('tc filter show dev "$interface" "$direction" protocol ip', active_filters)
+        self.assertIn('desired_state_signature', apply_limits)
+        self.assertIn('Лимиты HAProxy уже актуальны', apply_limits)
         self.assertIn('haproxy_input_ip_available "$input_ip"', set_limit)
         self.assertIn('Возвращаю предыдущие лимиты', commit)
         self.assertIn('reapply_haproxy_bandwidth_limits', apply_routes)
@@ -1201,6 +1232,14 @@ ip() {
 tc() {
     printf '%s ' "$@" >> "$work/events"
     printf '\n' >> "$work/events"
+    if [[ "${1:-}" == qdisc && "${2:-}" == show ]]; then
+        printf 'qdisc clsact ffff: parent ffff:fff1\n'
+    elif [[ "${1:-}" == filter && "${2:-}" == show ]]; then
+        printf 'filter protocol ip pref 42001 flower\n'
+        printf 'filter protocol ip pref 42002 flower\n'
+        printf 'filter protocol ip pref 42003 flower\n'
+        printf 'filter protocol ip pref 42004 flower\n'
+    fi
     return 0
 }
 install() {
@@ -1221,10 +1260,15 @@ grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8444 action polic
 grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8444 action police index 3900002' "$work/events"
 [[ "$(grep -c $'^F\t' "$STATE_FILE")" == 4 ]]
 [[ "$(grep -c $'^A\t' "$STATE_FILE")" == 2 ]]
+[[ "$(grep -c $'^S\t' "$STATE_FILE")" == 1 ]]
 status_output="$(show_status)"
 grep -q '2000 Mbit/s на каждое направление' <<< "$status_output"
 grep -q 'Вход (RX): OK' <<< "$status_output"
 grep -q 'Выход (TX): OK' <<< "$status_output"
+: > "$work/events"
+second_output="$(run_apply)"
+grep -q 'Лимиты HAProxy уже актуальны: 1 IP, 4 tc-фильтров' <<< "$second_output"
+! grep -Eq '^(filter (add|delete)|actions delete)' "$work/events"
 [[ -z "$(trap -p RETURN)" ]]
 '''
         result = subprocess.run(
@@ -1295,7 +1339,7 @@ install() {
 outer() { apply_limits; }
 outer
 [[ -z "$(trap -p RETURN)" ]]
-[[ "$(grep -c '^filter add dev ens3 .* flower ' "$work/events")" == 2 ]]
+[[ "$(grep -c '^filter add dev ens3 .* flower ' "$work/events")" == 1 ]]
 [[ "$(grep -c '^filter add dev ens3 .* u32 ' "$work/events")" == 2 ]]
 [[ "$(grep -c 'u32 .* action police rate 2000mbit ' "$work/events")" == 2 ]]
 grep -q 'u32 .* match ip dst 217.19.122.109/32 match ip dport 443 .* index 3900001' "$work/events"
@@ -1703,12 +1747,14 @@ unset KTO_HAPROXY_MAXCONN
         bounded_command = function_body(KTO, "run_bounded_command")
         stale_listeners = function_body(KTO, "kill_stale_haproxy_route_listeners")
         socket_details = function_body(KTO, "haproxy_tcp_port_socket_details")
+        socket_probe = function_body(KTO, "haproxy_tcp_port_has_socket")
         failure_details = function_body(KTO, "print_haproxy_failure_details")
         package = function_body(KTO, "ensure_haproxy_package")
 
         self.assertIn('haproxy_missing_listener_ports "$routes_file"', wait_for_routes)
         self.assertIn('run_systemctl_bounded 3 is-active --quiet haproxy', wait_for_routes)
-        self.assertIn('ss -H -ltnp', missing_listeners)
+        self.assertIn('haproxy_tcp_listener_endpoints', missing_listeners)
+        self.assertNotIn('ss -H -ltnp', missing_listeners)
         self.assertNotIn('haproxy_tcp_port_owned_by_haproxy', missing_listeners)
         self.assertIn('wait_for_haproxy_routes "$routes_file"', reload)
         self.assertIn('start_haproxy_cleanly "$routes_file"', reload)
@@ -1729,7 +1775,11 @@ unset KTO_HAPROXY_MAXCONN
         self.assertIn('ss -K state connected', stale_listeners)
         self.assertIn('ss -H -tanp', socket_details)
         self.assertIn('sport = :${wanted}', socket_details)
+        self.assertIn('run_bounded_command 3', socket_probe)
+        self.assertIn('return 0', socket_probe)
         self.assertIn('journalctl -u haproxy -n 40', failure_details)
+        self.assertIn('ss -H -ltn', failure_details)
+        self.assertNotIn('ss -H -ltnp', failure_details)
         self.assertIn('run_systemctl_bounded 5 show haproxy -p LimitNOFILE', failure_details)
         self.assertIn('haproxy socat iproute2', package)
 
@@ -1984,6 +2034,7 @@ printf '443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\n8443\t5
 render_haproxy_routes_config "$routes" "$config"
 grep -q '^    maxpipes 0$' "$config"
 grep -q '^    nosplice$' "$config"
+grep -q '^    timeout check 5s$' "$config"
 ! grep -q 'option splice-' "$config"
 grep -q '^frontend vless_in$' "$config"
 grep -q '^frontend vless_in_8443$' "$config"
