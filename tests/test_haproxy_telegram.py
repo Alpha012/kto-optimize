@@ -223,6 +223,39 @@ class TelegramHaproxyTests(unittest.TestCase):
         renamed = dict(self.node, id="New name", name="New name")
         self.assertEqual(self.collector.desired_haproxy_routes_for_node(renamed), routes)
 
+    def test_acknowledged_route_command_does_not_restore_later_local_delete(self):
+        routes = self.collector.reported_haproxy_routes_for_node(self.node)
+        self.collector.set_haproxy_routes_for_node(self.node, routes)
+
+        self.assertEqual(self.collector.acknowledge_haproxy_desired_state(self.node), ["routes"])
+        self.assertIsNone(self.collector.desired_haproxy_routes_for_node(self.node))
+
+        locally_changed = dict(self.node, haproxy_routes=[routes[0]])
+        effective, source = self.collector.effective_haproxy_routes_for_node(locally_changed)
+        self.assertEqual(source, "node")
+        self.assertEqual(effective, [routes[0]])
+
+    def test_unapplied_route_command_stays_pending(self):
+        desired = self.collector.reported_haproxy_routes_for_node(self.node)[:1]
+        self.collector.set_haproxy_routes_for_node(self.node, desired)
+
+        self.assertEqual(self.collector.acknowledge_haproxy_desired_state(self.node), [])
+        self.assertEqual(self.collector.desired_haproxy_routes_for_node(self.node), desired)
+
+    def test_route_ack_preserves_pending_bandwidth_command(self):
+        routes = self.collector.reported_haproxy_routes_for_node(self.node)
+        desired_limits = [{"ip": "10.0.0.2", "rate_mbit": 1500}]
+        self.collector.set_haproxy_routes_for_node(self.node, routes)
+        self.collector.set_haproxy_bandwidth_limits_for_node(self.node, desired_limits)
+
+        self.assertEqual(self.collector.acknowledge_haproxy_desired_state(self.node), ["routes"])
+        self.assertIsNone(self.collector.desired_haproxy_routes_for_node(self.node))
+        self.assertEqual(self.collector.desired_haproxy_bandwidth_limits_for_node(self.node), desired_limits)
+
+        updated = dict(self.node, haproxy_bandwidth_limits=desired_limits)
+        self.assertEqual(self.collector.acknowledge_haproxy_desired_state(updated), ["bandwidth"])
+        self.assertIsNone(self.collector.desired_haproxy_bandwidth_limits_for_node(updated))
+
     def test_bandwidth_change_preserves_routes_and_other_limits(self):
         self.collector.set_pending_haproxy(
             self.chat_id,
@@ -546,6 +579,7 @@ class HaproxyTransportContractTests(unittest.TestCase):
         self.assertIn("haproxy-remote-apply", kto)
         self.assertIn("haproxy-bandwidth-remote-apply", kto)
         self.assertIn('apply_haproxy_routes_config "$routes_file"', kto)
+        self.assertIn("acknowledge_haproxy_desired_state(node)", collector)
         self.assertIn('response["haproxy_routes"] = desired_haproxy_routes', collector)
         self.assertIn('response["haproxy_bandwidth_limits"] = desired_haproxy_bandwidth', collector)
 

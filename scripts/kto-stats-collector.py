@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v302"
+COLLECTOR_BUILD = "v303"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -5230,6 +5230,54 @@ def set_haproxy_bandwidth_limits_for_node(node, limits):
     return limits
 
 
+def acknowledge_haproxy_desired_state(node):
+    if not isinstance(node, dict):
+        return []
+    key = haproxy_state_key(node)
+    aliases = node_alias_keys(node)
+    routes_supported = bool(node.get("haproxy_routes_supported"))
+    bandwidth_supported = bool(node.get("haproxy_bandwidth_supported"))
+    reported_routes = reported_haproxy_routes_for_node(node) if routes_supported else []
+    reported_limits = reported_haproxy_bandwidth_limits_for_node(node) if bandwidth_supported else []
+    acknowledged = []
+
+    with LOCK:
+        nodes = HAPROXY_STATE.setdefault("nodes", {})
+        stored_key = key if isinstance(nodes.get(key), dict) else ""
+        if not stored_key:
+            for candidate, value in nodes.items():
+                if canonical_node_key(candidate) in aliases and isinstance(value, dict):
+                    stored_key = candidate
+                    break
+        if not stored_key:
+            return []
+
+        item = dict(nodes[stored_key])
+        if routes_supported and "routes" in item:
+            desired_routes = normalize_haproxy_routes(item.get("routes"))
+            if desired_routes and haproxy_routes_equal(desired_routes, reported_routes):
+                item.pop("routes", None)
+                item.pop("updated_at", None)
+                acknowledged.append("routes")
+        if bandwidth_supported and "bandwidth_limits" in item:
+            desired_limits = normalize_haproxy_bandwidth_limits(item.get("bandwidth_limits"))
+            if haproxy_bandwidth_limits_equal(desired_limits, reported_limits):
+                item.pop("bandwidth_limits", None)
+                item.pop("bandwidth_updated_at", None)
+                acknowledged.append("bandwidth")
+
+        if not acknowledged:
+            return []
+        if "routes" not in item and "bandwidth_limits" not in item:
+            nodes.pop(stored_key, None)
+        else:
+            nodes[stored_key] = item
+        save_haproxy_state()
+
+    log(f"haproxy command acknowledged node={key or stored_key}: {','.join(acknowledged)}")
+    return acknowledged
+
+
 def cleanup_haproxy_sessions_unlocked(current=None):
     current = int(current or now_ts())
     changed = False
@@ -8669,6 +8717,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8"))
             remote_ip = self.client_address[0] if self.client_address else ""
             node = update_node(payload, remote_ip)
+            acknowledge_haproxy_desired_state(node)
             response = {
                 "ok": True,
                 "id": node["id"],
