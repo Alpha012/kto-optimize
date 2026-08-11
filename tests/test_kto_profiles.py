@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v299"', KTO)
-        self.assertIn('PUSH_BUILD="v299"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v299"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v299"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v299"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v299"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v299"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v300"', KTO)
+        self.assertIn('PUSH_BUILD="v300"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v300"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v300"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v300"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v300"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v300"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -1165,6 +1165,7 @@ grep -Fq $'D\tvless_pool/xray2\tDOWN\tL4TOUT' <<< "$report"
         set_limit = function_body(KTO, "set_haproxy_input_bandwidth_limit")
         commit = function_body(KTO, "commit_haproxy_bandwidth_config")
         apply_routes = function_body(KTO, "apply_haproxy_routes_config")
+        reapply = function_body(KTO, "reapply_haproxy_bandwidth_limits")
 
         self.assertIn('tc qdisc add dev "$interface" clsact', ensure_clsact)
         self.assertNotIn(' root ', ensure_clsact)
@@ -1184,6 +1185,9 @@ grep -Fq $'D\tvless_pool/xray2\tDOWN\tL4TOUT' <<< "$report"
         self.assertIn('haproxy_input_ip_available "$input_ip"', set_limit)
         self.assertIn('Возвращаю предыдущие лимиты', commit)
         self.assertIn('reapply_haproxy_bandwidth_limits', apply_routes)
+        self.assertIn('skip_bandwidth_reapply', apply_routes)
+        self.assertIn('require_local_haproxy_bandwidth_manager', reapply)
+        self.assertNotIn('ensure_haproxy_bandwidth_manager', reapply)
         self.assertIn('haproxy-limit|haproxy-bandwidth-limit', KTO)
         self.assertIn('haproxy-limit-off|haproxy-bandwidth-off', KTO)
         self.assertIn('haproxy-limit-status|haproxy-bandwidth-status', KTO)
@@ -1346,6 +1350,52 @@ grep -q 'u32 .* match ip dst 217.19.122.109/32 match ip dport 443 .* index 39000
 grep -q 'u32 .* match ip src 217.19.122.109/32 match ip sport 443 .* index 3900002' "$work/events"
 [[ "$(grep -c $'^F\t' "$STATE_FILE")" == 2 ]]
 [[ "$(grep -c $'^A\t' "$STATE_FILE")" == 2 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_route_reapply_uses_only_local_bandwidth_manager(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export EVENTS="$work/events"
+export KTO_HAPROXY_BANDWIDTH_MANAGER="$work/manager"
+export KTO_HAPROXY_BANDWIDTH_SERVICE="manager.service"
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+cat > "$HAPROXY_BANDWIDTH_MANAGER" <<'EOF'
+#!/usr/bin/env bash
+printf 'manager:%s\n' "$*" >> "$EVENTS"
+EOF
+chmod +x "$HAPROXY_BANDWIDTH_MANAGER"
+ensure_haproxy_bandwidth_manager() {
+    printf 'network-install\n' >> "$EVENTS"
+    return 99
+}
+require_local_haproxy_bandwidth_manager() {
+    printf 'local-check\n' >> "$EVENTS"
+}
+run_bounded_command() {
+    shift
+    "$@"
+}
+run_systemctl_bounded() { return 1; }
+reapply_haproxy_bandwidth_limits
+grep -Fqx 'local-check' "$EVENTS"
+grep -Fqx 'manager:apply' "$EVENTS"
+! grep -q '^network-install$' "$EVENTS"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -1782,6 +1832,8 @@ unset KTO_HAPROXY_MAXCONN
         self.assertNotIn('ss -H -ltnp', failure_details)
         self.assertIn('run_systemctl_bounded 5 show haproxy -p LimitNOFILE', failure_details)
         self.assertIn('haproxy socat iproute2', package)
+        self.assertIn('command_exists haproxy && command_exists ss', package)
+        self.assertNotIn('command_exists haproxy && command_exists socat', package)
 
         bash = bash_executable()
         if bash is None:
@@ -2138,16 +2190,20 @@ grep -Fqx $'443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112
 
         harness = r'''
 source <(sed '/^main /d' kto.sh)
+SUDO=()
 routes=$(mktemp)
 applied=$(mktemp)
 events=$(mktemp)
 output=$(mktemp)
-trap 'rm -f "$routes" "$applied" "$events" "$output"' EXIT
+export HAPROXY_BANDWIDTH_CONFIG="$routes.limits"
+trap 'rm -f "$routes" "$routes.limits" "$applied" "$events" "$output"' EXIT
 printf '443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112\n443\t5.34.179.143:443\tb.example.com\t217.19.122.48\tdefault\t217.19.122.48\n8443\t5.34.179.144:443\tc.example.com\t217.19.122.48\tdefault\t217.19.122.48\n8444\t5.34.179.145:443\td.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
-apply_haproxy_routes_config() { cp "$1" "$applied"; }
+printf '217.19.122.48\t2000\n' > "$HAPROXY_BANDWIDTH_CONFIG"
+apply_haproxy_routes_config() { cp "$1" "$applied"; printf 'route-apply:%s\n' "${2:-0}" >> "$events"; }
 sync_haproxy_firewall() { printf 'sync\n' >> "$events"; }
 haproxy_bandwidth_current_rate() { return 0; }
 remove_haproxy_input_bandwidth_limit() { printf 'limit-removed:%s\n' "$1" >> "$events"; }
+reapply_haproxy_bandwidth_limits() { printf 'tc-reapply\n' >> "$events"; }
 delete_haproxy_route "$routes" <<< $'2\n2\ny' > "$output" 2>&1
 grep -q 'Выберите входной IP маршрута:' "$output"
 grep -q '217.19.122.48 | портов: 443, 8443, 8444' "$output"
@@ -2159,6 +2215,8 @@ grep -Fqx $'8444\t5.34.179.145:443\td.example.com\t217.19.122.48\tdefault\t217.1
 ! grep -q $'^8443\t' "$routes"
 cmp -s "$routes" "$applied"
 grep -Fqx 'sync' "$events"
+grep -Fqx 'route-apply:1' "$events"
+[[ "$(grep -c '^tc-reapply$' "$events")" == 1 ]]
 ! grep -q '^limit-removed:' "$events"
 '''
         result = subprocess.run(
@@ -2178,12 +2236,15 @@ grep -Fqx 'sync' "$events"
 
         harness = r'''
 source <(sed '/^main /d' kto.sh)
+SUDO=()
 routes=$(mktemp)
 events=$(mktemp)
 output=$(mktemp)
-trap 'rm -f "$routes" "$events" "$output"' EXIT
+export HAPROXY_BANDWIDTH_CONFIG="$routes.limits"
+trap 'rm -f "$routes" "$routes.limits" "$events" "$output"' EXIT
 printf '443\t89.144.8.3:443\ta.example.com\tdefault\tdefault\t78.159.250.112\n443\t5.34.179.144:443\tb.example.com\t217.19.122.48\tdefault\t217.19.122.48\n' > "$routes"
-apply_haproxy_routes_config() { return 0; }
+printf '217.19.122.48\t2000\n' > "$HAPROXY_BANDWIDTH_CONFIG"
+apply_haproxy_routes_config() { printf 'route-apply:%s\n' "${2:-0}" >> "$events"; }
 sync_haproxy_firewall() { printf 'sync\n' >> "$events"; }
 haproxy_bandwidth_current_rate() {
     if [[ "$1" == '217.19.122.48' ]]; then
@@ -2191,7 +2252,7 @@ haproxy_bandwidth_current_rate() {
     fi
     return 0
 }
-remove_haproxy_input_bandwidth_limit() { printf 'limit-removed:%s\n' "$1" >> "$events"; }
+remove_haproxy_input_bandwidth_limit() { printf 'limit-removed:%s:%s\n' "$1" "${2:-latest}" >> "$events"; }
 cp "$routes" "$routes.cancelled"
 delete_haproxy_route "$routes" <<< $'2\nn' > "$output" 2>&1
 cmp -s "$routes" "$routes.cancelled"
@@ -2199,7 +2260,9 @@ cmp -s "$routes" "$routes.cancelled"
 rm -f "$routes.cancelled"
 delete_haproxy_route "$routes" <<< $'2\ny' > "$output" 2>&1
 [[ "$(wc -l < "$routes")" == 1 ]]
-grep -Fqx 'limit-removed:217.19.122.48' "$events"
+grep -Fqx 'route-apply:1' "$events"
+grep -Fqx 'limit-removed:217.19.122.48:local' "$events"
+[[ "$(grep -c '^limit-removed:' "$events")" == 1 ]]
 cp "$routes" "$routes.before"
 if delete_haproxy_route "$routes" > "$output" 2>&1; then
     exit 1
