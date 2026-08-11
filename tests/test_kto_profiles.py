@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v308"', KTO)
-        self.assertIn('PUSH_BUILD="v308"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v308"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v308"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v308"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v308"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v308"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v309"', KTO)
+        self.assertIn('PUSH_BUILD="v309"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v309"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v309"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v309"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v309"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v309"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -693,19 +693,29 @@ ensure_hostname_hosts_entry
     def test_additional_ip_menu_uses_openstack_ports_and_source_routing(self):
         menu = function_body(KTO, "menu")
         wrapper = function_body(KTO, "setup_additional_ips")
+        optimizer_wrapper = function_body(KTO, "optimize_additional_ip_networks")
         setup = function_body(ADDITIONAL_IPS, "setup_additional_ips")
+        optimizer = function_body(ADDITIONAL_IPS, "optimize_all_ip_networks")
         apply_netplan = function_body(ADDITIONAL_IPS, "apply_managed_netplan")
         render = function_body(ADDITIONAL_IPS, "render_netplan")
 
         self.assertIn('labels+=("Проверить и завести дополнительные IP")', menu)
         self.assertIn('actions+=("additional-ips")', menu)
+        self.assertIn('labels+=("Оптимизировать сеть всех IP")', menu)
+        self.assertIn('actions+=("additional-ips-optimize")', menu)
         self.assertIn('ensure_additional_ip_manager', wrapper)
+        self.assertIn('ensure_additional_ip_manager', optimizer_wrapper)
+        self.assertIn('"$ADDITIONAL_IP_MANAGER" optimize', optimizer_wrapper)
         self.assertIn('fetch_openstack_metadata "$metadata_file"', setup)
         self.assertIn('setup_existing_source_routes', setup)
         self.assertIn('openstack_ipv4_port_macs "$metadata_file"', setup)
         self.assertIn('wait_for_dhcp "${names[@]}"', setup)
         self.assertIn('remove_duplicate_primary_addresses', setup)
         self.assertIn('write_multiwan_sysctl', setup)
+        self.assertIn('install_source_route_manager "$final_state"', setup)
+        self.assertIn('discover_existing_extra_state', optimizer)
+        self.assertIn('install_source_route_manager "$state_file"', optimizer)
+        self.assertNotIn('netplan apply', optimizer)
         self.assertIn('main_route_healthy', apply_netplan)
         self.assertIn('restore_managed_netplan', apply_netplan)
         self.assertIn('routing-policy:', render)
@@ -821,8 +831,8 @@ trap 'rm -f "$state" "$runner"' EXIT
 discover_existing_extra_state ens3 78.159.250.112 "$state"
 [[ "$DISCOVERED_EXTRA_COUNT" == 2 ]]
 [[ "$DISCOVERED_SKIPPED_COUNT" == 0 ]]
-grep -q '^wan2|.*|185.141.227.93/26|185.141.227.65|185.141.227.64/26|5201|15201$' "$state"
-grep -q '^wan3|.*|217.19.122.48/24|217.19.122.1|217.19.122.0/24|5202|15202$' "$state"
+grep -q '^wan2|.*|185.141.227.93/26|185.141.227.65|185.141.227.64/26|102|10200$' "$state"
+grep -q '^wan3|.*|217.19.122.48/24|217.19.122.1|217.19.122.0/24|103|10300$' "$state"
 ! grep -q 'docker0' "$state"
 MANAGED_ROUTE_STATE_FILE=/etc/kto-additional-ip-routes.conf
 render_source_route_script "$runner"
@@ -830,7 +840,152 @@ bash -n "$runner"
 grep -q 'route replace.*scope link table' "$runner"
 grep -q 'route replace default via.*onlink table' "$runner"
 grep -q 'rule add from.*table.*priority' "$runner"
+grep -q 'source_rule_count' "$runner"
+grep -q 'rule_count.*!=.*1' "$runner"
 ! grep -q 'route flush table' "$runner"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_additional_ip_self_heal_is_idempotent_and_timed(self):
+        install_manager = function_body(ADDITIONAL_IPS, "install_source_route_manager")
+        restore_manager = function_body(ADDITIONAL_IPS, "restore_source_route_manager")
+        self.assertNotIn('remove_source_routes_from_state "$MANAGED_ROUTE_STATE_FILE"', install_manager)
+        self.assertIn('remove_obsolete_source_routes', install_manager)
+        self.assertIn('if (( had_state == 1 )); then', restore_manager)
+        self.assertIn('Runtime source routes оставлены рабочими', restore_manager)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' scripts/kto-additional-ips.sh)
+unit=$(mktemp)
+timer=$(mktemp)
+trap 'rm -f "$unit" "$timer"' EXIT
+ROUTE_HEAL_INTERVAL_SEC=75
+render_source_route_unit "$unit"
+render_source_route_timer "$timer"
+grep -q '^Type=oneshot$' "$unit"
+grep -q '^TimeoutStartSec=45$' "$unit"
+! grep -q '^RemainAfterExit=yes$' "$unit"
+grep -q '^OnUnitActiveSec=75s$' "$timer"
+grep -q '^Unit=kto-additional-ip-routes.service$' "$timer"
+grep -q '^Persistent=true$' "$timer"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_additional_ip_self_heal_does_not_recreate_healthy_rule(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' scripts/kto-additional-ips.sh)
+state=$(mktemp)
+runner=$(mktemp)
+events=$(mktemp)
+trap 'rm -f "$state" "$runner" "$events"' EXIT
+printf 'wan2|aa|500|185.141.227.93/26|185.141.227.65|185.141.227.64/26|102|10200\n' > "$state"
+MANAGED_ROUTE_STATE_FILE="$state"
+render_source_route_script "$runner"
+rule_mode=present
+route_mode=present
+ip() {
+    if [[ "${1:-}" == -4 && "${2:-}" == -o && "${3:-}" == address && "${4:-}" == show ]]; then
+        printf '2: wan2 inet 185.141.227.93/26 scope global wan2\n'
+    elif [[ "${1:-}" == -4 && "${2:-}" == rule && "${3:-}" == show ]]; then
+        [[ "$rule_mode" == present ]] && printf '10200: from 185.141.227.93 lookup 102\n'
+    elif [[ "${1:-}" == -4 && "${2:-}" == route && "${3:-}" == show ]]; then
+        if [[ "$route_mode" == present && "${6:-}" == default ]]; then
+            printf 'default via 185.141.227.65 dev wan2 onlink\n'
+        elif [[ "$route_mode" == present ]]; then
+            printf '185.141.227.64/26 dev wan2 scope link src 185.141.227.93\n'
+        fi
+    elif [[ "${1:-}" == -4 && "${2:-}" == route && "${3:-}" == replace ]]; then
+        printf 'route-replace\n' >> "$events"
+    elif [[ "${1:-}" == -4 && "${2:-}" == rule && "${3:-}" == del ]]; then
+        printf 'rule-del\n' >> "$events"
+        return 1
+    elif [[ "${1:-}" == -4 && "${2:-}" == rule && "${3:-}" == add ]]; then
+        printf 'rule-add\n' >> "$events"
+    elif [[ "${1:-}" == -4 && "${2:-}" == route && "${3:-}" == flush ]]; then
+        :
+    else
+        return 1
+    fi
+}
+sleep() { :; }
+( set +e; set +o pipefail; source "$runner" )
+! grep -q '^route-replace$' "$events"
+! grep -q '^rule-del$' "$events"
+! grep -q '^rule-add$' "$events"
+: > "$events"
+rule_mode=missing
+route_mode=missing
+( set +e; set +o pipefail; source "$runner" )
+grep -q '^route-replace$' "$events"
+grep -q '^rule-del$' "$events"
+grep -q '^rule-add$' "$events"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_multiwan_sysctl_covers_physical_interfaces_only(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' scripts/kto-additional-ips.sh)
+root=$(mktemp -d)
+config=$(mktemp)
+trap 'rm -rf "$root" "$config"' EXIT
+mkdir -p "$root/ens3" "$root/wan2" "$root/docker0" "$root/wg0"
+IPV4_CONF_ROOT="$root"
+MANAGED_SYSCTL_FILE="$config"
+LOG_FILE=/dev/null
+sysctl() { :; }
+write_multiwan_sysctl
+grep -q '^net.ipv4.conf.ens3.rp_filter=2$' "$config"
+grep -q '^net.ipv4.conf.ens3.arp_notify=1$' "$config"
+grep -q '^net.ipv4.conf.wan2.arp_filter=1$' "$config"
+grep -q '^net.ipv4.conf.wan2.arp_announce=2$' "$config"
+! grep -q 'docker0' "$config"
+! grep -q 'wg0' "$config"
+printf 'old-config\n' > "$config"
+sysctl_calls=0
+sysctl() {
+    sysctl_calls=$((sysctl_calls + 1))
+    (( sysctl_calls > 1 ))
+}
+if write_multiwan_sysctl; then
+    exit 1
+fi
+grep -qx 'old-config' "$config"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -979,10 +1134,13 @@ network_for_cidr() {
 disable_legacy_alias_file() { :; }
 remove_duplicate_primary_addresses() { :; }
 write_multiwan_sysctl() { :; }
+install_count=0
+install_source_route_manager() { install_count=$((install_count + 1)); }
 sleep() { :; }
 print_result_table() { :; }
 setup_additional_ips
 [[ "$apply_count" == 2 ]]
+[[ "$install_count" == 1 ]]
 grep -q '^    wan2:$' "$first"
 ! grep -q 'routing-policy:' "$first"
 grep -q '^    wan2:$' "$second"
@@ -1025,6 +1183,44 @@ output=$(print_result_table ens3 78.159.250.112 "$state" 2>&1)
 grep -q '185.141.227.93.*46.243.235.141.*NAT' <<< "$output"
 grep -q 'Дополнительные IP имеют доступ в интернет: 1/1' <<< "$output"
 grep -q 'через NAT/прокси: 1' <<< "$output"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_additional_ip_parallel_probe_keeps_rows_aligned_and_checks_primary(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' scripts/kto-additional-ips.sh)
+state=$(mktemp)
+probes=$(mktemp -d)
+trap 'rm -rf "$state" "$probes"' EXIT
+printf '%s\n' \
+  'wan2|aa|500||||102|10200' \
+  'wan3|bb|501|217.19.122.48/24|217.19.122.1|217.19.122.0/24|103|10300' > "$state"
+bound_public_ip() {
+    case "$1" in
+        217.19.122.48) printf '217.19.122.48\n' ;;
+        *) return 1 ;;
+    esac
+}
+PROBE_CONCURRENCY=2
+collect_bound_public_ip_probes 78.159.250.112 "$state" "$probes"
+[[ ! -s "$probes/0" ]]
+[[ ! -s "$probes/1" ]]
+grep -qx '217.19.122.48' "$probes/2"
+ip() { printf '1.1.1.1 from 217.19.122.48 via 217.19.122.1 dev wan3 table 103\n'; }
+output=$(print_result_table ens3 78.159.250.112 <(tail -n 1 "$state") 2>&1) && exit 1
+grep -q 'Основной IP не прошёл HTTPS-проверку' <<< "$output"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

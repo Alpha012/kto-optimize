@@ -258,7 +258,7 @@ class TelegramHaproxyTests(unittest.TestCase):
             haproxy_apply_result={
                 "status": "ok",
                 "message": "routes applied",
-                "build": "v308",
+                "build": "v309",
                 "routes": len(desired),
                 "updated_at": 10,
                 "command_id": command_id,

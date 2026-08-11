@@ -598,7 +598,7 @@ class CollectorRegressionTests(unittest.TestCase):
             self.payload("Германия", str(uuid.uuid4()), "bl"),
             "203.0.113.39",
         )
-        node["push_build"] = "v308"
+        node["push_build"] = "v309"
 
         collector.queue_update_task("test", scope="panel", local_required=True)
         self.assertIsNone(collector.update_task_for_node(node))

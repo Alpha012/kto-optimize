@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v308"
+SCRIPT_BUILD="v309"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5400,6 +5400,15 @@ setup_additional_ips() {
     must "Установка сетевых зависимостей" apt_install_with_update_if_missing curl python3 iproute2 netplan.io procps
     ensure_additional_ip_manager
     "${SUDO[@]}" "$ADDITIONAL_IP_MANAGER" setup
+}
+
+optimize_additional_ip_networks() {
+    header
+    need_root
+    stage "Проверяю и восстанавливаю сеть всех IP"
+    must "Установка сетевых зависимостей" apt_install_with_update_if_missing curl python3 iproute2 netplan.io procps
+    ensure_additional_ip_manager
+    "${SUDO[@]}" "$ADDITIONAL_IP_MANAGER" optimize
 }
 
 install_remna_egress_manager() {
@@ -10940,6 +10949,8 @@ menu() {
     if [[ "$MACHINE_MODE" != "panel" ]]; then
         labels+=("Проверить и завести дополнительные IP")
         actions+=("additional-ips")
+        labels+=("Оптимизировать сеть всех IP")
+        actions+=("additional-ips-optimize")
     fi
     if [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_reality; then
         labels+=("Исходящий IP Remnawave")
@@ -11022,6 +11033,7 @@ menu() {
         network-test) network_test ;;
         dpi-test) run_dpi_detector ;;
         additional-ips) setup_additional_ips || true ;;
+        additional-ips-optimize) optimize_additional_ip_networks || true ;;
         remnawave-egress) configure_remnawave_egress || true ;;
         stats-collector) install_stats_collector ;;
         stats-collector-status) stats_collector_status ;;
@@ -11088,6 +11100,7 @@ main() {
         network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" ;;
         dpi-test|dpi-detector|tspu-test|tspu) run_dpi_detector "${2:-}" ;;
         additional-ips|extra-ips|multi-ip|multiwan) setup_additional_ips ;;
+        additional-ips-optimize|extra-ips-optimize|multi-ip-optimize|multiwan-optimize|network-repair) optimize_additional_ip_networks ;;
         remnawave-egress|remna-egress|reality-egress|xray-egress) shift; configure_remnawave_egress "${1:-menu}" ;;
         speedtest) install_speedtest "${2:-}" "${3:-}" ;;
         speedtest-ru|speedtestru|bench-ru|benchru) speedtest_ru "${2:-}" ;;
