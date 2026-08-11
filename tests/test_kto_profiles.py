@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v301"', KTO)
-        self.assertIn('PUSH_BUILD="v301"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v301"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v301"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v301"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v301"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v301"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v302"', KTO)
+        self.assertIn('PUSH_BUILD="v302"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v302"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v302"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v302"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v302"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v302"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2115,6 +2115,7 @@ expected=$'443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\n8443
 
         harness = r'''
 source <(sed '/^main /d' kto.sh)
+set -u
 SUDO=()
 routes=$(mktemp)
 config=$(mktemp)
@@ -2136,6 +2137,7 @@ expected=$'443\t89.144.8.3:443\tany\tdefault\n8443\t5.34.179.144:443\tstrict.exa
 [[ "$(normalize_haproxy_sni_list '*')" == any ]]
 ! normalize_haproxy_sni_list 'any strict.example.com'
 [[ "$(print_haproxy_route 9443 1.2.3.4:443 '' default)" == $'9443\t1.2.3.4:443\tany\tdefault' ]]
+[[ "$(ask_haproxy_sni_list SNI <<< '')" == any ]]
 [[ "$(ask_haproxy_sni_list SNI old.example.com <<< '')" == any ]]
 [[ "$(ask_haproxy_sni_list SNI old.example.com <<< '=')" == old.example.com ]]
 '''
