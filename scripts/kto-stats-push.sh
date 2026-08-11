@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v304"
+PUSH_BUILD="v305"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
@@ -675,7 +675,10 @@ read_haproxy_routes() {
         echo "push ${PUSH_BUILD}: HAProxy route report is invalid" >&2
         return 0
     fi
-    haproxy_routes="$(printf '%s' "$reported" | jq -c 'map(.sni = ((.sni // []) | sort)) | sort_by(.listen_ip, .port)' 2>/dev/null || echo '[]')"
+    haproxy_routes="$(printf '%s' "$reported" | jq -c '
+        map(.sni = ((.sni // []) | sort) | .send_proxy_v2 = (.send_proxy_v2 == true))
+        | sort_by(.listen_ip, .port)
+    ' 2>/dev/null || echo '[]')"
     haproxy_routes_supported=true
     if [[ ! -s /etc/haproxy/haproxy.cfg ]] || grep -Fq '# Managed by kto. Edit routes through the HAProxy menu.' /etc/haproxy/haproxy.cfg 2>/dev/null; then
         haproxy_routes_managed=true
@@ -728,7 +731,8 @@ apply_collector_haproxy_routes() {
             sni: ((.sni // []) | sort),
             source_ip: (.source_ip // "default"),
             server_maxconn: (.server_maxconn // "default"),
-            listen_ip: (.listen_ip // "*")
+            listen_ip: (.listen_ip // "*"),
+            send_proxy_v2: (.send_proxy_v2 == true)
           })
         | sort_by(.listen_ip, .port)
     ' 2>/dev/null || true)"
@@ -742,14 +746,20 @@ apply_collector_haproxy_routes() {
         write_haproxy_apply_result "error" "HAProxy helper unavailable" "$route_count"
         return 0
     fi
-    current="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-remote-report 2>/dev/null | jq -c 'map(.sni = ((.sni // []) | sort)) | sort_by(.listen_ip, .port)' 2>/dev/null || echo '[]')"
+    current="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-remote-report 2>/dev/null | jq -c '
+        map(.sni = ((.sni // []) | sort) | .send_proxy_v2 = (.send_proxy_v2 == true))
+        | sort_by(.listen_ip, .port)
+    ' 2>/dev/null || echo '[]')"
     if [[ "$(printf '%s' "$current" | jq -cS '.' 2>/dev/null || true)" == "$(printf '%s' "$desired" | jq -cS '.' 2>/dev/null || true)" ]]; then
         return 0
     fi
 
     output_file="$(mktemp)"
     if printf '%s' "$desired" | timeout 300 "$KTO_HAPROXY_HELPER" haproxy-remote-apply > "$output_file" 2>&1; then
-        after="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-remote-report 2>/dev/null | jq -c 'map(.sni = ((.sni // []) | sort)) | sort_by(.listen_ip, .port)' 2>/dev/null || echo '[]')"
+        after="$(timeout 8 "$KTO_HAPROXY_HELPER" haproxy-remote-report 2>/dev/null | jq -c '
+            map(.sni = ((.sni // []) | sort) | .send_proxy_v2 = (.send_proxy_v2 == true))
+            | sort_by(.listen_ip, .port)
+        ' 2>/dev/null || echo '[]')"
         if [[ "$(printf '%s' "$after" | jq -cS '.' 2>/dev/null || true)" == "$(printf '%s' "$desired" | jq -cS '.' 2>/dev/null || true)" ]]; then
             write_haproxy_apply_result "ok" "routes applied" "$route_count"
             echo "push ${PUSH_BUILD}: HAProxy routes applied count=${route_count}"

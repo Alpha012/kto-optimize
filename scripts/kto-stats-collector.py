@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v304"
+COLLECTOR_BUILD = "v305"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -760,6 +760,21 @@ def normalize_haproxy_server_maxconn(value):
     return number
 
 
+def normalize_haproxy_send_proxy_v2(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("", "0", "n", "no", "off", "false"):
+        return False
+    if text in ("1", "y", "yes", "on", "true"):
+        return True
+    raise ValueError("bad haproxy send-proxy-v2")
+
+
 def normalize_haproxy_route(value):
     if not isinstance(value, dict):
         raise ValueError("bad haproxy route")
@@ -780,6 +795,7 @@ def normalize_haproxy_route(value):
         "sni": sni,
         "source_ip": normalize_haproxy_source_ip(value.get("source_ip")),
         "server_maxconn": normalize_haproxy_server_maxconn(value.get("server_maxconn")),
+        "send_proxy_v2": normalize_haproxy_send_proxy_v2(value.get("send_proxy_v2")),
     }
 
 
@@ -5653,6 +5669,7 @@ def haproxy_route_editor_payload(node, token, selected_ip, port):
     listen_label = "Все IP (*)" if selected_ip == "*" else selected_ip
     maxconn = route.get("server_maxconn")
     maxconn_text = "автоматически" if maxconn == "default" else str(maxconn)
+    proxy_v2_enabled = bool(route.get("send_proxy_v2"))
     lines = [
         "<b>HAProxy маршрут</b>",
         ALERT_SEPARATOR,
@@ -5660,12 +5677,15 @@ def haproxy_route_editor_payload(node, token, selected_ip, port):
         detail_line("Вход", f"{listen_label}:{int(route['port'])}/tcp"),
         detail_line("Выходной IP", route.get("source_ip") or "default"),
         detail_line("Maxconn", maxconn_text),
+        detail_line("PROXY protocol v2", "Включён" if proxy_v2_enabled else "Выключен"),
         detail_line("Статус", haproxy_apply_status_text(node, desired, reported)),
         "",
         "<b>Backend:</b>",
         haproxy_route_values_block(route.get("targets") or []),
         "<b>SNI:</b>",
         haproxy_sni_values_block(route.get("sni") or []),
+        "",
+        "<i>Включай PROXY v2 только если backend ожидает PROXY protocol v2.</i>",
     ]
     rows = [
         [
@@ -5680,6 +5700,10 @@ def haproxy_route_editor_payload(node, token, selected_ip, port):
             {"text": "Выходной IP", "callback_data": f"hpx:f:{token}:{int(route['port'])}"},
             {"text": "Maxconn", "callback_data": f"hpx:j:{token}:{int(route['port'])}"},
         ],
+        [{
+            "text": f"PROXY v2: {'ON' if proxy_v2_enabled else 'OFF'}",
+            "callback_data": f"hpx:t:{token}:{int(route['port'])}",
+        }],
         [{"text": "Удалить маршрут", "callback_data": f"hpx:q:{token}:{int(route['port'])}"}],
         [
             {"text": "К маршрутам", "callback_data": f"hpx:s:{token}"},
@@ -6321,6 +6345,7 @@ def handle_pending_haproxy(chat_id, from_id, text):
             "sni": sni,
             "source_ip": selected_ip if selected_ip != "*" else "default",
             "server_maxconn": "default",
+            "send_proxy_v2": False,
         })
     try:
         set_haproxy_routes_for_node(node, updated)
@@ -6329,7 +6354,10 @@ def handle_pending_haproxy(chat_id, from_id, text):
         edit_haproxy_session_message(token, "<b>Маршрут не сохранён.</b>\n\nПроверка нашла конфликт входного IP или порта.")
         return True
     pop_pending_haproxy(chat_id, from_id)
-    show_haproxy_selected_ip(token)
+    if action == "add_sni":
+        show_haproxy_route_editor(token, port)
+    else:
+        show_haproxy_selected_ip(token)
     return True
 
 
@@ -6534,7 +6562,7 @@ def handle_haproxy_callback(callback):
         answer_callback(callback_id, "ожидает ближайший push")
         show_haproxy_route_editor(token, int(changed_route.get("port") or port))
         return True
-    if action in ("v", "k", "c", "o", "w", "f", "j"):
+    if action in ("v", "k", "c", "o", "w", "f", "j", "t"):
         if not value.isdigit():
             answer_callback(callback_id, "неверный порт")
             return True
@@ -6548,6 +6576,23 @@ def handle_haproxy_callback(callback):
         if action == "v":
             answer_callback(callback_id, "маршрут")
             show_haproxy_route_editor(token, port)
+            return True
+        if action == "t":
+            enabled = not bool(route.get("send_proxy_v2"))
+            try:
+                updated, changed_route = replace_haproxy_route(
+                    routes,
+                    selected_ip,
+                    port,
+                    send_proxy_v2=enabled,
+                )
+                set_haproxy_routes_for_node(node, updated)
+            except Exception as exc:
+                log(f"haproxy proxy-v2 save failed node={haproxy_state_key(node)}: {exc}")
+                answer_callback(callback_id, "не удалось сохранить")
+                return True
+            answer_callback(callback_id, "PROXY v2 включён" if enabled else "PROXY v2 выключен")
+            show_haproxy_route_editor(token, int(changed_route.get("port") or port))
             return True
         if action == "k":
             set_pending_haproxy(chat_id, from_id, "route_targets", token, listen_ip=selected_ip, port=port)

@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v304"', KTO)
-        self.assertIn('PUSH_BUILD="v304"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v304"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v304"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v304"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v304"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v304"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v305"', KTO)
+        self.assertIn('PUSH_BUILD="v305"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v305"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v305"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v305"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v305"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v305"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2133,6 +2133,43 @@ grep -q '^    acl allowed_sni req.ssl_sni -m end -i \.rog-self.co.uk$' "$config"
 actual=$(extract_haproxy_routes "$config")
 expected=$'443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\textra.example.com *.other.example.com\t185.141.227.93'
 [[ "$actual" == "$expected" ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_send_proxy_v2_is_per_route_and_defaults_off(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+set -u
+SUDO=()
+routes=$(mktemp)
+config=$(mktemp)
+parsed=$(mktemp)
+trap 'rm -f "$routes" "$config" "$parsed"' EXIT
+printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n8443\t5.34.179.144:443,5.34.179.145:443\textra.example.com\t185.141.227.93\t10000\t78.159.250.112\t1\n' > "$routes"
+render_haproxy_routes_config "$routes" "$config"
+grep -q '^    server xray1 89.144.8.3:443 check weight 10$' "$config"
+grep -q '^    server xray1 5.34.179.144:443 check weight 10 maxconn 10000 source 185.141.227.93 send-proxy-v2$' "$config"
+grep -q '^    server xray2 5.34.179.145:443 check weight 10 maxconn 10000 source 185.141.227.93 send-proxy-v2$' "$config"
+extract_haproxy_routes "$config" > "$parsed"
+haproxy_routes_round_trip_equal "$routes" "$parsed"
+[[ "$(tail -n 1 "$parsed")" == $'8443\t5.34.179.144:443,5.34.179.145:443\textra.example.com\t185.141.227.93\t10000\t78.159.250.112\t1' ]]
+[[ "$(print_haproxy_route 9443 1.2.3.4:443 any default default '*' 1)" == $'9443\t1.2.3.4:443\tany\tdefault\tdefault\t*\t1' ]]
+[[ "$(ask_haproxy_send_proxy_v2 0 <<< '')" == 0 ]]
+[[ "$(ask_haproxy_send_proxy_v2 0 <<< 'y')" == 1 ]]
+[[ "$(ask_haproxy_send_proxy_v2 1 <<< '')" == 1 ]]
+! normalize_haproxy_send_proxy_v2 maybe
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

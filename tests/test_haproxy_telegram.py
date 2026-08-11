@@ -315,10 +315,46 @@ class TelegramHaproxyTests(unittest.TestCase):
             8443,
         )
         self.assertIn("10.0.0.2:8443/tcp", editor_body)
+        self.assertIn("PROXY protocol v2", editor_body)
+        self.assertIn("Выключен", editor_body)
         labels = {button["text"] for row in editor_markup["inline_keyboard"] for button in row}
         self.assertTrue(
-            {"Backend", "SNI", "Входной IP", "Входной порт", "Выходной IP", "Maxconn", "Удалить маршрут"}.issubset(labels)
+            {"Backend", "SNI", "Входной IP", "Входной порт", "Выходной IP", "Maxconn", "PROXY v2: OFF", "Удалить маршрут"}.issubset(labels)
         )
+
+    def test_proxy_v2_button_toggles_only_selected_route(self):
+        callback = {
+            "id": "toggle-proxy-v2",
+            "data": f"hpx:t:{self.token}:8443",
+            "from": {"id": self.from_id},
+            "message": {"message_id": 77, "chat": {"id": self.chat_id}},
+        }
+
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        routes = self.collector.desired_haproxy_routes_for_node(self.node)
+        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443)
+        base = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 443)
+        self.assertTrue(changed["send_proxy_v2"])
+        self.assertFalse(base["send_proxy_v2"])
+
+        self.assertTrue(self.collector.handle_haproxy_callback(callback))
+        routes = self.collector.desired_haproxy_routes_for_node(self.node)
+        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443)
+        self.assertFalse(changed["send_proxy_v2"])
+
+    def test_proxy_v2_normalization_defaults_off_and_rejects_unknown_values(self):
+        route = self.collector.normalize_haproxy_route(self.node["haproxy_routes"][0])
+        self.assertFalse(route["send_proxy_v2"])
+        enabled = self.collector.normalize_haproxy_route({
+            **self.node["haproxy_routes"][0],
+            "send_proxy_v2": "yes",
+        })
+        self.assertTrue(enabled["send_proxy_v2"])
+        with self.assertRaises(ValueError):
+            self.collector.normalize_haproxy_route({
+                **self.node["haproxy_routes"][0],
+                "send_proxy_v2": "maybe",
+            })
 
     def test_backend_only_edit_preserves_sni_and_endpoint(self):
         self.collector.set_pending_haproxy(
@@ -579,6 +615,8 @@ class HaproxyTransportContractTests(unittest.TestCase):
         self.assertIn("haproxy-remote-apply", kto)
         self.assertIn("haproxy-bandwidth-remote-apply", kto)
         self.assertIn('apply_haproxy_routes_config "$routes_file"', kto)
+        self.assertIn('send-proxy-v2', kto)
+        self.assertIn('send_proxy_v2: (.send_proxy_v2 == true)', push)
         self.assertIn("acknowledge_haproxy_desired_state(node)", collector)
         self.assertIn('response["haproxy_routes"] = desired_haproxy_routes', collector)
         self.assertIn('response["haproxy_bandwidth_limits"] = desired_haproxy_bandwidth', collector)
