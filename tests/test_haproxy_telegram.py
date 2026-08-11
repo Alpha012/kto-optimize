@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -234,6 +235,130 @@ class TelegramHaproxyTests(unittest.TestCase):
         effective, source = self.collector.effective_haproxy_routes_for_node(locally_changed)
         self.assertEqual(source, "node")
         self.assertEqual(effective, [routes[0]])
+
+    def test_successful_command_id_does_not_restore_route_after_local_ip_change(self):
+        routes = self.collector.reported_haproxy_routes_for_node(self.node)
+        desired, _ = self.collector.replace_haproxy_route(
+            routes,
+            "10.0.0.2",
+            443,
+            listen_ip="10.0.0.3",
+        )
+        self.collector.set_haproxy_routes_for_node(self.node, desired)
+        command_id = self.collector.haproxy_state_item_for_node(self.node)["routes_command_id"]
+        locally_changed, _ = self.collector.replace_haproxy_route(
+            desired,
+            "10.0.0.3",
+            443,
+            listen_ip="10.0.0.4",
+        )
+        reported = dict(
+            self.node,
+            haproxy_routes=locally_changed,
+            haproxy_apply_result={
+                "status": "ok",
+                "message": "routes applied",
+                "build": "v308",
+                "routes": len(desired),
+                "updated_at": 10,
+                "command_id": command_id,
+            },
+        )
+
+        self.assertEqual(self.collector.acknowledge_haproxy_desired_state(reported), ["routes"])
+        self.assertIsNone(self.collector.desired_haproxy_routes_for_node(reported))
+        effective, source = self.collector.effective_haproxy_routes_for_node(reported)
+        self.assertEqual("node", source)
+        self.assertTrue(self.collector.haproxy_routes_equal(locally_changed, effective))
+
+    def test_newer_local_route_change_discards_undelivered_telegram_state(self):
+        routes = self.collector.reported_haproxy_routes_for_node(self.node)
+        desired, _ = self.collector.replace_haproxy_route(
+            routes,
+            "10.0.0.2",
+            443,
+            listen_ip="10.0.0.3",
+        )
+        self.collector.set_haproxy_routes_for_node(self.node, desired)
+        locally_changed, _ = self.collector.replace_haproxy_route(
+            routes,
+            "10.0.0.2",
+            443,
+            listen_ip="10.0.0.4",
+        )
+        reported = dict(self.node, haproxy_routes=locally_changed)
+
+        self.assertEqual(
+            self.collector.acknowledge_haproxy_desired_state(reported),
+            ["routes_local"],
+        )
+        self.assertIsNone(self.collector.desired_haproxy_routes_for_node(reported))
+        effective, source = self.collector.effective_haproxy_routes_for_node(reported)
+        self.assertEqual("node", source)
+        self.assertTrue(self.collector.haproxy_routes_equal(locally_changed, effective))
+
+    def test_empty_route_report_does_not_discard_pending_telegram_state(self):
+        desired = self.collector.reported_haproxy_routes_for_node(self.node)[:1]
+        self.collector.set_haproxy_routes_for_node(self.node, desired)
+        reported = dict(self.node, haproxy_routes=[])
+
+        self.assertEqual([], self.collector.acknowledge_haproxy_desired_state(reported))
+        self.assertTrue(
+            self.collector.haproxy_routes_equal(
+                desired,
+                self.collector.desired_haproxy_routes_for_node(reported),
+            )
+        )
+
+    def test_follow_up_telegram_edit_accepts_previous_desired_state_as_baseline(self):
+        routes = self.collector.reported_haproxy_routes_for_node(self.node)
+        first, _ = self.collector.replace_haproxy_route(
+            routes,
+            "10.0.0.2",
+            443,
+            listen_ip="10.0.0.3",
+        )
+        self.collector.set_haproxy_routes_for_node(self.node, first)
+        second, _ = self.collector.replace_haproxy_route(
+            first,
+            "10.0.0.3",
+            443,
+            listen_ip="10.0.0.4",
+        )
+        self.collector.set_haproxy_routes_for_node(self.node, second)
+        reported = dict(self.node, haproxy_routes=first)
+
+        self.assertEqual([], self.collector.acknowledge_haproxy_desired_state(reported))
+        self.assertTrue(
+            self.collector.haproxy_routes_equal(
+                second,
+                self.collector.desired_haproxy_routes_for_node(reported),
+            )
+        )
+
+    def test_legacy_pending_route_without_baseline_is_discarded_on_reload(self):
+        routes = self.collector.reported_haproxy_routes_for_node(self.node)
+        Path(self.collector.HAPROXY_CONTROL_FILE).write_text(
+            json.dumps({
+                "nodes": {
+                    self.collector.node_record_key(self.node): {
+                        "name": self.node["name"],
+                        "routes": routes,
+                        "routes_command_id": "a" * 32,
+                    }
+                },
+                "sessions": {},
+                "pending": {},
+            }),
+            encoding="utf-8",
+        )
+        self.collector.HAPROXY_STATE = {"nodes": {}, "sessions": {}, "pending": {}}
+
+        self.collector.load_haproxy_state()
+
+        self.assertIsNone(self.collector.desired_haproxy_routes_for_node(self.node))
+        persisted = json.loads(Path(self.collector.HAPROXY_CONTROL_FILE).read_text(encoding="utf-8"))
+        self.assertEqual({}, persisted["nodes"])
 
     def test_unapplied_route_command_stays_pending(self):
         desired = self.collector.reported_haproxy_routes_for_node(self.node)[:1]
@@ -698,7 +823,10 @@ class HaproxyTransportContractTests(unittest.TestCase):
         self.assertIn('response["haproxy_routes_command_id"]', collector)
         self.assertIn('response["haproxy_bandwidth_command_id"]', collector)
         self.assertIn('"${previous_command_id,,}" == "$command_id"', push)
-        self.assertGreaterEqual(push.count('previous_status" == "error"'), 2)
+        self.assertGreaterEqual(
+            push.count('( "$previous_status" == "ok" || "$previous_status" == "error" )'),
+            2,
+        )
 
 
 if __name__ == "__main__":

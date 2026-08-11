@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v307"
+COLLECTOR_BUILD = "v308"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -846,6 +846,24 @@ def haproxy_routes_equal(left, right):
     return normalize_haproxy_routes(left) == normalize_haproxy_routes(right)
 
 
+def haproxy_routes_fingerprint(values):
+    normalized = normalize_haproxy_routes(values)
+    return hashlib.sha256(
+        json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def clean_haproxy_base_hashes(values):
+    result = []
+    for value in values if isinstance(values, list) else []:
+        value = str(value or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", value) and value not in result:
+            result.append(value)
+        if len(result) >= 8:
+            break
+    return result
+
+
 def normalize_haproxy_apply_result(value):
     if not isinstance(value, dict):
         return {}
@@ -906,6 +924,13 @@ def normalize_haproxy_bandwidth_limits(values, strict=False):
 
 def haproxy_bandwidth_limits_equal(left, right):
     return normalize_haproxy_bandwidth_limits(left) == normalize_haproxy_bandwidth_limits(right)
+
+
+def haproxy_bandwidth_fingerprint(values):
+    normalized = normalize_haproxy_bandwidth_limits(values)
+    return hashlib.sha256(
+        json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def normalize_haproxy_bandwidth_apply_result(value):
@@ -1007,6 +1032,7 @@ def load_haproxy_state():
     clean_nodes = {}
     clean_sessions = {}
     clean_pending = {}
+    discarded_legacy_commands = 0
     current = now_ts()
     if isinstance(raw_nodes, dict):
         for key, item in raw_nodes.items():
@@ -1014,13 +1040,21 @@ def load_haproxy_state():
                 continue
             node_key = str(key or "").strip()[:200]
             routes = normalize_haproxy_routes(item.get("routes"))
+            route_base_hashes = clean_haproxy_base_hashes(item.get("routes_base_hashes"))
+            if routes and not route_base_hashes:
+                routes = []
+                discarded_legacy_commands += 1
             has_bandwidth_limits = isinstance(item.get("bandwidth_limits"), list)
             bandwidth_limits = []
+            bandwidth_base_hashes = clean_haproxy_base_hashes(item.get("bandwidth_base_hashes"))
             if has_bandwidth_limits:
                 try:
                     bandwidth_limits = normalize_haproxy_bandwidth_limits(item.get("bandwidth_limits"), strict=True)
                 except Exception:
                     has_bandwidth_limits = False
+            if has_bandwidth_limits and not bandwidth_base_hashes:
+                has_bandwidth_limits = False
+                discarded_legacy_commands += 1
             if not node_key or (not routes and not has_bandwidth_limits):
                 continue
             clean_item = {
@@ -1032,6 +1066,7 @@ def load_haproxy_state():
                 clean_item["routes_command_id"] = (
                     clean_haproxy_command_id(item.get("routes_command_id")) or new_haproxy_command_id()
                 )
+                clean_item["routes_base_hashes"] = route_base_hashes
                 clean_item["routes_error_baseline"] = clean_haproxy_command_id(
                     item.get("routes_error_baseline")
                 )
@@ -1041,6 +1076,7 @@ def load_haproxy_state():
                 clean_item["bandwidth_command_id"] = (
                     clean_haproxy_command_id(item.get("bandwidth_command_id")) or new_haproxy_command_id()
                 )
+                clean_item["bandwidth_base_hashes"] = bandwidth_base_hashes
                 clean_item["bandwidth_error_baseline"] = clean_haproxy_command_id(
                     item.get("bandwidth_error_baseline")
                 )
@@ -1081,6 +1117,12 @@ def load_haproxy_state():
             if current - created_at <= HAPROXY_SESSION_TTL:
                 clean_pending[str(key)[:160]] = item
     HAPROXY_STATE = {"nodes": clean_nodes, "sessions": clean_sessions, "pending": clean_pending}
+    if discarded_legacy_commands:
+        log(f"discarded legacy HAProxy command(s) without baseline: {discarded_legacy_commands}")
+        atomic_write(
+            HAPROXY_CONTROL_FILE,
+            json.dumps(HAPROXY_STATE, ensure_ascii=False, indent=2, sort_keys=True),
+        )
 
 
 def save_haproxy_state():
@@ -5351,11 +5393,18 @@ def set_haproxy_routes_for_node(node, routes):
                 if not preserved and isinstance(nodes.get(stored_key), dict):
                     preserved = dict(nodes[stored_key])
                 del nodes[stored_key]
+        base_hashes = clean_haproxy_base_hashes(preserved.get("routes_base_hashes"))
+        if bool(node.get("haproxy_routes_supported")):
+            base_hashes.append(haproxy_routes_fingerprint(reported_haproxy_routes_for_node(node)))
+        if isinstance(preserved.get("routes"), list):
+            base_hashes.append(haproxy_routes_fingerprint(preserved.get("routes")))
+        base_hashes = list(dict.fromkeys(base_hashes))[-8:]
         preserved.update({
             "name": node_display_name(node, key)[:120],
             "routes": routes,
             "updated_at": now_ts(),
             "routes_command_id": new_haproxy_command_id(),
+            "routes_base_hashes": base_hashes,
             "routes_error_baseline": haproxy_apply_result_fingerprint(node.get("haproxy_apply_result")),
         })
         nodes[key] = preserved
@@ -5397,11 +5446,20 @@ def set_haproxy_bandwidth_limits_for_node(node, limits):
                 if not preserved and isinstance(nodes.get(stored_key), dict):
                     preserved = dict(nodes[stored_key])
                 del nodes[stored_key]
+        base_hashes = clean_haproxy_base_hashes(preserved.get("bandwidth_base_hashes"))
+        if bool(node.get("haproxy_bandwidth_supported")):
+            base_hashes.append(
+                haproxy_bandwidth_fingerprint(reported_haproxy_bandwidth_limits_for_node(node))
+            )
+        if isinstance(preserved.get("bandwidth_limits"), list):
+            base_hashes.append(haproxy_bandwidth_fingerprint(preserved.get("bandwidth_limits")))
+        base_hashes = list(dict.fromkeys(base_hashes))[-8:]
         preserved.update({
             "name": node_display_name(node, key)[:120],
             "bandwidth_limits": limits,
             "bandwidth_updated_at": now_ts(),
             "bandwidth_command_id": new_haproxy_command_id(),
+            "bandwidth_base_hashes": base_hashes,
             "bandwidth_error_baseline": haproxy_apply_result_fingerprint(
                 node.get("haproxy_bandwidth_apply_result")
             ),
@@ -5436,20 +5494,60 @@ def acknowledge_haproxy_desired_state(node):
         item = dict(nodes[stored_key])
         if routes_supported and "routes" in item:
             desired_routes = normalize_haproxy_routes(item.get("routes"))
-            if desired_routes and haproxy_routes_equal(desired_routes, reported_routes):
+            command_id = clean_haproxy_command_id(item.get("routes_command_id"))
+            apply_result = normalize_haproxy_apply_result(node.get("haproxy_apply_result"))
+            result_matches = bool(
+                command_id
+                and apply_result.get("command_id") == command_id
+                and apply_result.get("status") in ("ok", "error")
+            )
+            applied = result_matches and apply_result.get("status") == "ok"
+            failed = result_matches and apply_result.get("status") == "error"
+            base_hashes = clean_haproxy_base_hashes(item.get("routes_base_hashes"))
+            reported_hash = haproxy_routes_fingerprint(reported_routes)
+            local_change = bool(
+                desired_routes
+                and reported_routes
+                and base_hashes
+                and reported_hash not in base_hashes
+                and not haproxy_routes_equal(desired_routes, reported_routes)
+                and not failed
+            )
+            if desired_routes and (applied or haproxy_routes_equal(desired_routes, reported_routes) or local_change):
                 item.pop("routes", None)
                 item.pop("updated_at", None)
                 item.pop("routes_command_id", None)
+                item.pop("routes_base_hashes", None)
                 item.pop("routes_error_baseline", None)
-                acknowledged.append("routes")
+                acknowledged.append("routes_local" if local_change and not applied else "routes")
         if bandwidth_supported and "bandwidth_limits" in item:
             desired_limits = normalize_haproxy_bandwidth_limits(item.get("bandwidth_limits"))
-            if haproxy_bandwidth_limits_equal(desired_limits, reported_limits):
+            command_id = clean_haproxy_command_id(item.get("bandwidth_command_id"))
+            apply_result = normalize_haproxy_bandwidth_apply_result(
+                node.get("haproxy_bandwidth_apply_result")
+            )
+            result_matches = bool(
+                command_id
+                and apply_result.get("command_id") == command_id
+                and apply_result.get("status") in ("ok", "error")
+            )
+            applied = result_matches and apply_result.get("status") == "ok"
+            failed = result_matches and apply_result.get("status") == "error"
+            base_hashes = clean_haproxy_base_hashes(item.get("bandwidth_base_hashes"))
+            reported_hash = haproxy_bandwidth_fingerprint(reported_limits)
+            local_change = bool(
+                base_hashes
+                and reported_hash not in base_hashes
+                and not haproxy_bandwidth_limits_equal(desired_limits, reported_limits)
+                and not failed
+            )
+            if applied or haproxy_bandwidth_limits_equal(desired_limits, reported_limits) or local_change:
                 item.pop("bandwidth_limits", None)
                 item.pop("bandwidth_updated_at", None)
                 item.pop("bandwidth_command_id", None)
+                item.pop("bandwidth_base_hashes", None)
                 item.pop("bandwidth_error_baseline", None)
-                acknowledged.append("bandwidth")
+                acknowledged.append("bandwidth_local" if local_change and not applied else "bandwidth")
 
         if not acknowledged:
             return []

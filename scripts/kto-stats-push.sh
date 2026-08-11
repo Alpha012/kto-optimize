@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v307"
+PUSH_BUILD="v308"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
@@ -731,7 +731,7 @@ apply_collector_haproxy_routes() {
     command_id="${command_id,,}"
     previous_command_id="$(printf '%s' "$haproxy_apply_result" | jq -r '.command_id // ""' 2>/dev/null || true)"
     previous_status="$(printf '%s' "$haproxy_apply_result" | jq -r '.status // ""' 2>/dev/null || true)"
-    if [[ -n "$command_id" && "$previous_status" == "error" && "${previous_command_id,,}" == "$command_id" ]]; then
+    if [[ -n "$command_id" && ( "$previous_status" == "ok" || "$previous_status" == "error" ) && "${previous_command_id,,}" == "$command_id" ]]; then
         return 0
     fi
     desired="$(printf '%s' "$response" | jq -c '
@@ -862,7 +862,7 @@ apply_collector_haproxy_bandwidth_limits() {
     command_id="${command_id,,}"
     previous_command_id="$(printf '%s' "$haproxy_bandwidth_apply_result" | jq -r '.command_id // ""' 2>/dev/null || true)"
     previous_status="$(printf '%s' "$haproxy_bandwidth_apply_result" | jq -r '.status // ""' 2>/dev/null || true)"
-    if [[ -n "$command_id" && "$previous_status" == "error" && "${previous_command_id,,}" == "$command_id" ]]; then
+    if [[ -n "$command_id" && ( "$previous_status" == "ok" || "$previous_status" == "error" ) && "${previous_command_id,,}" == "$command_id" ]]; then
         return 0
     fi
     desired="$(printf '%s' "$response" | jq -c '

@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v307"', KTO)
-        self.assertIn('PUSH_BUILD="v307"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v307"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v307"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v307"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v307"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v307"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v308"', KTO)
+        self.assertIn('PUSH_BUILD="v308"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v308"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v308"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v308"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v308"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v308"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
