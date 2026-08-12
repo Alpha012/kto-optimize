@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v310"
+SCRIPT_BUILD="v311"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -6915,8 +6915,8 @@ haproxy_nofile_limit() {
 }
 
 recommended_haproxy_maxconn() {
-    local override="${KTO_HAPROXY_MAXCONN:-}"
-    local total_mb maxconn nofile_limit fds_per_connection fd_reserve fd_cap
+    local override="${KTO_HAPROXY_MAXCONN:-100000}"
+    local maxconn nofile_limit fds_per_connection fd_reserve fd_cap
 
     if [[ "$override" =~ ^[0-9]+$ ]]; then
         maxconn=$(( 10#$override ))
@@ -6925,14 +6925,7 @@ recommended_haproxy_maxconn() {
         maxconn=0
     fi
 
-    if (( maxconn == 0 )); then
-        total_mb="$(memory_total_mb)"
-        [[ "$total_mb" =~ ^[0-9]+$ ]] || total_mb=0
-        (( total_mb > 0 )) || total_mb=2048
-
-        # Start with a memory-derived target, then clamp it to the process FD budget.
-        maxconn=$(( total_mb * 16 ))
-    fi
+    (( maxconn > 0 )) || maxconn=100000
     (( maxconn < 10000 )) && maxconn=10000
     (( maxconn > 500000 )) && maxconn=500000
 
@@ -6957,6 +6950,18 @@ recommended_haproxy_maxconn() {
     (( fd_cap >= 1000 )) || fd_cap=1000
     (( maxconn <= fd_cap )) || maxconn="$fd_cap"
     echo "$maxconn"
+}
+
+haproxy_thread_count() {
+    local threads="${KTO_HAPROXY_NBTHREAD:-1}"
+
+    if [[ "$threads" =~ ^[0-9]+$ ]]; then
+        threads=$((10#$threads))
+    else
+        threads=1
+    fi
+    (( threads >= 1 && threads <= 64 )) || threads=1
+    printf '%d\n' "$threads"
 }
 
 render_haproxy_routes_config() {
@@ -7009,18 +7014,14 @@ render_haproxy_routes_config() {
         return 1
     }
 
-    haproxy_threads="$(cpu_count)"
-    (( haproxy_threads > 64 )) && haproxy_threads=64
+    haproxy_threads="$(haproxy_thread_count)"
     haproxy_maxconn="$(recommended_haproxy_maxconn)"
 
     cat > "$output_file" <<EOF
 # Managed by kto. Edit routes through the HAProxy menu.
 global
     maxconn ${haproxy_maxconn}
-    maxpipes 0
-    nosplice
     nbthread ${haproxy_threads}
-    hard-stop-after 5m
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
     tune.ssl.default-dh-param 2048
 
@@ -7031,18 +7032,18 @@ defaults
     option srvtcpka
     option tcp-smart-accept
     option tcp-smart-connect
-    option redispatch
+    option splice-auto
+    option splice-request
+    option splice-response
 
-    retries 2
-    timeout connect 4s
+    timeout connect 5s
     timeout client 2h
     timeout server 2h
     timeout tunnel 2h
     timeout client-fin 30s
     timeout server-fin 30s
-    timeout check 3s
 
-    default-server inter 15s fastinter 3s downinter 5s fall 2 rise 2
+    default-server inter 30s fall 8 rise 3
 
 backend wrong_sni_names
     stick-table type string len 160 size 100k expire 30m store gpc0
@@ -7313,8 +7314,7 @@ EOF
     fi
 
     rm -f "$tmp_config" "$backup" "$backup_routes"
-    haproxy_threads="$(cpu_count)"
-    (( haproxy_threads > 64 )) && haproxy_threads=64
+    haproxy_threads="$(haproxy_thread_count)"
     haproxy_maxconn="$(recommended_haproxy_maxconn)"
     route_count="$(haproxy_route_count "$routes_file")"
     ok "HAProxy маршрутов: ${route_count}"
@@ -7329,8 +7329,9 @@ EOF
 }
 
 apply_haproxy_config() {
-    local backend_target="$1" allowed_sni="$2" listen_ip="${3:-*}" routes_file base_port
+    local backend_target="$1" allowed_sni="$2" listen_ip="${3:-}" routes_file base_port
     base_port="$(haproxy_base_port)"
+    [[ -n "$listen_ip" ]] || listen_ip="$(haproxy_default_listen_ip_for_source default)"
     routes_file="$(mktemp)"
     print_haproxy_route "$base_port" "$backend_target" "$allowed_sni" default default "$listen_ip" > "$routes_file"
     if apply_haproxy_routes_config "$routes_file"; then
@@ -7484,6 +7485,23 @@ haproxy_input_ip_available() {
     local wanted="$1"
     list_haproxy_input_ips |
         awk -F '\t' -v wanted="$wanted" '$1 == wanted { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+haproxy_default_listen_ip_for_source() {
+    local source_ip default_ip
+
+    source_ip="$(normalize_haproxy_source_ip "${1:-default}" 2>/dev/null || printf 'default')"
+    if [[ "$source_ip" != "default" ]] && haproxy_input_ip_available "$source_ip"; then
+        printf '%s\n' "$source_ip"
+        return 0
+    fi
+
+    default_ip="$(haproxy_default_source_ip)"
+    if validate_ipv4 "$default_ip" && haproxy_input_ip_available "$default_ip"; then
+        printf '%s\n' "$default_ip"
+    else
+        printf '*\n'
+    fi
 }
 
 select_haproxy_route_listen_ip() {
@@ -7911,9 +7929,10 @@ configure_haproxy_backend() {
     header
     require_haproxy_mode
     need_root
-    local backend_target allowed_sni listen_ip send_proxy_v2 routes_file previous_routes_file base_port
+    local backend_target allowed_sni default_listen_ip listen_ip send_proxy_v2 routes_file previous_routes_file base_port
     base_port="$(haproxy_base_port)"
-    listen_ip="$(select_haproxy_route_listen_ip "*")" || return 1
+    default_listen_ip="$(haproxy_default_listen_ip_for_source default)"
+    listen_ip="$(select_haproxy_route_listen_ip "$default_listen_ip")" || return 1
     if haproxy_tcp_port_listening "$base_port" "$listen_ip"; then
         fail "TCP listener ${listen_ip}:${base_port} уже занят. HAProxy config не изменён."
         if [[ "$MACHINE_MODE" == "node" ]]; then
@@ -8505,10 +8524,7 @@ add_haproxy_route_with_source() {
         return 1
     fi
 
-    default_listen_ip="*"
-    if [[ "$source_ip" != default ]] && haproxy_input_ip_available "$source_ip"; then
-        default_listen_ip="$source_ip"
-    fi
+    default_listen_ip="$(haproxy_default_listen_ip_for_source "$source_ip")"
     listen_ip="$(select_haproxy_route_listen_ip "$default_listen_ip")" || return 1
     default_port="$(default_haproxy_extra_port "$routes_file" "$listen_ip")" || {
         fail "Нет свободного HAProxy-порта"
@@ -8702,13 +8718,13 @@ retarget_haproxy_wildcard_route() {
 add_haproxy_pool_route() {
     local routes_file="$1" listen_ip default_port port source_ip allowed_sni server_maxconn send_proxy_v2 raw_targets target_pool
 
-    listen_ip="$(select_haproxy_route_listen_ip "*")" || return 1
+    source_ip="$(ask_text "Исходящий IP (default или IPv4)" default)"
+    listen_ip="$(select_haproxy_route_listen_ip "$(haproxy_default_listen_ip_for_source "$source_ip")")" || return 1
     default_port="$(default_haproxy_extra_port "$routes_file" "$listen_ip")" || {
         fail "Нет свободного HAProxy-порта"
         return 1
     }
     port="$(ask_int "Входной HAProxy порт" "$default_port" 1 65535)"
-    source_ip="$(ask_text "Исходящий IP (default или IPv4)" default)"
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 0)"
     server_maxconn="$(ask_int "maxconn на каждый backend" 10000 1 10000000)"
@@ -8726,7 +8742,7 @@ set_haproxy_pool_route_cli() {
     require_haproxy_mode
     need_root
     local port="${1:-}" source_ip="${2:-}" allowed_sni="${3:-}" server_maxconn="${4:-}"
-    local routes_file target target_pool="" listen_ip="*" normalized_listen_ip
+    local routes_file target target_pool="" listen_ip="" normalized_listen_ip
     local listen_ip_explicit=0
 
     if (( $# < 4 )) || [[ -z "$port" || -z "$source_ip" || -z "$server_maxconn" ]]; then
@@ -8750,6 +8766,9 @@ set_haproxy_pool_route_cli() {
             shift
             ;;
     esac
+    if (( listen_ip_explicit == 0 )); then
+        listen_ip="$(haproxy_default_listen_ip_for_source "$source_ip")"
+    fi
     if (( $# < 2 )); then
         fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI|any MAXCONN [--listen-ip IP] BACKEND1 BACKEND2 [...]"
         return 1
@@ -8775,7 +8794,7 @@ set_haproxy_pool_route_cli() {
         fail "Текущий HAProxy config не распознан. Конфиг не изменён."
         return 1
     fi
-    if (( listen_ip_explicit == 1 )) && [[ "$listen_ip" != "*" ]] &&
+    if [[ "$listen_ip" != "*" ]] &&
         haproxy_route_file_has_endpoint "$routes_file" "$port" "*"; then
         if ! retarget_haproxy_wildcard_route "$routes_file" "$port" "$listen_ip"; then
             rm -f "$routes_file"
@@ -8996,13 +9015,13 @@ set_haproxy_sequential_routes() {
 add_haproxy_sequential_routes() {
     local routes_file="$1" listen_ip default_port start_port source_ip allowed_sni server_maxconn send_proxy_v2 raw_targets target_pool
 
-    listen_ip="$(select_haproxy_route_listen_ip "*")" || return 1
+    source_ip="$(ask_text "Исходящий IP (default или IPv4)" default)"
+    listen_ip="$(select_haproxy_route_listen_ip "$(haproxy_default_listen_ip_for_source "$source_ip")")" || return 1
     default_port="$(default_haproxy_extra_port "$routes_file" "$listen_ip")" || {
         fail "Нет свободного HAProxy-порта"
         return 1
     }
     start_port="$(ask_int "Первый входной HAProxy порт" "$default_port" 1 65535)"
-    source_ip="$(ask_text "Исходящий IP (default или IPv4)" default)"
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 0)"
     server_maxconn="$(ask_int "maxconn на каждый backend" 10000 1 10000000)"
@@ -9020,7 +9039,7 @@ set_haproxy_sequential_routes_cli() {
     require_haproxy_mode
     need_root
     local start_port="${1:-}" source_ip="${2:-}" allowed_sni="${3:-}" server_maxconn="${4:-}"
-    local routes_file target target_pool=""
+    local routes_file target target_pool="" listen_ip
     shift $(( $# >= 4 ? 4 : $# ))
 
     if [[ -z "$start_port" || -z "$source_ip" || -z "$server_maxconn" || $# -lt 1 ]]; then
@@ -9042,7 +9061,8 @@ set_haproxy_sequential_routes_cli() {
         fail "Текущий HAProxy config не распознан. Конфиг не изменён."
         return 1
     fi
-    if set_haproxy_sequential_routes "$routes_file" "$start_port" "$source_ip" "$allowed_sni" "$server_maxconn" "$target_pool"; then
+    listen_ip="$(haproxy_default_listen_ip_for_source "$source_ip")"
+    if set_haproxy_sequential_routes "$routes_file" "$start_port" "$source_ip" "$allowed_sni" "$server_maxconn" "$target_pool" "$listen_ip"; then
         rm -f "$routes_file"
         return 0
     fi

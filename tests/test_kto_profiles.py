@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v310"', KTO)
-        self.assertIn('PUSH_BUILD="v310"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v310"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v310"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v310"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v310"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v310"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v311"', KTO)
+        self.assertIn('PUSH_BUILD="v311"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v311"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v311"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v311"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v311"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v311"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -1765,12 +1765,60 @@ remove_haproxy_input_bandwidth_limit 217.19.122.109
         self.assertIn('require_haproxy_mode', configure)
         self.assertIn('base_port="$(haproxy_base_port)"', configure)
         self.assertIn('haproxy_tcp_port_listening "$base_port" "$listen_ip"', configure)
-        self.assertIn('select_haproxy_route_listen_ip "*"', configure)
+        self.assertIn('default_listen_ip="$(haproxy_default_listen_ip_for_source default)"', configure)
+        self.assertIn('select_haproxy_route_listen_ip "$default_listen_ip"', configure)
         self.assertIn('print_haproxy_route "$base_port"', configure)
         self.assertIn('sync_haproxy_firewall "$routes_file" "$previous_routes_file"', configure)
         self.assertIn('require_haproxy_mode', haproxy_menu)
         self.assertIn('if haproxy_mode_supported; then', settings_menu)
         self.assertIn('labels+=("HAProxy (мост, 8443/tcp)")', main_menu)
+
+    def test_new_haproxy_routes_default_to_an_exact_input_ip(self):
+        default_bind = function_body(KTO, "haproxy_default_listen_ip_for_source")
+        configure = function_body(KTO, "configure_haproxy_backend")
+        add_route = function_body(KTO, "add_haproxy_route_with_source")
+        add_pool = function_body(KTO, "add_haproxy_pool_route")
+        add_sequential = function_body(KTO, "add_haproxy_sequential_routes")
+        pool_cli = function_body(KTO, "set_haproxy_pool_route_cli")
+        sequential_cli = function_body(KTO, "set_haproxy_sequential_routes_cli")
+
+        self.assertIn('haproxy_input_ip_available "$source_ip"', default_bind)
+        self.assertIn('default_ip="$(haproxy_default_source_ip)"', default_bind)
+        self.assertIn('printf \'*\\n\'', default_bind)
+        self.assertIn('haproxy_default_listen_ip_for_source default', configure)
+        self.assertIn('default_listen_ip="$(haproxy_default_listen_ip_for_source "$source_ip")"', add_route)
+        self.assertIn('haproxy_default_listen_ip_for_source "$source_ip"', add_pool)
+        self.assertIn('haproxy_default_listen_ip_for_source "$source_ip"', add_sequential)
+        self.assertIn('if (( listen_ip_explicit == 0 )); then', pool_cli)
+        self.assertIn('listen_ip="$(haproxy_default_listen_ip_for_source "$source_ip")"', pool_cli)
+        self.assertIn('listen_ip="$(haproxy_default_listen_ip_for_source "$source_ip")"', sequential_cli)
+        self.assertIn('"$target_pool" "$listen_ip"', sequential_cli)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+haproxy_default_source_ip() { printf '198.51.100.10\n'; }
+haproxy_input_ip_available() {
+    [[ "$1" == 198.51.100.10 || "$1" == 203.0.113.20 ]]
+}
+[[ "$(haproxy_default_listen_ip_for_source default)" == 198.51.100.10 ]]
+[[ "$(haproxy_default_listen_ip_for_source 203.0.113.20)" == 203.0.113.20 ]]
+[[ "$(haproxy_default_listen_ip_for_source 192.0.2.99)" == 198.51.100.10 ]]
+haproxy_input_ip_available() { return 1; }
+[[ "$(haproxy_default_listen_ip_for_source default)" == '*' ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_reality_haproxy_does_not_reclassify_push_as_whitelist(self):
         identity = function_body(PUSH, "ensure_node_identity")
@@ -2008,10 +2056,14 @@ after="$(wc -l < "$events")"
         clear_limits = function_body(KTO, "clear_all_haproxy_bandwidth_limits")
         diagnose = function_body(KTO, "diagnose_haproxy")
 
-        self.assertIn("hard-stop-after 5m", render)
-        self.assertIn("option redispatch", render)
-        self.assertIn("timeout check 3s", render)
-        self.assertIn("default-server inter 15s fastinter 3s downinter 5s fall 2 rise 2", render)
+        self.assertIn("option splice-auto", render)
+        self.assertIn("option splice-request", render)
+        self.assertIn("option splice-response", render)
+        self.assertIn("timeout connect 5s", render)
+        self.assertIn("default-server inter 30s fall 8 rise 3", render)
+        self.assertNotIn("hard-stop-after", render)
+        self.assertNotIn("option redispatch", render)
+        self.assertNotIn("timeout check", render)
         self.assertIn('extract_haproxy_routes > "$routes_file"', stabilize)
         self.assertIn('apply_haproxy_routes_config "$routes_file" 1 1', stabilize)
         self.assertIn('run_bounded_command 20', clear_limits)
@@ -2064,12 +2116,13 @@ grep -Fqx beta "$target"
 
         harness = r'''
 source <(sed '/^main /d' kto.sh)
-memory_total_mb() { printf '32768\n'; }
 KTO_HAPROXY_NOFILE_LIMIT=1048576
 KTO_HAPROXY_FDS_PER_CONNECTION=3
 KTO_HAPROXY_FD_RESERVE=8192
 unset KTO_HAPROXY_MAXCONN
-[[ "$(recommended_haproxy_maxconn)" == 346000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 100000 ]]
+KTO_HAPROXY_MAXCONN=invalid
+[[ "$(recommended_haproxy_maxconn)" == 100000 ]]
 KTO_HAPROXY_MAXCONN=500000
 [[ "$(recommended_haproxy_maxconn)" == 346000 ]]
 KTO_HAPROXY_MAXCONN=200000
@@ -2077,6 +2130,12 @@ KTO_HAPROXY_MAXCONN=200000
 KTO_HAPROXY_NOFILE_LIMIT=65536
 unset KTO_HAPROXY_MAXCONN
 [[ "$(recommended_haproxy_maxconn)" == 19000 ]]
+unset KTO_HAPROXY_NBTHREAD
+[[ "$(haproxy_thread_count)" == 1 ]]
+KTO_HAPROXY_NBTHREAD=8
+[[ "$(haproxy_thread_count)" == 8 ]]
+KTO_HAPROXY_NBTHREAD=0
+[[ "$(haproxy_thread_count)" == 1 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -2420,12 +2479,17 @@ config=$(mktemp)
 trap 'rm -f "$routes" "$config"' EXIT
 printf '443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\textra.example.com *.other.example.com\t185.141.227.93\n' > "$routes"
 render_haproxy_routes_config "$routes" "$config"
-grep -q '^    maxpipes 0$' "$config"
-grep -q '^    nosplice$' "$config"
-grep -q '^    hard-stop-after 5m$' "$config"
-grep -q '^    timeout check 3s$' "$config"
-grep -q '^    default-server inter 15s fastinter 3s downinter 5s fall 2 rise 2$' "$config"
-! grep -q 'option splice-' "$config"
+grep -q '^    maxconn 100000$' "$config"
+grep -q '^    nbthread 1$' "$config"
+! grep -q '^    maxpipes ' "$config"
+! grep -q '^    nosplice$' "$config"
+! grep -q '^    hard-stop-after ' "$config"
+grep -q '^    option splice-auto$' "$config"
+grep -q '^    option splice-request$' "$config"
+grep -q '^    option splice-response$' "$config"
+grep -q '^    timeout connect 5s$' "$config"
+! grep -q '^    timeout check ' "$config"
+grep -q '^    default-server inter 30s fall 8 rise 3$' "$config"
 grep -q '^frontend vless_in$' "$config"
 grep -q '^frontend vless_in_8443$' "$config"
 grep -q '^    server xray1 89.144.8.3:443 check weight 10$' "$config"
@@ -2765,6 +2829,8 @@ grep -Fqx 'sync' "$events"
             'retarget_haproxy_wildcard_route "$routes_file" "$port" "$listen_ip"',
             cli,
         )
+        self.assertIn('if [[ "$listen_ip" != "*" ]] &&', cli)
+        self.assertNotIn('listen_ip_explicit == 1 )) && [[ "$listen_ip" != "*" ]]', cli)
         self.assertIn('"$server_maxconn" "$target_pool" "$listen_ip"', cli)
         self.assertIn('current_listen="$listen_ip"', migration)
 
