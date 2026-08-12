@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v309"', KTO)
-        self.assertIn('PUSH_BUILD="v309"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v309"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v309"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v309"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v309"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v309"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v310"', KTO)
+        self.assertIn('PUSH_BUILD="v310"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v310"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v310"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v310"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v310"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v310"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -398,6 +398,88 @@ list_test_source_ipv4s() { printf '198.51.100.10\tens3\tосновной\n'; }
 select_test_source_ipv4 </dev/null
 [[ "$TEST_SOURCE_IP" == 198.51.100.10 ]]
 [[ "$TEST_SOURCE_INTERFACE" == ens3 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_tspu_ip_probe_targets_one_ip_through_the_selected_source(self):
+        menu = function_body(KTO, "menu")
+        runner = function_body(KTO, "run_tspu_ip_test")
+        tcp_probe = function_body(KTO, "tspu_ip_tcp_probe")
+        http_probe = function_body(KTO, "tspu_ip_http_probe")
+        mtu_probe = function_body(KTO, "tspu_ip_path_mtu_probe")
+        trace = function_body(KTO, "tspu_ip_trace")
+        main = function_body(KTO, "main")
+
+        self.assertIn('labels+=("Проверка ТСПУ (IP)")', menu)
+        self.assertIn('actions+=("dpi-ip-test")', menu)
+        self.assertIn('dpi-ip-test) run_tspu_ip_test', menu)
+        self.assertIn('select_test_source_ipv4 "$requested_source_ip"', runner)
+        self.assertIn('ask_text "Целевой IPv4"', runner)
+        self.assertLess(
+            runner.index('select_test_source_ipv4 "$requested_source_ip"'),
+            runner.index('ask_text "Целевой IPv4"'),
+        )
+        self.assertIn('validate_ipv4 "$target_ip"', runner)
+        self.assertIn('ip -4 route get "$target_ip" from "$source_ip"', runner)
+        self.assertIn('[[ "$route_interface" != "$source_interface"', runner)
+        self.assertIn('network_test_ping "$target_ip" "$target_ip"', runner)
+        self.assertIn('tspu_ip_tcp_probe "$source_ip" "$target_ip" 80', runner)
+        self.assertIn('tspu_ip_tcp_probe "$source_ip" "$target_ip" 443', runner)
+        self.assertIn('tspu_ip_http_probe "$source_ip" "$target_ip" http 80', runner)
+        self.assertIn('tspu_ip_http_probe "$source_ip" "$target_ip" https 443', runner)
+        self.assertIn('tspu_ip_path_mtu_probe "$source_ip" "$target_ip"', runner)
+        self.assertIn('tspu_ip_trace "$source_ip" "$target_ip" "$trace_port"', runner)
+        self.assertIn('sock.bind((source_ip, 0))', tcp_probe)
+        self.assertIn('--interface "$source_ip"', http_probe)
+        self.assertIn('-I "$source_ip"', mtu_probe)
+        self.assertIn('-a "$source_ip"', trace)
+        self.assertIn('Один замер не доказывает ТСПУ', runner)
+        self.assertIn('dpi-ip-test|dpi-ip|tspu-ip-test|tspu-ip', main)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+MACHINE_MODE=whitelist
+LOG_FILE=$(mktemp)
+events=$(mktemp)
+trap 'rm -f "$LOG_FILE" "$events"' EXIT
+header() { :; }
+need_root() { :; }
+must() { return 0; }
+command_exists() { return 0; }
+select_test_source_ipv4() {
+    printf 'select=%s\n' "${1:-}" >> "$events"
+    TEST_SOURCE_IP=203.0.113.20
+    TEST_SOURCE_INTERFACE=wan2
+}
+ip() {
+    printf '198.51.100.30 from 203.0.113.20 via 203.0.113.1 dev wan2 table 102\n'
+}
+network_test_ping() { printf 'ping=%s|source=%s\n' "$1" "$NETTEST_SOURCE_IP" >> "$events"; }
+tspu_ip_tcp_probe() { printf 'tcp=%s|%s|%s\n' "$1" "$2" "$3" >> "$events"; return 0; }
+tspu_ip_http_probe() { printf 'http=%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >> "$events"; return 0; }
+tspu_ip_path_mtu_probe() { printf 'mtu=%s|%s\n' "$1" "$2" >> "$events"; }
+tspu_ip_trace() { printf 'trace=%s|%s|%s\n' "$1" "$2" "$3" >> "$events"; }
+run_tspu_ip_test 203.0.113.20 198.51.100.30 >/dev/null
+grep -Fqx 'select=203.0.113.20' "$events"
+grep -Fqx 'ping=198.51.100.30|source=203.0.113.20' "$events"
+grep -Fqx 'tcp=203.0.113.20|198.51.100.30|80' "$events"
+grep -Fqx 'tcp=203.0.113.20|198.51.100.30|443' "$events"
+grep -Fqx 'http=203.0.113.20|198.51.100.30|http|80' "$events"
+grep -Fqx 'http=203.0.113.20|198.51.100.30|https|443' "$events"
+grep -Fqx 'mtu=203.0.113.20|198.51.100.30' "$events"
+grep -Fqx 'trace=203.0.113.20|198.51.100.30|443' "$events"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v309"
+SCRIPT_BUILD="v310"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5008,6 +5008,342 @@ network_test() {
 
     echo
     ok "Сеть выглядит нормально по базовым проверкам."
+}
+
+tspu_ip_tcp_probe() {
+    local source_ip="$1"
+    local target_ip="$2"
+    local port="$3"
+    local timeout_sec="${4:-3}"
+    local attempts="${5:-2}"
+    local output state details
+
+    if ! command_exists python3; then
+        network_test_row "TCP ${port}" "python3 не найден" "skip"
+        return 4
+    fi
+
+    if ! output="$(python3 - "$source_ip" "$target_ip" "$port" "$timeout_sec" "$attempts" 2>&1 <<'PY'
+import errno
+import socket
+import sys
+import time
+
+source_ip = sys.argv[1]
+target_ip = sys.argv[2]
+port = int(sys.argv[3])
+timeout = float(sys.argv[4])
+attempts = int(sys.argv[5])
+outcomes = []
+latencies = []
+last_error = "-"
+
+for attempt in range(attempts):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    started = time.monotonic()
+    try:
+        sock.bind((source_ip, 0))
+        code = sock.connect_ex((target_ip, port))
+        elapsed_ms = (time.monotonic() - started) * 1000
+        latencies.append(elapsed_ms)
+        if code == 0:
+            outcomes.append("open")
+        elif code == errno.ECONNREFUSED:
+            outcomes.append("refused")
+            last_error = "ECONNREFUSED"
+        elif code == errno.ETIMEDOUT:
+            outcomes.append("timeout")
+            last_error = "ETIMEDOUT"
+        else:
+            outcomes.append("error")
+            last_error = errno.errorcode.get(code, "ERR" + str(code))
+    except socket.timeout:
+        outcomes.append("timeout")
+        last_error = "ETIMEDOUT"
+    except OSError as exc:
+        outcomes.append("error")
+        last_error = errno.errorcode.get(exc.errno or 0, exc.__class__.__name__)
+    finally:
+        sock.close()
+    if attempt + 1 < attempts:
+        time.sleep(0.15)
+
+opened = outcomes.count("open")
+refused = outcomes.count("refused")
+timed_out = outcomes.count("timeout")
+failed = outcomes.count("error")
+if opened == attempts:
+    state = "open"
+elif opened or (refused and refused < attempts):
+    state = "unstable"
+elif refused == attempts:
+    state = "closed"
+elif timed_out == attempts:
+    state = "timeout"
+else:
+    state = "error"
+
+parts = [
+    "open={}/{}".format(opened, attempts),
+    "refused={}".format(refused),
+    "timeout={}".format(timed_out),
+]
+if failed:
+    parts.append("error={}".format(failed))
+if latencies:
+    parts.append("avg={:.1f}ms".format(sum(latencies) / len(latencies)))
+if last_error != "-":
+    parts.append("last={}".format(last_error))
+print(state + "\t" + " ".join(parts))
+PY
+)"; then
+        network_test_row "TCP ${port}" "probe error: $(network_test_short "$output")" "fail"
+        return 4
+    fi
+
+    IFS=$'\t' read -r state details <<< "$output"
+    case "$state" in
+        open)
+            network_test_row "TCP ${port}" "$details" "ok"
+            return 0
+            ;;
+        unstable)
+            network_test_row "TCP ${port}" "$details" "warn"
+            return 1
+            ;;
+        closed)
+            network_test_row "TCP ${port}" "$details" "warn"
+            return 2
+            ;;
+        timeout)
+            network_test_row "TCP ${port}" "$details" "fail"
+            return 3
+            ;;
+        *)
+            network_test_row "TCP ${port}" "${details:-неизвестная ошибка}" "fail"
+            return 4
+            ;;
+    esac
+}
+
+tspu_ip_http_probe() {
+    local source_ip="$1"
+    local target_ip="$2"
+    local scheme="$3"
+    local port="$4"
+    local label="${scheme^^} ${port}"
+    local url="${scheme}://${target_ip}:${port}/"
+    local output rc status
+    local -a curl_args=(
+        -q -4 --noproxy '*' --interface "$source_ip"
+        -sS -o /dev/null
+        -w 'http=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s remote=%{remote_ip}'
+        --connect-timeout 4 --max-time 8
+    )
+
+    if ! command_exists curl; then
+        network_test_row "$label" "curl не найден" "skip"
+        return 4
+    fi
+    [[ "$scheme" == "https" ]] && curl_args+=(-k)
+
+    if output="$(curl "${curl_args[@]}" "$url" 2>&1)"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    output="$(network_test_short "$output")"
+
+    case "$rc" in
+        0)
+            status="ok"
+            ;;
+        7)
+            status="warn"
+            output="rc=7 порт закрыт или соединение отклонено; ${output}"
+            ;;
+        28)
+            status="fail"
+            output="rc=28 таймаут; ${output}"
+            ;;
+        35|52|56)
+            status="warn"
+            output="rc=${rc} TCP достигнут, протокол не ответил; ${output}"
+            ;;
+        *)
+            status="fail"
+            output="rc=${rc} ${output}"
+            ;;
+    esac
+    network_test_row "$label" "$output" "$status"
+
+    case "$rc" in
+        0) return 0 ;;
+        7|35|52|56) return 2 ;;
+        28) return 3 ;;
+        *) return 4 ;;
+    esac
+}
+
+tspu_ip_path_mtu_probe() {
+    local source_ip="$1"
+    local target_ip="$2"
+    local payload found_payload=""
+    local -a payloads=(1472 1400 1200)
+
+    if ! command_exists ping; then
+        network_test_row "Path MTU" "ping не найден" "skip"
+        return 0
+    fi
+
+    for payload in "${payloads[@]}"; do
+        if run_bounded_command 5 ping -4 -I "$source_ip" -c 1 -W 2 -M do -s "$payload" \
+            "$target_ip" >/dev/null 2>&1; then
+            found_payload="$payload"
+            break
+        fi
+    done
+
+    if [[ -z "$found_payload" ]]; then
+        network_test_row "Path MTU" "не определить: цель может блокировать ICMP" "skip"
+    elif (( found_payload == 1472 )); then
+        network_test_row "Path MTU" "$(( found_payload + 28 )) B проходит" "ok"
+    else
+        network_test_row "Path MTU" "не меньше $(( found_payload + 28 )) B; 1500 B не прошёл" "warn"
+    fi
+}
+
+tspu_ip_trace() {
+    local source_ip="$1"
+    local target_ip="$2"
+    local port="${3:-443}"
+    local output rc
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ TCP-ТРАССА :${port} ]${NC}"
+    if ! command_exists mtr; then
+        network_test_row "mtr" "mtr не установлен" "skip"
+        return 0
+    fi
+
+    if output="$(run_bounded_command 25 "${SUDO[@]}" mtr -4 -n -a "$source_ip" \
+        -T -P "$port" -c 5 -m 20 -r -w "$target_ip" 2>&1)"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    output="$(sed -n '1,22p' <<< "$output")"
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output"
+    else
+        network_test_row "mtr" "нет вывода" "warn"
+    fi
+    (( rc == 0 )) || warn "mtr завершился с кодом ${rc}; промежуточные узлы могут не отвечать на probe."
+}
+
+run_tspu_ip_test() {
+    header
+    local requested_source_ip="${1:-}" target_ip="${2:-}"
+    local source_ip source_interface route_line route_interface route_source
+    local tcp80_rc tcp443_rc http_rc https_rc trace_port=443 ping_ok=0
+    local tcp_open=0 tcp_reachable=0 tcp_timeout=0 rc
+    local -a packages=(curl iproute2 iputils-ping python3)
+
+    if [[ "$MACHINE_MODE" == "panel" ]]; then
+        fail "Проверка ТСПУ (IP) доступна для node и whitelist."
+        return 1
+    fi
+
+    select_test_source_ipv4 "$requested_source_ip" || return 1
+    source_ip="$TEST_SOURCE_IP"
+    source_interface="$TEST_SOURCE_INTERFACE"
+
+    target_ip="$(trim_whitespace "$target_ip")"
+    while ! validate_ipv4 "$target_ip"; do
+        [[ -z "$target_ip" ]] || fail "Некорректный целевой IPv4: ${target_ip}"
+        target_ip="$(trim_whitespace "$(ask_text "Целевой IPv4")")"
+    done
+
+    need_root
+    command_exists mtr || packages+=(mtr-tiny)
+    must "Установка зависимостей проверки ТСПУ (IP)" \
+        apt_install_with_update_if_missing "${packages[@]}"
+
+    NETTEST_SOURCE_IP="$source_ip"
+    NETTEST_SOURCE_INTERFACE="$source_interface"
+    NETTEST_PING_BAD=0
+    NETTEST_WARN=0
+
+    echo -e "${BOLD}${PURPLE}[ ПРОВЕРКА ТСПУ (IP) ]${NC}"
+    network_test_row "Исходящий IP" "$source_ip"
+    network_test_row "Интерфейс" "$source_interface"
+    network_test_row "Целевой IP" "$target_ip"
+
+    if ! route_line="$(ip -4 route get "$target_ip" from "$source_ip" 2>&1)"; then
+        network_test_row "Маршрут" "$(network_test_short "$route_line")" "fail"
+        fail "До ${target_ip} нет маршрута от ${source_ip}"
+        return 1
+    fi
+    route_interface="$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$route_line")"
+    route_source="$(awk '{for (i=1; i<=NF; i++) if ($i=="from" || $i=="src") {print $(i+1); exit}}' <<< "$route_line")"
+    if [[ "$route_interface" != "$source_interface" || ( -n "$route_source" && "$route_source" != "$source_ip" ) ]]; then
+        network_test_row "Маршрут" "$(network_test_short "$route_line")" "fail"
+        fail "Маршрут ушёл не через выбранный IP/интерфейс; тест остановлен."
+        return 1
+    fi
+    network_test_row "Маршрут" "$(network_test_short "$route_line")" "ok"
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ДОСТУПНОСТЬ ]${NC}"
+    network_test_ping "$target_ip" "$target_ip"
+    (( NETTEST_PING_BAD == 0 )) && ping_ok=1
+
+    if tspu_ip_tcp_probe "$source_ip" "$target_ip" 80; then tcp80_rc=0; else tcp80_rc=$?; fi
+    if tspu_ip_tcp_probe "$source_ip" "$target_ip" 443; then tcp443_rc=0; else tcp443_rc=$?; fi
+    if tspu_ip_http_probe "$source_ip" "$target_ip" http 80; then http_rc=0; else http_rc=$?; fi
+    if tspu_ip_http_probe "$source_ip" "$target_ip" https 443; then https_rc=0; else https_rc=$?; fi
+    tspu_ip_path_mtu_probe "$source_ip" "$target_ip"
+
+    if (( tcp443_rc >= 3 && tcp80_rc < 3 )); then
+        trace_port=80
+    fi
+    tspu_ip_trace "$source_ip" "$target_ip" "$trace_port"
+
+    for rc in "$tcp80_rc" "$tcp443_rc"; do
+        case "$rc" in
+            0)
+                (( tcp_open += 1 ))
+                (( tcp_reachable += 1 ))
+                ;;
+            1|2) (( tcp_reachable += 1 )) ;;
+            3) (( tcp_timeout += 1 )) ;;
+        esac
+    done
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ИТОГ ]${NC}"
+    if (( tcp_open > 0 )); then
+        network_test_row "Сетевой путь" "открытых TCP-портов: ${tcp_open}/2" "ok"
+        (( tcp_timeout == 0 )) || network_test_row "Фильтрация" "один из TCP-портов уходит в таймаут" "warn"
+    elif (( tcp_reachable > 0 )); then
+        network_test_row "Сетевой путь" "цель отвечает RST или нестабильно" "warn"
+    elif (( ping_ok == 1 )); then
+        network_test_row "Фильтрация" "ICMP проходит, TCP 80/443 не отвечает" "warn"
+    else
+        network_test_row "Сетевой путь" "нет ответа по ICMP и TCP 80/443" "fail"
+    fi
+
+    if (( tcp443_rc == 0 && https_rc != 0 )); then
+        network_test_row "HTTPS" "TCP 443 открыт, но запрос по IP не завершился" "warn"
+        warn "Сервер может требовать доменный SNI; это само по себе не означает блокировку."
+    elif (( http_rc == 0 || https_rc == 0 )); then
+        network_test_row "HTTP(S)" "получен прикладной ответ" "ok"
+    fi
+
+    echo "tspu-ip source=${source_ip} interface=${source_interface} target=${target_ip} tcp80=${tcp80_rc} tcp443=${tcp443_rc} http=${http_rc} https=${https_rc}" >> "$LOG_FILE" 2>/dev/null || true
+    warn "Один замер не доказывает ТСПУ. Для сравнения повтори ту же цель с другим исходящим IP."
+    ok "Проверка ${source_ip} -> ${target_ip} завершена"
 }
 
 DPI_RESOLV_SNAPSHOT_DIR=""
@@ -10945,6 +11281,8 @@ menu() {
     if [[ "$MACHINE_MODE" != "panel" ]]; then
         labels+=("Проверка ТСПУ")
         actions+=("dpi-test")
+        labels+=("Проверка ТСПУ (IP)")
+        actions+=("dpi-ip-test")
     fi
     if [[ "$MACHINE_MODE" != "panel" ]]; then
         labels+=("Проверить и завести дополнительные IP")
@@ -11032,6 +11370,7 @@ menu() {
         status) show_status ;;
         network-test) network_test ;;
         dpi-test) run_dpi_detector ;;
+        dpi-ip-test) run_tspu_ip_test ;;
         additional-ips) setup_additional_ips || true ;;
         additional-ips-optimize) optimize_additional_ip_networks || true ;;
         remnawave-egress) configure_remnawave_egress || true ;;
@@ -11099,6 +11438,7 @@ main() {
         status) show_status ;;
         network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" ;;
         dpi-test|dpi-detector|tspu-test|tspu) run_dpi_detector "${2:-}" ;;
+        dpi-ip-test|dpi-ip|tspu-ip-test|tspu-ip) shift; run_tspu_ip_test "${1:-}" "${2:-}" ;;
         additional-ips|extra-ips|multi-ip|multiwan) setup_additional_ips ;;
         additional-ips-optimize|extra-ips-optimize|multi-ip-optimize|multiwan-optimize|network-repair) optimize_additional_ip_networks ;;
         remnawave-egress|remna-egress|reality-egress|xray-egress) shift; configure_remnawave_egress "${1:-menu}" ;;
