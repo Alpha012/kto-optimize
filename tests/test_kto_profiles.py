@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v313"', KTO)
-        self.assertIn('PUSH_BUILD="v313"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v313"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v313"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v313"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v313"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v313"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v314"', KTO)
+        self.assertIn('PUSH_BUILD="v314"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v314"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v314"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v314"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v314"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v314"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -436,6 +436,119 @@ network_test_ping 1.1.1.1 cloudflare > "$tmp"
 output="$(cat "$tmp")"
 grep -q 'ping cloudflare|loss=20% avg=0.500 ms|warn' <<< "$output"
 [[ "$NETTEST_PING_BAD" == 1 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_conntrack_capacity_scales_with_ram_and_network_test_detects_full_table(self):
+        capacity = function_body(KTO, "conntrack_capacity_values")
+        configure = function_body(KTO, "configure_conntrack_capacity")
+        network_conntrack = function_body(KTO, "network_test_conntrack")
+        system_check = function_body(KTO, "system_check_network_limits")
+        main = function_body(KTO, "main")
+
+        self.assertIn("target_max=2097152", capacity)
+        self.assertIn('net.netfilter.nf_conntrack_max = ${target_max}', configure)
+        self.assertIn("nf_conntrack_tcp_timeout_established = 10800", configure)
+        self.assertIn("nf_conntrack_tcp_timeout_time_wait = 30", configure)
+        self.assertIn('options nf_conntrack hashsize=${target_buckets}', configure)
+        self.assertNotIn("conntrack -F", configure)
+        self.assertNotIn("systemctl restart", configure)
+        self.assertIn("count >= maximum || percent >= 95", network_conntrack)
+        self.assertIn("nf_conntrack: table full, dropping packet", network_conntrack)
+        self.assertIn('system_check_row miss "conntrack"', system_check)
+        self.assertIn("conntrack-fix|fix-conntrack|conntrack-optimize", main)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+memory_total_mb() { printf '16000\n'; }
+sysctl() {
+    if [[ "${1:-}" == -n && "${2:-}" == net.netfilter.nf_conntrack_max ]]; then
+        printf '262144\n'
+    elif [[ "${1:-}" == -n && "${2:-}" == net.netfilter.nf_conntrack_buckets ]]; then
+        printf '65536\n'
+    elif [[ "${1:-}" == -n && "${2:-}" == net.netfilter.nf_conntrack_count ]]; then
+        printf '262144\n'
+    else
+        return 1
+    fi
+}
+IFS=$'\t' read -r maximum buckets < <(conntrack_capacity_values)
+[[ "$maximum" == 2097152 ]]
+[[ "$buckets" == 524288 ]]
+
+NETTEST_CONNTRACK_BAD=0
+NETTEST_WARN=0
+dmesg() { printf 'nf_conntrack: table full, dropping packet\n'; }
+network_test_row() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+network_test_conntrack > "$tmp"
+grep -q 'conntrack|262144/262144 (100%)|fail' "$tmp"
+grep -q 'conntrack drops|в последних kernel-сообщениях был table full|warn' "$tmp"
+[[ "$NETTEST_CONNTRACK_BAD" == 1 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_conntrack_capacity_applies_live_without_flushing_connections(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+KTO_CONNTRACK_SYSCTL_CONF="$work/conntrack.conf"
+KTO_CONNTRACK_MODPROBE_CONF="$work/nf_conntrack.conf"
+LOG_FILE="$work/log"
+SUDO=()
+printf '262144\n' > "$work/max"
+printf '65536\n' > "$work/buckets"
+memory_total_mb() { printf '16000\n'; }
+modprobe() { return 0; }
+sysctl() {
+    if [[ "${1:-}" == -n ]]; then
+        case "${2:-}" in
+            net.netfilter.nf_conntrack_count) printf '262144\n' ;;
+            net.netfilter.nf_conntrack_max) cat "$work/max" ;;
+            net.netfilter.nf_conntrack_buckets) cat "$work/buckets" ;;
+            *) return 1 ;;
+        esac
+    elif [[ "${1:-}" == -p ]]; then
+        awk -F= '/nf_conntrack_max/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$2" > "$work/max"
+    elif [[ "${1:-}" == -w && "${2:-}" == net.netfilter.nf_conntrack_buckets=* ]]; then
+        printf '%s\n' "${2#*=}" > "$work/buckets"
+    else
+        return 1
+    fi
+}
+output="$(configure_conntrack_capacity)"
+[[ "$(cat "$work/max")" == 2097152 ]]
+[[ "$(cat "$work/buckets")" == 524288 ]]
+grep -q '^net.netfilter.nf_conntrack_max = 2097152$' "$KTO_CONNTRACK_SYSCTL_CONF"
+grep -q '^net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30$' "$KTO_CONNTRACK_SYSCTL_CONF"
+grep -q '^options nf_conntrack hashsize=524288$' "$KTO_CONNTRACK_MODPROBE_CONF"
+grep -q 'Conntrack: 262144/2097152 (12%), buckets=524288' <<< "$output"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

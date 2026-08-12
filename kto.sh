@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v313"
+SCRIPT_BUILD="v314"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -44,6 +44,8 @@ ZRAM_MAX_MB="${KTO_ZRAM_MAX_MB:-2048}"
 STORAGE_GUARD_JOURNAL_CONF="/etc/systemd/journald.conf.d/99-kto-storage.conf"
 KTO_LOGROTATE_CONF="/etc/logrotate.d/kto"
 KTO_TUNING_SYSCTL_CONF="/etc/sysctl.d/99-kto-tuning.conf"
+KTO_CONNTRACK_SYSCTL_CONF="/etc/sysctl.d/99-z-kto-conntrack.conf"
+KTO_CONNTRACK_MODPROBE_CONF="/etc/modprobe.d/99-kto-nf-conntrack.conf"
 KTO_LIMITS_CONF="/etc/security/limits.d/99-kto-limits.conf"
 KTO_SYSTEMD_LIMITS_CONF="/etc/systemd/system.conf.d/99-kto-limits.conf"
 KTO_USER_LIMITS_CONF="/etc/systemd/user.conf.d/99-kto-limits.conf"
@@ -2867,6 +2869,103 @@ opt_kernel_network_memory_parallel() {
         "memory guard" opt_memory_guard
 }
 
+conntrack_capacity_values() {
+    local mem_mb target_max target_buckets current_max current_buckets override
+    mem_mb="$(memory_total_mb)"
+    [[ "$mem_mb" =~ ^[0-9]+$ ]] || mem_mb=0
+
+    if (( mem_mb >= 24576 )); then
+        target_max=4194304
+    elif (( mem_mb >= 12288 )); then
+        target_max=2097152
+    elif (( mem_mb >= 6144 )); then
+        target_max=1048576
+    elif (( mem_mb >= 3072 )); then
+        target_max=524288
+    else
+        target_max=262144
+    fi
+
+    override="${KTO_CONNTRACK_MAX:-}"
+    if [[ "$override" =~ ^[0-9]+$ ]] && (( 10#$override >= 65536 && 10#$override <= 8388608 )); then
+        target_max=$((10#$override))
+    fi
+
+    current_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)"
+    if [[ "$current_max" =~ ^[0-9]+$ ]] && (( current_max > target_max )); then
+        target_max="$current_max"
+    fi
+    target_buckets=$(( target_max / 4 ))
+    (( target_buckets >= 16384 )) || target_buckets=16384
+
+    current_buckets="$(sysctl -n net.netfilter.nf_conntrack_buckets 2>/dev/null || echo 0)"
+    if [[ "$current_buckets" =~ ^[0-9]+$ ]] && (( current_buckets > target_buckets )); then
+        target_buckets="$current_buckets"
+    fi
+    printf '%s\t%s\n' "$target_max" "$target_buckets"
+}
+
+configure_conntrack_capacity() {
+    local target_max target_buckets current_buckets applied_max count percent
+    cmd "${SUDO[@]}" modprobe nf_conntrack || true
+    if ! sysctl -n net.netfilter.nf_conntrack_count >/dev/null 2>&1; then
+        echo "conntrack skipped: kernel module is unavailable" >> "$LOG_FILE"
+        return 0
+    fi
+
+    IFS=$'\t' read -r target_max target_buckets < <(conntrack_capacity_values)
+    write_root_file "$KTO_CONNTRACK_SYSCTL_CONF" <<EOF || return 1
+# Managed by kto. Capacity is selected from available system memory.
+net.netfilter.nf_conntrack_max = ${target_max}
+net.netfilter.nf_conntrack_tcp_timeout_established = 10800
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 60
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
+net.netfilter.nf_conntrack_tcp_timeout_last_ack = 30
+net.netfilter.nf_conntrack_generic_timeout = 120
+EOF
+    write_root_file "$KTO_CONNTRACK_MODPROBE_CONF" <<EOF || return 1
+# Managed by kto. Applied when nf_conntrack is loaded at boot.
+options nf_conntrack hashsize=${target_buckets}
+EOF
+
+    if ! cmd "${SUDO[@]}" sysctl -p "$KTO_CONNTRACK_SYSCTL_CONF"; then
+        fail "Не удалось применить параметры conntrack"
+        return 1
+    fi
+
+    current_buckets="$(sysctl -n net.netfilter.nf_conntrack_buckets 2>/dev/null || echo 0)"
+    if [[ "$current_buckets" =~ ^[0-9]+$ ]] && (( current_buckets < target_buckets )); then
+        if ! cmd "${SUDO[@]}" sysctl -w "net.netfilter.nf_conntrack_buckets=${target_buckets}"; then
+            if [[ -e /sys/module/nf_conntrack/parameters/hashsize ]]; then
+                printf '%s\n' "$target_buckets" | "${SUDO[@]}" tee \
+                    /sys/module/nf_conntrack/parameters/hashsize >> "$LOG_FILE" 2>&1 || \
+                    warn "Hash-таблица conntrack увеличится после reboot"
+            fi
+        fi
+    fi
+
+    applied_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)"
+    count="$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo 0)"
+    if [[ ! "$applied_max" =~ ^[0-9]+$ || "$applied_max" -lt "$target_max" ]]; then
+        fail "Conntrack max не применился: ${applied_max:-неизвестно}, ожидалось ${target_max}"
+        return 1
+    fi
+    if [[ "$count" =~ ^[0-9]+$ && "$applied_max" =~ ^[0-9]+$ && "$applied_max" -gt 0 ]]; then
+        percent=$(( count * 100 / applied_max ))
+    else
+        percent=0
+    fi
+    ok "Conntrack: ${count}/${applied_max} (${percent}%), buckets=${target_buckets}"
+}
+
+fix_conntrack_capacity_cli() {
+    header
+    need_root
+    stage "Исправляю ёмкость conntrack без очистки живых соединений"
+    configure_conntrack_capacity
+}
+
 opt_network_limits() {
     opt_dns_guard
     opt_ipv6_mode_guard
@@ -2903,6 +3002,7 @@ net.ipv4.tcp_rmem = 4096 1048576 33554432
 net.ipv4.tcp_wmem = 4096 1048576 33554432
 vm.swappiness = 1
 EOF
+    configure_conntrack_capacity || return 1
     cmd "${SUDO[@]}" sysctl --system || true
 
     write_root_file "$KTO_LIMITS_CONF" <<'EOF'
@@ -3564,6 +3664,7 @@ system_check_storage() {
 
 system_check_network_limits() {
     local cc qdisc limits_ok=1 sysctl_file_ok=1 service_issues=() cpus
+    local ct_count ct_max ct_percent ct_target ct_buckets ct_config_ok=1
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
 
@@ -3615,6 +3716,39 @@ system_check_network_limits() {
     else
         SYSTEM_CHECK_NEEDS_NETWORK=1
         system_check_row miss "BBR + FQ" "${cc} + ${qdisc}"
+    fi
+
+    ct_count="$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || true)"
+    ct_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
+    if [[ "$ct_count" =~ ^[0-9]+$ && "$ct_max" =~ ^[0-9]+$ && "$ct_max" -gt 0 ]]; then
+        ct_percent=$(( ct_count * 100 / ct_max ))
+        if (( ct_count >= ct_max || ct_percent >= 95 )); then
+            SYSTEM_CHECK_NEEDS_NETWORK=1
+            system_check_row miss "conntrack" "${ct_count}/${ct_max} (${ct_percent}%), пакеты теряются"
+        elif (( ct_percent >= 75 )); then
+            SYSTEM_CHECK_NEEDS_NETWORK=1
+            system_check_row warn "conntrack" "${ct_count}/${ct_max} (${ct_percent}%), мало запаса"
+        else
+            system_check_row ok "conntrack" "${ct_count}/${ct_max} (${ct_percent}%)"
+        fi
+
+        IFS=$'\t' read -r ct_target ct_buckets < <(conntrack_capacity_values)
+        root_file_has_line "$KTO_CONNTRACK_SYSCTL_CONF" \
+            "net.netfilter.nf_conntrack_max = ${ct_target}" || ct_config_ok=0
+        root_file_has_line "$KTO_CONNTRACK_SYSCTL_CONF" \
+            "net.netfilter.nf_conntrack_tcp_timeout_established = 10800" || ct_config_ok=0
+        root_file_has_line "$KTO_CONNTRACK_SYSCTL_CONF" \
+            "net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30" || ct_config_ok=0
+        root_file_has_line "$KTO_CONNTRACK_MODPROBE_CONF" \
+            "options nf_conntrack hashsize=${ct_buckets}" || ct_config_ok=0
+        if (( ct_config_ok == 1 )); then
+            system_check_row ok "conntrack config" "max ${ct_target}, buckets ${ct_buckets}"
+        else
+            SYSTEM_CHECK_NEEDS_NETWORK=1
+            system_check_row miss "conntrack config" "не настроен под объём RAM"
+        fi
+    else
+        system_check_row skip "conntrack" "kernel module не используется"
     fi
 
     root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.ipv4.tcp_congestion_control = bbr" || sysctl_file_ok=0
@@ -4869,6 +5003,34 @@ network_test_mtr() {
     network_test_row "mtr ${label}" "$(network_test_short "${out:-нет вывода}")"
 }
 
+network_test_conntrack() {
+    local count maximum percent status="ok" recent_full=0
+    count="$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || true)"
+    maximum="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
+    if [[ ! "$count" =~ ^[0-9]+$ || ! "$maximum" =~ ^[0-9]+$ || "$maximum" -le 0 ]]; then
+        network_test_row "conntrack" "не используется" "skip"
+        return 0
+    fi
+
+    percent=$(( count * 100 / maximum ))
+    if (( count >= maximum || percent >= 95 )); then
+        status="fail"
+        (( NETTEST_CONNTRACK_BAD += 1 ))
+    elif (( percent >= 75 )); then
+        status="warn"
+        (( NETTEST_WARN += 1 ))
+    fi
+    network_test_row "conntrack" "${count}/${maximum} (${percent}%)" "$status"
+
+    if dmesg 2>/dev/null | tail -n 200 | grep -F 'nf_conntrack: table full, dropping packet' >/dev/null; then
+        recent_full=1
+    fi
+    if (( recent_full == 1 )); then
+        network_test_row "conntrack drops" "в последних kernel-сообщениях был table full" "warn"
+        (( NETTEST_WARN += 1 ))
+    fi
+}
+
 network_test_extra_target() {
     local target="$1"
     [[ -n "$target" ]] || return 0
@@ -4921,6 +5083,7 @@ network_test() {
     NETTEST_RAW_OK=0
     NETTEST_RAW_BAD=0
     NETTEST_PING_BAD=0
+    NETTEST_CONNTRACK_BAD=0
     NETTEST_WARN=0
 
     echo -e "${BOLD}${PURPLE}[ СЕТЬ ]${NC}"
@@ -4967,6 +5130,10 @@ network_test() {
     done
 
     echo
+    echo -e "${BOLD}${PURPLE}[ CONNTRACK ]${NC}"
+    network_test_conntrack
+
+    echo
     echo -e "${BOLD}${PURPLE}[ LOSS ]${NC}"
     [[ -n "$gateway" ]] && network_test_ping "$gateway" "gateway"
     network_test_ping "1.1.1.1" "1.1.1.1"
@@ -5005,11 +5172,22 @@ network_test() {
         network_test_row "ICMP" "без явных потерь" "ok"
     fi
 
-    if (( NETTEST_DNS_BAD > 0 || NETTEST_HTTPS_BAD > 0 || NETTEST_RAW_BAD > 0 )); then
+    if (( NETTEST_CONNTRACK_BAD > 0 )); then
+        network_test_row "conntrack" "переполнен или уже дропал пакеты; запусти conntrack-fix" "fail"
+    else
+        network_test_row "conntrack" "нет признаков переполнения" "ok"
+    fi
+
+    if (( NETTEST_DNS_BAD > 0 || NETTEST_HTTPS_BAD > 0 || NETTEST_RAW_BAD > 0 || NETTEST_CONNTRACK_BAD > 0 )); then
         echo
-        warn "Если github/api живые, а raw IP выборочно таймаутятся - это обычно маршрут провайдера до Fastly/GitHub, а не Ubuntu."
-        warn "Для временного костыля можно прибить raw.githubusercontent.com к рабочему IP из блока RAW GITHUB IP."
-        return 1
+        if (( NETTEST_CONNTRACK_BAD > 0 )); then
+            warn "Conntrack переполнен: kernel отбрасывает новые пакеты. Запусти: kto.sh conntrack-fix"
+        fi
+        if (( NETTEST_DNS_BAD > 0 || NETTEST_HTTPS_BAD > 0 || NETTEST_RAW_BAD > 0 )); then
+            warn "Если github/api живые, а raw IP выборочно таймаутятся - это обычно маршрут провайдера до Fastly/GitHub, а не Ubuntu."
+            warn "Для временного костыля можно прибить raw.githubusercontent.com к рабочему IP из блока RAW GITHUB IP."
+        fi
+        return 0
     fi
 
     echo
@@ -11471,6 +11649,7 @@ main() {
         warp) install_warp_native ;;
         status) show_status ;;
         network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" || true ;;
+        conntrack-fix|fix-conntrack|conntrack-optimize) fix_conntrack_capacity_cli ;;
         dpi-test|dpi-detector|tspu-test|tspu) run_dpi_detector "${2:-}" ;;
         dpi-ip-test|dpi-ip|tspu-ip-test|tspu-ip) shift; run_tspu_ip_test "${1:-}" "${2:-}" ;;
         additional-ips|extra-ips|multi-ip|multiwan) setup_additional_ips ;;
