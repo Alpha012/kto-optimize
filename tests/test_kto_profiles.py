@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v312"', KTO)
-        self.assertIn('PUSH_BUILD="v312"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v312"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v312"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v312"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v312"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v312"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v313"', KTO)
+        self.assertIn('PUSH_BUILD="v313"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v313"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v313"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v313"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v313"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v313"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -398,6 +398,44 @@ list_test_source_ipv4s() { printf '198.51.100.10\tens3\tосновной\n'; }
 select_test_source_ipv4 </dev/null
 [[ "$TEST_SOURCE_IP" == 198.51.100.10 ]]
 [[ "$TEST_SOURCE_INTERFACE" == ens3 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_network_ping_marks_partial_packet_loss_as_warning(self):
+        main = function_body(KTO, "main")
+        self.assertIn('network_test "$@" || true', main)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+NETTEST_SOURCE_IP=198.51.100.10
+NETTEST_PING_BAD=0
+ping() {
+    [[ "$*" == *'-c 10 -i 0.2'* ]]
+    cat <<'EOF'
+10 packets transmitted, 8 received, 20% packet loss, time 1800ms
+rtt min/avg/max/mdev = 0.400/0.500/0.600/0.050 ms
+EOF
+    return 0
+}
+network_test_row() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+network_test_ping 1.1.1.1 cloudflare > "$tmp"
+output="$(cat "$tmp")"
+grep -q 'ping cloudflare|loss=20% avg=0.500 ms|warn' <<< "$output"
+[[ "$NETTEST_PING_BAD" == 1 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v312"
+SCRIPT_BUILD="v313"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4830,7 +4830,7 @@ network_test_raw_ip() {
 network_test_ping() {
     local target="$1"
     local label="${2:-$1}"
-    local tmp loss rtt status
+    local tmp loss loss_percent rtt status ping_rc=0
     if ! command_exists ping; then
         network_test_row "ping ${label}" "ping не найден" "skip"
         (( NETTEST_WARN += 1 ))
@@ -4838,15 +4838,21 @@ network_test_ping() {
     fi
 
     tmp="$(mktemp)"
-    if ping -4 -I "$NETTEST_SOURCE_IP" -c 4 -W 2 "$target" > "$tmp" 2>&1; then
-        status="ok"
-    else
-        status="warn"
-        (( NETTEST_PING_BAD += 1 ))
-    fi
+    ping -4 -I "$NETTEST_SOURCE_IP" -c 10 -i 0.2 -W 2 "$target" > "$tmp" 2>&1 || ping_rc=$?
     loss="$(awk -F',' '/packet loss/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3); print $3; exit}' "$tmp" 2>/dev/null || true)"
+    loss_percent="$(sed -nE 's/.* ([0-9]+([.][0-9]+)?)% packet loss.*/\1/p' "$tmp" | tail -n 1)"
+    [[ -z "$loss_percent" ]] || loss="${loss_percent}%"
     rtt="$(awk -F'/' '/^(rtt|round-trip)/ {print $5 " ms"; exit}' "$tmp" 2>/dev/null || true)"
     rm -f "$tmp"
+    if [[ -n "$loss_percent" ]] && awk -v loss="$loss_percent" 'BEGIN { exit !(loss > 0) }'; then
+        status="warn"
+        (( NETTEST_PING_BAD += 1 ))
+    elif (( ping_rc != 0 )) || [[ -z "$loss_percent" ]]; then
+        status="warn"
+        (( NETTEST_PING_BAD += 1 ))
+    else
+        status="ok"
+    fi
     network_test_row "ping ${label}" "loss=${loss:-?}${rtt:+ avg=${rtt}}" "$status"
 }
 
@@ -11464,7 +11470,7 @@ main() {
         selfsteal-harden|selfsteal-timeouts) harden_selfsteal_caddy_now ;;
         warp) install_warp_native ;;
         status) show_status ;;
-        network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" ;;
+        network-test|net-test|netcheck|network-check|diag-network|diagnose-network) shift; network_test "$@" || true ;;
         dpi-test|dpi-detector|tspu-test|tspu) run_dpi_detector "${2:-}" ;;
         dpi-ip-test|dpi-ip|tspu-ip-test|tspu-ip) shift; run_tspu_ip_test "${1:-}" "${2:-}" ;;
         additional-ips|extra-ips|multi-ip|multiwan) setup_additional_ips ;;
