@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v311"', KTO)
-        self.assertIn('PUSH_BUILD="v311"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v311"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v311"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v311"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v311"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v311"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v312"', KTO)
+        self.assertIn('PUSH_BUILD="v312"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v312"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v312"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v312"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v312"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v312"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -1437,37 +1437,50 @@ grep -Fq $'D\tvless_pool/xray2\tDOWN\tL4TOUT' <<< "$report"
 
     def test_haproxy_bandwidth_limit_is_scoped_to_selected_input_ip(self):
         apply_limits = function_body(HAPROXY_BANDWIDTH, "apply_limits")
-        add_filter = function_body(HAPROXY_BANDWIDTH, "add_police_filter")
+        add_ingress = function_body(HAPROXY_BANDWIDTH, "add_ingress_redirect_filter")
+        add_egress = function_body(HAPROXY_BANDWIDTH, "add_egress_class_filter")
+        setup_ifb = function_body(HAPROXY_BANDWIDTH, "setup_ifb_shaper")
+        setup_root = function_body(HAPROXY_BANDWIDTH, "setup_egress_root")
         ensure_clsact = function_body(HAPROXY_BANDWIDTH, "ensure_clsact")
         active_filters = function_body(HAPROXY_BANDWIDTH, "active_filter_count")
+        active_layout = function_body(HAPROXY_BANDWIDTH, "state_layout_active")
+        cleanup = function_body(HAPROXY_BANDWIDTH, "cleanup_state_file")
         set_limit = function_body(KTO, "set_haproxy_input_bandwidth_limit")
         commit = function_body(KTO, "commit_haproxy_bandwidth_config")
         apply_routes = function_body(KTO, "apply_haproxy_routes_config")
         reapply = function_body(KTO, "reapply_haproxy_bandwidth_limits")
+        apply_cli = function_body(KTO, "apply_haproxy_bandwidth_limits_cli")
 
-        self.assertIn('tc qdisc add dev "$interface" clsact', ensure_clsact)
+        self.assertIn('tc_logged qdisc add dev "$interface" clsact', ensure_clsact)
         self.assertNotIn(' root ', ensure_clsact)
-        self.assertIn('flower_match=(dst_ip "$ip" dst_port "$port")', add_filter)
-        self.assertIn('flower_match=(src_ip "$ip" src_port "$port")', add_filter)
-        self.assertIn('u32_match=(match ip dst "${ip}/32"', add_filter)
-        self.assertIn('u32_match=(match ip src "${ip}/32"', add_filter)
-        self.assertIn('action police rate "${rate}mbit"', add_filter)
-        self.assertIn('action_args=(action police index "$action_index")', add_filter)
-        self.assertIn('"$ingress_action_index" "$rate" "$burst"', apply_limits)
-        self.assertIn('"$egress_action_index" "$rate" "$burst"', apply_limits)
+        self.assertIn('dst_ip "$ip" dst_port "$port"', add_ingress)
+        self.assertIn('action mirred egress redirect dev "$ifb"', add_ingress)
+        self.assertIn('src_ip "$ip" src_port "$port" classid "$classid"', add_egress)
+        self.assertIn('flowid "$classid"', add_egress)
+        self.assertIn('handle "${IFB_ROOT_MAJOR}:" htb', setup_ifb)
+        self.assertIn('add_fq_codel "$ifb"', setup_ifb)
+        self.assertIn('handle "${ROOT_MAJOR}:" htb', setup_root)
+        self.assertNotIn('action police rate', HAPROXY_BANDWIDTH)
+        self.assertIn('cleanup_orphaned_legacy_tc', apply_limits)
+        self.assertIn('tc actions delete action police index', cleanup)
         self.assertIn("trap 'rc=$?; trap - EXIT;", apply_limits)
         self.assertNotIn("RETURN", apply_limits)
-        self.assertIn('tc filter show dev "$interface" "$direction" protocol ip', active_filters)
+        self.assertIn('state_filter_snapshot "$interface" "$direction"', active_filters)
+        self.assertIn('tc class show dev "$ifb"', active_layout)
+        self.assertIn('tc class show dev "$interface"', active_layout)
         self.assertIn('desired_state_signature', apply_limits)
-        self.assertIn('Лимиты HAProxy уже актуальны', apply_limits)
+        self.assertIn('Shaper HAProxy уже актуален', apply_limits)
         self.assertIn('haproxy_input_ip_available "$input_ip"', set_limit)
         self.assertIn('Возвращаю предыдущие лимиты', commit)
         self.assertIn('reapply_haproxy_bandwidth_limits', apply_routes)
         self.assertIn('skip_bandwidth_reapply', apply_routes)
         self.assertIn('require_local_haproxy_bandwidth_manager', reapply)
         self.assertNotIn('ensure_haproxy_bandwidth_manager', reapply)
+        self.assertIn('ensure_haproxy_bandwidth_manager', apply_cli)
+        self.assertIn('reapply_haproxy_bandwidth_limits', apply_cli)
         self.assertIn('haproxy-limit|haproxy-bandwidth-limit', KTO)
         self.assertIn('haproxy-limit-off|haproxy-bandwidth-off', KTO)
+        self.assertIn('haproxy-limit-apply|haproxy-bandwidth-apply', KTO)
         self.assertIn('haproxy-limit-status|haproxy-bandwidth-status', KTO)
 
         bash = bash_executable()
@@ -1491,15 +1504,20 @@ global
 defaults
     mode tcp
 frontend vless_in_8443
-    bind *:8443 backlog 65535
+    bind 217.19.122.109:8443 backlog 65535
     default_backend vless_pool_8443
 frontend vless_in_8444
-    bind 0.0.0.0:8444 backlog 65535
+    bind 198.51.100.44:8444 backlog 65535
     default_backend vless_pool_8444
+frontend vless_in_9443
+    bind *:9443 backlog 65535
+    default_backend vless_pool_9443
 backend vless_pool_8443
     server xray1 1.1.1.1:443
 backend vless_pool_8444
     server xray2 2.2.2.2:443
+backend vless_pool_9443
+    server xray3 3.3.3.3:443
 EOF
 printf 'A\t3900001\nF\tens3\tingress\t42001\t3900001\nF\tens3\tegress\t42002\t3900001\n' > "$STATE_FILE"
 : > "$LOG_FILE"
@@ -1509,18 +1527,22 @@ ip() {
         printf '2: ens3    inet 217.19.122.109/24 brd 217.19.122.255 scope global ens3\n'
         return 0
     fi
-    return 1
+    if [[ "${1:-}" == link && "${2:-}" == show ]]; then
+        return 1
+    fi
+    return 0
 }
 tc() {
     printf '%s ' "$@" >> "$work/events"
     printf '\n' >> "$work/events"
     if [[ "${1:-}" == qdisc && "${2:-}" == show ]]; then
+        printf 'qdisc mq 0: root\n'
         printf 'qdisc clsact ffff: parent ffff:fff1\n'
     elif [[ "${1:-}" == filter && "${2:-}" == show ]]; then
         printf 'filter protocol ip pref 42001 flower\n'
         printf 'filter protocol ip pref 42002 flower\n'
-        printf 'filter protocol ip pref 42003 flower\n'
-        printf 'filter protocol ip pref 42004 flower\n'
+    elif [[ "${1:-}" == actions && "${2:-}" == ls ]]; then
+        printf 'index 3900001 ref 1 bind 1\n'
     fi
     return 0
 }
@@ -1529,28 +1551,35 @@ install() {
     cp "$3" "$4"
     chmod "$2" "$4"
 }
+preflight_shaper() { return 0; }
+state_layout_active() { return 0; }
 run_apply() { apply_limits; }
 run_apply
 [[ -z "$(trap -p RETURN)" ]]
 grep -q '^actions delete action police index 3900001 ' "$work/events"
-[[ "$(grep -c '^actions add action police ' "$work/events" || true)" == 0 ]]
-[[ "$(grep -c 'action police rate 2000mbit ' "$work/events")" == 2 ]]
+! grep -q 'action police rate' "$work/events"
+grep -q '^qdisc replace dev ktoifb.* root handle 7b00: htb ' "$work/events"
+grep -q '^qdisc replace dev ens3 root handle 7a00: htb ' "$work/events"
+grep -q '^qdisc replace dev ktoifb.* fq_codel ' "$work/events"
+grep -q '^qdisc replace dev ens3 parent 7a00:101 .* fq_codel ' "$work/events"
 [[ "$(grep -c '^filter add dev ens3 ' "$work/events")" == 4 ]]
-grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8443 action police rate 2000mbit .* index 3900001' "$work/events"
-grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8443 action police rate 2000mbit .* index 3900002' "$work/events"
-grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8444 action police index 3900001' "$work/events"
-grep -q 'egress protocol ip .* src_ip 217.19.122.109 src_port 8444 action police index 3900002' "$work/events"
+grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 8443 action mirred egress redirect dev ktoifb' "$work/events"
+grep -q 'parent 7a00: protocol ip .* src_ip 217.19.122.109 src_port 8443 classid 7a00:101' "$work/events"
+grep -q 'ingress protocol ip .* dst_ip 217.19.122.109 dst_port 9443 action mirred egress redirect dev ktoifb' "$work/events"
+grep -q 'parent 7a00: protocol ip .* src_ip 217.19.122.109 src_port 9443 classid 7a00:101' "$work/events"
+! grep -q 'dst_port 8444' "$work/events"
+! grep -q 'src_port 8444' "$work/events"
 [[ "$(grep -c $'^F\t' "$STATE_FILE")" == 4 ]]
-[[ "$(grep -c $'^A\t' "$STATE_FILE")" == 2 ]]
+[[ "$(grep -c $'^A\t' "$STATE_FILE" || true)" == 0 ]]
 [[ "$(grep -c $'^S\t' "$STATE_FILE")" == 1 ]]
-status_output="$(show_status)"
-grep -q '2000 Mbit/s на каждое направление' <<< "$status_output"
-grep -q 'Вход (RX): OK' <<< "$status_output"
-grep -q 'Выход (TX): OK' <<< "$status_output"
+[[ "$(grep -c $'^V\t3$' "$STATE_FILE")" == 1 ]]
+[[ "$(grep -c $'^R\tens3\tmq$' "$STATE_FILE")" == 1 ]]
+[[ "$(grep -c $'^I\t' "$STATE_FILE")" == 1 ]]
+grep -q $'^L\t217.19.122.109\t2000\tens3\t.*\t7a00:101\t8443,9443$' "$STATE_FILE"
 : > "$work/events"
 second_output="$(run_apply)"
-grep -q 'Лимиты HAProxy уже актуальны: 1 IP, 4 tc-фильтров' <<< "$second_output"
-! grep -Eq '^(filter (add|delete)|actions delete)' "$work/events"
+grep -q 'Shaper HAProxy уже актуален: 1 IP, 4 точных фильтров' <<< "$second_output"
+! grep -Eq '^(qdisc (add|replace|delete)|class (add|replace|delete)|filter (add|delete)|actions delete)' "$work/events"
 [[ -z "$(trap -p RETURN)" ]]
 '''
         result = subprocess.run(
@@ -1563,7 +1592,7 @@ grep -q 'Лимиты HAProxy уже актуальны: 1 IP, 4 tc-фильтр
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_haproxy_bandwidth_falls_back_to_u32_when_flower_is_unavailable(self):
+    def test_haproxy_bandwidth_shaper_falls_back_to_u32_when_flower_is_unavailable(self):
         bash = bash_executable()
         if bash is None:
             self.skipTest("bash is unavailable")
@@ -1597,7 +1626,10 @@ ip() {
         printf '2: ens3    inet 217.19.122.109/24 brd 217.19.122.255 scope global ens3\n'
         return 0
     fi
-    return 1
+    if [[ "${1:-}" == link && "${2:-}" == show ]]; then
+        return 1
+    fi
+    return 0
 }
 tc() {
     local argument
@@ -1610,6 +1642,9 @@ tc() {
                 return 2
             fi
         done
+    elif [[ "${1:-}" == qdisc && "${2:-}" == show ]]; then
+        printf 'qdisc fq 0: root\n'
+        printf 'qdisc clsact ffff: parent ffff:fff1\n'
     fi
     return 0
 }
@@ -1618,16 +1653,196 @@ install() {
     cp "$3" "$4"
     chmod "$2" "$4"
 }
+preflight_shaper() { return 0; }
 outer() { apply_limits; }
 outer
 [[ -z "$(trap -p RETURN)" ]]
 [[ "$(grep -c '^filter add dev ens3 .* flower ' "$work/events")" == 1 ]]
 [[ "$(grep -c '^filter add dev ens3 .* u32 ' "$work/events")" == 2 ]]
-[[ "$(grep -c 'u32 .* action police rate 2000mbit ' "$work/events")" == 2 ]]
-grep -q 'u32 .* match ip dst 217.19.122.109/32 match ip dport 443 .* index 3900001' "$work/events"
-grep -q 'u32 .* match ip src 217.19.122.109/32 match ip sport 443 .* index 3900002' "$work/events"
+grep -q 'u32 .* match ip dst 217.19.122.109/32 match ip dport 443 .* action mirred egress redirect dev ktoifb' "$work/events"
+grep -q 'parent 7a00: protocol ip .* u32 .* match ip src 217.19.122.109/32 match ip sport 443 .* flowid 7a00:101' "$work/events"
+! grep -q 'action police rate' "$work/events"
 [[ "$(grep -c $'^F\t' "$STATE_FILE")" == 2 ]]
-[[ "$(grep -c $'^A\t' "$STATE_FILE")" == 2 ]]
+[[ "$(grep -c $'^A\t' "$STATE_FILE" || true)" == 0 ]]
+[[ "$(grep -c $'^R\tens3\tfq$' "$STATE_FILE")" == 1 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_bandwidth_shaper_groups_multiple_ips_on_one_interface(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export KTO_HAPROXY_BANDWIDTH_CONFIG="$work/limits"
+export KTO_HAPROXY_CONFIG="$work/haproxy.cfg"
+export KTO_HAPROXY_BANDWIDTH_STATE="$work/state"
+export KTO_HAPROXY_BANDWIDTH_LOG="$work/log"
+export KTO_HAPROXY_BANDWIDTH_LOCK="$work/lock"
+source <(sed '/^main /d' scripts/kto-haproxy-bandwidth.sh)
+printf '217.19.122.109\t2000\n217.19.122.148\t1000\n' > "$LIMITS_CONFIG"
+cat > "$HAPROXY_CONFIG" <<'EOF'
+global
+    maxconn 10000
+defaults
+    mode tcp
+frontend vless_a
+    bind 217.19.122.109:443
+    default_backend pool_a
+frontend vless_b
+    bind 217.19.122.148:443
+    default_backend pool_b
+frontend vless_shared
+    bind *:8443
+    default_backend pool_shared
+backend pool_a
+    server a 1.1.1.1:443
+backend pool_b
+    server b 2.2.2.2:443
+backend pool_shared
+    server c 3.3.3.3:443
+EOF
+: > "$LOG_FILE"
+ip() {
+    if [[ "${1:-}" == -4 && "${2:-}" == -o && "${3:-}" == address ]]; then
+        printf '2: ens3 inet 217.19.122.109/24 scope global ens3\n'
+        printf '2: ens3 inet 217.19.122.148/24 scope global secondary ens3\n'
+        return 0
+    fi
+    [[ "${1:-}" == link && "${2:-}" == show ]] && return 1
+    return 0
+}
+tc() {
+    printf '%s ' "$@" >> "$work/events"
+    printf '\n' >> "$work/events"
+    if [[ "${1:-}" == qdisc && "${2:-}" == show ]]; then
+        printf 'qdisc fq 0: root\nqdisc clsact ffff: parent ffff:fff1\n'
+    fi
+    return 0
+}
+install() {
+    [[ "$1" == -m ]]
+    cp "$3" "$4"
+    chmod "$2" "$4"
+}
+preflight_shaper() { return 0; }
+apply_limits
+[[ "$(grep -c '^qdisc replace dev ens3 root handle 7a00: htb ' "$work/events")" == 1 ]]
+[[ "$(grep -c '^qdisc replace dev ktoifb.* root handle 7b00: htb ' "$work/events")" == 2 ]]
+grep -q '^class replace dev ens3 parent 7a00:1 classid 7a00:101 htb rate 2000mbit ' "$work/events"
+grep -q '^class replace dev ens3 parent 7a00:1 classid 7a00:102 htb rate 1000mbit ' "$work/events"
+[[ "$(grep -c '^filter add dev ens3 ' "$work/events")" == 8 ]]
+[[ "$(grep -c $'^R\tens3\tfq$' "$STATE_FILE")" == 1 ]]
+[[ "$(grep -c $'^I\t' "$STATE_FILE")" == 2 ]]
+[[ "$(grep -c $'^L\t' "$STATE_FILE")" == 2 ]]
+[[ "$(grep -c $'^F\t' "$STATE_FILE")" == 8 ]]
+grep -q $'^L\t217.19.122.109\t2000\tens3\t.*\t7a00:101\t443,8443$' "$STATE_FILE"
+grep -q $'^L\t217.19.122.148\t1000\tens3\t.*\t7a00:102\t443,8443$' "$STATE_FILE"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_bandwidth_shaper_rolls_back_partial_apply(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export KTO_HAPROXY_BANDWIDTH_CONFIG="$work/limits"
+export KTO_HAPROXY_CONFIG="$work/haproxy.cfg"
+export KTO_HAPROXY_BANDWIDTH_STATE="$work/state"
+export KTO_HAPROXY_BANDWIDTH_LOG="$work/log"
+export KTO_HAPROXY_BANDWIDTH_LOCK="$work/lock"
+source <(sed '/^main /d' scripts/kto-haproxy-bandwidth.sh)
+printf '217.19.122.109\t2000\n' > "$LIMITS_CONFIG"
+cat > "$HAPROXY_CONFIG" <<'EOF'
+global
+defaults
+    mode tcp
+frontend vless_in
+    bind 217.19.122.109:443
+    default_backend pool
+backend pool
+    server xray 1.1.1.1:443
+EOF
+: > "$LOG_FILE"
+ip() {
+    if [[ "${1:-}" == -4 && "${2:-}" == -o && "${3:-}" == address ]]; then
+        printf '2: ens3 inet 217.19.122.109/24 scope global ens3\n'
+        return 0
+    fi
+    if [[ "${1:-}" == link && "${2:-}" == show ]]; then
+        [[ -e "$work/ifb-up" ]]
+        return
+    fi
+    if [[ "${1:-}" == link && "${2:-}" == add ]]; then
+        : > "$work/ifb-up"
+    elif [[ "${1:-}" == link && "${2:-}" == delete ]]; then
+        rm -f "$work/ifb-up"
+    fi
+    printf 'ip:' >> "$work/events"
+    printf '%s ' "$@" >> "$work/events"
+    printf '\n' >> "$work/events"
+    return 0
+}
+tc() {
+    printf '%s ' "$@" >> "$work/events"
+    printf '\n' >> "$work/events"
+    if [[ "${1:-}" == qdisc && "${2:-}" == show && "${4:-}" == ens3 ]]; then
+        if [[ -e "$work/root-owned" ]]; then
+            printf 'qdisc htb 7a00: root\n'
+        else
+            printf 'qdisc fq 0: root\n'
+        fi
+        printf 'qdisc clsact ffff: parent ffff:fff1\n'
+    elif [[ "${1:-}" == qdisc && "${2:-}" == replace && "${4:-}" == ens3 &&
+        "${5:-}" == root && "${6:-}" == handle && "${7:-}" == 7a00: ]]; then
+        : > "$work/root-owned"
+    elif [[ "${1:-}" == qdisc && "${2:-}" == delete && "${4:-}" == ens3 && "${5:-}" == root ]]; then
+        rm -f "$work/root-owned"
+    elif [[ "${1:-}" == filter && "${2:-}" == add && "${5:-}" == parent && "${6:-}" == 7a00: ]]; then
+        printf 'simulated egress classifier failure\n' >&2
+        return 2
+    fi
+    return 0
+}
+install() {
+    [[ "$1" == -m ]]
+    cp "$3" "$4"
+    chmod "$2" "$4"
+}
+preflight_shaper() { return 0; }
+if apply_limits; then
+    echo 'apply unexpectedly succeeded' >&2
+    exit 1
+fi
+[[ ! -e "$work/root-owned" ]]
+[[ ! -e "$work/ifb-up" ]]
+[[ ! -e "$STATE_FILE" ]]
+grep -q '^filter delete dev ens3 ingress protocol ip pref 42001 ' "$work/events"
+grep -q '^qdisc delete dev ens3 root ' "$work/events"
+grep -q '^ip:link delete dev ktoifb' "$work/events"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

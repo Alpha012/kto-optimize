@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v311"
+SCRIPT_BUILD="v312"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -7366,7 +7366,7 @@ install_haproxy_bandwidth_manager() {
     install_asset_file scripts/kto-haproxy-bandwidth.sh "$HAPROXY_BANDWIDTH_MANAGER" 0755 || return 1
     if write_root_file_if_changed "$HAPROXY_BANDWIDTH_UNIT" <<EOF
 [Unit]
-Description=KTO per-input-IP and per-direction HAProxy bandwidth limits
+Description=KTO per-input-IP and per-direction HAProxy bandwidth shaper
 Wants=network-online.target
 After=network-online.target haproxy.service kto-additional-ip-routes.service
 
@@ -7413,7 +7413,7 @@ ensure_haproxy_bandwidth_manager() {
         fi
         return 0
     fi
-    must "Установка зависимостей лимита HAProxy" apt_install_with_update_if_missing iproute2 util-linux || return 1
+    must "Установка зависимостей лимита HAProxy" apt_install_with_update_if_missing iproute2 util-linux kmod || return 1
     install_haproxy_bandwidth_manager
 }
 
@@ -7871,6 +7871,14 @@ show_haproxy_bandwidth_status_cli() {
     require_haproxy_mode
     need_root
     show_haproxy_bandwidth_status
+}
+
+apply_haproxy_bandwidth_limits_cli() {
+    header
+    require_haproxy_mode
+    need_root
+    ensure_haproxy_bandwidth_manager || return 1
+    reapply_haproxy_bandwidth_limits
 }
 
 sync_haproxy_firewall() {
@@ -11476,6 +11484,7 @@ main() {
         haproxy-limit|haproxy-bandwidth-limit) shift; set_haproxy_input_bandwidth_limit_cli "$@" ;;
         haproxy-limit-off|haproxy-bandwidth-off) shift; remove_haproxy_input_bandwidth_limit_cli "$@" ;;
         haproxy-limit-clear|haproxy-bandwidth-clear) clear_all_haproxy_bandwidth_limits_cli ;;
+        haproxy-limit-apply|haproxy-bandwidth-apply|haproxy-limit-reapply) apply_haproxy_bandwidth_limits_cli ;;
         haproxy-limit-status|haproxy-bandwidth-status) show_haproxy_bandwidth_status_cli ;;
         haproxy-diagnose|haproxy-diagnostic|haproxy-diag|haproxy-status) diagnose_haproxy || true ;;
         haproxy-stabilize|haproxy-recover) stabilize_haproxy ;;
