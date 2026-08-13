@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v317"
+PUSH_BUILD="v318"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
@@ -746,8 +746,7 @@ haproxy_frontend_counters_tsv() {
             gsub(/\r/, "", bytes_in)
             gsub(/\r/, "", bytes_out)
             if (service != "FRONTEND" || proxy == "") next
-            if (bytes_in !~ /^[0-9]+$/) bytes_in = 0
-            if (bytes_out !~ /^[0-9]+$/) bytes_out = 0
+            if (bytes_in !~ /^[0-9]+$/ || bytes_out !~ /^[0-9]+$/) next
             print proxy "\t" bytes_in "\t" bytes_out
         }
     ' | sort -t $'\t' -k1,1
@@ -755,6 +754,7 @@ haproxy_frontend_counters_tsv() {
 
 build_haproxy_traffic_counters_json() {
     local bindings_file="$1" counters_file="$2" routes_json="$3" sample_ms="$4" wildcard_ip="${5:-}"
+    local counter_generation="${6:-}" link_counters_json="${7:-[]}"
     local routes_file rows_file frontend listen_ip port bytes_in bytes_out endpoint
     local -A route_endpoints=() frontend_in=() frontend_out=() used_frontends=()
 
@@ -795,18 +795,29 @@ build_haproxy_traffic_counters_json() {
     done < "$bindings_file"
 
     if [[ -s "$rows_file" ]]; then
-        jq -R -s -c --argjson sample_ms "$sample_ms" '
+        jq -R -s -c \
+            --argjson sample_ms "$sample_ms" \
+            --arg counter_generation "$counter_generation" \
+            --argjson link_counters "$link_counters_json" '
             [split("\n")[] | select(length > 0) | split("\t") |
                 {ip: .[0], rx: (.[1] | tonumber), tx: (.[2] | tonumber)}]
             | sort_by(.ip)
             | group_by(.ip)
-            | map({
-                ip: .[0].ip,
-                rate_source: "haproxy",
-                counter_rx_bytes: (map(.rx) | add),
-                counter_tx_bytes: (map(.tx) | add),
-                counter_sample_ms: $sample_ms
-              })
+            | map(
+                {
+                    ip: .[0].ip,
+                    rate_source: "haproxy",
+                    counter_generation: $counter_generation,
+                    counter_rx_bytes: (map(.rx) | add),
+                    counter_tx_bytes: (map(.tx) | add),
+                    counter_sample_ms: $sample_ms
+                }
+                | . as $counter
+                | ($link_counters | map(select(.ip == $counter.ip)) | .[0]) as $link
+                | .link_counter_rx_bytes = ($link.rx // 0)
+                | .link_counter_tx_bytes = ($link.tx // 0)
+                | .link_counter_sample_ms = ($link.sample_ms // 0)
+              )
         ' "$rows_file" 2>/dev/null || printf '[]\n'
     else
         printf '[]\n'
@@ -815,7 +826,10 @@ build_haproxy_traffic_counters_json() {
 }
 
 read_haproxy_traffic_counters() {
-    local socket="/run/haproxy/admin.sock" bindings_file counters_file raw fallback_ip sample_ms route_count
+    local socket="/run/haproxy/admin.sock" bindings_file counters_file link_counters_file
+    local raw info_before info_after pid_before pid_after fallback_ip sample_ms route_count
+    local boot_id config_hash generation generation_seed iface link_ip link_rx link_tx link_sample_ms
+    local link_counters_json='[]'
 
     haproxy_traffic_enabled=false
     haproxy_traffic_counters='[]'
@@ -828,19 +842,49 @@ read_haproxy_traffic_counters() {
     [[ -S "$socket" && -r /etc/haproxy/haproxy.cfg ]] || return 0
     bindings_file="$(mktemp)"
     counters_file="$(mktemp)"
+    link_counters_file="$(mktemp)"
     haproxy_frontend_bindings_tsv /etc/haproxy/haproxy.cfg > "$bindings_file"
+    info_before="$(printf 'show info\n' | socat -t 3 - UNIX-CONNECT:"$socket" 2>/dev/null || true)"
     raw="$(printf 'show stat\n' | socat -t 3 - UNIX-CONNECT:"$socket" 2>/dev/null || true)"
+    info_after="$(printf 'show info\n' | socat -t 3 - UNIX-CONNECT:"$socket" 2>/dev/null || true)"
+    pid_before="$(awk -F ':' '$1 == "Pid" { gsub(/[[:space:]\r]/, "", $2); print $2; exit }' <<< "$info_before")"
+    pid_after="$(awk -F ':' '$1 == "Pid" { gsub(/[[:space:]\r]/, "", $2); print $2; exit }' <<< "$info_after")"
+    if [[ ! "$pid_before" =~ ^[0-9]+$ || "$pid_before" != "$pid_after" ]]; then
+        raw=""
+    fi
     if [[ -n "$raw" ]]; then
         haproxy_frontend_counters_tsv <<< "$raw" > "$counters_file"
     fi
     fallback_ip="$(list_public_ipv4_interfaces | awk -F '\t' 'NR == 1 { print $2; exit }')"
     sample_ms="$(int_or_zero "$(monotonic_milliseconds)")"
+    while IFS=$'\t' read -r iface link_ip; do
+        [[ -n "$iface" && "$link_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+        link_rx="$(cat "/sys/class/net/${iface}/statistics/rx_bytes" 2>/dev/null || true)"
+        link_tx="$(cat "/sys/class/net/${iface}/statistics/tx_bytes" 2>/dev/null || true)"
+        [[ "$link_rx" =~ ^[0-9]+$ && "$link_tx" =~ ^[0-9]+$ ]] || continue
+        link_sample_ms="$(int_or_zero "$(monotonic_milliseconds)")"
+        printf '%s\t%s\t%s\t%s\n' "$link_ip" "$link_rx" "$link_tx" "$link_sample_ms" >> "$link_counters_file"
+    done < <(list_public_ipv4_interfaces)
+    if [[ -s "$link_counters_file" ]]; then
+        link_counters_json="$(jq -R -s -c '
+            [split("\n")[] | select(length > 0) | split("\t") |
+                {ip: .[0], rx: (.[1] | tonumber), tx: (.[2] | tonumber), sample_ms: (.[3] | tonumber)}]
+        ' "$link_counters_file" 2>/dev/null || echo '[]')"
+    fi
+    boot_id="$(tr -d '[:space:]' < /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    config_hash="$(sha256sum /etc/haproxy/haproxy.cfg 2>/dev/null | awk '{ print $1; exit }' || true)"
+    generation_seed="${boot_id}|${pid_before}|${config_hash}"
+    generation="$(printf '%s' "$generation_seed" | sha256sum 2>/dev/null | awk '{ print substr($1, 1, 32); exit }' || true)"
+    if [[ -z "$generation" ]]; then
+        generation="$(printf '%s' "$generation_seed" | cksum | awk '{ print $1 "-" $2; exit }')"
+    fi
     haproxy_traffic_counters="$(build_haproxy_traffic_counters_json \
-        "$bindings_file" "$counters_file" "$haproxy_routes" "$sample_ms" "$fallback_ip")"
+        "$bindings_file" "$counters_file" "$haproxy_routes" "$sample_ms" "$fallback_ip" \
+        "$generation" "$link_counters_json")"
     if ! printf '%s' "$haproxy_traffic_counters" | jq -e 'type == "array" and length <= 64' >/dev/null 2>&1; then
         haproxy_traffic_counters='[]'
     fi
-    rm -f "$bindings_file" "$counters_file"
+    rm -f "$bindings_file" "$counters_file" "$link_counters_file"
 }
 
 apply_haproxy_traffic_counters() {
@@ -855,12 +899,17 @@ apply_haproxy_traffic_counters() {
             . as $entry
             | ($counters | map(select(.ip == ($entry.ip // ""))) | .[0]) as $counter
             | .rate_source = "haproxy"
+            | .link_counter_rx_bytes = ($counter.link_counter_rx_bytes // $entry.counter_rx_bytes // 0)
+            | .link_counter_tx_bytes = ($counter.link_counter_tx_bytes // $entry.counter_tx_bytes // 0)
+            | .link_counter_sample_ms = ($counter.link_counter_sample_ms // $entry.counter_sample_ms // 0)
             | if $counter == null then
-                .counter_rx_bytes = 0
+                .counter_generation = ""
+                | .counter_rx_bytes = 0
                 | .counter_tx_bytes = 0
                 | .counter_sample_ms = 0
               else
-                .counter_rx_bytes = $counter.counter_rx_bytes
+                .counter_generation = ($counter.counter_generation // "")
+                | .counter_rx_bytes = $counter.counter_rx_bytes
                 | .counter_tx_bytes = $counter.counter_tx_bytes
                 | .counter_sample_ms = $counter.counter_sample_ms
               end

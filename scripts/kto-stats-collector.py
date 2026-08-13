@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v317"
+COLLECTOR_BUILD = "v318"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -373,6 +373,9 @@ NETWORK_RATE_BUCKET_SEC = 60
 NETWORK_RATE_RETENTION_SEC = 24 * 60 * 60
 NETWORK_RATE_MAX_SAMPLE_MS = 5 * 60 * 1000
 NETWORK_RATE_MAX_BPS = 100_000_000_000_000
+NETWORK_RATE_LINK_TOLERANCE_BPS = 250_000_000
+NETWORK_RATE_LINK_TOLERANCE_PERCENT = 25
+NETWORK_RATE_SCHEMA_VERSION = 2
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
 LOST_EMOJI = '<tg-emoji emoji-id="5447183459602669338">🚨</tg-emoji>'
 BL_NODE_ORDER = [
@@ -2017,7 +2020,40 @@ def init_network_rate_db():
         CREATE INDEX IF NOT EXISTS idx_cpu_minute_node
             ON cpu_minute(node_key, minute);
     """)
+    version_row = db.execute("PRAGMA user_version").fetchone()
+    version = int(version_row[0] if version_row else 0)
+    reset_history = version < NETWORK_RATE_SCHEMA_VERSION
+    if reset_history:
+        db.execute("DELETE FROM network_rate_minute")
+        db.execute(f"PRAGMA user_version = {NETWORK_RATE_SCHEMA_VERSION}")
     db.commit()
+    return reset_history
+
+
+def clear_loaded_network_rate_fields():
+    cleared = 0
+    fields = (
+        "rate_rx_bps",
+        "rate_tx_bps",
+        "rate_sample_ms",
+        "peak_rx_bps_24h",
+        "peak_tx_bps_24h",
+        "rate_samples_24h",
+    )
+    for node in NODES.values():
+        if not isinstance(node, dict):
+            continue
+        for field in fields:
+            if node.pop(field, None) is not None:
+                cleared += 1
+        ip_stats = node.get("ip_stats") if isinstance(node.get("ip_stats"), list) else []
+        for entry in ip_stats:
+            if not isinstance(entry, dict):
+                continue
+            for field in fields:
+                if entry.pop(field, None) is not None:
+                    cleared += 1
+    return cleared
 
 
 def ip_limit_db():
@@ -3981,9 +4017,13 @@ def normalized_traffic_entry(raw, fallback_iface="", fallback_ip=""):
         "ip": ip_text,
         "error": clean_display_text(raw.get("error") or "").strip()[:300],
         "rate_source": normalize_network_rate_source(raw.get("rate_source")),
+        "counter_generation": clean_display_text(raw.get("counter_generation") or "").strip()[:160],
         "counter_rx_bytes": normalize_network_counter(raw.get("counter_rx_bytes")),
         "counter_tx_bytes": normalize_network_counter(raw.get("counter_tx_bytes")),
         "counter_sample_ms": normalize_traffic_counter(raw.get("counter_sample_ms")),
+        "link_counter_rx_bytes": normalize_network_counter(raw.get("link_counter_rx_bytes")),
+        "link_counter_tx_bytes": normalize_network_counter(raw.get("link_counter_tx_bytes")),
+        "link_counter_sample_ms": normalize_traffic_counter(raw.get("link_counter_sample_ms")),
         "rate_rx_bps": normalize_network_rate(raw.get("rate_rx_bps")),
         "rate_tx_bps": normalize_network_rate(raw.get("rate_tx_bps")),
         "rate_sample_ms": normalize_traffic_counter(raw.get("rate_sample_ms")),
@@ -4071,16 +4111,14 @@ def network_rate_series_key(entry):
     return ""
 
 
-def calculate_network_rate_sample(entry, previous):
-    if not isinstance(entry, dict) or not isinstance(previous, dict):
-        return None
-    current_ms = normalize_traffic_counter(entry.get("counter_sample_ms"))
-    previous_ms = normalize_traffic_counter(previous.get("counter_sample_ms"))
+def calculate_counter_rate_sample(entry, previous, rx_field, tx_field, sample_field):
+    current_ms = normalize_traffic_counter(entry.get(sample_field))
+    previous_ms = normalize_traffic_counter(previous.get(sample_field))
     elapsed_ms = current_ms - previous_ms
     if elapsed_ms < 250 or elapsed_ms > NETWORK_RATE_MAX_SAMPLE_MS:
         return None
-    rx_delta = normalize_network_counter(entry.get("counter_rx_bytes")) - normalize_network_counter(previous.get("counter_rx_bytes"))
-    tx_delta = normalize_network_counter(entry.get("counter_tx_bytes")) - normalize_network_counter(previous.get("counter_tx_bytes"))
+    rx_delta = normalize_network_counter(entry.get(rx_field)) - normalize_network_counter(previous.get(rx_field))
+    tx_delta = normalize_network_counter(entry.get(tx_field)) - normalize_network_counter(previous.get(tx_field))
     if rx_delta < 0 or tx_delta < 0:
         return None
     return {
@@ -4088,6 +4126,52 @@ def calculate_network_rate_sample(entry, previous):
         "tx_bps": normalize_network_rate((tx_delta * 8000) // elapsed_ms),
         "elapsed_ms": elapsed_ms,
     }
+
+
+def calculate_network_rate_sample(entry, previous):
+    if not isinstance(entry, dict) or not isinstance(previous, dict):
+        return None
+    source = normalize_network_rate_source(entry.get("rate_source"))
+    if source != normalize_network_rate_source(previous.get("rate_source")):
+        return None
+    if source == "haproxy":
+        generation = clean_display_text(entry.get("counter_generation") or "").strip()
+        previous_generation = clean_display_text(previous.get("counter_generation") or "").strip()
+        if not generation or generation != previous_generation:
+            return None
+    sample = calculate_counter_rate_sample(
+        entry,
+        previous,
+        "counter_rx_bytes",
+        "counter_tx_bytes",
+        "counter_sample_ms",
+    )
+    if sample is None:
+        return None
+    if source == "haproxy":
+        link_sample = calculate_counter_rate_sample(
+            entry,
+            previous,
+            "link_counter_rx_bytes",
+            "link_counter_tx_bytes",
+            "link_counter_sample_ms",
+        )
+        if link_sample is None:
+            return None
+        rx_tolerance = max(
+            NETWORK_RATE_LINK_TOLERANCE_BPS,
+            (link_sample["rx_bps"] * NETWORK_RATE_LINK_TOLERANCE_PERCENT) // 100,
+        )
+        tx_tolerance = max(
+            NETWORK_RATE_LINK_TOLERANCE_BPS,
+            (link_sample["tx_bps"] * NETWORK_RATE_LINK_TOLERANCE_PERCENT) // 100,
+        )
+        if (
+            sample["rx_bps"] > link_sample["rx_bps"] + rx_tolerance
+            or sample["tx_bps"] > link_sample["tx_bps"] + tx_tolerance
+        ):
+            return None
+    return sample
 
 
 def purge_metric_history(db, minute):
@@ -12050,8 +12134,13 @@ def main():
     if not SECRET:
         raise SystemExit("KTO_COLLECTOR_SECRET is empty")
     os.makedirs(STATE_DIR, exist_ok=True)
-    init_network_rate_db()
+    network_rate_history_reset = init_network_rate_db()
     load_nodes()
+    if network_rate_history_reset:
+        cleared = clear_loaded_network_rate_fields()
+        if cleared:
+            save_nodes()
+        log(f"network rate history reset schema={NETWORK_RATE_SCHEMA_VERSION} fields={cleared}")
     load_falls()
     load_ssh_allowed_ips()
     load_ssh_firewall_state()

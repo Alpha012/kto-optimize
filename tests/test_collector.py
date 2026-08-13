@@ -384,16 +384,32 @@ class CollectorRegressionTests(unittest.TestCase):
         base_time = 1_800_100_000
         original_now = collector.now_ts
 
-        def rate_payload(source, counter_rx, counter_tx, sample_ms):
+        def rate_payload(
+            source,
+            counter_rx,
+            counter_tx,
+            sample_ms,
+            generation="generation-a",
+            link_rx=None,
+            link_tx=None,
+        ):
             payload = self.payload("Обход №12", node_uuid, "wl")
-            payload["ip_stats"] = [{
+            entry = {
                 "iface": "ens3",
                 "ip": "203.0.113.120",
                 "rate_source": source,
                 "counter_rx_bytes": counter_rx,
                 "counter_tx_bytes": counter_tx,
                 "counter_sample_ms": sample_ms,
-            }]
+            }
+            if source == "haproxy":
+                entry.update({
+                    "counter_generation": generation,
+                    "link_counter_rx_bytes": counter_rx if link_rx is None else link_rx,
+                    "link_counter_tx_bytes": counter_tx if link_tx is None else link_tx,
+                    "link_counter_sample_ms": sample_ms,
+                })
+            payload["ip_stats"] = [entry]
             return payload
 
         try:
@@ -408,7 +424,7 @@ class CollectorRegressionTests(unittest.TestCase):
 
             collector.now_ts = lambda: base_time + 10
             first_haproxy = collector.update_node(
-                rate_payload("haproxy", 10_000_000, 20_000_000, 20_000),
+                rate_payload("haproxy", 10_000_000, 20_000_000, 20_000, link_rx=100_000_000, link_tx=200_000_000),
                 "203.0.113.120",
             )
             self.assertEqual("haproxy", first_haproxy["ip_stats"][0]["rate_source"])
@@ -416,7 +432,7 @@ class CollectorRegressionTests(unittest.TestCase):
 
             collector.now_ts = lambda: base_time + 15
             second_haproxy = collector.update_node(
-                rate_payload("haproxy", 35_000_000, 32_500_000, 25_000),
+                rate_payload("haproxy", 35_000_000, 32_500_000, 25_000, link_rx=150_000_000, link_tx=250_000_000),
                 "203.0.113.120",
             )
             entry = second_haproxy["ip_stats"][0]
@@ -429,6 +445,125 @@ class CollectorRegressionTests(unittest.TestCase):
             )
         finally:
             collector.now_ts = original_now
+
+    def test_haproxy_peak_rejects_generation_changes_and_impossible_link_delta(self):
+        node_uuid = str(uuid.uuid4())
+        base_time = 1_800_200_000
+        original_now = collector.now_ts
+
+        def payload(counter_rx, counter_tx, link_rx, link_tx, sample_ms, generation):
+            value = self.payload("Обход №13", node_uuid, "wl")
+            value["ip_stats"] = [{
+                "iface": "ens3",
+                "ip": "203.0.113.130",
+                "rate_source": "haproxy",
+                "counter_generation": generation,
+                "counter_rx_bytes": counter_rx,
+                "counter_tx_bytes": counter_tx,
+                "counter_sample_ms": sample_ms,
+                "link_counter_rx_bytes": link_rx,
+                "link_counter_tx_bytes": link_tx,
+                "link_counter_sample_ms": sample_ms,
+            }]
+            return value
+
+        try:
+            collector.now_ts = lambda: base_time
+            collector.update_node(
+                payload(10_000_000, 20_000_000, 100_000_000, 200_000_000, 10_000, "generation-a"),
+                "203.0.113.130",
+            )
+
+            collector.now_ts = lambda: base_time + 5
+            changed = collector.update_node(
+                payload(9_000_000_000, 8_000_000_000, 110_000_000, 210_000_000, 15_000, "generation-b"),
+                "203.0.113.130",
+            )
+            self.assertEqual("-", collector.peak_rate_table_text(changed["ip_stats"][0]))
+
+            collector.now_ts = lambda: base_time + 10
+            impossible = collector.update_node(
+                payload(18_000_000_000, 16_000_000_000, 120_000_000, 220_000_000, 20_000, "generation-b"),
+                "203.0.113.130",
+            )
+            self.assertEqual("-", collector.peak_rate_table_text(impossible["ip_stats"][0]))
+
+            collector.now_ts = lambda: base_time + 15
+            valid = collector.update_node(
+                payload(18_050_000_000, 16_025_000_000, 220_000_000, 320_000_000, 25_000, "generation-b"),
+                "203.0.113.130",
+            )
+            entry = valid["ip_stats"][0]
+            self.assertEqual(80_000_000, entry["peak_rx_bps_24h"])
+            self.assertEqual(40_000_000, entry["peak_tx_bps_24h"])
+            self.assertEqual("40 | 80 Mbit/s", collector.peak_rate_table_text(entry))
+        finally:
+            collector.now_ts = original_now
+
+    def test_haproxy_counter_gap_cannot_turn_lifetime_bytes_into_speed(self):
+        missing = {
+            "rate_source": "haproxy",
+            "counter_generation": "",
+            "counter_rx_bytes": 0,
+            "counter_tx_bytes": 0,
+            "counter_sample_ms": 15_000,
+            "link_counter_rx_bytes": 2_000_000_000,
+            "link_counter_tx_bytes": 3_000_000_000,
+            "link_counter_sample_ms": 15_000,
+        }
+        recovered = {
+            "rate_source": "haproxy",
+            "counter_generation": "generation-a",
+            "counter_rx_bytes": 900_000_000_000,
+            "counter_tx_bytes": 700_000_000_000,
+            "counter_sample_ms": 20_000,
+            "link_counter_rx_bytes": 2_100_000_000,
+            "link_counter_tx_bytes": 3_100_000_000,
+            "link_counter_sample_ms": 20_000,
+        }
+        steady = dict(recovered)
+        steady.update({
+            "counter_rx_bytes": 900_050_000_000,
+            "counter_tx_bytes": 700_025_000_000,
+            "counter_sample_ms": 25_000,
+            "link_counter_rx_bytes": 2_200_000_000,
+            "link_counter_tx_bytes": 3_200_000_000,
+            "link_counter_sample_ms": 25_000,
+        })
+
+        self.assertIsNone(collector.calculate_network_rate_sample(recovered, missing))
+        self.assertEqual(
+            {"rx_bps": 80_000_000, "tx_bps": 40_000_000, "elapsed_ms": 5_000},
+            collector.calculate_network_rate_sample(steady, recovered),
+        )
+
+    def test_network_rate_schema_upgrade_clears_poisoned_history_and_cached_fields(self):
+        db = collector.network_rate_db()
+        db.execute(
+            "INSERT INTO network_rate_minute"
+            "(node_key, series_key, iface, ip, minute, peak_rx_bps, peak_tx_bps) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            ("node", "series", "ens3", "203.0.113.140", 123, 129_802_000_000, 7_196_000_000),
+        )
+        db.execute("PRAGMA user_version = 0")
+        db.commit()
+        collector.NODES = {
+            "node": {
+                "peak_rx_bps_24h": 129_802_000_000,
+                "ip_stats": [{
+                    "ip": "203.0.113.140",
+                    "peak_rx_bps_24h": 129_802_000_000,
+                    "peak_tx_bps_24h": 7_196_000_000,
+                    "rate_samples_24h": 5,
+                }],
+            }
+        }
+
+        self.assertTrue(collector.init_network_rate_db())
+        self.assertEqual(0, db.execute("SELECT count(*) FROM network_rate_minute").fetchone()[0])
+        self.assertGreater(collector.clear_loaded_network_rate_fields(), 0)
+        self.assertNotIn("peak_rx_bps_24h", collector.NODES["node"])
+        self.assertNotIn("peak_rx_bps_24h", collector.NODES["node"]["ip_stats"][0])
 
     def test_cpu_average_uses_minute_buckets_and_rolls_over_after_24_hours(self):
         node_uuid = str(uuid.uuid4())

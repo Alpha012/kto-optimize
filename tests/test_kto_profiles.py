@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v317"', KTO)
-        self.assertIn('PUSH_BUILD="v317"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v317"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v317"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v317"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v317"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v317"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v318"', KTO)
+        self.assertIn('PUSH_BUILD="v318"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v318"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v318"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v318"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v318"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v318"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -68,6 +68,8 @@ class CombinedNodeProfileTests(unittest.TestCase):
         self.assertIn('rate_source: "interface"', PUSH)
         self.assertIn('read_haproxy_traffic_counters', PUSH)
         self.assertIn('apply_haproxy_traffic_counters "$ip_stats"', PUSH)
+        self.assertIn("counter_generation", PUSH)
+        self.assertIn("link_counter_rx_bytes", PUSH)
         self.assertIn("list_haproxy_additional_source_ips | awk", KTO)
 
     def test_stats_push_uses_haproxy_frontend_bytes_for_rate_counters(self):
@@ -114,25 +116,33 @@ FRONTEND,2000,vless_in,1000,OPEN
 FRONTEND,4000,vless_in_8443,3000,OPEN
 FRONTEND,7000,vless_in_9443,5000,OPEN
 FRONTEND,9000,unrelated,8000,OPEN
+FRONTEND,broken,vless_broken,not-a-counter,OPEN
 BACKEND,2000,vless_pool,1000,UP
 EOF
 grep -Fqx $'vless_in\t1000\t2000' "$counters"
 grep -Fqx $'vless_in_8443\t3000\t4000' "$counters"
 grep -Fqx $'vless_in_9443\t5000\t7000' "$counters"
 ! grep -Fq $'vless_pool\t' "$counters"
+! grep -Fq $'vless_broken\t' "$counters"
 command -v jq >/dev/null 2>&1 || exit 0
 routes='[
   {"listen_ip":"203.0.113.10","port":443},
   {"listen_ip":"203.0.113.10","port":8443},
   {"listen_ip":"*","port":9443}
 ]'
-result=$(build_haproxy_traffic_counters_json "$bindings" "$counters" "$routes" 123456 203.0.113.10)
+links='[{"ip":"203.0.113.10","rx":900000,"tx":800000,"sample_ms":123460}]'
+result=$(build_haproxy_traffic_counters_json \
+  "$bindings" "$counters" "$routes" 123456 203.0.113.10 generation-a "$links")
 jq -e '. == [{
     "ip":"203.0.113.10",
     "rate_source":"haproxy",
+    "counter_generation":"generation-a",
     "counter_rx_bytes":9000,
     "counter_tx_bytes":13000,
-    "counter_sample_ms":123456
+    "counter_sample_ms":123456,
+    "link_counter_rx_bytes":900000,
+    "link_counter_tx_bytes":800000,
+    "link_counter_sample_ms":123460
 }]' <<< "$result" >/dev/null
 
 haproxy_traffic_enabled=true
@@ -145,10 +155,18 @@ jq -e '.[0].rate_source == "haproxy"
     and .[0].counter_rx_bytes == 9000
     and .[0].counter_tx_bytes == 13000
     and .[0].counter_sample_ms == 123456
+    and .[0].counter_generation == "generation-a"
+    and .[0].link_counter_rx_bytes == 900000
+    and .[0].link_counter_tx_bytes == 800000
+    and .[0].link_counter_sample_ms == 123460
     and .[1].rate_source == "haproxy"
+    and .[1].counter_generation == ""
     and .[1].counter_rx_bytes == 0
     and .[1].counter_tx_bytes == 0
-    and .[1].counter_sample_ms == 0' <<< "$merged" >/dev/null
+    and .[1].counter_sample_ms == 0
+    and .[1].link_counter_rx_bytes == 888888
+    and .[1].link_counter_tx_bytes == 888888
+    and .[1].link_counter_sample_ms == 10' <<< "$merged" >/dev/null
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
