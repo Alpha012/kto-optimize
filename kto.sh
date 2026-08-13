@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v314"
+SCRIPT_BUILD="v315"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5311,6 +5311,37 @@ PY
     esac
 }
 
+TSPU_TARGET_IP=""
+TSPU_TARGET_PORT=""
+TSPU_TARGET_HAS_PORT=0
+
+parse_tspu_ipv4_target() {
+    local raw="${1:-}" ip port
+
+    raw="$(trim_whitespace "$raw")"
+    raw="${raw//[[:space:]]/}"
+    [[ -n "$raw" ]] || return 1
+
+    if [[ "$raw" == *:* ]]; then
+        [[ "$raw" != *:*:* ]] || return 1
+        ip="${raw%%:*}"
+        port="${raw#*:}"
+        validate_ipv4 "$ip" || return 1
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+        port=$(( 10#$port ))
+        (( port >= 1 && port <= 65535 )) || return 1
+        TSPU_TARGET_PORT="$port"
+        TSPU_TARGET_HAS_PORT=1
+    else
+        ip="$raw"
+        validate_ipv4 "$ip" || return 1
+        TSPU_TARGET_PORT=""
+        TSPU_TARGET_HAS_PORT=0
+    fi
+
+    TSPU_TARGET_IP="$ip"
+}
+
 tspu_ip_http_probe() {
     local source_ip="$1"
     local target_ip="$2"
@@ -5428,10 +5459,12 @@ tspu_ip_trace() {
 
 run_tspu_ip_test() {
     header
-    local requested_source_ip="${1:-}" target_ip="${2:-}"
+    local requested_source_ip="${1:-}" target_input="${2:-}" target_ip target_port="" target_label
+    local target_has_port=0
     local source_ip source_interface route_line route_interface route_source
-    local tcp80_rc tcp443_rc http_rc https_rc trace_port=443 ping_ok=0
-    local tcp_open=0 tcp_reachable=0 tcp_timeout=0 rc
+    local tcp80_rc=4 tcp443_rc=4 tcp_target_rc=4 http_rc=4 https_rc=4 trace_port=443 ping_ok=0
+    local tcp_open=0 tcp_reachable=0 tcp_timeout=0 tcp_total=0 rc
+    local -a tcp_results=()
     local -a packages=(curl iproute2 iputils-ping python3)
 
     if [[ "$MACHINE_MODE" == "panel" ]]; then
@@ -5443,11 +5476,16 @@ run_tspu_ip_test() {
     source_ip="$TEST_SOURCE_IP"
     source_interface="$TEST_SOURCE_INTERFACE"
 
-    target_ip="$(trim_whitespace "$target_ip")"
-    while ! validate_ipv4 "$target_ip"; do
-        [[ -z "$target_ip" ]] || fail "Некорректный целевой IPv4: ${target_ip}"
-        target_ip="$(trim_whitespace "$(ask_text "Целевой IPv4")")"
+    target_input="$(trim_whitespace "$target_input")"
+    while ! parse_tspu_ipv4_target "$target_input"; do
+        [[ -z "$target_input" ]] || fail "Некорректная цель: ${target_input}. Нужен IPv4 или IPv4:порт."
+        target_input="$(trim_whitespace "$(ask_text "Целевой IPv4 или IPv4:порт")")"
     done
+    target_ip="$TSPU_TARGET_IP"
+    target_port="$TSPU_TARGET_PORT"
+    target_has_port="$TSPU_TARGET_HAS_PORT"
+    target_label="$target_ip"
+    (( target_has_port == 0 )) || target_label+=":${target_port}"
 
     need_root
     command_exists mtr || packages+=(mtr-tiny)
@@ -5463,6 +5501,7 @@ run_tspu_ip_test() {
     network_test_row "Исходящий IP" "$source_ip"
     network_test_row "Интерфейс" "$source_interface"
     network_test_row "Целевой IP" "$target_ip"
+    (( target_has_port == 0 )) || network_test_row "Целевой порт" "$target_port"
 
     if ! route_line="$(ip -4 route get "$target_ip" from "$source_ip" 2>&1)"; then
         network_test_row "Маршрут" "$(network_test_short "$route_line")" "fail"
@@ -5483,18 +5522,28 @@ run_tspu_ip_test() {
     network_test_ping "$target_ip" "$target_ip"
     (( NETTEST_PING_BAD == 0 )) && ping_ok=1
 
-    if tspu_ip_tcp_probe "$source_ip" "$target_ip" 80; then tcp80_rc=0; else tcp80_rc=$?; fi
-    if tspu_ip_tcp_probe "$source_ip" "$target_ip" 443; then tcp443_rc=0; else tcp443_rc=$?; fi
-    if tspu_ip_http_probe "$source_ip" "$target_ip" http 80; then http_rc=0; else http_rc=$?; fi
-    if tspu_ip_http_probe "$source_ip" "$target_ip" https 443; then https_rc=0; else https_rc=$?; fi
+    if (( target_has_port == 1 )); then
+        if tspu_ip_tcp_probe "$source_ip" "$target_ip" "$target_port"; then tcp_target_rc=0; else tcp_target_rc=$?; fi
+        tcp_results+=("$tcp_target_rc")
+        if tspu_ip_http_probe "$source_ip" "$target_ip" http "$target_port"; then http_rc=0; else http_rc=$?; fi
+        if tspu_ip_http_probe "$source_ip" "$target_ip" https "$target_port"; then https_rc=0; else https_rc=$?; fi
+        trace_port="$target_port"
+    else
+        if tspu_ip_tcp_probe "$source_ip" "$target_ip" 80; then tcp80_rc=0; else tcp80_rc=$?; fi
+        if tspu_ip_tcp_probe "$source_ip" "$target_ip" 443; then tcp443_rc=0; else tcp443_rc=$?; fi
+        tcp_results+=("$tcp80_rc" "$tcp443_rc")
+        if tspu_ip_http_probe "$source_ip" "$target_ip" http 80; then http_rc=0; else http_rc=$?; fi
+        if tspu_ip_http_probe "$source_ip" "$target_ip" https 443; then https_rc=0; else https_rc=$?; fi
+    fi
     tspu_ip_path_mtu_probe "$source_ip" "$target_ip"
 
-    if (( tcp443_rc >= 3 && tcp80_rc < 3 )); then
+    if (( target_has_port == 0 && tcp443_rc >= 3 && tcp80_rc < 3 )); then
         trace_port=80
     fi
     tspu_ip_trace "$source_ip" "$target_ip" "$trace_port"
 
-    for rc in "$tcp80_rc" "$tcp443_rc"; do
+    tcp_total="${#tcp_results[@]}"
+    for rc in "${tcp_results[@]}"; do
         case "$rc" in
             0)
                 (( tcp_open += 1 ))
@@ -5508,26 +5557,41 @@ run_tspu_ip_test() {
     echo
     echo -e "${BOLD}${PURPLE}[ ИТОГ ]${NC}"
     if (( tcp_open > 0 )); then
-        network_test_row "Сетевой путь" "открытых TCP-портов: ${tcp_open}/2" "ok"
-        (( tcp_timeout == 0 )) || network_test_row "Фильтрация" "один из TCP-портов уходит в таймаут" "warn"
+        network_test_row "Сетевой путь" "открытых TCP-портов: ${tcp_open}/${tcp_total}" "ok"
+        (( tcp_timeout == 0 )) || network_test_row "Фильтрация" "TCP-порт уходит в таймаут" "warn"
     elif (( tcp_reachable > 0 )); then
         network_test_row "Сетевой путь" "цель отвечает RST или нестабильно" "warn"
     elif (( ping_ok == 1 )); then
-        network_test_row "Фильтрация" "ICMP проходит, TCP 80/443 не отвечает" "warn"
+        if (( target_has_port == 1 )); then
+            network_test_row "Фильтрация" "ICMP проходит, TCP ${target_port} не отвечает" "warn"
+        else
+            network_test_row "Фильтрация" "ICMP проходит, TCP 80/443 не отвечает" "warn"
+        fi
     else
-        network_test_row "Сетевой путь" "нет ответа по ICMP и TCP 80/443" "fail"
+        if (( target_has_port == 1 )); then
+            network_test_row "Сетевой путь" "нет ответа по ICMP и TCP ${target_port}" "fail"
+        else
+            network_test_row "Сетевой путь" "нет ответа по ICMP и TCP 80/443" "fail"
+        fi
     fi
 
-    if (( tcp443_rc == 0 && https_rc != 0 )); then
+    if (( target_has_port == 1 && tcp_target_rc == 0 && http_rc != 0 && https_rc != 0 )); then
+        network_test_row "HTTP(S) ${target_port}" "TCP открыт, прикладной ответ не получен" "warn"
+        warn "На порту может быть не HTTP(S) либо сервер требует доменный SNI. Это само по себе не означает блокировку."
+    elif (( target_has_port == 0 && tcp443_rc == 0 && https_rc != 0 )); then
         network_test_row "HTTPS" "TCP 443 открыт, но запрос по IP не завершился" "warn"
         warn "Сервер может требовать доменный SNI; это само по себе не означает блокировку."
     elif (( http_rc == 0 || https_rc == 0 )); then
         network_test_row "HTTP(S)" "получен прикладной ответ" "ok"
     fi
 
-    echo "tspu-ip source=${source_ip} interface=${source_interface} target=${target_ip} tcp80=${tcp80_rc} tcp443=${tcp443_rc} http=${http_rc} https=${https_rc}" >> "$LOG_FILE" 2>/dev/null || true
+    if (( target_has_port == 1 )); then
+        echo "tspu-ip source=${source_ip} interface=${source_interface} target=${target_label} tcp=${tcp_target_rc} http=${http_rc} https=${https_rc}" >> "$LOG_FILE" 2>/dev/null || true
+    else
+        echo "tspu-ip source=${source_ip} interface=${source_interface} target=${target_ip} tcp80=${tcp80_rc} tcp443=${tcp443_rc} http=${http_rc} https=${https_rc}" >> "$LOG_FILE" 2>/dev/null || true
+    fi
     warn "Один замер не доказывает ТСПУ. Для сравнения повтори ту же цель с другим исходящим IP."
-    ok "Проверка ${source_ip} -> ${target_ip} завершена"
+    ok "Проверка ${source_ip} -> ${target_label} завершена"
 }
 
 DPI_RESOLV_SNAPSHOT_DIR=""

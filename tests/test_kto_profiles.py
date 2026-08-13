@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v314"', KTO)
-        self.assertIn('PUSH_BUILD="v314"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v314"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v314"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v314"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v314"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v314"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v315"', KTO)
+        self.assertIn('PUSH_BUILD="v315"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v315"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v315"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v315"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v315"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v315"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -573,12 +573,12 @@ grep -q 'Conntrack: 262144/2097152 (12%), buckets=524288' <<< "$output"
         self.assertIn('actions+=("dpi-ip-test")', menu)
         self.assertIn('dpi-ip-test) run_tspu_ip_test', menu)
         self.assertIn('select_test_source_ipv4 "$requested_source_ip"', runner)
-        self.assertIn('ask_text "Целевой IPv4"', runner)
+        self.assertIn('ask_text "Целевой IPv4 или IPv4:порт"', runner)
         self.assertLess(
             runner.index('select_test_source_ipv4 "$requested_source_ip"'),
-            runner.index('ask_text "Целевой IPv4"'),
+            runner.index('ask_text "Целевой IPv4 или IPv4:порт"'),
         )
-        self.assertIn('validate_ipv4 "$target_ip"', runner)
+        self.assertIn('parse_tspu_ipv4_target "$target_input"', runner)
         self.assertIn('ip -4 route get "$target_ip" from "$source_ip"', runner)
         self.assertIn('[[ "$route_interface" != "$source_interface"', runner)
         self.assertIn('network_test_ping "$target_ip" "$target_ip"', runner)
@@ -631,6 +631,26 @@ grep -Fqx 'http=203.0.113.20|198.51.100.30|http|80' "$events"
 grep -Fqx 'http=203.0.113.20|198.51.100.30|https|443' "$events"
 grep -Fqx 'mtu=203.0.113.20|198.51.100.30' "$events"
 grep -Fqx 'trace=203.0.113.20|198.51.100.30|443' "$events"
+
+: > "$events"
+run_tspu_ip_test 203.0.113.20 198.51.100.30:8443 >/dev/null
+grep -Fqx 'ping=198.51.100.30|source=203.0.113.20' "$events"
+grep -Fqx 'tcp=203.0.113.20|198.51.100.30|8443' "$events"
+grep -Fqx 'http=203.0.113.20|198.51.100.30|http|8443' "$events"
+grep -Fqx 'http=203.0.113.20|198.51.100.30|https|8443' "$events"
+grep -Fqx 'mtu=203.0.113.20|198.51.100.30' "$events"
+grep -Fqx 'trace=203.0.113.20|198.51.100.30|8443' "$events"
+! grep -Fq '|80' "$events"
+! grep -Fq '|443' "$events"
+
+parse_tspu_ipv4_target '198.51.100.30:65535'
+[[ "$TSPU_TARGET_IP" == 198.51.100.30 ]]
+[[ "$TSPU_TARGET_PORT" == 65535 ]]
+[[ "$TSPU_TARGET_HAS_PORT" == 1 ]]
+! parse_tspu_ipv4_target '198.51.100.30:0'
+! parse_tspu_ipv4_target '198.51.100.30:65536'
+! parse_tspu_ipv4_target '198.51.100.30:abc'
+! parse_tspu_ipv4_target '198.51.100.30:999999999999999999999'
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
