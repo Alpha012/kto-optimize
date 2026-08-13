@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v316"', KTO)
-        self.assertIn('PUSH_BUILD="v316"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v316"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v316"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v316"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v316"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v316"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v317"', KTO)
+        self.assertIn('PUSH_BUILD="v317"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v317"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v317"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v317"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v317"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v317"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2538,11 +2538,16 @@ after="$(wc -l < "$events")"
         self.assertIn("option splice-auto", render)
         self.assertIn("option splice-request", render)
         self.assertIn("option splice-response", render)
-        self.assertIn("timeout connect 5s", render)
-        self.assertIn("default-server inter 30s fall 8 rise 3", render)
+        self.assertIn("option redispatch", render)
+        self.assertIn("retries 2", render)
+        self.assertIn("timeout connect 4s", render)
+        self.assertIn("timeout queue 4s", render)
+        self.assertIn("timeout check 3s", render)
+        self.assertIn("default-server inter 10s fastinter 2s downinter 10s fall 3 rise 2", render)
+        self.assertIn("spread-checks 5", render)
         self.assertNotIn("hard-stop-after", render)
-        self.assertNotIn("option redispatch", render)
-        self.assertNotIn("timeout check", render)
+        self.assertNotIn("tune.maxaccept", render)
+        self.assertNotIn("tune.bufsize", render)
         self.assertIn('extract_haproxy_routes > "$routes_file"', stabilize)
         self.assertIn('apply_haproxy_routes_config "$routes_file" 1 1', stabilize)
         self.assertIn('run_bounded_command 20', clear_limits)
@@ -2595,26 +2600,45 @@ grep -Fqx beta "$target"
 
         harness = r'''
 source <(sed '/^main /d' kto.sh)
+memory_total_mb() { printf '%s\n' "${TEST_MEMORY_MB:-16384}"; }
+cpu_count() { printf '%s\n' "${TEST_CPU_COUNT:-16}"; }
+sysctl() {
+    if [[ "${1:-}" == -n && "${2:-}" == net.netfilter.nf_conntrack_max ]]; then
+        printf '%s\n' "${TEST_CONNTRACK_MAX:-2097152}"
+        return 0
+    fi
+    return 1
+}
 KTO_HAPROXY_NOFILE_LIMIT=1048576
 KTO_HAPROXY_FDS_PER_CONNECTION=3
 KTO_HAPROXY_FD_RESERVE=8192
 unset KTO_HAPROXY_MAXCONN
-[[ "$(recommended_haproxy_maxconn)" == 100000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 262000 ]]
 KTO_HAPROXY_MAXCONN=invalid
-[[ "$(recommended_haproxy_maxconn)" == 100000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 262000 ]]
 KTO_HAPROXY_MAXCONN=500000
 [[ "$(recommended_haproxy_maxconn)" == 346000 ]]
 KTO_HAPROXY_MAXCONN=200000
 [[ "$(recommended_haproxy_maxconn)" == 200000 ]]
+TEST_CONNTRACK_MAX=524288
+KTO_HAPROXY_NOFILE_LIMIT=1048576
+KTO_HAPROXY_MAXCONN=500000
+[[ "$(recommended_haproxy_maxconn)" == 196000 ]]
+TEST_CONNTRACK_MAX=2097152
 KTO_HAPROXY_NOFILE_LIMIT=65536
 unset KTO_HAPROXY_MAXCONN
 [[ "$(recommended_haproxy_maxconn)" == 19000 ]]
+KTO_HAPROXY_NOFILE_LIMIT=1048576
 unset KTO_HAPROXY_NBTHREAD
-[[ "$(haproxy_thread_count)" == 1 ]]
+[[ "$(haproxy_thread_count)" == 16 ]]
+TEST_CPU_COUNT=32
+[[ "$(haproxy_thread_count)" == 16 ]]
+KTO_HAPROXY_AUTO_THREADS_MAX=8
+[[ "$(haproxy_thread_count)" == 8 ]]
 KTO_HAPROXY_NBTHREAD=8
 [[ "$(haproxy_thread_count)" == 8 ]]
 KTO_HAPROXY_NBTHREAD=0
-[[ "$(haproxy_thread_count)" == 1 ]]
+[[ "$(haproxy_thread_count)" == 8 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -2953,22 +2977,30 @@ grep -Fqx 'ufw --force delete allow 8444/tcp' "$events"
         harness = r'''
 source <(sed '/^main /d' kto.sh)
 SUDO=()
+KTO_HAPROXY_MAXCONN=100000
+KTO_HAPROXY_NBTHREAD=4
 routes=$(mktemp)
 config=$(mktemp)
 trap 'rm -f "$routes" "$config"' EXIT
 printf '443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\n8443\t5.34.179.144:443\textra.example.com *.other.example.com\t185.141.227.93\n' > "$routes"
 render_haproxy_routes_config "$routes" "$config"
 grep -q '^    maxconn 100000$' "$config"
-grep -q '^    nbthread 1$' "$config"
+grep -q '^    nbthread 4$' "$config"
+grep -q '^    spread-checks 5$' "$config"
 ! grep -q '^    maxpipes ' "$config"
 ! grep -q '^    nosplice$' "$config"
 ! grep -q '^    hard-stop-after ' "$config"
 grep -q '^    option splice-auto$' "$config"
 grep -q '^    option splice-request$' "$config"
 grep -q '^    option splice-response$' "$config"
-grep -q '^    timeout connect 5s$' "$config"
-! grep -q '^    timeout check ' "$config"
-grep -q '^    default-server inter 30s fall 8 rise 3$' "$config"
+grep -q '^    option redispatch$' "$config"
+grep -q '^    retries 2$' "$config"
+grep -q '^    timeout connect 4s$' "$config"
+grep -q '^    timeout queue 4s$' "$config"
+grep -q '^    timeout check 3s$' "$config"
+grep -q '^    default-server inter 10s fastinter 2s downinter 10s fall 3 rise 2$' "$config"
+! grep -q '^    tune.maxaccept ' "$config"
+! grep -q '^    tune.bufsize ' "$config"
 grep -q '^frontend vless_in$' "$config"
 grep -q '^frontend vless_in_8443$' "$config"
 grep -q '^    server xray1 89.144.8.3:443 check weight 10$' "$config"

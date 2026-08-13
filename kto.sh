@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v316"
+SCRIPT_BUILD="v317"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -7163,8 +7163,9 @@ haproxy_nofile_limit() {
 }
 
 recommended_haproxy_maxconn() {
-    local override="${KTO_HAPROXY_MAXCONN:-100000}"
-    local maxconn nofile_limit fds_per_connection fd_reserve fd_cap
+    local override="${KTO_HAPROXY_MAXCONN:-}"
+    local total_mb maxconn nofile_limit fds_per_connection fd_reserve fd_cap
+    local conntrack_max conntrack_cap
 
     if [[ "$override" =~ ^[0-9]+$ ]]; then
         maxconn=$(( 10#$override ))
@@ -7173,7 +7174,12 @@ recommended_haproxy_maxconn() {
         maxconn=0
     fi
 
-    (( maxconn > 0 )) || maxconn=100000
+    if (( maxconn == 0 )); then
+        total_mb="$(memory_total_mb)"
+        [[ "$total_mb" =~ ^[0-9]+$ ]] || total_mb=0
+        (( total_mb > 0 )) || total_mb=2048
+        maxconn=$(( total_mb * 16 ))
+    fi
     (( maxconn < 10000 )) && maxconn=10000
     (( maxconn > 500000 )) && maxconn=500000
 
@@ -7197,18 +7203,47 @@ recommended_haproxy_maxconn() {
     fi
     (( fd_cap >= 1000 )) || fd_cap=1000
     (( maxconn <= fd_cap )) || maxconn="$fd_cap"
+
+    conntrack_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)"
+    if [[ "$conntrack_max" =~ ^[0-9]+$ ]] && (( conntrack_max >= 65536 )); then
+        # A proxied TCP session normally occupies a client-side and a backend-side
+        # conntrack entry. Keep another 25% of the table free for host traffic.
+        conntrack_cap=$(( conntrack_max * 3 / 8 ))
+        (( conntrack_cap >= 1000 )) && conntrack_cap=$(( conntrack_cap / 1000 * 1000 ))
+        (( conntrack_cap >= 1000 )) || conntrack_cap=1000
+        (( maxconn <= conntrack_cap )) || maxconn="$conntrack_cap"
+    fi
+    if (( maxconn >= 1000 )); then
+        maxconn=$(( maxconn / 1000 * 1000 ))
+    fi
+    (( maxconn >= 1000 )) || maxconn=1000
     echo "$maxconn"
 }
 
 haproxy_thread_count() {
-    local threads="${KTO_HAPROXY_NBTHREAD:-1}"
+    local override="${KTO_HAPROXY_NBTHREAD:-auto}"
+    local auto_max="${KTO_HAPROXY_AUTO_THREADS_MAX:-16}"
+    local threads
 
-    if [[ "$threads" =~ ^[0-9]+$ ]]; then
-        threads=$((10#$threads))
-    else
-        threads=1
+    if [[ "$override" =~ ^[0-9]+$ ]]; then
+        threads=$((10#$override))
+        if (( threads >= 1 && threads <= 64 )); then
+            printf '%d\n' "$threads"
+            return 0
+        fi
     fi
-    (( threads >= 1 && threads <= 64 )) || threads=1
+
+    threads="$(cpu_count)"
+    [[ "$threads" =~ ^[0-9]+$ ]] || threads=1
+    threads=$((10#$threads))
+    if [[ "$auto_max" =~ ^[0-9]+$ ]]; then
+        auto_max=$((10#$auto_max))
+    else
+        auto_max=16
+    fi
+    (( auto_max >= 1 && auto_max <= 64 )) || auto_max=16
+    (( threads <= auto_max )) || threads="$auto_max"
+    (( threads >= 1 )) || threads=1
     printf '%d\n' "$threads"
 }
 
@@ -7270,6 +7305,7 @@ render_haproxy_routes_config() {
 global
     maxconn ${haproxy_maxconn}
     nbthread ${haproxy_threads}
+    spread-checks 5
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
     tune.ssl.default-dh-param 2048
 
@@ -7283,15 +7319,19 @@ defaults
     option splice-auto
     option splice-request
     option splice-response
+    option redispatch
 
-    timeout connect 5s
+    retries 2
+    timeout connect 4s
+    timeout queue 4s
     timeout client 2h
     timeout server 2h
     timeout tunnel 2h
     timeout client-fin 30s
     timeout server-fin 30s
+    timeout check 3s
 
-    default-server inter 30s fall 8 rise 3
+    default-server inter 10s fastinter 2s downinter 10s fall 3 rise 2
 
 backend wrong_sni_names
     stick-table type string len 160 size 100k expire 30m store gpc0
@@ -8387,6 +8427,7 @@ diagnose_haproxy() {
     local backend_stats health_report summary_line marker pools pools_down servers servers_up servers_down servers_other
     local detail_line status_output status_summary ufw_status missing_firewall=0 result=0
     local process_info process_summary process_count=0 process_cpu="0" process_rss_kb=0 process_rss_mb=0
+    local config_threads conntrack_count conntrack_max conntrack_percent capacity_summary
     local -A seen_inputs=() seen_sources=() seen_ports=()
 
     HAPROXY_DIAG_ERRORS=0
@@ -8568,10 +8609,24 @@ diagnose_haproxy() {
     fi
 
     value="$(awk '$1 == "maxconn" { print $2; exit }' "$HAPROXY_CONFIG_FILE")"
-    if [[ "$value" =~ ^[1-9][0-9]*$ && "$nofile" =~ ^[1-9][0-9]*$ ]]; then
-        haproxy_diagnostic_row ok "capacity" "maxconn=${value}, nofile=${nofile}"
+    config_threads="$(awk '$1 == "nbthread" { print $2; exit }' "$HAPROXY_CONFIG_FILE")"
+    conntrack_count="$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || true)"
+    conntrack_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
+    capacity_summary="maxconn=${value:-unknown}, nofile=${nofile:-unknown}, threads=${config_threads:-unknown}"
+    if [[ "$conntrack_count" =~ ^[0-9]+$ && "$conntrack_max" =~ ^[1-9][0-9]*$ ]]; then
+        conntrack_percent=$(( conntrack_count * 100 / conntrack_max ))
+        capacity_summary+=", conntrack=${conntrack_count}/${conntrack_max} (${conntrack_percent}%)"
     else
-        haproxy_diagnostic_row warn "capacity" "maxconn=${value:-unknown}, nofile=${nofile:-unknown}"
+        conntrack_percent=0
+    fi
+    if [[ "$value" =~ ^[1-9][0-9]*$ && "$nofile" =~ ^[1-9][0-9]*$ ]]; then
+        if (( conntrack_percent >= 75 )); then
+            haproxy_diagnostic_row warn "capacity" "$capacity_summary"
+        else
+            haproxy_diagnostic_row ok "capacity" "$capacity_summary"
+        fi
+    else
+        haproxy_diagnostic_row warn "capacity" "$capacity_summary"
     fi
     echo
     if (( HAPROXY_DIAG_ERRORS > 0 )); then
