@@ -40,13 +40,13 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v315"', KTO)
-        self.assertIn('PUSH_BUILD="v315"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v315"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v315"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v315"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v315"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v315"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v316"', KTO)
+        self.assertIn('PUSH_BUILD="v316"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v316"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v316"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v316"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v316"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v316"', HAPROXY_BANDWIDTH)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -65,7 +65,100 @@ class CombinedNodeProfileTests(unittest.TestCase):
         self.assertIn("counter_rx_bytes: $counter_rx_bytes", PUSH)
         self.assertIn("counter_tx_bytes: $counter_tx_bytes", PUSH)
         self.assertIn("counter_sample_ms: $counter_sample_ms", PUSH)
+        self.assertIn('rate_source: "interface"', PUSH)
+        self.assertIn('read_haproxy_traffic_counters', PUSH)
+        self.assertIn('apply_haproxy_traffic_counters "$ip_stats"', PUSH)
         self.assertIn("list_haproxy_additional_source_ips | awk", KTO)
+
+    def test_stats_push_uses_haproxy_frontend_bytes_for_rate_counters(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+source <(awk '/^haproxy_frontend_bindings_tsv\(\)/ { keep=1 } /^load_haproxy_apply_result\(\)/ { exit } keep' scripts/kto-stats-push.sh)
+config=$(mktemp)
+bindings=$(mktemp)
+counters=$(mktemp)
+trap 'rm -f "$config" "$bindings" "$counters"' EXIT
+cat > "$config" <<'EOF'
+global
+    stats socket /run/haproxy/admin.sock
+frontend vless_in
+    bind 203.0.113.10:443
+    default_backend vless_pool
+frontend vless_in_8443
+    bind 203.0.113.10:8443
+    default_backend vless_pool_8443
+frontend vless_in_9443
+    bind *:9443
+    default_backend vless_pool_9443
+frontend unrelated
+    bind 198.51.100.20:9000
+    default_backend unrelated_pool
+frontend ambiguous
+    bind 203.0.113.10:10000
+    bind 198.51.100.20:10000
+    default_backend ambiguous_pool
+EOF
+haproxy_frontend_bindings_tsv "$config" > "$bindings"
+grep -Fqx $'vless_in\t203.0.113.10\t443' "$bindings"
+grep -Fqx $'vless_in_8443\t203.0.113.10\t8443' "$bindings"
+grep -Fqx $'vless_in_9443\t*\t9443' "$bindings"
+! grep -Fq $'ambiguous\t' "$bindings"
+
+haproxy_frontend_counters_tsv > "$counters" <<'EOF'
+# svname,bout,pxname,bin,status
+FRONTEND,2000,vless_in,1000,OPEN
+FRONTEND,4000,vless_in_8443,3000,OPEN
+FRONTEND,7000,vless_in_9443,5000,OPEN
+FRONTEND,9000,unrelated,8000,OPEN
+BACKEND,2000,vless_pool,1000,UP
+EOF
+grep -Fqx $'vless_in\t1000\t2000' "$counters"
+grep -Fqx $'vless_in_8443\t3000\t4000' "$counters"
+grep -Fqx $'vless_in_9443\t5000\t7000' "$counters"
+! grep -Fq $'vless_pool\t' "$counters"
+command -v jq >/dev/null 2>&1 || exit 0
+routes='[
+  {"listen_ip":"203.0.113.10","port":443},
+  {"listen_ip":"203.0.113.10","port":8443},
+  {"listen_ip":"*","port":9443}
+]'
+result=$(build_haproxy_traffic_counters_json "$bindings" "$counters" "$routes" 123456 203.0.113.10)
+jq -e '. == [{
+    "ip":"203.0.113.10",
+    "rate_source":"haproxy",
+    "counter_rx_bytes":9000,
+    "counter_tx_bytes":13000,
+    "counter_sample_ms":123456
+}]' <<< "$result" >/dev/null
+
+haproxy_traffic_enabled=true
+haproxy_traffic_counters="$result"
+merged=$(apply_haproxy_traffic_counters '[
+  {"iface":"ens3","ip":"203.0.113.10","counter_rx_bytes":999999,"counter_tx_bytes":999999,"counter_sample_ms":10},
+  {"iface":"wan2","ip":"198.51.100.20","counter_rx_bytes":888888,"counter_tx_bytes":888888,"counter_sample_ms":10}
+]')
+jq -e '.[0].rate_source == "haproxy"
+    and .[0].counter_rx_bytes == 9000
+    and .[0].counter_tx_bytes == 13000
+    and .[0].counter_sample_ms == 123456
+    and .[1].rate_source == "haproxy"
+    and .[1].counter_rx_bytes == 0
+    and .[1].counter_tx_bytes == 0
+    and .[1].counter_sample_ms == 0' <<< "$merged" >/dev/null
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_combined_profile_exposes_both_capabilities(self):
         valid = function_body(KTO, "valid_node_profile")

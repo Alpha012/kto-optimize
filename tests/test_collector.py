@@ -379,6 +379,57 @@ class CollectorRegressionTests(unittest.TestCase):
         finally:
             collector.now_ts = original_now
 
+    def test_haproxy_rate_source_does_not_reuse_interface_peak(self):
+        node_uuid = str(uuid.uuid4())
+        base_time = 1_800_100_000
+        original_now = collector.now_ts
+
+        def rate_payload(source, counter_rx, counter_tx, sample_ms):
+            payload = self.payload("Обход №12", node_uuid, "wl")
+            payload["ip_stats"] = [{
+                "iface": "ens3",
+                "ip": "203.0.113.120",
+                "rate_source": source,
+                "counter_rx_bytes": counter_rx,
+                "counter_tx_bytes": counter_tx,
+                "counter_sample_ms": sample_ms,
+            }]
+            return payload
+
+        try:
+            collector.now_ts = lambda: base_time
+            collector.update_node(rate_payload("interface", 1_000_000_000, 2_000_000_000, 10_000), "203.0.113.120")
+            collector.now_ts = lambda: base_time + 5
+            interface = collector.update_node(
+                rate_payload("interface", 1_100_000_000, 2_050_000_000, 15_000),
+                "203.0.113.120",
+            )
+            self.assertEqual("80 | 160 Mbit/s", collector.peak_rate_table_text(interface["ip_stats"][0]))
+
+            collector.now_ts = lambda: base_time + 10
+            first_haproxy = collector.update_node(
+                rate_payload("haproxy", 10_000_000, 20_000_000, 20_000),
+                "203.0.113.120",
+            )
+            self.assertEqual("haproxy", first_haproxy["ip_stats"][0]["rate_source"])
+            self.assertEqual("-", collector.peak_rate_table_text(first_haproxy["ip_stats"][0]))
+
+            collector.now_ts = lambda: base_time + 15
+            second_haproxy = collector.update_node(
+                rate_payload("haproxy", 35_000_000, 32_500_000, 25_000),
+                "203.0.113.120",
+            )
+            entry = second_haproxy["ip_stats"][0]
+            self.assertEqual(40_000_000, entry["peak_rx_bps_24h"])
+            self.assertEqual(20_000_000, entry["peak_tx_bps_24h"])
+            self.assertEqual("20 | 40 Mbit/s", collector.peak_rate_table_text(entry))
+            self.assertNotEqual(
+                collector.network_rate_series_key({"iface": "ens3", "ip": "203.0.113.120", "rate_source": "interface"}),
+                collector.network_rate_series_key({"iface": "ens3", "ip": "203.0.113.120", "rate_source": "haproxy"}),
+            )
+        finally:
+            collector.now_ts = original_now
+
     def test_cpu_average_uses_minute_buckets_and_rolls_over_after_24_hours(self):
         node_uuid = str(uuid.uuid4())
         base_time = 1_800_000_000

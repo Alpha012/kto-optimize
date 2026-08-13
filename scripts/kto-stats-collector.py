@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v315"
+COLLECTOR_BUILD = "v316"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -3950,6 +3950,13 @@ def normalize_network_rate(value):
     return max(0, min(parsed, NETWORK_RATE_MAX_BPS))
 
 
+def normalize_network_rate_source(value):
+    source = str(value or "").strip().lower()
+    if source == "haproxy":
+        return "haproxy"
+    return "interface"
+
+
 def normalize_ipv4_text(value):
     text = str(value or "").strip()
     if not text:
@@ -3973,6 +3980,7 @@ def normalized_traffic_entry(raw, fallback_iface="", fallback_ip=""):
         "iface": iface,
         "ip": ip_text,
         "error": clean_display_text(raw.get("error") or "").strip()[:300],
+        "rate_source": normalize_network_rate_source(raw.get("rate_source")),
         "counter_rx_bytes": normalize_network_counter(raw.get("counter_rx_bytes")),
         "counter_tx_bytes": normalize_network_counter(raw.get("counter_tx_bytes")),
         "counter_sample_ms": normalize_traffic_counter(raw.get("counter_sample_ms")),
@@ -4053,12 +4061,13 @@ def network_rate_series_key(entry):
         return ""
     iface = clean_display_text(entry.get("iface") or "").strip().casefold()[:80]
     ip_text = normalize_ipv4_text(entry.get("ip"))
+    source = normalize_network_rate_source(entry.get("rate_source"))
     if iface and ip_text:
-        return f"iface:{iface}|ip:{ip_text}"
+        return f"source:{source}|iface:{iface}|ip:{ip_text}"
     if iface:
-        return f"iface:{iface}"
+        return f"source:{source}|iface:{iface}"
     if ip_text:
-        return f"ip:{ip_text}"
+        return f"source:{source}|ip:{ip_text}"
     return ""
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v315"
+PUSH_BUILD="v316"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
@@ -98,6 +98,8 @@ haproxy_apply_result='{}'
 haproxy_bandwidth_limits='[]'
 haproxy_bandwidth_supported=false
 haproxy_bandwidth_apply_result='{}'
+haproxy_traffic_enabled=false
+haproxy_traffic_counters='[]'
 ip_limit_events='[]'
 ip_limit_events_count=0
 update_result='{}'
@@ -257,6 +259,7 @@ vnstat_entry_json() {
         '{
             iface: $iface,
             ip: $ip,
+            rate_source: "interface",
             day_rx: $day_rx,
             day_tx: $day_tx,
             day_total: ($day_rx + $day_tx),
@@ -683,6 +686,186 @@ read_haproxy_routes() {
     if [[ ! -s /etc/haproxy/haproxy.cfg ]] || grep -Fq '# Managed by kto. Edit routes through the HAProxy menu.' /etc/haproxy/haproxy.cfg 2>/dev/null; then
         haproxy_routes_managed=true
     fi
+}
+
+haproxy_frontend_bindings_tsv() {
+    local config="${1:-/etc/haproxy/haproxy.cfg}"
+
+    awk '
+        $1 == "frontend" {
+            current = $2
+            next
+        }
+        $1 == "global" || $1 == "defaults" || $1 == "backend" || $1 == "listen" {
+            current = ""
+            next
+        }
+        current != "" && $1 == "bind" {
+            spec = $2
+            bind_count[current]++
+            if (spec ~ /,/ || spec ~ /^\[/ || spec ~ /^::/ || !match(spec, /:[0-9]+$/)) {
+                unsupported[current] = 1
+                next
+            }
+            port = substr(spec, RSTART + 1)
+            ip = substr(spec, 1, RSTART - 1)
+            if (ip == "" || ip == "0.0.0.0" || ip == "::" || ip == "*") ip = "*"
+            if (ip != "*" && ip !~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+                unsupported[current] = 1
+                next
+            }
+            names[current] = current
+            ips[current] = ip
+            ports[current] = port
+        }
+        END {
+            for (name in names) {
+                if (bind_count[name] == 1 && !unsupported[name]) {
+                    print name "\t" ips[name] "\t" ports[name]
+                }
+            }
+        }
+    ' "$config" 2>/dev/null | sort -t $'\t' -k1,1
+}
+
+haproxy_frontend_counters_tsv() {
+    awk -F ',' '
+        NR == 1 && $0 ~ /^#/ {
+            sub(/^#[[:space:]]*/, "", $1)
+            for (i = 1; i <= NF; i++) column[$i] = i
+            header = (column["pxname"] && column["svname"] && column["bin"] && column["bout"])
+            next
+        }
+        header {
+            proxy = $(column["pxname"])
+            service = $(column["svname"])
+            bytes_in = $(column["bin"])
+            bytes_out = $(column["bout"])
+            gsub(/\r/, "", proxy)
+            gsub(/\r/, "", service)
+            gsub(/\r/, "", bytes_in)
+            gsub(/\r/, "", bytes_out)
+            if (service != "FRONTEND" || proxy == "") next
+            if (bytes_in !~ /^[0-9]+$/) bytes_in = 0
+            if (bytes_out !~ /^[0-9]+$/) bytes_out = 0
+            print proxy "\t" bytes_in "\t" bytes_out
+        }
+    ' | sort -t $'\t' -k1,1
+}
+
+build_haproxy_traffic_counters_json() {
+    local bindings_file="$1" counters_file="$2" routes_json="$3" sample_ms="$4" wildcard_ip="${5:-}"
+    local routes_file rows_file frontend listen_ip port bytes_in bytes_out endpoint
+    local -A route_endpoints=() frontend_in=() frontend_out=() used_frontends=()
+
+    routes_file="$(mktemp)"
+    rows_file="$(mktemp)"
+    if ! printf '%s' "$routes_json" | jq -r '
+        .[]
+        | select((.port | type) == "number")
+        | [(.listen_ip // "*" | tostring), (.port | tostring)]
+        | @tsv
+    ' > "$routes_file" 2>/dev/null; then
+        rm -f "$routes_file" "$rows_file"
+        printf '[]\n'
+        return 0
+    fi
+
+    while IFS=$'\t' read -r listen_ip port; do
+        [[ -n "$listen_ip" && "$port" =~ ^[0-9]{1,5}$ ]] || continue
+        route_endpoints["${listen_ip}|${port}"]=1
+    done < "$routes_file"
+    while IFS=$'\t' read -r frontend bytes_in bytes_out; do
+        [[ -n "$frontend" && "$bytes_in" =~ ^[0-9]+$ && "$bytes_out" =~ ^[0-9]+$ ]] || continue
+        frontend_in["$frontend"]="$bytes_in"
+        frontend_out["$frontend"]="$bytes_out"
+    done < "$counters_file"
+
+    while IFS=$'\t' read -r frontend listen_ip port; do
+        [[ -n "$frontend" && -n "$listen_ip" && "$port" =~ ^[0-9]{1,5}$ ]] || continue
+        endpoint="${listen_ip}|${port}"
+        [[ -n "${route_endpoints[$endpoint]+x}" ]] || continue
+        [[ -n "${frontend_in[$frontend]+x}" && -z "${used_frontends[$frontend]+x}" ]] || continue
+        used_frontends["$frontend"]=1
+        if [[ "$listen_ip" == "*" ]]; then
+            listen_ip="$wildcard_ip"
+        fi
+        [[ "$listen_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+        printf '%s\t%s\t%s\n' "$listen_ip" "${frontend_in[$frontend]}" "${frontend_out[$frontend]}" >> "$rows_file"
+    done < "$bindings_file"
+
+    if [[ -s "$rows_file" ]]; then
+        jq -R -s -c --argjson sample_ms "$sample_ms" '
+            [split("\n")[] | select(length > 0) | split("\t") |
+                {ip: .[0], rx: (.[1] | tonumber), tx: (.[2] | tonumber)}]
+            | sort_by(.ip)
+            | group_by(.ip)
+            | map({
+                ip: .[0].ip,
+                rate_source: "haproxy",
+                counter_rx_bytes: (map(.rx) | add),
+                counter_tx_bytes: (map(.tx) | add),
+                counter_sample_ms: $sample_ms
+              })
+        ' "$rows_file" 2>/dev/null || printf '[]\n'
+    else
+        printf '[]\n'
+    fi
+    rm -f "$routes_file" "$rows_file"
+}
+
+read_haproxy_traffic_counters() {
+    local socket="/run/haproxy/admin.sock" bindings_file counters_file raw fallback_ip sample_ms route_count
+
+    haproxy_traffic_enabled=false
+    haproxy_traffic_counters='[]'
+    route_count="$(printf '%s' "$haproxy_routes" | jq -r 'if type == "array" then length else 0 end' 2>/dev/null || echo 0)"
+    [[ "$route_count" =~ ^[0-9]+$ ]] || route_count=0
+    (( route_count > 0 )) || return 0
+    haproxy_traffic_enabled=true
+
+    command -v socat >/dev/null 2>&1 || return 0
+    [[ -S "$socket" && -r /etc/haproxy/haproxy.cfg ]] || return 0
+    bindings_file="$(mktemp)"
+    counters_file="$(mktemp)"
+    haproxy_frontend_bindings_tsv /etc/haproxy/haproxy.cfg > "$bindings_file"
+    raw="$(printf 'show stat\n' | socat -t 3 - UNIX-CONNECT:"$socket" 2>/dev/null || true)"
+    if [[ -n "$raw" ]]; then
+        haproxy_frontend_counters_tsv <<< "$raw" > "$counters_file"
+    fi
+    fallback_ip="$(list_public_ipv4_interfaces | awk -F '\t' 'NR == 1 { print $2; exit }')"
+    sample_ms="$(int_or_zero "$(monotonic_milliseconds)")"
+    haproxy_traffic_counters="$(build_haproxy_traffic_counters_json \
+        "$bindings_file" "$counters_file" "$haproxy_routes" "$sample_ms" "$fallback_ip")"
+    if ! printf '%s' "$haproxy_traffic_counters" | jq -e 'type == "array" and length <= 64' >/dev/null 2>&1; then
+        haproxy_traffic_counters='[]'
+    fi
+    rm -f "$bindings_file" "$counters_file"
+}
+
+apply_haproxy_traffic_counters() {
+    local entries_json="$1"
+
+    if [[ "$haproxy_traffic_enabled" != true ]]; then
+        printf '%s\n' "$entries_json"
+        return 0
+    fi
+    jq -c --argjson counters "$haproxy_traffic_counters" '
+        map(
+            . as $entry
+            | ($counters | map(select(.ip == ($entry.ip // ""))) | .[0]) as $counter
+            | .rate_source = "haproxy"
+            | if $counter == null then
+                .counter_rx_bytes = 0
+                | .counter_tx_bytes = 0
+                | .counter_sample_ms = 0
+              else
+                .counter_rx_bytes = $counter.counter_rx_bytes
+                | .counter_tx_bytes = $counter.counter_tx_bytes
+                | .counter_sample_ms = $counter.counter_sample_ms
+              end
+        )
+    ' <<< "$entries_json" 2>/dev/null || printf '%s\n' "$entries_json"
 }
 
 load_haproxy_apply_result() {
@@ -2670,6 +2853,7 @@ read_haproxy_scan_stats
 read_haproxy_allowed_sni
 read_haproxy_backend_target
 read_haproxy_routes
+read_haproxy_traffic_counters
 load_haproxy_apply_result
 read_haproxy_bandwidth_limits
 load_haproxy_bandwidth_apply_result
@@ -2693,6 +2877,7 @@ else
     done < <(list_public_ipv4_interfaces)
     ip_stats="$(jq -s '.[0:64]' "$traffic_stats_file" 2>/dev/null || echo '[]')"
     rm -f "$traffic_stats_file"
+    ip_stats="$(apply_haproxy_traffic_counters "$ip_stats")"
 
     successful_interfaces="$(printf '%s' "$ip_stats" | jq -r '[.[] | select((.error // "") == "")] | length' 2>/dev/null || echo 0)"
     successful_interfaces="$(int_or_zero "$successful_interfaces")"
