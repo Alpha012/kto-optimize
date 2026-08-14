@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v318"
+SCRIPT_BUILD="v319"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -63,6 +63,7 @@ HOSTS_FILE="${KTO_HOSTS_FILE:-/etc/hosts}"
 HOSTS_BACKUP_FILE="${KTO_HOSTS_BACKUP_FILE:-/etc/hosts.kto-backup}"
 DPI_RESOLV_CONF_FILE="${KTO_DPI_RESOLV_CONF_FILE:-/etc/resolv.conf}"
 DPI_RESOLVED_UPSTREAM_FILE="${KTO_DPI_RESOLVED_UPSTREAM_FILE:-/run/systemd/resolve/resolv.conf}"
+DPI_PREFLIGHT_HELPER="${KTO_DPI_PREFLIGHT_HELPER:-/usr/local/lib/kto-dpi-preflight.py}"
 IPV6_WHITELIST_SYSCTL_CONF="/etc/sysctl.d/98-kto-whitelist-ipv6.conf"
 STATS_COLLECTOR_CONFIG="/etc/kto-stats-collector.conf"
 STATS_COLLECTOR_SCRIPT="/usr/local/bin/kto-stats-collector"
@@ -5797,6 +5798,202 @@ dpi_detector_prepare_image() {
     dpi_detector_pull_image
 }
 
+install_dpi_preflight_helper() {
+    install_asset_file scripts/kto-dpi-preflight.py "$DPI_PREFLIGHT_HELPER" 0644
+}
+
+ensure_dpi_preflight_helper() {
+    if "${SUDO[@]}" test -r "$DPI_PREFLIGHT_HELPER" 2>/dev/null &&
+        "${SUDO[@]}" grep -Fqx "DPI_PREFLIGHT_BUILD = \"${SCRIPT_BUILD}\"" \
+            "$DPI_PREFLIGHT_HELPER" 2>/dev/null; then
+        return 0
+    fi
+
+    stage "Обновляю preflight целей DPI Detector"
+    install_dpi_preflight_helper
+}
+
+dpi_detector_export_targets() {
+    local output_file="$1"
+
+    if ! run_bounded_command 20 "${SUDO[@]}" docker run --rm \
+        --network none \
+        --user 65534:65534 \
+        --cap-drop ALL \
+        --security-opt no-new-privileges:true \
+        --read-only \
+        --entrypoint cat \
+        "$DPI_DETECTOR_IMAGE" /app/tcp16.json > "$output_file" 2>> "$LOG_FILE"; then
+        fail "Не удалось получить tcp16.json из ${DPI_DETECTOR_IMAGE}"
+        return 1
+    fi
+    if [[ ! -s "$output_file" ]]; then
+        fail "DPI Detector вернул пустой tcp16.json"
+        return 1
+    fi
+    chmod 0644 "$output_file"
+}
+
+dpi_detector_probe_targets() {
+    local input_file="$1" output_file="$2" uid="$3" container_name="$4"
+    local connect_timeout concurrency attempts command_timeout
+
+    connect_timeout="${KTO_DPI_PREFLIGHT_CONNECT_TIMEOUT:-2.0}"
+    concurrency="${KTO_DPI_PREFLIGHT_CONCURRENCY:-48}"
+    attempts="${KTO_DPI_PREFLIGHT_ATTEMPTS:-1}"
+    command_timeout="${KTO_DPI_PREFLIGHT_RUN_TIMEOUT:-60}"
+    [[ "$connect_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] || connect_timeout=2.0
+    [[ "$concurrency" =~ ^[0-9]+$ && "$concurrency" -ge 1 && "$concurrency" -le 256 ]] || concurrency=48
+    [[ "$attempts" =~ ^[0-9]+$ && "$attempts" -ge 1 && "$attempts" -le 5 ]] || attempts=1
+    [[ "$command_timeout" =~ ^[0-9]+$ && "$command_timeout" -ge 15 ]] || command_timeout=60
+
+    if ! run_bounded_command "$command_timeout" "${SUDO[@]}" docker run --rm \
+        --name "$container_name" \
+        --network host \
+        --user "${uid}:${uid}" \
+        --cap-drop ALL \
+        --security-opt no-new-privileges:true \
+        --pids-limit 256 \
+        --read-only \
+        --tmpfs "/tmp:rw,nosuid,nodev,noexec,size=32m" \
+        --env HOME=/tmp \
+        --env PYTHONDONTWRITEBYTECODE=1 \
+        --volume "${DPI_PREFLIGHT_HELPER}:/opt/kto-dpi-preflight.py:ro" \
+        --volume "${input_file}:/opt/kto-tcp16.json:ro" \
+        --entrypoint python \
+        "$DPI_DETECTOR_IMAGE" /opt/kto-dpi-preflight.py probe \
+        --input /opt/kto-tcp16.json \
+        --timeout "$connect_timeout" \
+        --concurrency "$concurrency" \
+        --attempts "$attempts" > "$output_file" 2>> "$LOG_FILE"; then
+        "${SUDO[@]}" docker rm -f "$container_name" >/dev/null 2>&1 || true
+        return 1
+    fi
+    [[ -s "$output_file" ]]
+}
+
+dpi_detector_combine_targets() {
+    local work_dir="$1" summary_file="$2"
+    local host_uid host_gid min_kept min_ratio
+
+    host_uid="$(id -u)"
+    host_gid="$(id -g)"
+    min_kept="${KTO_DPI_PREFLIGHT_MIN_TARGETS:-10}"
+    min_ratio="${KTO_DPI_PREFLIGHT_MIN_RATIO:-0.35}"
+    [[ "$min_kept" =~ ^[0-9]+$ && "$min_kept" -ge 1 ]] || min_kept=10
+    [[ "$min_ratio" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]] || min_ratio=0.35
+
+    run_bounded_command 30 "${SUDO[@]}" docker run --rm \
+        --network none \
+        --user "${host_uid}:${host_gid}" \
+        --cap-drop ALL \
+        --security-opt no-new-privileges:true \
+        --pids-limit 64 \
+        --read-only \
+        --tmpfs "/tmp:rw,nosuid,nodev,noexec,size=16m" \
+        --env HOME=/tmp \
+        --env PYTHONDONTWRITEBYTECODE=1 \
+        --volume "${DPI_PREFLIGHT_HELPER}:/opt/kto-dpi-preflight.py:ro" \
+        --volume "${work_dir}:/work:rw" \
+        --entrypoint python \
+        "$DPI_DETECTOR_IMAGE" /opt/kto-dpi-preflight.py combine \
+        --input /work/tcp16.original.json \
+        --selected /work/selected.json \
+        --reference /work/reference.json \
+        --output /work/tcp16.filtered.json \
+        --min-kept "$min_kept" \
+        --min-kept-ratio "$min_ratio" > "$summary_file" 2>> "$LOG_FILE"
+}
+
+dpi_detector_print_preflight_summary() {
+    local summary_file="$1"
+    local total kept skipped selected_alive reference_alive differential unverified shown remaining
+
+    total="$(awk -F '\t' '$1 == "TOTAL" { print $2; exit }' "$summary_file")"
+    kept="$(awk -F '\t' '$1 == "KEPT" { print $2; exit }' "$summary_file")"
+    skipped="$(awk -F '\t' '$1 == "SKIPPED" { print $2; exit }' "$summary_file")"
+    selected_alive="$(awk -F '\t' '$1 == "SELECTED_ALIVE" { print $2; exit }' "$summary_file")"
+    reference_alive="$(awk -F '\t' '$1 == "REFERENCE_ALIVE" { print $2; exit }' "$summary_file")"
+    differential="$(awk -F '\t' '$1 == "DIFFERENTIAL" { print $2; exit }' "$summary_file")"
+    unverified="$(awk -F '\t' '$1 == "UNVERIFIED" { print $2; exit }' "$summary_file")"
+    if [[ ! "$total" =~ ^[0-9]+$ || ! "$kept" =~ ^[0-9]+$ || ! "$skipped" =~ ^[0-9]+$ ]]; then
+        fail "Не удалось прочитать результат preflight DPI Detector"
+        return 1
+    fi
+
+    echo
+    echo -e "${BOLD}[ ПРЕДПРОВЕРКА TCP16 ]${NC}"
+    ok "Доступных целей: ${kept}/${total}"
+    echo " Выбранный маршрут: ${selected_alive:-0}/${total} TCP-портов"
+    echo " Обычный маршрут:   ${reference_alive:-0}/${total} TCP-портов"
+    if [[ "${differential:-0}" =~ ^[0-9]+$ ]] && (( differential > 0 )); then
+        warn "Недоступны через выбранный IP, но живы через обычный маршрут: ${differential}. Они оставлены в тесте."
+    fi
+    if [[ "${unverified:-0}" =~ ^[0-9]+$ ]] && (( unverified > 0 )); then
+        warn "Недоступны с обоих маршрутов целыми ASN-группами: ${unverified}. Они оставлены как возможная фильтрация."
+    fi
+    if (( skipped == 0 )); then
+        return 0
+    fi
+
+    warn "Пропущены отдельные недоступные цели, у которых живы соседи того же ASN: ${skipped}"
+    shown=0
+    while IFS=$'\t' read -r kind target_id provider ip port selected_reason reference_reason; do
+        [[ "$kind" == "SKIP" ]] || continue
+        printf ' - %s | %s:%s | %s | %s / %s\n' \
+            "$target_id" "$ip" "$port" "$provider" "$selected_reason" "$reference_reason"
+        shown=$(( shown + 1 ))
+        (( shown >= 8 )) && break
+    done < "$summary_file"
+    remaining=$(( skipped - shown ))
+    (( remaining <= 0 )) || echo " ... и ещё ${remaining}"
+}
+
+dpi_detector_prepare_targets() {
+    local work_dir="$1" selected_uid="$2" selected_container="$3" reference_container="$4"
+    local enabled original_file selected_file reference_file summary_file reference_uid
+
+    DPI_PREFLIGHT_TARGET_FILE=""
+    enabled="${KTO_DPI_PREFLIGHT_ENABLED:-1}"
+    if [[ "$enabled" == "0" ]]; then
+        warn "Preflight целей DPI Detector отключён через KTO_DPI_PREFLIGHT_ENABLED=0."
+        return 0
+    fi
+    [[ "$enabled" == "1" ]] || enabled=1
+
+    ensure_dpi_preflight_helper || return 1
+    mkdir -p "$work_dir"
+    chmod 0755 "$work_dir"
+    original_file="${work_dir}/tcp16.original.json"
+    selected_file="${work_dir}/selected.json"
+    reference_file="${work_dir}/reference.json"
+    summary_file="${work_dir}/summary.tsv"
+    reference_uid="$(id -u)"
+
+    dpi_detector_export_targets "$original_file" || return 1
+    stage "Проверяю TCP16 через выбранный IP"
+    if ! dpi_detector_probe_targets "$original_file" "$selected_file" "$selected_uid" "$selected_container"; then
+        fail "Preflight не смог проверить цели через выбранный IP"
+        return 1
+    fi
+    stage "Сверяю TCP16 через обычный маршрут"
+    if ! dpi_detector_probe_targets "$original_file" "$reference_file" "$reference_uid" "$reference_container"; then
+        fail "Preflight не смог проверить цели через обычный маршрут"
+        return 1
+    fi
+    if ! dpi_detector_combine_targets "$work_dir" "$summary_file"; then
+        fail "Доступно слишком мало целей TCP16 или preflight вернул некорректные данные"
+        [[ -s "$summary_file" ]] && cat "$summary_file" >&2
+        return 1
+    fi
+    [[ -s "${work_dir}/tcp16.filtered.json" ]] || {
+        fail "Preflight не создал итоговый tcp16.json"
+        return 1
+    }
+    dpi_detector_print_preflight_summary "$summary_file" || return 1
+    DPI_PREFLIGHT_TARGET_FILE="${work_dir}/tcp16.filtered.json"
+}
+
 dpi_detector_policy_slot() {
     local offset uid table priority used_uids rules table_routes
     used_uids="$(ps -e -o uid= 2>/dev/null | awk '{$1=$1; if ($1 != "") print $1}' | sort -u || true)"
@@ -5871,8 +6068,13 @@ dpi_detector_prepare_source_policy() {
 
 dpi_detector_cleanup() {
     local container_name="${1:-}" table="${2:-}" priority="${3:-}"
-    if [[ -n "$container_name" ]] && command_exists docker; then
-        "${SUDO[@]}" docker rm -f "$container_name" >/dev/null 2>&1 || true
+    local extra_container
+    shift 3 || true
+    if command_exists docker; then
+        for extra_container in "$container_name" "$@"; do
+            [[ -n "$extra_container" ]] || continue
+            "${SUDO[@]}" docker rm -f "$extra_container" >/dev/null 2>&1 || true
+        done
     fi
     if [[ -n "$priority" ]]; then
         "${SUDO[@]}" ip -4 rule del priority "$priority" >/dev/null 2>&1 || true
@@ -5889,6 +6091,7 @@ run_dpi_detector() {
     header
     local requested_source_ip="${1:-}" source_ip source_interface
     local slot uid table priority container_name security_options rc=0
+    local preflight_dir preflight_selected_name preflight_reference_name
 
     if [[ "$MACHINE_MODE" == "panel" ]]; then
         fail "Проверка ТСПУ доступна для node и whitelist."
@@ -5904,9 +6107,12 @@ run_dpi_detector() {
         DPI_RESOLV_SNAPSHOT_DIR=""
         DPI_RESOLV_CHANGED=0
         container_name=""
+        preflight_dir=""
+        preflight_selected_name=""
+        preflight_reference_name=""
         table=""
         priority=""
-        trap 'dpi_detector_cleanup "$container_name" "$table" "$priority"; dpi_detector_restore_resolver || true' EXIT
+        trap 'dpi_detector_cleanup "$container_name" "$table" "$priority" "$preflight_selected_name" "$preflight_reference_name"; [[ -z "$preflight_dir" ]] || rm -rf -- "$preflight_dir"; dpi_detector_restore_resolver || true' EXIT
         trap 'exit 130' INT TERM HUP
 
         dpi_detector_prepare_image || exit 1
@@ -5923,9 +6129,14 @@ run_dpi_detector() {
         fi
         IFS=$'\t' read -r uid table priority <<< "$slot"
         container_name="kto-dpi-detector-${uid}-$$"
+        preflight_selected_name="${container_name}-selected"
+        preflight_reference_name="${container_name}-reference"
+        preflight_dir="$(mktemp -d)"
 
         stage "Закрепляю тест за ${source_ip} (${source_interface})"
         dpi_detector_prepare_source_policy "$source_ip" "$source_interface" "$uid" "$table" "$priority" || exit 1
+        dpi_detector_prepare_targets "$preflight_dir" "$uid" \
+            "$preflight_selected_name" "$preflight_reference_name" || exit 1
 
         docker_args=(
             run --rm --name "$container_name"
@@ -5941,6 +6152,9 @@ run_dpi_detector() {
             --env "TERM=${TERM:-xterm-256color}"
             --init
         )
+        if [[ -n "$DPI_PREFLIGHT_TARGET_FILE" ]]; then
+            docker_args+=(--volume "${DPI_PREFLIGHT_TARGET_FILE}:/app/tcp16.json:ro")
+        fi
         detector_args=(--batch)
         if [[ -t 0 && -t 1 ]]; then
             docker_args+=(-it)

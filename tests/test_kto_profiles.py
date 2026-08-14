@@ -1,6 +1,9 @@
+import json
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,6 +16,8 @@ MOBILE443 = (ROOT / "scripts" / "kto-mobile443.sh").read_text(encoding="utf-8")
 ADDITIONAL_IPS = (ROOT / "scripts" / "kto-additional-ips.sh").read_text(encoding="utf-8")
 REMNA_EGRESS = (ROOT / "scripts" / "kto-remnawave-egress.sh").read_text(encoding="utf-8")
 HAPROXY_BANDWIDTH = (ROOT / "scripts" / "kto-haproxy-bandwidth.sh").read_text(encoding="utf-8")
+DPI_PREFLIGHT_PATH = ROOT / "scripts" / "kto-dpi-preflight.py"
+DPI_PREFLIGHT = DPI_PREFLIGHT_PATH.read_text(encoding="utf-8")
 
 
 def bash_executable():
@@ -40,13 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v318"', KTO)
-        self.assertIn('PUSH_BUILD="v318"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v318"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v318"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v318"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v318"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v318"', HAPROXY_BANDWIDTH)
+        self.assertIn('SCRIPT_BUILD="v319"', KTO)
+        self.assertIn('PUSH_BUILD="v319"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v319"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v319"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v319"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v319"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v319"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v319"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -871,6 +877,8 @@ grep -Fqx 'arg1=|arg2=|xdg=/tmp/kto-btop-xdg' "$events"
         dns_prepare = function_body(KTO, "dpi_detector_prepare_registry_dns")
         policy = function_body(KTO, "dpi_detector_prepare_source_policy")
         cleanup = function_body(KTO, "dpi_detector_cleanup")
+        preflight = function_body(KTO, "dpi_detector_prepare_targets")
+        probe = function_body(KTO, "dpi_detector_probe_targets")
         main = function_body(KTO, "main")
 
         self.assertIn(
@@ -900,6 +908,13 @@ grep -Fqx 'arg1=|arg2=|xdg=/tmp/kto-btop-xdg' "$events"
         self.assertIn('--tmpfs "/tmp:rw,nosuid,nodev,noexec,size=128m"', runner)
         self.assertIn('detector_args=(--batch)', runner)
         self.assertIn('detector_args=(-t 123 --batch)', runner)
+        self.assertIn('dpi_detector_prepare_targets "$preflight_dir"', runner)
+        self.assertIn('--volume "${DPI_PREFLIGHT_TARGET_FILE}:/app/tcp16.json:ro"', runner)
+        self.assertIn('ensure_dpi_preflight_helper', preflight)
+        self.assertIn('dpi_detector_probe_targets "$original_file" "$selected_file"', preflight)
+        self.assertIn('dpi_detector_probe_targets "$original_file" "$reference_file" "$reference_uid"', preflight)
+        self.assertIn('--network host', probe)
+        self.assertIn('--user "${uid}:${uid}"', probe)
         self.assertIn("trap 'dpi_detector_cleanup", runner)
         self.assertIn('uidrange "${uid}-${uid}"', policy)
         self.assertIn('src "$source_ip"', policy)
@@ -951,6 +966,85 @@ grep -Fq -- '-4|route|flush|table|61000|' "$events"
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dpi_preflight_keeps_route_differences_and_drops_only_double_failures(self):
+        targets = [
+            {"id": "A-01", "asn": "64500", "provider": "Alpha", "ip": "192.0.2.10", "port": 443},
+            {"id": "B-01", "asn": "64501", "provider": "Beta", "ip": "198.51.100.20", ",port": 80},
+            {"id": "C-01", "asn": "64500", "provider": "Alpha 2", "ip": "203.0.113.30", "port": 443},
+            {"id": "D-01", "asn": "64502", "provider": "Delta", "ip": "203.0.113.40", "port": 443},
+        ]
+
+        def report(statuses):
+            results = []
+            for index, (item, status) in enumerate(zip(targets, statuses, strict=True)):
+                ok, reason = status
+                port = item.get("port", item.get(",port", 443))
+                results.append(
+                    {
+                        "index": index,
+                        "ip": item["ip"],
+                        "port": port,
+                        "ok": ok,
+                        "reason": reason,
+                        "latency_ms": 1.0 if ok else None,
+                    }
+                )
+            return {"schema": 1, "build": "v319", "results": results}
+
+        selected = report(
+            [(True, "open"), (False, "timeout"), (False, "refused"), (False, "timeout")]
+        )
+        reference = report(
+            [(False, "timeout"), (True, "open"), (False, "timeout"), (False, "timeout")]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_path = root / "targets.json"
+            selected_path = root / "selected.json"
+            reference_path = root / "reference.json"
+            output_path = root / "filtered.json"
+            input_path.write_text(json.dumps(targets), encoding="utf-8")
+            selected_path.write_text(json.dumps(selected), encoding="utf-8")
+            reference_path.write_text(json.dumps(reference), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(DPI_PREFLIGHT_PATH),
+                    "combine",
+                    "--input",
+                    str(input_path),
+                    "--selected",
+                    str(selected_path),
+                    "--reference",
+                    str(reference_path),
+                    "--output",
+                    str(output_path),
+                    "--min-kept",
+                    "1",
+                    "--min-kept-ratio",
+                    "0.1",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            filtered = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual([item["id"] for item in filtered], ["A-01", "B-01", "D-01"])
+            self.assertEqual(filtered[1]["port"], 80)
+            self.assertNotIn(",port", filtered[1])
+            self.assertIn("KEPT\t3", result.stdout)
+            self.assertIn("SKIPPED\t1", result.stdout)
+            self.assertIn("DIFFERENTIAL\t1", result.stdout)
+            self.assertIn("UNVERIFIED\t1", result.stdout)
+            self.assertIn("SKIP\tC-01\tAlpha 2\t203.0.113.30\t443", result.stdout)
+            self.assertIn("UNVERIFIED_TARGET\tD-01\tDelta\t203.0.113.40\t443", result.stdout)
 
     def test_dpi_detector_preflight_restores_resolver_and_uses_cached_image(self):
         bash = bash_executable()

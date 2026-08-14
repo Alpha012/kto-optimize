@@ -24,8 +24,9 @@ fi
 PYTHONDONTWRITEBYTECODE=1 "${PYTHON_CMD[@]}" - <<'PY'
 from pathlib import Path
 
-path = Path("scripts/kto-stats-collector.py")
-compile(path.read_text(encoding="utf-8"), str(path), "exec")
+for name in ("scripts/kto-stats-collector.py", "scripts/kto-dpi-preflight.py"):
+    path = Path(name)
+    compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
 
 PYTHONDONTWRITEBYTECODE=1 "${PYTHON_CMD[@]}" -m unittest discover -s tests -p 'test_*.py'
