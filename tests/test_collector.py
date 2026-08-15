@@ -334,7 +334,7 @@ class CollectorRegressionTests(unittest.TestCase):
             ordered,
         )
 
-    def test_network_peak_is_per_ip_and_rolls_over_after_24_hours(self):
+    def test_network_average_is_per_ip_weighted_and_rolls_over_after_one_hour(self):
         node_uuid = str(uuid.uuid4())
         base_time = 1_800_000_000
         original_now = collector.now_ts
@@ -353,33 +353,34 @@ class CollectorRegressionTests(unittest.TestCase):
         try:
             collector.now_ts = lambda: base_time
             first = collector.update_node(rate_payload(1_000_000_000, 2_000_000_000, 10_000), "203.0.113.80")
-            self.assertEqual("-", collector.peak_rate_table_text(first["ip_stats"][0]))
+            self.assertEqual("-", collector.average_rate_table_text(first["ip_stats"][0]))
 
             collector.now_ts = lambda: base_time + 5
             second = collector.update_node(rate_payload(1_100_000_000, 2_050_000_000, 15_000), "203.0.113.80")
             entry = second["ip_stats"][0]
-            self.assertEqual(160_000_000, entry["peak_rx_bps_24h"])
-            self.assertEqual(80_000_000, entry["peak_tx_bps_24h"])
-            self.assertEqual("80 | 160 Mbit/s", collector.peak_rate_table_text(entry))
+            self.assertEqual(160_000_000, entry["avg_rx_bps_1h"])
+            self.assertEqual(80_000_000, entry["avg_tx_bps_1h"])
+            self.assertEqual("80 | 160 Mbit/s", collector.average_rate_table_text(entry))
             rich = collector.aggregate_wl_rich_message()
-            self.assertIn("Пик ↑/↓ (24ч)", rich)
+            self.assertIn("Сред. ↑/↓ (1ч)", rich)
             self.assertIn("80 | 160 Mbit/s", rich)
 
-            collector.now_ts = lambda: base_time + 10
-            third = collector.update_node(rate_payload(1_110_000_000, 2_055_000_000, 20_000), "203.0.113.80")
-            self.assertEqual(160_000_000, third["ip_stats"][0]["peak_rx_bps_24h"])
-            self.assertEqual(80_000_000, third["ip_stats"][0]["peak_tx_bps_24h"])
+            collector.now_ts = lambda: base_time + 15
+            third = collector.update_node(rate_payload(1_120_000_000, 2_060_000_000, 25_000), "203.0.113.80")
+            self.assertEqual(64_000_000, third["ip_stats"][0]["avg_rx_bps_1h"])
+            self.assertEqual(32_000_000, third["ip_stats"][0]["avg_tx_bps_1h"])
+            self.assertEqual("32 | 64 Mbit/s", collector.average_rate_table_text(third["ip_stats"][0]))
 
             collector.now_ts = lambda: base_time + collector.NETWORK_RATE_RETENTION_SEC + 61
             expired = collector.update_node(
                 rate_payload(1_110_000_000, 2_055_000_000, 86_471_000),
                 "203.0.113.80",
             )
-            self.assertEqual("-", collector.peak_rate_table_text(expired["ip_stats"][0]))
+            self.assertEqual("-", collector.average_rate_table_text(expired["ip_stats"][0]))
         finally:
             collector.now_ts = original_now
 
-    def test_haproxy_rate_source_does_not_reuse_interface_peak(self):
+    def test_haproxy_rate_source_does_not_reuse_interface_average(self):
         node_uuid = str(uuid.uuid4())
         base_time = 1_800_100_000
         original_now = collector.now_ts
@@ -420,7 +421,7 @@ class CollectorRegressionTests(unittest.TestCase):
                 rate_payload("interface", 1_100_000_000, 2_050_000_000, 15_000),
                 "203.0.113.120",
             )
-            self.assertEqual("80 | 160 Mbit/s", collector.peak_rate_table_text(interface["ip_stats"][0]))
+            self.assertEqual("80 | 160 Mbit/s", collector.average_rate_table_text(interface["ip_stats"][0]))
 
             collector.now_ts = lambda: base_time + 10
             first_haproxy = collector.update_node(
@@ -428,7 +429,7 @@ class CollectorRegressionTests(unittest.TestCase):
                 "203.0.113.120",
             )
             self.assertEqual("haproxy", first_haproxy["ip_stats"][0]["rate_source"])
-            self.assertEqual("-", collector.peak_rate_table_text(first_haproxy["ip_stats"][0]))
+            self.assertEqual("-", collector.average_rate_table_text(first_haproxy["ip_stats"][0]))
 
             collector.now_ts = lambda: base_time + 15
             second_haproxy = collector.update_node(
@@ -436,9 +437,9 @@ class CollectorRegressionTests(unittest.TestCase):
                 "203.0.113.120",
             )
             entry = second_haproxy["ip_stats"][0]
-            self.assertEqual(40_000_000, entry["peak_rx_bps_24h"])
-            self.assertEqual(20_000_000, entry["peak_tx_bps_24h"])
-            self.assertEqual("20 | 40 Mbit/s", collector.peak_rate_table_text(entry))
+            self.assertEqual(40_000_000, entry["avg_rx_bps_1h"])
+            self.assertEqual(20_000_000, entry["avg_tx_bps_1h"])
+            self.assertEqual("20 | 40 Mbit/s", collector.average_rate_table_text(entry))
             self.assertNotEqual(
                 collector.network_rate_series_key({"iface": "ens3", "ip": "203.0.113.120", "rate_source": "interface"}),
                 collector.network_rate_series_key({"iface": "ens3", "ip": "203.0.113.120", "rate_source": "haproxy"}),
@@ -446,7 +447,7 @@ class CollectorRegressionTests(unittest.TestCase):
         finally:
             collector.now_ts = original_now
 
-    def test_haproxy_peak_rejects_generation_changes_and_impossible_link_delta(self):
+    def test_haproxy_average_rejects_generation_changes_and_impossible_link_delta(self):
         node_uuid = str(uuid.uuid4())
         base_time = 1_800_200_000
         original_now = collector.now_ts
@@ -479,14 +480,14 @@ class CollectorRegressionTests(unittest.TestCase):
                 payload(9_000_000_000, 8_000_000_000, 110_000_000, 210_000_000, 15_000, "generation-b"),
                 "203.0.113.130",
             )
-            self.assertEqual("-", collector.peak_rate_table_text(changed["ip_stats"][0]))
+            self.assertEqual("-", collector.average_rate_table_text(changed["ip_stats"][0]))
 
             collector.now_ts = lambda: base_time + 10
             impossible = collector.update_node(
                 payload(18_000_000_000, 16_000_000_000, 120_000_000, 220_000_000, 20_000, "generation-b"),
                 "203.0.113.130",
             )
-            self.assertEqual("-", collector.peak_rate_table_text(impossible["ip_stats"][0]))
+            self.assertEqual("-", collector.average_rate_table_text(impossible["ip_stats"][0]))
 
             collector.now_ts = lambda: base_time + 15
             valid = collector.update_node(
@@ -494,9 +495,9 @@ class CollectorRegressionTests(unittest.TestCase):
                 "203.0.113.130",
             )
             entry = valid["ip_stats"][0]
-            self.assertEqual(80_000_000, entry["peak_rx_bps_24h"])
-            self.assertEqual(40_000_000, entry["peak_tx_bps_24h"])
-            self.assertEqual("40 | 80 Mbit/s", collector.peak_rate_table_text(entry))
+            self.assertEqual(80_000_000, entry["avg_rx_bps_1h"])
+            self.assertEqual(40_000_000, entry["avg_tx_bps_1h"])
+            self.assertEqual("40 | 80 Mbit/s", collector.average_rate_table_text(entry))
         finally:
             collector.now_ts = original_now
 
@@ -539,13 +540,21 @@ class CollectorRegressionTests(unittest.TestCase):
 
     def test_network_rate_schema_upgrade_clears_poisoned_history_and_cached_fields(self):
         db = collector.network_rate_db()
+        db.execute("DROP TABLE network_rate_minute")
+        db.execute(
+            "CREATE TABLE network_rate_minute ("
+            "node_key TEXT NOT NULL, series_key TEXT NOT NULL, iface TEXT NOT NULL DEFAULT '', "
+            "ip TEXT NOT NULL DEFAULT '', minute INTEGER NOT NULL, "
+            "peak_rx_bps INTEGER NOT NULL DEFAULT 0, peak_tx_bps INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (node_key, series_key, minute))"
+        )
         db.execute(
             "INSERT INTO network_rate_minute"
             "(node_key, series_key, iface, ip, minute, peak_rx_bps, peak_tx_bps) "
             "VALUES(?, ?, ?, ?, ?, ?, ?)",
             ("node", "series", "ens3", "203.0.113.140", 123, 129_802_000_000, 7_196_000_000),
         )
-        db.execute("PRAGMA user_version = 0")
+        db.execute("PRAGMA user_version = 2")
         db.commit()
         collector.NODES = {
             "node": {
@@ -561,11 +570,14 @@ class CollectorRegressionTests(unittest.TestCase):
 
         self.assertTrue(collector.init_network_rate_db())
         self.assertEqual(0, db.execute("SELECT count(*) FROM network_rate_minute").fetchone()[0])
+        columns = {row[1] for row in db.execute("PRAGMA table_info(network_rate_minute)").fetchall()}
+        self.assertIn("rx_bps_ms", columns)
+        self.assertNotIn("peak_rx_bps", columns)
         self.assertGreater(collector.clear_loaded_network_rate_fields(), 0)
         self.assertNotIn("peak_rx_bps_24h", collector.NODES["node"])
         self.assertNotIn("peak_rx_bps_24h", collector.NODES["node"]["ip_stats"][0])
 
-    def test_cpu_average_uses_minute_buckets_and_rolls_over_after_24_hours(self):
+    def test_cpu_average_uses_minute_buckets_and_rolls_over_after_one_hour(self):
         node_uuid = str(uuid.uuid4())
         base_time = 1_800_000_000
         original_now = collector.now_ts
@@ -578,25 +590,25 @@ class CollectorRegressionTests(unittest.TestCase):
         try:
             collector.now_ts = lambda: base_time
             first = collector.update_node(cpu_payload(20), "203.0.113.90")
-            self.assertEqual(20.0, first["cpu_avg_24h"])
-            self.assertEqual(1, first["cpu_samples_24h"])
+            self.assertEqual(20.0, first["cpu_avg_1h"])
+            self.assertEqual(1, first["cpu_samples_1h"])
 
             collector.now_ts = lambda: base_time + 10
             same_minute = collector.update_node(cpu_payload(40), "203.0.113.90")
-            self.assertEqual(30.0, same_minute["cpu_avg_24h"])
-            self.assertEqual(2, same_minute["cpu_samples_24h"])
+            self.assertEqual(30.0, same_minute["cpu_avg_1h"])
+            self.assertEqual(2, same_minute["cpu_samples_1h"])
 
             collector.now_ts = lambda: base_time + 60
             next_minute = collector.update_node(cpu_payload(60), "203.0.113.90")
-            self.assertEqual(45.0, next_minute["cpu_avg_24h"])
+            self.assertEqual(45.0, next_minute["cpu_avg_1h"])
             rich = collector.aggregate_wl_rich_message()
-            self.assertIn("CPU ср. (24ч)", rich)
+            self.assertIn("CPU ср. (1ч)", rich)
             self.assertIn("45%", rich)
 
             collector.now_ts = lambda: base_time + collector.NETWORK_RATE_RETENTION_SEC + 61
             expired = collector.update_node(cpu_payload(80), "203.0.113.90")
-            self.assertEqual(80.0, expired["cpu_avg_24h"])
-            self.assertEqual(1, expired["cpu_samples_24h"])
+            self.assertEqual(80.0, expired["cpu_avg_1h"])
+            self.assertEqual(1, expired["cpu_samples_1h"])
         finally:
             collector.now_ts = original_now
 
@@ -614,7 +626,7 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertIn("203.0.113.31", rich)
         self.assertIn("203.0.113.32", rich)
         self.assertLess(rich.index("203.0.113.32"), rich.index("203.0.113.31"))
-        self.assertIn("CPU ср. (24ч)", rich)
+        self.assertIn("CPU ср. (1ч)", rich)
         self.assertIn('colspan="11"', rich)
 
     def test_rich_tables_show_separate_centered_traffic_totals(self):

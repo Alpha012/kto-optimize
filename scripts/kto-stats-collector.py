@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v319"
+COLLECTOR_BUILD = "v320"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -370,12 +370,12 @@ HAPROXY_MAX_BANDWIDTH_MBIT = 100000
 HAPROXY_MACHINE_PAGE_SIZE = 20
 HAPROXY_MAX_MACHINE_CHOICES = 1024
 NETWORK_RATE_BUCKET_SEC = 60
-NETWORK_RATE_RETENTION_SEC = 24 * 60 * 60
+NETWORK_RATE_RETENTION_SEC = 60 * 60
 NETWORK_RATE_MAX_SAMPLE_MS = 5 * 60 * 1000
 NETWORK_RATE_MAX_BPS = 100_000_000_000_000
 NETWORK_RATE_LINK_TOLERANCE_BPS = 250_000_000
 NETWORK_RATE_LINK_TOLERANCE_PERCENT = 25
-NETWORK_RATE_SCHEMA_VERSION = 2
+NETWORK_RATE_SCHEMA_VERSION = 3
 RESTORED_EMOJI = '<tg-emoji emoji-id="5449683594425410231">❇️</tg-emoji>'
 LOST_EMOJI = '<tg-emoji emoji-id="5447183459602669338">🚨</tg-emoji>'
 BL_NODE_ORDER = [
@@ -1993,6 +1993,14 @@ def network_rate_db():
 
 def init_network_rate_db():
     db = network_rate_db()
+    version_row = db.execute("PRAGMA user_version").fetchone()
+    version = int(version_row[0] if version_row else 0)
+    reset_history = version < NETWORK_RATE_SCHEMA_VERSION
+    if reset_history:
+        db.executescript("""
+            DROP TABLE IF EXISTS network_rate_minute;
+            DROP TABLE IF EXISTS cpu_minute;
+        """)
     db.executescript("""
         CREATE TABLE IF NOT EXISTS network_rate_minute (
             node_key TEXT NOT NULL,
@@ -2000,8 +2008,10 @@ def init_network_rate_db():
             iface TEXT NOT NULL DEFAULT '',
             ip TEXT NOT NULL DEFAULT '',
             minute INTEGER NOT NULL,
-            peak_rx_bps INTEGER NOT NULL DEFAULT 0,
-            peak_tx_bps INTEGER NOT NULL DEFAULT 0,
+            rx_bps_ms REAL NOT NULL DEFAULT 0,
+            tx_bps_ms REAL NOT NULL DEFAULT 0,
+            sample_ms INTEGER NOT NULL DEFAULT 0,
+            sample_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (node_key, series_key, minute)
         );
         CREATE INDEX IF NOT EXISTS idx_network_rate_minute_time
@@ -2020,11 +2030,7 @@ def init_network_rate_db():
         CREATE INDEX IF NOT EXISTS idx_cpu_minute_node
             ON cpu_minute(node_key, minute);
     """)
-    version_row = db.execute("PRAGMA user_version").fetchone()
-    version = int(version_row[0] if version_row else 0)
-    reset_history = version < NETWORK_RATE_SCHEMA_VERSION
     if reset_history:
-        db.execute("DELETE FROM network_rate_minute")
         db.execute(f"PRAGMA user_version = {NETWORK_RATE_SCHEMA_VERSION}")
     db.commit()
     return reset_history
@@ -2036,9 +2042,16 @@ def clear_loaded_network_rate_fields():
         "rate_rx_bps",
         "rate_tx_bps",
         "rate_sample_ms",
+        "avg_rx_bps_1h",
+        "avg_tx_bps_1h",
+        "rate_samples_1h",
+        "cpu_avg_1h",
+        "cpu_samples_1h",
         "peak_rx_bps_24h",
         "peak_tx_bps_24h",
         "rate_samples_24h",
+        "cpu_avg_24h",
+        "cpu_samples_24h",
     )
     for node in NODES.values():
         if not isinstance(node, dict):
@@ -3842,7 +3855,7 @@ def node_message(node, status=None, compact=False):
     remna_line = remna_html_line(node)
     if remna_line:
         cpu_line = f"{cpu_line}\n{remna_line}"
-    peak_rate = node_peak_rate_table_text(node)
+    average_rate = node_average_rate_table_text(node)
     if compact:
         lines = [f"<blockquote><b>{name}</b>\nIP: {ip}</blockquote>", ""]
         if error:
@@ -3857,8 +3870,8 @@ def node_message(node, status=None, compact=False):
         lines += [
             f"<b>Сегодня: {format_bytes(node.get('day_total', 0))} | Вчера: {format_bytes(node.get('yesterday_total', 0))} | Месяц: {format_bytes(node.get('month_total', 0))}</b>",
         ]
-        if peak_rate != "-":
-            lines.append(f"<b>Пик ↑/↓ за 24ч: {peak_rate}</b>")
+        if average_rate != "-":
+            lines.append(f"<b>Средняя ↑/↓ за 1ч: {average_rate}</b>")
         if wrong_sni_line:
             lines += ["", f"<b><i>{wrong_sni_line}</i></b>"]
         if remna_line:
@@ -3883,8 +3896,8 @@ def node_message(node, status=None, compact=False):
         f"<b>I/O: {format_bytes(node.get('day_rx', 0))} | {format_bytes(node.get('day_tx', 0))}</b>",
         f"<b>Сегодня: {format_bytes(node.get('day_total', 0))} | Вчера: {format_bytes(node.get('yesterday_total', 0))} | Месяц: {format_bytes(node.get('month_total', 0))}</b>",
     ]
-    if peak_rate != "-":
-        lines.append(f"<b>Пик ↑/↓ за 24ч: {peak_rate}</b>")
+    if average_rate != "-":
+        lines.append(f"<b>Средняя ↑/↓ за 1ч: {average_rate}</b>")
     lines += ["", f"<b><i>{ram_line}", f"{cpu_line}</i></b>", "", footer]
     return "\n".join(lines)
 
@@ -4027,9 +4040,9 @@ def normalized_traffic_entry(raw, fallback_iface="", fallback_ip=""):
         "rate_rx_bps": normalize_network_rate(raw.get("rate_rx_bps")),
         "rate_tx_bps": normalize_network_rate(raw.get("rate_tx_bps")),
         "rate_sample_ms": normalize_traffic_counter(raw.get("rate_sample_ms")),
-        "peak_rx_bps_24h": normalize_network_rate(raw.get("peak_rx_bps_24h")),
-        "peak_tx_bps_24h": normalize_network_rate(raw.get("peak_tx_bps_24h")),
-        "rate_samples_24h": normalize_traffic_counter(raw.get("rate_samples_24h")),
+        "avg_rx_bps_1h": normalize_network_rate(raw.get("avg_rx_bps_1h")),
+        "avg_tx_bps_1h": normalize_network_rate(raw.get("avg_tx_bps_1h")),
+        "rate_samples_1h": normalize_traffic_counter(raw.get("rate_samples_1h")),
     }
     for prefix in ("day", "yesterday", "month"):
         rx = normalize_traffic_counter(raw.get(f"{prefix}_rx"))
@@ -4213,47 +4226,48 @@ def enrich_network_rate_stats(node_key, entries, previous_entries, current):
         entry["rate_tx_bps"] = sample["tx_bps"]
         entry["rate_sample_ms"] = sample["elapsed_ms"]
         db.execute(
-            "INSERT INTO network_rate_minute(node_key, series_key, iface, ip, minute, peak_rx_bps, peak_tx_bps) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO network_rate_minute"
+            "(node_key, series_key, iface, ip, minute, rx_bps_ms, tx_bps_ms, sample_ms, sample_count) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1) "
             "ON CONFLICT(node_key, series_key, minute) DO UPDATE SET "
             "iface = excluded.iface, ip = excluded.ip, "
-            "peak_rx_bps = max(network_rate_minute.peak_rx_bps, excluded.peak_rx_bps), "
-            "peak_tx_bps = max(network_rate_minute.peak_tx_bps, excluded.peak_tx_bps) "
-            "WHERE excluded.peak_rx_bps > network_rate_minute.peak_rx_bps "
-            "OR excluded.peak_tx_bps > network_rate_minute.peak_tx_bps "
-            "OR excluded.iface != network_rate_minute.iface "
-            "OR excluded.ip != network_rate_minute.ip",
+            "rx_bps_ms = network_rate_minute.rx_bps_ms + excluded.rx_bps_ms, "
+            "tx_bps_ms = network_rate_minute.tx_bps_ms + excluded.tx_bps_ms, "
+            "sample_ms = network_rate_minute.sample_ms + excluded.sample_ms, "
+            "sample_count = network_rate_minute.sample_count + 1",
             (
                 node_key,
                 series_key,
                 str(entry.get("iface") or "")[:80],
                 str(entry.get("ip") or "")[:45],
                 minute,
-                sample["rx_bps"],
-                sample["tx_bps"],
+                float(sample["rx_bps"] * sample["elapsed_ms"]),
+                float(sample["tx_bps"] * sample["elapsed_ms"]),
+                sample["elapsed_ms"],
             ),
         )
 
     purge_metric_history(db, minute)
     db.commit()
 
-    peaks = {}
+    averages = {}
     if series_keys:
         placeholders = ",".join("?" for _ in series_keys)
         rows = db.execute(
-            f"SELECT series_key, max(peak_rx_bps) AS peak_rx_bps, "
-            f"max(peak_tx_bps) AS peak_tx_bps, count(*) AS sample_count "
+            f"SELECT series_key, sum(rx_bps_ms) / sum(sample_ms) AS avg_rx_bps, "
+            f"sum(tx_bps_ms) / sum(sample_ms) AS avg_tx_bps, "
+            f"sum(sample_count) AS sample_count "
             f"FROM network_rate_minute WHERE node_key = ? AND minute >= ? "
-            f"AND series_key IN ({placeholders}) GROUP BY series_key",
+            f"AND sample_ms > 0 AND series_key IN ({placeholders}) GROUP BY series_key",
             (node_key, oldest_minute, *series_keys),
         ).fetchall()
-        peaks = {str(row["series_key"]): row for row in rows}
+        averages = {str(row["series_key"]): row for row in rows}
 
     for entry in entries:
-        row = peaks.get(network_rate_series_key(entry))
-        entry["peak_rx_bps_24h"] = normalize_network_rate(row["peak_rx_bps"] if row else 0)
-        entry["peak_tx_bps_24h"] = normalize_network_rate(row["peak_tx_bps"] if row else 0)
-        entry["rate_samples_24h"] = int(row["sample_count"] if row else 0)
+        row = averages.get(network_rate_series_key(entry))
+        entry["avg_rx_bps_1h"] = normalize_network_rate(row["avg_rx_bps"] if row else 0)
+        entry["avg_tx_bps_1h"] = normalize_network_rate(row["avg_tx_bps"] if row else 0)
+        entry["rate_samples_1h"] = int(row["sample_count"] if row else 0)
     return entries
 
 
@@ -4756,32 +4770,32 @@ def format_mbit_rate(value):
     return f"{mbps:.2f}".rstrip("0").rstrip(".") or "0"
 
 
-def peak_rate_table_text(entry):
-    if not isinstance(entry, dict) or normalize_traffic_counter(entry.get("rate_samples_24h")) <= 0:
+def average_rate_table_text(entry):
+    if not isinstance(entry, dict) or normalize_traffic_counter(entry.get("rate_samples_1h")) <= 0:
         return "-"
-    upload = format_mbit_rate(entry.get("peak_tx_bps_24h"))
-    download = format_mbit_rate(entry.get("peak_rx_bps_24h"))
+    upload = format_mbit_rate(entry.get("avg_tx_bps_1h"))
+    download = format_mbit_rate(entry.get("avg_rx_bps_1h"))
     return f"{upload} | {download} Mbit/s"
 
 
-def node_peak_rate_table_text(node):
+def node_average_rate_table_text(node):
     entries = [
         entry for entry in node_ip_stats(node)
-        if normalize_traffic_counter(entry.get("rate_samples_24h")) > 0
+        if normalize_traffic_counter(entry.get("rate_samples_1h")) > 0
     ]
     if not entries:
         return "-"
-    return peak_rate_table_text({
-        "peak_tx_bps_24h": max(normalize_network_rate(entry.get("peak_tx_bps_24h")) for entry in entries),
-        "peak_rx_bps_24h": max(normalize_network_rate(entry.get("peak_rx_bps_24h")) for entry in entries),
-        "rate_samples_24h": sum(normalize_traffic_counter(entry.get("rate_samples_24h")) for entry in entries),
+    return average_rate_table_text({
+        "avg_tx_bps_1h": sum(normalize_network_rate(entry.get("avg_tx_bps_1h")) for entry in entries),
+        "avg_rx_bps_1h": sum(normalize_network_rate(entry.get("avg_rx_bps_1h")) for entry in entries),
+        "rate_samples_1h": sum(normalize_traffic_counter(entry.get("rate_samples_1h")) for entry in entries),
     })
 
 
 def cpu_average_table_text(node):
-    if not isinstance(node, dict) or int(node.get("cpu_samples_24h") or 0) <= 0:
+    if not isinstance(node, dict) or int(node.get("cpu_samples_1h") or 0) <= 0:
         return "-"
-    return format_percent(normalize_cpu_percent(node.get("cpu_avg_24h")))
+    return format_percent(normalize_cpu_percent(node.get("cpu_avg_1h")))
 
 
 def wrong_sni_table_text(node):
@@ -4844,7 +4858,7 @@ def rich_wl_rows(nodes, ts):
                 (today, "right"),
                 (yesterday, "right"),
                 (month, "right"),
-                (peak_rate_table_text(entry), "right"),
+                (average_rate_table_text(entry), "right"),
             ])
             if index == 0:
                 row.extend([
@@ -4901,7 +4915,7 @@ def aggregate_wl_rich_message():
         return "<h3>Статистика обходов</h3><p>Нет данных от машин.</p>"
     nodes.sort(key=node_natural_sort_key)
     other_nodes.sort(key=wl_other_node_sort_key)
-    headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "Пик ↑/↓ (24ч)", "CPU ср. (24ч)", "SNI", "Статус"]
+    headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "Сред. ↑/↓ (1ч)", "CPU ср. (1ч)", "SNI", "Статус"]
     parts = [
         "<h3>Статистика обходов</h3>",
         rich_table(headers, rich_wl_rows(nodes, ts), footer=rich_traffic_total_text(nodes)),
@@ -4986,7 +5000,7 @@ def rich_bl_rows(nodes, ts):
                 (today, "right"),
                 (yesterday, "right"),
                 (month, "right"),
-                (peak_rate_table_text(entry), "right"),
+                (average_rate_table_text(entry), "right"),
             ])
             if index == 0:
                 row.extend([
@@ -5028,7 +5042,7 @@ def bl_nodes_rich_section(group_name, group_nodes, ts=None):
     if not group_nodes:
         return f"<h4>{rich_text(group_name)}</h4><p>Нет машин в группе.</p>"
     ts = now_ts() if ts is None else int(ts)
-    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "Пик ↑/↓ (24ч)", "RAM", "CPU", "CPU ср. (24ч)", "Remnawave", "Статус"]
+    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "Сред. ↑/↓ (1ч)", "RAM", "CPU", "CPU ср. (1ч)", "Remnawave", "Статус"]
     parts = [
         f"<h4>{rich_text(group_name)}</h4>",
         rich_table(headers, rich_bl_rows(group_nodes, ts), footer=rich_traffic_total_text(group_nodes)),
@@ -9055,23 +9069,21 @@ def update_node(payload, remote_ip=""):
                     record["metrics_ok"],
                     current,
                 )
-                record["cpu_avg_24h"] = cpu_average
-                record["cpu_samples_24h"] = cpu_samples
+                record["cpu_avg_1h"] = cpu_average
+                record["cpu_samples_1h"] = cpu_samples
             except Exception as exc:
                 log(f"cpu average sample failed node={record_key}: {exc}")
                 try:
                     network_rate_db().rollback()
                 except Exception:
                     pass
-                record["cpu_avg_24h"] = normalize_cpu_percent(old.get("cpu_avg_24h"))
-                record["cpu_samples_24h"] = int(old.get("cpu_samples_24h") or 0)
-            record["peak_rx_bps_24h"] = max(
-                (normalize_network_rate(entry.get("peak_rx_bps_24h")) for entry in record["ip_stats"]),
-                default=0,
+                record["cpu_avg_1h"] = normalize_cpu_percent(old.get("cpu_avg_1h"))
+                record["cpu_samples_1h"] = int(old.get("cpu_samples_1h") or 0)
+            record["avg_rx_bps_1h"] = sum(
+                normalize_network_rate(entry.get("avg_rx_bps_1h")) for entry in record["ip_stats"]
             )
-            record["peak_tx_bps_24h"] = max(
-                (normalize_network_rate(entry.get("peak_tx_bps_24h")) for entry in record["ip_stats"]),
-                default=0,
+            record["avg_tx_bps_1h"] = sum(
+                normalize_network_rate(entry.get("avg_tx_bps_1h")) for entry in record["ip_stats"]
             )
             was_offline = bool(old.get("offline_alerted")) and bool(old.get("offline_confirmed", True))
             if node_stats_disabled(record):

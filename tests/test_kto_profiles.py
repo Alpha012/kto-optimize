@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v319"', KTO)
-        self.assertIn('PUSH_BUILD="v319"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v319"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v319"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v319"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v319"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v319"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v319"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v320"', KTO)
+        self.assertIn('PUSH_BUILD="v320"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v320"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v320"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v320"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v320"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v320"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v320"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
