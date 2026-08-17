@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v320"
+SCRIPT_BUILD="v321"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -7436,7 +7436,7 @@ recommended_haproxy_maxconn() {
 
 haproxy_thread_count() {
     local override="${KTO_HAPROXY_NBTHREAD:-auto}"
-    local auto_max="${KTO_HAPROXY_AUTO_THREADS_MAX:-16}"
+    local auto_max="${KTO_HAPROXY_AUTO_THREADS_MAX:-32}"
     local threads
 
     if [[ "$override" =~ ^[0-9]+$ ]]; then
@@ -7453,9 +7453,9 @@ haproxy_thread_count() {
     if [[ "$auto_max" =~ ^[0-9]+$ ]]; then
         auto_max=$((10#$auto_max))
     else
-        auto_max=16
+        auto_max=32
     fi
-    (( auto_max >= 1 && auto_max <= 64 )) || auto_max=16
+    (( auto_max >= 1 && auto_max <= 64 )) || auto_max=32
     (( threads <= auto_max )) || threads="$auto_max"
     (( threads >= 1 )) || threads=1
     printf '%d\n' "$threads"

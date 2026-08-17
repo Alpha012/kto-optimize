@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v320"', KTO)
-        self.assertIn('PUSH_BUILD="v320"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v320"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v320"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v320"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v320"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v320"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v320"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v321"', KTO)
+        self.assertIn('PUSH_BUILD="v321"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v321"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v321"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v321"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v321"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v321"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v321"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2744,7 +2744,7 @@ KTO_HAPROXY_NOFILE_LIMIT=1048576
 unset KTO_HAPROXY_NBTHREAD
 [[ "$(haproxy_thread_count)" == 16 ]]
 TEST_CPU_COUNT=32
-[[ "$(haproxy_thread_count)" == 16 ]]
+[[ "$(haproxy_thread_count)" == 32 ]]
 KTO_HAPROXY_AUTO_THREADS_MAX=8
 [[ "$(haproxy_thread_count)" == 8 ]]
 KTO_HAPROXY_NBTHREAD=8
