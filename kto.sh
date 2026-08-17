@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v321"
+SCRIPT_BUILD="v322"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5341,6 +5341,280 @@ parse_tspu_ipv4_target() {
     fi
 
     TSPU_TARGET_IP="$ip"
+}
+
+MTR_BATCH_TARGET_COUNT=0
+MTR_BATCH_INVALID_COUNT=0
+MTR_BATCH_DUPLICATE_COUNT=0
+
+parse_mtr_batch_targets() {
+    local input_file="$1"
+    local output_file="$2"
+    local line raw token ip port label key current_label=""
+    local line_number=0 max_targets="${KTO_MTR_BATCH_MAX_TARGETS:-64}"
+    local -A seen=()
+
+    [[ "$max_targets" =~ ^[0-9]+$ ]] || max_targets=64
+    (( max_targets >= 1 && max_targets <= 256 )) || max_targets=64
+    MTR_BATCH_TARGET_COUNT=0
+    MTR_BATCH_INVALID_COUNT=0
+    MTR_BATCH_DUPLICATE_COUNT=0
+    : > "$output_file"
+
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        (( line_number += 1 ))
+        line="${raw%$'\r'}"
+        line="$(trim_whitespace "$line")"
+        [[ -n "$line" ]] || continue
+        [[ "$line" == \#* ]] && continue
+        case "$line" in
+            done|DONE|Done|готово|ГОТОВО|Готово|end|END|конец|КОНЕЦ) continue ;;
+        esac
+
+        token=""
+        if [[ "$line" =~ ([0-9]{1,3}([.][0-9]{1,3}){3})(:([^[:space:]]+))? ]]; then
+            token="${BASH_REMATCH[0]}"
+        elif [[ "$line" == *: ]]; then
+            current_label="$(trim_whitespace "${line%:}")"
+            if [[ -z "$current_label" ]]; then
+                fail "Строка ${line_number}: пустое название группы"
+                (( MTR_BATCH_INVALID_COUNT += 1 ))
+            fi
+            continue
+        else
+            fail "Строка ${line_number}: не найден IPv4 или IPv4:порт: ${line}"
+            (( MTR_BATCH_INVALID_COUNT += 1 ))
+            continue
+        fi
+
+        if ! parse_tspu_ipv4_target "$token"; then
+            fail "Строка ${line_number}: некорректная цель ${token}"
+            (( MTR_BATCH_INVALID_COUNT += 1 ))
+            continue
+        fi
+        ip="$TSPU_TARGET_IP"
+        port="${TSPU_TARGET_PORT:-443}"
+        key="${ip}:${port}"
+        if [[ -n "${seen[$key]:-}" ]]; then
+            (( MTR_BATCH_DUPLICATE_COUNT += 1 ))
+            continue
+        fi
+        if (( MTR_BATCH_TARGET_COUNT >= max_targets )); then
+            fail "Строка ${line_number}: превышен лимит ${max_targets} целей"
+            (( MTR_BATCH_INVALID_COUNT += 1 ))
+            continue
+        fi
+
+        label="${line/"$token"/}"
+        label="$(sed -E 's/^[[:space:]]*[-|:=>]+[[:space:]]*//; s/[[:space:]]*[-|:=>]+[[:space:]]*$//' <<< "$label")"
+        label="$(trim_whitespace "$label")"
+        label="${label//$'\t'/ }"
+        [[ -n "$label" ]] || label="$current_label"
+        [[ -n "$label" ]] || label="цель $(( MTR_BATCH_TARGET_COUNT + 1 ))"
+        label="$(printf '%s' "$label" | cut -c1-80)"
+
+        seen["$key"]=1
+        (( MTR_BATCH_TARGET_COUNT += 1 ))
+        printf '%s\t%s\t%s\n' "$label" "$ip" "$port" >> "$output_file"
+    done < "$input_file"
+
+    if (( MTR_BATCH_TARGET_COUNT == 0 )); then
+        fail "Не найдено ни одной корректной цели для MTR"
+        return 1
+    fi
+    if (( MTR_BATCH_INVALID_COUNT > 0 )); then
+        fail "Исправь некорректные строки: ${MTR_BATCH_INVALID_COUNT}"
+        return 1
+    fi
+}
+
+collect_mtr_batch_input() {
+    local output_file="$1"
+    shift
+    local line
+
+    : > "$output_file"
+    if (( $# > 0 )); then
+        printf '%s\n' "$@" > "$output_file"
+    elif [[ ! -t 0 ]]; then
+        cat > "$output_file"
+    else
+        echo -e "${BOLD}${PURPLE}[ ЦЕЛИ TCP-MTR ]${NC}"
+        echo "Вставь IPv4:порт по одному на строку. Можно указывать подписи и группы:"
+        echo "  95.85.252.203:443 - клиент 1"
+        echo "  клиент 5:"
+        echo "  82.27.0.247:8443"
+        echo "Пустые строки разрешены. Для запуска введи отдельной строкой: ГОТОВО"
+        echo
+        while IFS= read -r line; do
+            line="${line%$'\r'}"
+            case "$line" in
+                done|DONE|Done|готово|ГОТОВО|Готово|end|END|конец|КОНЕЦ) break ;;
+            esac
+            printf '%s\n' "$line" >> "$output_file"
+        done
+    fi
+
+    if [[ ! -s "$output_file" ]]; then
+        fail "Список целей пуст"
+        return 1
+    fi
+}
+
+run_mtr_batch_target() {
+    local index="$1"
+    local label="$2"
+    local source_ip="$3"
+    local source_interface="$4"
+    local target_ip="$5"
+    local target_port="$6"
+    local cycles="$7"
+    local interval="$8"
+    local max_hops="$9"
+    local timeout_sec="${10}"
+    local result_dir="${11}"
+    local result_file status_file route_line route_interface route_source rc=0
+
+    printf -v result_file '%s/%03d.txt' "$result_dir" "$index"
+    printf -v status_file '%s/%03d.status' "$result_dir" "$index"
+    {
+        echo "===== ${label} | ${target_ip}:${target_port} ====="
+        echo "Источник: ${source_ip} (${source_interface})"
+        if ! route_line="$(ip -4 route get "$target_ip" from "$source_ip" 2>&1)"; then
+            echo "Маршрут: ошибка: ${route_line}"
+            printf '65\n' > "$status_file"
+            return 0
+        fi
+        route_interface="$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$route_line")"
+        route_source="$(awk '{for (i=1; i<=NF; i++) if ($i=="from" || $i=="src") {print $(i+1); exit}}' <<< "$route_line")"
+        echo "Маршрут: ${route_line}"
+        if [[ "$route_interface" != "$source_interface" || ( -n "$route_source" && "$route_source" != "$source_ip" ) ]]; then
+            echo "Ошибка: маршрут ушёл не через ${source_ip}/${source_interface}"
+            printf '66\n' > "$status_file"
+            return 0
+        fi
+        echo
+
+        if run_bounded_command "$timeout_sec" "${SUDO[@]}" mtr \
+            -4 -a "$source_ip" -T -P "$target_port" -c "$cycles" -i "$interval" \
+            -m "$max_hops" -r -w -b "$target_ip"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        echo
+        if (( rc == 0 )); then
+            echo "Статус: завершено"
+        elif (( rc == 124 || rc == 137 )); then
+            echo "Статус: таймаут ${timeout_sec}s"
+        else
+            echo "Статус: mtr завершился с кодом ${rc}"
+        fi
+        printf '%s\n' "$rc" > "$status_file"
+    } > "$result_file" 2>&1
+    return 0
+}
+
+run_mtr_batch() {
+    header
+    local requested_source_ip="${KTO_TEST_SOURCE_IP:-}"
+    local source_ip source_interface
+    local cycles="${KTO_MTR_BATCH_CYCLES:-100}"
+    local interval="${KTO_MTR_BATCH_INTERVAL:-0.2}"
+    local parallel="${KTO_MTR_BATCH_PARALLEL:-4}"
+    local max_hops="${KTO_MTR_BATCH_MAX_HOPS:-30}"
+    local timeout_sec="${KTO_MTR_BATCH_TIMEOUT_SEC:-90}"
+    local result_dir raw_file targets_file label target_ip target_port
+    local index=0 completed=0 failed=0 pid status result_file status_file
+    local -a pids=()
+
+    if [[ "$MACHINE_MODE" == "panel" ]]; then
+        fail "Пакетный TCP-MTR доступен для node и whitelist."
+        return 1
+    fi
+    [[ "$cycles" =~ ^[0-9]+$ ]] && (( cycles >= 10 && cycles <= 500 )) || cycles=100
+    [[ "$parallel" =~ ^[0-9]+$ ]] && (( parallel >= 1 && parallel <= 8 )) || parallel=4
+    [[ "$max_hops" =~ ^[0-9]+$ ]] && (( max_hops >= 5 && max_hops <= 64 )) || max_hops=30
+    [[ "$timeout_sec" =~ ^[0-9]+$ ]] && (( timeout_sec >= 20 && timeout_sec <= 600 )) || timeout_sec=90
+    [[ "$interval" =~ ^(0[.][1-9][0-9]*|[1-9][0-9]*([.][0-9]+)?)$ ]] || interval=0.2
+
+    select_test_source_ipv4 "$requested_source_ip" || return 1
+    source_ip="$TEST_SOURCE_IP"
+    source_interface="$TEST_SOURCE_INTERFACE"
+    need_root
+    must "Установка TCP-MTR" apt_install_with_update_if_missing iproute2 mtr-tiny
+
+    result_dir="$(mktemp -d "${TMPDIR:-/tmp}/kto-mtr-batch.XXXXXX")" || {
+        fail "Не удалось создать каталог результатов"
+        return 1
+    }
+    chmod 0755 "$result_dir" 2>/dev/null || true
+    raw_file="${result_dir}/input.txt"
+    targets_file="${result_dir}/targets.tsv"
+    if ! collect_mtr_batch_input "$raw_file" "$@"; then
+        return 1
+    fi
+    if ! parse_mtr_batch_targets "$raw_file" "$targets_file"; then
+        warn "Исходный ввод сохранён: ${raw_file}"
+        return 1
+    fi
+    (( MTR_BATCH_DUPLICATE_COUNT == 0 )) || warn "Повторяющихся целей пропущено: ${MTR_BATCH_DUPLICATE_COUNT}"
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ПАКЕТНЫЙ TCP-MTR ]${NC}"
+    network_test_row "Исходящий IP" "$source_ip"
+    network_test_row "Интерфейс" "$source_interface"
+    network_test_row "Целей" "$MTR_BATCH_TARGET_COUNT"
+    network_test_row "Параллельно" "$parallel"
+    network_test_row "Проб на цель" "$cycles"
+    network_test_row "Результаты" "$result_dir"
+    echo
+
+    while IFS=$'\t' read -r label target_ip target_port; do
+        (( index += 1 ))
+        stage "[${index}/${MTR_BATCH_TARGET_COUNT}] ${label} | ${target_ip}:${target_port}"
+        run_mtr_batch_target "$index" "$label" "$source_ip" "$source_interface" \
+            "$target_ip" "$target_port" "$cycles" "$interval" "$max_hops" \
+            "$timeout_sec" "$result_dir" &
+        pids+=("$!")
+        if (( ${#pids[@]} >= parallel )); then
+            wait "${pids[0]}" || true
+            pids=("${pids[@]:1}")
+        fi
+    done < "$targets_file"
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ РЕЗУЛЬТАТЫ TCP-MTR ]${NC}"
+    for (( index=1; index<=MTR_BATCH_TARGET_COUNT; index++ )); do
+        printf -v result_file '%s/%03d.txt' "$result_dir" "$index"
+        printf -v status_file '%s/%03d.status' "$result_dir" "$index"
+        echo
+        if [[ -s "$result_file" ]]; then
+            cat "$result_file"
+        else
+            echo "===== цель ${index} ====="
+            echo "Статус: результат не создан"
+        fi
+        status="$(cat "$status_file" 2>/dev/null || echo 255)"
+        if [[ "$status" == 0 ]]; then
+            (( completed += 1 ))
+        else
+            (( failed += 1 ))
+        fi
+    done
+
+    echo
+    echo -e "${BOLD}${PURPLE}[ ИТОГ ]${NC}"
+    network_test_row "Завершено" "${completed}/${MTR_BATCH_TARGET_COUNT}" "$([[ $failed -eq 0 ]] && echo ok || echo warn)"
+    network_test_row "Файлы" "$result_dir"
+    if (( failed > 0 )); then
+        warn "Не завершилось целей: ${failed}. Детали сохранены в ${result_dir}"
+        return 1
+    fi
+    ok "TCP-MTR завершён для ${completed} целей"
 }
 
 tspu_ip_http_probe() {
@@ -11828,6 +12102,8 @@ menu() {
         actions+=("dpi-test")
         labels+=("Проверка ТСПУ (IP)")
         actions+=("dpi-ip-test")
+        labels+=("Пакетный TCP-MTR")
+        actions+=("mtr-batch")
     fi
     if [[ "$MACHINE_MODE" != "panel" ]]; then
         labels+=("Проверить и завести дополнительные IP")
@@ -11916,6 +12192,7 @@ menu() {
         network-test) network_test ;;
         dpi-test) run_dpi_detector ;;
         dpi-ip-test) run_tspu_ip_test ;;
+        mtr-batch) run_mtr_batch || true ;;
         additional-ips) setup_additional_ips || true ;;
         additional-ips-optimize) optimize_additional_ip_networks || true ;;
         remnawave-egress) configure_remnawave_egress || true ;;
@@ -11985,6 +12262,7 @@ main() {
         conntrack-fix|fix-conntrack|conntrack-optimize) fix_conntrack_capacity_cli ;;
         dpi-test|dpi-detector|tspu-test|tspu) run_dpi_detector "${2:-}" ;;
         dpi-ip-test|dpi-ip|tspu-ip-test|tspu-ip) shift; run_tspu_ip_test "${1:-}" "${2:-}" ;;
+        mtr-batch|batch-mtr|multi-mtr|tcp-mtr-batch) shift; run_mtr_batch "$@" ;;
         additional-ips|extra-ips|multi-ip|multiwan) setup_additional_ips ;;
         additional-ips-optimize|extra-ips-optimize|multi-ip-optimize|multiwan-optimize|network-repair) optimize_additional_ip_networks ;;
         remnawave-egress|remna-egress|reality-egress|xray-egress) shift; configure_remnawave_egress "${1:-menu}" ;;

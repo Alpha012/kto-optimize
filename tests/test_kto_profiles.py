@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v321"', KTO)
-        self.assertIn('PUSH_BUILD="v321"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v321"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v321"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v321"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v321"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v321"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v321"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v322"', KTO)
+        self.assertIn('PUSH_BUILD="v322"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v322"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v322"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v322"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v322"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v322"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v322"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -768,6 +768,122 @@ parse_tspu_ipv4_target '198.51.100.30:65535'
 ! parse_tspu_ipv4_target '198.51.100.30:65536'
 ! parse_tspu_ipv4_target '198.51.100.30:abc'
 ! parse_tspu_ipv4_target '198.51.100.30:999999999999999999999'
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_batch_tcp_mtr_parses_groups_and_uses_each_target_port(self):
+        menu = function_body(KTO, "menu")
+        parser = function_body(KTO, "parse_mtr_batch_targets")
+        runner = function_body(KTO, "run_mtr_batch")
+        target_runner = function_body(KTO, "run_mtr_batch_target")
+        main = function_body(KTO, "main")
+
+        self.assertIn('labels+=("Пакетный TCP-MTR")', menu)
+        self.assertIn('actions+=("mtr-batch")', menu)
+        self.assertIn('mtr-batch) run_mtr_batch || true', menu)
+        self.assertIn('parse_tspu_ipv4_target "$token"', parser)
+        self.assertIn('KTO_MTR_BATCH_MAX_TARGETS', parser)
+        self.assertIn('KTO_MTR_BATCH_PARALLEL', runner)
+        self.assertIn('pids+=("$!")', runner)
+        self.assertIn('wait "${pids[0]}" || true', runner)
+        self.assertIn('-a "$source_ip"', target_runner)
+        self.assertIn('-T -P "$target_port"', target_runner)
+        self.assertIn('mtr-batch|batch-mtr|multi-mtr|tcp-mtr-batch', main)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+raw="$work/input.txt"
+parsed="$work/targets.tsv"
+cat > "$raw" <<'EOF'
+95.85.252.203:443 - клиент 1
+5.42.114.188:443 - клиент 2
+94.26.90.182:443 - клиент 3
+185.23.19.215:8443 - клиент 4
+
+клиент 5:
+82.27.0.247:8443
+5.255.113.251:8443
+5.255.127.33:8443
+82.27.0.175:8443
+
+клиент 6:
+84.32.64.14:19272
+84.32.96.215:19272
+84.32.101.85:19272
+84.32.102.204:19272
+EOF
+parse_mtr_batch_targets "$raw" "$parsed"
+[[ "$MTR_BATCH_TARGET_COUNT" == 12 ]]
+[[ "$MTR_BATCH_INVALID_COUNT" == 0 ]]
+[[ "$MTR_BATCH_DUPLICATE_COUNT" == 0 ]]
+grep -Fqx $'клиент 1\t95.85.252.203\t443' "$parsed"
+grep -Fqx $'клиент 5\t82.27.0.247\t8443' "$parsed"
+grep -Fqx $'клиент 6\t84.32.102.204\t19272' "$parsed"
+
+printf '198.51.100.20:443\n198.51.100.20:443\n' > "$raw"
+parse_mtr_batch_targets "$raw" "$parsed"
+[[ "$MTR_BATCH_TARGET_COUNT" == 1 ]]
+[[ "$MTR_BATCH_DUPLICATE_COUNT" == 1 ]]
+
+printf '198.51.100.20:70000\n' > "$raw"
+! parse_mtr_batch_targets "$raw" "$parsed"
+
+SUDO=()
+run_bounded_command() { shift; "$@"; }
+ip() { printf '198.51.100.30 from 203.0.113.20 via 203.0.113.1 dev ens3 table 100\n'; }
+mtr() {
+    printf 'ARGS'
+    printf ' <%s>' "$@"
+    printf '\n'
+}
+mkdir -p "$work/results"
+run_mtr_batch_target 1 'клиент тест' 203.0.113.20 ens3 \
+    198.51.100.30 8443 10 0.2 30 20 "$work/results"
+[[ "$(cat "$work/results/001.status")" == 0 ]]
+grep -Fq '===== клиент тест | 198.51.100.30:8443 =====' "$work/results/001.txt"
+grep -Fq '<-a> <203.0.113.20>' "$work/results/001.txt"
+grep -Fq '<-T> <-P> <8443>' "$work/results/001.txt"
+grep -Fq '<198.51.100.30>' "$work/results/001.txt"
+
+MACHINE_MODE=whitelist
+TMPDIR="$work"
+header() { :; }
+select_test_source_ipv4() {
+    TEST_SOURCE_IP=203.0.113.20
+    TEST_SOURCE_INTERFACE=ens3
+}
+need_root() { :; }
+apt_install_with_update_if_missing() { :; }
+must() { shift; "$@"; }
+network_test_row() { :; }
+stage() { :; }
+KTO_MTR_BATCH_CYCLES=10
+KTO_MTR_BATCH_PARALLEL=2
+run_mtr_batch \
+    '198.51.100.1:443 - one' \
+    '198.51.100.2:8443 - two' \
+    'group:' \
+    '198.51.100.3:19272' \
+    '198.51.100.4:443' \
+    '198.51.100.5:443' > "$work/batch-output"
+result_dir=$(find "$work" -maxdepth 1 -type d -name 'kto-mtr-batch.*' | head -n 1)
+[[ -n "$result_dir" ]]
+[[ "$(find "$result_dir" -name '*.status' | wc -l | tr -d ' ')" == 5 ]]
+grep -Fq 'TCP-MTR завершён для 5 целей' "$work/batch-output"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
