@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v322"', KTO)
-        self.assertIn('PUSH_BUILD="v322"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v322"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v322"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v322"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v322"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v322"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v322"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v323"', KTO)
+        self.assertIn('PUSH_BUILD="v323"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v323"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v323"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v323"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v323"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v323"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v323"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -4020,6 +4020,36 @@ grep -qx $'8470\t117.55.203.106:7443\tdev-yandex.sbs\t217.19.122.109\t10000' "$r
 cp "$routes" "$snapshot"
 set_haproxy_sequential_routes "$routes" 8450 217.19.122.109 dev-yandex.sbs 10000 "$pool"
 cmp -s "$routes" "$snapshot"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_pool_accepts_explicit_primary_source_ip(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+routes=$(mktemp)
+trap 'rm -f "$routes"' EXIT
+printf '443\t1.1.1.1:443\tany\tdefault\tdefault\t81.94.148.126\n' > "$routes"
+haproxy_default_source_ip() { printf '81.94.148.126\n'; }
+haproxy_additional_source_ip_available() { return 1; }
+haproxy_input_ip_available() { [[ "$1" == '81.94.148.126' ]]; }
+haproxy_tcp_port_listening() { return 1; }
+apply_haproxy_routes_config() { return 0; }
+sync_haproxy_firewall() { return 0; }
+pool='31.59.140.66:7443,31.77.154.79:7443'
+set_haproxy_pool_route "$routes" 8450 81.94.148.126 '*.dev-yandex.sbs' 10000 "$pool" 81.94.148.126
+grep -Fqx $'8450\t31.59.140.66:7443,31.77.154.79:7443\t*.dev-yandex.sbs\tdefault\t10000\t81.94.148.126' "$routes"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

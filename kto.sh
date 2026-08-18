@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v322"
+SCRIPT_BUILD="v323"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -1428,6 +1428,20 @@ normalize_haproxy_source_ip() {
     esac
     validate_ipv4 "$raw" || return 1
     printf '%s\n' "$raw"
+}
+
+canonicalize_haproxy_runtime_source_ip() {
+    local source_ip default_ip
+
+    source_ip="$(normalize_haproxy_source_ip "${1:-default}" 2>/dev/null || true)"
+    [[ -n "$source_ip" ]] || return 1
+    if [[ "$source_ip" != default ]]; then
+        default_ip="$(haproxy_default_source_ip)"
+        if validate_ipv4 "$default_ip" && [[ "$source_ip" == "$default_ip" ]]; then
+            source_ip=default
+        fi
+    fi
+    printf '%s\n' "$source_ip"
 }
 
 normalize_haproxy_listen_ip() {
@@ -9313,7 +9327,7 @@ haproxy_tcp_port_listening() {
 add_haproxy_route_with_source() {
     local routes_file="$1" source_ip="${2:-default}"
     local default_listen_ip listen_ip default_port port backend_target allowed_sni send_proxy_v2 next_file
-    source_ip="$(normalize_haproxy_source_ip "$source_ip" 2>/dev/null || true)"
+    source_ip="$(canonicalize_haproxy_runtime_source_ip "$source_ip" 2>/dev/null || true)"
     if [[ -z "$source_ip" ]]; then
         fail "Некорректный исходящий IP"
         return 1
@@ -9394,7 +9408,7 @@ set_haproxy_pool_route() {
         fail "HAProxy порт вне диапазона: $port"
         return 1
     }
-    normalized_source_ip="$(normalize_haproxy_source_ip "$source_ip" 2>/dev/null || true)"
+    normalized_source_ip="$(canonicalize_haproxy_runtime_source_ip "$source_ip" 2>/dev/null || true)"
     normalized_sni="$(normalize_haproxy_sni_list "$allowed_sni" 2>/dev/null || true)"
     normalized_maxconn="$(normalize_haproxy_server_maxconn "$server_maxconn" 2>/dev/null || true)"
     normalized_pool="$(normalize_haproxy_target_pool "$target_pool" 2>/dev/null || true)"
@@ -9706,7 +9720,7 @@ set_haproxy_sequential_routes() {
         return 1
     }
     start_port=$((10#$start_port))
-    normalized_source_ip="$(normalize_haproxy_source_ip "$source_ip" 2>/dev/null || true)"
+    normalized_source_ip="$(canonicalize_haproxy_runtime_source_ip "$source_ip" 2>/dev/null || true)"
     normalized_sni="$(normalize_haproxy_sni_list "$allowed_sni" 2>/dev/null || true)"
     normalized_maxconn="$(normalize_haproxy_server_maxconn "$server_maxconn" 2>/dev/null || true)"
     normalized_pool="$(normalize_haproxy_target_pool "$target_pool" 2>/dev/null || true)"
