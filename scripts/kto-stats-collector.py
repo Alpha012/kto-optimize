@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v333"
+COLLECTOR_BUILD = "v334"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -9189,10 +9189,19 @@ def dashboard_authorized(headers):
 def dashboard_rate_snapshot(node):
     entries = node_ip_stats(node)
     valid = [entry for entry in entries if normalize_traffic_counter(entry.get("rate_sample_ms")) > 0]
+    if valid:
+        return {
+            "rx_bps": sum(normalize_network_rate(entry.get("rate_rx_bps")) for entry in valid),
+            "tx_bps": sum(normalize_network_rate(entry.get("rate_tx_bps")) for entry in valid),
+            "valid": True,
+            "source": "current",
+        }
+    averaged = [entry for entry in entries if normalize_traffic_counter(entry.get("rate_samples_1h")) > 0]
     return {
-        "rx_bps": sum(normalize_network_rate(entry.get("rate_rx_bps")) for entry in valid),
-        "tx_bps": sum(normalize_network_rate(entry.get("rate_tx_bps")) for entry in valid),
-        "valid": bool(valid),
+        "rx_bps": sum(normalize_network_rate(entry.get("avg_rx_bps_1h")) for entry in averaged),
+        "tx_bps": sum(normalize_network_rate(entry.get("avg_tx_bps_1h")) for entry in averaged),
+        "valid": bool(averaged),
+        "source": "hour_average" if averaged else "none",
     }
 
 
@@ -9241,6 +9250,7 @@ def dashboard_node_summary(record_key, node, current=None):
         "rate_rx_bps": rates["rx_bps"],
         "rate_tx_bps": rates["tx_bps"],
         "rate_valid": bool(rates["valid"] and status != "offline"),
+        "rate_source": rates["source"],
         "ip_count": len([entry for entry in entries if entry.get("ip")]),
         "push_build": clean_display_text(node.get("push_build") or ""),
         "remna_status": clean_display_text(remna.get("status") or ""),
@@ -9254,13 +9264,22 @@ def dashboard_node_detail(record_key, node, current=None):
     result = dashboard_node_summary(record_key, node, current)
     interfaces = []
     for entry in node_ip_stats_by_traffic(node):
+        current_rate_valid = normalize_traffic_counter(entry.get("rate_sample_ms")) > 0
+        average_rate_valid = normalize_traffic_counter(entry.get("rate_samples_1h")) > 0
         interfaces.append({
             "iface": clean_display_text(entry.get("iface") or ""),
             "ip": normalize_ipv4_text(entry.get("ip")),
             "rate_source": normalize_network_rate_source(entry.get("rate_source")),
-            "rate_rx_bps": normalize_network_rate(entry.get("rate_rx_bps")),
-            "rate_tx_bps": normalize_network_rate(entry.get("rate_tx_bps")),
-            "rate_valid": normalize_traffic_counter(entry.get("rate_sample_ms")) > 0,
+            "rate_rx_bps": normalize_network_rate(
+                entry.get("rate_rx_bps") if current_rate_valid else entry.get("avg_rx_bps_1h")
+            ),
+            "rate_tx_bps": normalize_network_rate(
+                entry.get("rate_tx_bps") if current_rate_valid else entry.get("avg_tx_bps_1h")
+            ),
+            "rate_valid": bool(current_rate_valid or average_rate_valid),
+            "rate_display_source": "current" if current_rate_valid else (
+                "hour_average" if average_rate_valid else "none"
+            ),
             "day_rx": normalize_traffic_counter(entry.get("day_rx")),
             "day_tx": normalize_traffic_counter(entry.get("day_tx")),
             "day_total": normalize_traffic_counter(entry.get("day_total")),
@@ -9301,14 +9320,58 @@ def dashboard_node_detail(record_key, node, current=None):
     return result
 
 
+def dashboard_node_aliases(storage_key, node):
+    aliases = []
+    for value in (
+        storage_key,
+        node_record_key(node),
+        node_canonical_key(node),
+        canonical_node_key(node.get("id")),
+        canonical_node_key(node.get("hostname")),
+    ):
+        value = str(value or "").strip()[:200]
+        if value and value not in aliases:
+            aliases.append(value)
+    return aliases
+
+
+def dashboard_bl_records_snapshot():
+    with LOCK:
+        raw_records = [(str(key), dict(node)) for key, node in NODES.items() if isinstance(node, dict)]
+
+    records = {}
+    diagnostics = {
+        "collector_records": len(raw_records),
+        "filtered_wl": 0,
+        "filtered_disabled": 0,
+        "duplicates": 0,
+    }
+    for storage_key, node in raw_records:
+        if node_stats_disabled(node):
+            diagnostics["filtered_disabled"] += 1
+            continue
+        if node_is_wl(node):
+            diagnostics["filtered_wl"] += 1
+            continue
+        stable_key = str(node_record_key(node) or node_canonical_key(node) or storage_key).strip()[:200]
+        aliases = dashboard_node_aliases(storage_key, node)
+        current = records.get(stable_key)
+        if current is None:
+            records[stable_key] = {"key": stable_key, "node": node, "aliases": aliases}
+            continue
+        diagnostics["duplicates"] += 1
+        for alias in aliases:
+            if alias not in current["aliases"]:
+                current["aliases"].append(alias)
+        if int(node.get("last_seen") or 0) > int(current["node"].get("last_seen") or 0):
+            current["node"] = node
+    return list(records.values()), diagnostics
+
+
 def dashboard_nodes_payload(current=None):
     current = int(current or now_ts())
-    with LOCK:
-        nodes = [
-            dashboard_node_summary(record_key, dict(node), current)
-            for record_key, node in NODES.items()
-            if isinstance(node, dict) and not node_is_wl(node)
-        ]
+    records, diagnostics = dashboard_bl_records_snapshot()
+    nodes = [dashboard_node_summary(record["key"], record["node"], current) for record in records]
     status_order = {"online": 0, "warning": 1, "offline": 2}
     nodes.sort(key=lambda item: (status_order.get(item["status"], 9), natural_sort_key(item["name"])))
     return {
@@ -9324,55 +9387,81 @@ def dashboard_nodes_payload(current=None):
             "day_total": sum(item["day_total"] for item in nodes),
             "rate_rx_bps": sum(item["rate_rx_bps"] for item in nodes if item["rate_valid"]),
             "rate_tx_bps": sum(item["rate_tx_bps"] for item in nodes if item["rate_valid"]),
+            **diagnostics,
         },
         "nodes": nodes,
     }
 
 
+def dashboard_find_bl_record(record_key):
+    requested = str(record_key or "").strip()
+    records, _ = dashboard_bl_records_snapshot()
+    for record in records:
+        if requested == record["key"] or requested in record["aliases"]:
+            return record
+    return None
+
+
 def dashboard_find_bl_node(record_key):
-    with LOCK:
-        node = NODES.get(str(record_key))
-        if not isinstance(node, dict) or node_is_wl(node):
-            return None
-        return dict(node)
+    record = dashboard_find_bl_record(record_key)
+    return dict(record["node"]) if record is not None else None
 
 
 def dashboard_history_payload(record_key, seconds=3600, current=None):
     current = int(current or now_ts())
     seconds = max(900, min(int(seconds or 3600), NETWORK_RATE_RETENTION_SEC))
     cutoff = current - seconds
-    node = dashboard_find_bl_node(record_key)
-    if node is None:
+    record = dashboard_find_bl_record(record_key)
+    if record is None:
         return None
+    aliases = record["aliases"] or [record["key"]]
+    preferred_aliases = [record["key"], *[alias for alias in aliases if alias != record["key"]]]
+    alias_rank = {alias: index for index, alias in enumerate(preferred_aliases)}
+    placeholders = ",".join("?" for _ in aliases)
     with LOCK:
         db = network_rate_db()
         network_rows = db.execute(
-            "SELECT minute, "
-            "sum(CASE WHEN sample_ms > 0 THEN rx_bps_ms / sample_ms ELSE 0 END) AS rx_bps, "
-            "sum(CASE WHEN sample_ms > 0 THEN tx_bps_ms / sample_ms ELSE 0 END) AS tx_bps "
-            "FROM network_rate_minute WHERE node_key = ? AND minute >= ? GROUP BY minute ORDER BY minute",
-            (str(record_key), cutoff),
+            "SELECT node_key, series_key, minute, rx_bps_ms, tx_bps_ms, sample_ms "
+            f"FROM network_rate_minute WHERE node_key IN ({placeholders}) AND minute >= ? "
+            "AND sample_ms > 0 ORDER BY minute, series_key",
+            (*aliases, cutoff),
         ).fetchall()
         cpu_rows = db.execute(
-            "SELECT minute, sample_sum / sample_count AS cpu_percent "
-            "FROM cpu_minute WHERE node_key = ? AND minute >= ? AND sample_count > 0 ORDER BY minute",
-            (str(record_key), cutoff),
+            "SELECT node_key, minute, sample_sum / sample_count AS cpu_percent "
+            f"FROM cpu_minute WHERE node_key IN ({placeholders}) AND minute >= ? "
+            "AND sample_count > 0 ORDER BY minute",
+            (*aliases, cutoff),
         ).fetchall()
     points = {}
+    selected_network = {}
     for row in network_rows:
         ts = int(row["minute"] or 0)
-        points.setdefault(ts, {"ts": ts, "rx_bps": None, "tx_bps": None, "cpu_percent": None})
-        points[ts]["rx_bps"] = normalize_network_rate(row["rx_bps"])
-        points[ts]["tx_bps"] = normalize_network_rate(row["tx_bps"])
+        series_key = str(row["series_key"] or "")
+        candidate_key = (ts, series_key)
+        rank = alias_rank.get(str(row["node_key"] or ""), len(alias_rank))
+        selected = selected_network.get(candidate_key)
+        if selected is None or rank < selected[0]:
+            selected_network[candidate_key] = (rank, row)
+    for (ts, _), (_, row) in selected_network.items():
+        point = points.setdefault(ts, {"ts": ts, "rx_bps": 0, "tx_bps": 0, "cpu_percent": None})
+        sample_ms = max(1, int(row["sample_ms"] or 0))
+        point["rx_bps"] += normalize_network_rate(float(row["rx_bps_ms"] or 0) / sample_ms)
+        point["tx_bps"] += normalize_network_rate(float(row["tx_bps_ms"] or 0) / sample_ms)
+    selected_cpu = {}
     for row in cpu_rows:
         ts = int(row["minute"] or 0)
+        rank = alias_rank.get(str(row["node_key"] or ""), len(alias_rank))
+        if ts not in selected_cpu or rank < selected_cpu[ts][0]:
+            selected_cpu[ts] = (rank, row)
+    for ts, (_, row) in selected_cpu.items():
         points.setdefault(ts, {"ts": ts, "rx_bps": None, "tx_bps": None, "cpu_percent": None})
         points[ts]["cpu_percent"] = normalize_cpu_percent(row["cpu_percent"])
     return {
         "ok": True,
-        "key": str(record_key),
+        "key": record["key"],
         "server_time": current,
         "range_sec": seconds,
+        "history_aliases": len(aliases),
         "points": [points[key] for key in sorted(points)],
     }
 
@@ -9433,9 +9522,14 @@ DASHBOARD_HTML = rf"""<!doctype html>
 
       <main class="content" id="content">
         <section class="empty-state" id="emptyState">
-          <div class="empty-mark">K</div>
+          <div class="empty-mark"><span>K</span></div>
           <h2>Нет данных от BL-машин</h2>
-          <p>Ожидается первый push</p>
+          <p id="emptyMessage">Проверяю данные коллектора</p>
+          <div class="empty-diagnostics" id="emptyDiagnostics" hidden>
+            <span>В collector: <b id="collectorRecordCount">0</b></span>
+            <span>WL: <b id="filteredWlCount">0</b></span>
+            <span>Stats off: <b id="filteredDisabledCount">0</b></span>
+          </div>
         </section>
 
         <div class="machine-view" id="machineView" hidden>
@@ -9459,13 +9553,13 @@ DASHBOARD_HTML = rf"""<!doctype html>
             <article class="chart-panel network-panel">
               <header class="panel-head">
                 <div><span class="eyebrow">Сеть</span><h2>Пропускная способность</h2></div>
-                <div class="network-now"><span class="rx"><i></i>RX <b id="rxNow">—</b></span><span class="tx"><i></i>TX <b id="txNow">—</b></span></div>
+                <div class="network-now"><span class="rx"><i></i>RX <b id="rxNow">—</b></span><span class="tx"><i></i>TX <b id="txNow">—</b></span><small id="networkSource">live</small></div>
                 <div class="segmented" id="rangeControl" aria-label="Период графиков">
                   <button type="button" data-range="900">15м</button>
                   <button type="button" class="active" data-range="3600">1ч</button>
                 </div>
               </header>
-              <div class="chart-wrap"><canvas id="networkChart" role="img" aria-label="График сетевой скорости"></canvas><div class="chart-empty" id="networkEmpty">Нет данных</div></div>
+              <div class="chart-wrap"><canvas id="networkChart" role="img" aria-label="График сетевой скорости"></canvas><div class="chart-empty" id="networkEmpty">Собираю точки графика</div></div>
             </article>
 
             <article class="chart-panel cpu-panel">
@@ -9473,7 +9567,7 @@ DASHBOARD_HTML = rf"""<!doctype html>
                 <div><span class="eyebrow">CPU</span><h2>Нагрузка</h2></div>
                 <strong class="cpu-now" id="cpuNow">—</strong>
               </header>
-              <div class="chart-wrap"><canvas id="cpuChart" role="img" aria-label="График нагрузки процессора"></canvas><div class="chart-empty" id="cpuEmpty">Нет данных</div></div>
+              <div class="chart-wrap"><canvas id="cpuChart" role="img" aria-label="График нагрузки процессора"></canvas><div class="chart-empty" id="cpuEmpty">Собираю точки графика</div></div>
               <div class="cpu-footer"><span>Средняя за час</span><strong id="cpuAverage">—</strong></div>
             </article>
           </section>
@@ -9825,6 +9919,233 @@ tbody tr:last-child td { border-bottom: 0; }
   .table-scroll { max-width: calc(100vw - 30px); }
   table { min-width: 680px; }
 }
+
+/* Neon glass finish. Kept gradient-free so the data stays crisp. */
+:root {
+  --bg: #09070e;
+  --surface: rgba(20, 14, 29, .86);
+  --surface-2: rgba(28, 18, 40, .9);
+  --surface-3: rgba(39, 24, 55, .94);
+  --line: rgba(174, 125, 255, .17);
+  --line-strong: rgba(174, 125, 255, .34);
+  --text: #fbf8ff;
+  --muted: #a79bb3;
+  --purple: #b47cff;
+  --purple-soft: #d0afff;
+  --cyan: #39f5d0;
+  --blue: #65b7ff;
+  --online: #42f5a7;
+  --shadow: 0 24px 64px rgba(0, 0, 0, .48);
+  --glow-purple: 0 0 0 1px rgba(180, 124, 255, .08), 0 0 28px rgba(151, 74, 255, .13);
+  --glow-cyan: 0 0 0 1px rgba(57, 245, 208, .08), 0 0 28px rgba(57, 245, 208, .1);
+}
+
+html, body { background: #09070e; }
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  border: 1px solid rgba(180, 124, 255, .035);
+  box-shadow: inset 0 0 160px rgba(115, 52, 164, .09);
+  pointer-events: none;
+}
+
+.login-view { background: rgba(9, 7, 14, .98); }
+.login-panel {
+  position: relative;
+  overflow: hidden;
+  border-color: rgba(180, 124, 255, .38);
+  background: rgba(19, 13, 28, .88);
+  box-shadow: var(--shadow), 0 0 54px rgba(151, 74, 255, .16), inset 0 1px rgba(255, 255, 255, .035);
+  backdrop-filter: blur(22px);
+  animation: login-enter .55s cubic-bezier(.2, .8, .2, 1) both;
+}
+.login-panel::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 28px;
+  right: 28px;
+  height: 1px;
+  background: var(--purple);
+  box-shadow: 0 0 18px rgba(180, 124, 255, .8);
+  opacity: .72;
+}
+.brand-mark {
+  border-color: rgba(180, 124, 255, .55);
+  background: rgba(45, 25, 63, .92);
+  color: #f5eaff;
+  box-shadow: 0 0 20px rgba(180, 124, 255, .2), inset 0 0 14px rgba(180, 124, 255, .08);
+  transition: transform .22s ease, box-shadow .22s ease;
+}
+.brand:hover .brand-mark { transform: translateY(-1px); box-shadow: 0 0 28px rgba(180, 124, 255, .34); }
+.token-input { border-color: rgba(180, 124, 255, .25); background: rgba(7, 5, 11, .72); transition: border-color .2s ease, box-shadow .2s ease; }
+.token-input:focus { box-shadow: 0 0 0 3px rgba(180, 124, 255, .12), 0 0 24px rgba(180, 124, 255, .12); }
+.primary-button { border-color: rgba(180, 124, 255, .72); background: #7541b7; box-shadow: 0 0 22px rgba(151, 74, 255, .16); transition: transform .18s ease, box-shadow .18s ease, background .18s ease; }
+.primary-button:hover { transform: translateY(-1px); background: #8450c9; box-shadow: 0 0 30px rgba(151, 74, 255, .3); }
+
+.topbar {
+  border-bottom-color: rgba(180, 124, 255, .2);
+  background: rgba(13, 9, 19, .84);
+  box-shadow: 0 8px 34px rgba(0, 0, 0, .24);
+  backdrop-filter: blur(20px);
+}
+.sidebar {
+  border-right-color: rgba(180, 124, 255, .16);
+  background: rgba(13, 9, 20, .82);
+  box-shadow: 14px 0 40px rgba(0, 0, 0, .15);
+  backdrop-filter: blur(18px);
+}
+.sidebar-head, .sidebar-total { border-color: rgba(180, 124, 255, .14); background: rgba(12, 8, 18, .5); }
+.search-field { border-color: rgba(180, 124, 255, .18); background: rgba(5, 4, 8, .5); transition: border-color .2s ease, box-shadow .2s ease; }
+.search-field:focus-within { border-color: rgba(57, 245, 208, .42); box-shadow: 0 0 18px rgba(57, 245, 208, .08); }
+
+.status-dot.online, .live-state i { box-shadow: 0 0 11px rgba(66, 245, 167, .72); animation: signal-pulse 2.2s ease-in-out infinite; }
+.status-dot.warning { box-shadow: 0 0 11px rgba(251, 191, 36, .62); }
+.status-dot.offline, .live-state.disconnected i { box-shadow: 0 0 11px rgba(251, 113, 133, .66); }
+.icon-button, .logout-button { border-color: rgba(180, 124, 255, .24); background: rgba(27, 18, 38, .78); transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
+.icon-button:hover, .logout-button:hover { transform: translateY(-1px); border-color: rgba(180, 124, 255, .54); box-shadow: 0 0 18px rgba(180, 124, 255, .12); }
+
+.machine-list { padding: 12px 10px 16px; }
+.machine-item {
+  position: relative;
+  margin-bottom: 5px;
+  border-color: transparent;
+  transition: transform .2s ease, border-color .2s ease, background .2s ease, box-shadow .2s ease;
+  animation: list-enter .36s cubic-bezier(.2, .8, .2, 1) both;
+  animation-delay: calc(min(var(--item-index, 0), 12) * 28ms);
+}
+.machine-item:hover { transform: translateX(3px); border-color: rgba(180, 124, 255, .18); background: rgba(34, 22, 47, .68); }
+.machine-item.active { border-color: rgba(180, 124, 255, .46); background: rgba(39, 24, 55, .82); box-shadow: var(--glow-purple), inset 0 1px rgba(255, 255, 255, .025); }
+.machine-item .state-line { box-shadow: 0 0 12px rgba(66, 245, 167, .56); }
+.machine-item.warning .state-line { box-shadow: 0 0 12px rgba(251, 191, 36, .5); }
+.machine-item.offline .state-line { box-shadow: 0 0 12px rgba(251, 113, 133, .5); }
+.machine-rate strong { text-shadow: 0 0 12px rgba(57, 245, 208, .32); }
+
+.machine-view { animation: view-enter .42s cubic-bezier(.2, .8, .2, 1) both; }
+.machine-header { padding: 2px 2px 0; }
+.title-line h1 { text-shadow: 0 0 28px rgba(180, 124, 255, .16); }
+.status-badge { box-shadow: 0 0 17px rgba(66, 245, 167, .1); }
+.status-badge.warning { box-shadow: 0 0 17px rgba(251, 191, 36, .1); }
+.status-badge.offline { box-shadow: 0 0 17px rgba(251, 113, 133, .1); }
+
+.metric-strip {
+  overflow: hidden;
+  border-color: rgba(180, 124, 255, .2);
+  border-radius: 8px;
+  background: rgba(20, 14, 29, .8);
+  box-shadow: var(--glow-purple), inset 0 1px rgba(255, 255, 255, .025);
+  backdrop-filter: blur(16px);
+}
+.metric-cell { border-color: rgba(180, 124, 255, .12); transition: background .2s ease; }
+.metric-cell:hover { background: rgba(180, 124, 255, .035); }
+.metric-cell strong { text-shadow: 0 0 20px rgba(180, 124, 255, .12); }
+
+.chart-panel, .data-panel {
+  position: relative;
+  overflow: hidden;
+  border-color: rgba(180, 124, 255, .2);
+  background: rgba(20, 14, 29, .8);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .22), inset 0 1px rgba(255, 255, 255, .025);
+  backdrop-filter: blur(16px);
+  transition: border-color .24s ease, box-shadow .24s ease, transform .24s ease;
+}
+.chart-panel::before, .data-panel::before {
+  content: "";
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  left: 18px;
+  width: 72px;
+  height: 1px;
+  background: var(--purple);
+  box-shadow: 0 0 16px rgba(180, 124, 255, .72);
+  opacity: .62;
+  pointer-events: none;
+}
+.network-panel::before, .interfaces-panel::before { background: var(--cyan); box-shadow: 0 0 16px rgba(57, 245, 208, .65); }
+.chart-panel:hover, .data-panel:hover { border-color: rgba(180, 124, 255, .34); box-shadow: 0 20px 56px rgba(0, 0, 0, .28), var(--glow-purple); }
+.network-panel:hover, .interfaces-panel:hover { box-shadow: 0 20px 56px rgba(0, 0, 0, .28), var(--glow-cyan); }
+.panel-head, .section-head, .cpu-footer { border-color: rgba(180, 124, 255, .13); }
+.network-now i { box-shadow: 0 0 10px rgba(57, 245, 208, .85); }
+.network-now .tx i { box-shadow: 0 0 10px rgba(180, 124, 255, .85); }
+.network-now small { padding-left: 4px; color: #756a7f; font-size: 9px; text-transform: uppercase; }
+.cpu-now { text-shadow: 0 0 18px rgba(180, 124, 255, .36); }
+.segmented { border-color: rgba(180, 124, 255, .2); background: rgba(6, 4, 9, .55); }
+.segmented button { transition: color .18s ease, background .18s ease, box-shadow .18s ease; }
+.segmented button.active { background: rgba(67, 39, 91, .86); box-shadow: 0 0 14px rgba(180, 124, 255, .12); }
+.chart-wrap canvas { filter: drop-shadow(0 0 6px rgba(180, 124, 255, .08)); }
+.chart-empty { color: #8d8097; }
+
+th, td { border-color: rgba(180, 124, 255, .1); }
+tbody tr { transition: background .18s ease; }
+tbody tr:hover { background: rgba(180, 124, 255, .035); }
+.rate-pair .rx { text-shadow: 0 0 10px rgba(57, 245, 208, .22); }
+.rate-pair .tx { text-shadow: 0 0 10px rgba(180, 124, 255, .22); }
+.health-list div { border-color: rgba(180, 124, 255, .1); }
+
+.empty-state { animation: view-enter .4s ease both; }
+.empty-mark {
+  position: relative;
+  border-color: rgba(180, 124, 255, .48);
+  background: rgba(38, 23, 53, .76);
+  box-shadow: 0 0 32px rgba(180, 124, 255, .18), inset 0 0 18px rgba(180, 124, 255, .08);
+}
+.empty-mark::after {
+  content: "";
+  position: absolute;
+  inset: -7px;
+  border: 1px solid rgba(180, 124, 255, .14);
+  border-radius: 8px;
+  animation: empty-ring 2.4s ease-in-out infinite;
+}
+.empty-diagnostics { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 14px; margin-top: 15px; color: #766b80; font-size: 10px; }
+.empty-diagnostics b { color: #b9acc3; }
+
+@keyframes login-enter { from { opacity: 0; transform: translateY(14px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes view-enter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes list-enter { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: none; } }
+@keyframes signal-pulse { 0%, 100% { opacity: .72; } 50% { opacity: 1; box-shadow: 0 0 16px currentColor; } }
+@keyframes empty-ring { 0%, 100% { opacity: .45; transform: scale(.96); } 50% { opacity: .9; transform: scale(1.04); } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}
+
+@media (max-width: 860px) {
+  .app, .topbar, .workspace, .sidebar, .content { width: 100%; max-width: 100%; min-width: 0; }
+  .sidebar { height: auto; max-height: none; display: block; overflow: hidden; }
+  .machine-list {
+    width: 100%;
+    max-width: 100vw;
+    min-height: 0;
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 10px 14px 12px;
+    scroll-snap-type: x proximity;
+    scrollbar-width: none;
+  }
+  .machine-list::-webkit-scrollbar { display: none; }
+  .machine-item {
+    width: min(270px, calc(100vw - 56px));
+    min-width: min(270px, calc(100vw - 56px));
+    margin: 0;
+    scroll-snap-align: start;
+  }
+  .machine-item:hover { transform: translateY(-1px); }
+  .sidebar-total {
+    min-height: 62px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-content: center;
+    column-gap: 18px;
+  }
+  .sidebar-total strong { grid-column: 1; }
+  .sidebar-total small { grid-column: 2; grid-row: 1 / span 2; align-self: center; text-align: right; }
+}
 """
 
 
@@ -9836,6 +10157,7 @@ const state = {
   token: "",
   nodes: [],
   overview: {},
+  diagnostics: {},
   selectedKey: "",
   detail: null,
   history: [],
@@ -9963,6 +10285,12 @@ function showApp() {
 function applyFleet(payload) {
   state.nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
   state.overview = payload.overview || {};
+  state.diagnostics = {
+    collectorRecords: number(state.overview.collector_records),
+    filteredWl: number(state.overview.filtered_wl),
+    filteredDisabled: number(state.overview.filtered_disabled),
+    duplicates: number(state.overview.duplicates),
+  };
   state.pollMs = Math.max(1000, number(payload.poll_interval_ms) || 2000);
   setText("buildLabel", payload.build || "collector");
   setText("machineCount", state.nodes.length);
@@ -9971,6 +10299,9 @@ function applyFleet(payload) {
   setText("offlineCount", state.overview.offline || 0);
   setText("fleetTraffic", formatBytes(state.overview.day_total));
   setText("fleetRate", `${formatRate(state.overview.rate_rx_bps)} RX · ${formatRate(state.overview.rate_tx_bps)} TX`);
+  setText("collectorRecordCount", state.diagnostics.collectorRecords);
+  setText("filteredWlCount", state.diagnostics.filteredWl);
+  setText("filteredDisabledCount", state.diagnostics.filteredDisabled);
   renderMachineList();
 
   if (state.selectedKey && !state.nodes.some((node) => node.key === state.selectedKey)) {
@@ -9983,6 +10314,17 @@ function applyFleet(payload) {
   if (!state.nodes.length) {
     machineView.hidden = true;
     emptyState.hidden = false;
+    const diagnostics = $("emptyDiagnostics");
+    diagnostics.hidden = state.diagnostics.collectorRecords <= 0;
+    if (state.diagnostics.collectorRecords <= 0) {
+      setText("emptyMessage", "Коллектор ещё не получил ни одного push");
+    } else if (state.diagnostics.filteredDisabled >= state.diagnostics.collectorRecords) {
+      setText("emptyMessage", "Все найденные машины исключены через stats_off");
+    } else if (state.diagnostics.filteredWl > 0) {
+      setText("emptyMessage", "Коллектор видит машины, но среди них нет BL-нод");
+    } else {
+      setText("emptyMessage", "BL-записи не прошли дедупликацию, обнови страницу");
+    }
   }
 }
 
@@ -10002,11 +10344,12 @@ function renderMachineList() {
     return;
   }
 
-  for (const node of filtered) {
+  filtered.forEach((node, index) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `machine-item ${node.status || "offline"}${node.key === state.selectedKey ? " active" : ""}`;
     button.dataset.key = node.key;
+    button.style.setProperty("--item-index", index);
     button.setAttribute("aria-current", node.key === state.selectedKey ? "true" : "false");
 
     const line = document.createElement("span");
@@ -10029,7 +10372,7 @@ function renderMachineList() {
     button.append(line, copy, rate);
     button.addEventListener("click", () => selectNode(node.key));
     machineList.append(button);
-  }
+  });
   machineList.scrollTop = previousScroll;
 }
 
@@ -10063,6 +10406,7 @@ function renderDetail() {
   setText("remnaDetail", remna.error_count ? `${remna.error_count} ошибок` : remna.restarts ? `${remna.restarts} рестартов` : "Без ошибок");
   setText("rxNow", data.rate_valid ? formatRate(data.rate_rx_bps) : "—");
   setText("txNow", data.rate_valid ? formatRate(data.rate_tx_bps) : "—");
+  setText("networkSource", data.status === "offline" ? "stale" : data.rate_source === "current" ? "live" : data.rate_source === "hour_average" ? "avg 1h" : "no sample");
   setText("cpuNow", data.metrics_ok ? formatPercent(data.cpu_percent) : "—");
   setText("cpuAverage", data.cpu_samples_1h || data.cpu_avg_1h ? formatPercent(data.cpu_avg_1h) : "—");
   setText("interfaceCount", Array.isArray(data.interfaces) ? data.interfaces.length : 0);
@@ -10115,6 +10459,7 @@ function renderInterfaces(interfaces) {
       tx.className = "tx";
       tx.textContent = formatRate(item.rate_tx_bps);
       rate.append(rx, separator, tx);
+      if (item.rate_display_source === "hour_average") rate.title = "Средняя скорость за последний час";
     } else {
       rate.textContent = "—";
       rate.classList.add("cell-muted");
@@ -10234,12 +10579,16 @@ function drawLineChart(canvas, emptyNode, points, series, options) {
     ctx.lineWidth = 2;
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
+    ctx.shadowColor = item.color;
+    ctx.shadowBlur = 8;
     ctx.beginPath();
     let started = false;
+    let previous = null;
     for (const point of usable) {
       const value = point[item.key];
       if (value === null || value === undefined) {
         started = false;
+        previous = null;
         continue;
       }
       const px = x(point.ts);
@@ -10247,17 +10596,25 @@ function drawLineChart(canvas, emptyNode, points, series, options) {
       if (!started) {
         ctx.moveTo(px, py);
         started = true;
+      } else if (previous) {
+        const distance = px - previous.x;
+        ctx.bezierCurveTo(previous.x + distance * .42, previous.y, px - distance * .42, py, px, py);
       } else {
         ctx.lineTo(px, py);
       }
+      previous = { x: px, y: py };
     }
     ctx.stroke();
+    ctx.shadowBlur = 0;
     const last = [...usable].reverse().find((point) => point[item.key] !== null && point[item.key] !== undefined);
     if (last) {
       ctx.fillStyle = item.color;
+      ctx.shadowColor = item.color;
+      ctx.shadowBlur = 12;
       ctx.beginPath();
       ctx.arc(x(last.ts), y(number(last[item.key])), 3, 0, Math.PI * 2);
       ctx.fill();
+      ctx.shadowBlur = 0;
     }
   }
 
@@ -10331,6 +10688,11 @@ function handleApiError(error) {
     return;
   }
   setLive("disconnected", "Нет связи");
+  if (!state.nodes.length) {
+    emptyState.hidden = false;
+    machineView.hidden = true;
+    setText("emptyMessage", `API коллектора не отвечает: ${error && error.message ? error.message : "неизвестная ошибка"}`);
+  }
 }
 
 async function poll() {
@@ -10407,11 +10769,17 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && !app.hidden) poll();
 });
 
-const resizeObserver = new ResizeObserver(() => {
-  if (!machineView.hidden) drawCharts();
-});
-resizeObserver.observe(networkCanvas);
-resizeObserver.observe(cpuCanvas);
+if ("ResizeObserver" in window) {
+  const resizeObserver = new ResizeObserver(() => {
+    if (!machineView.hidden) drawCharts();
+  });
+  resizeObserver.observe(networkCanvas);
+  resizeObserver.observe(cpuCanvas);
+} else {
+  window.addEventListener("resize", () => {
+    if (!machineView.hidden) drawCharts();
+  }, { passive: true });
+}
 
 const savedToken = localStorage.getItem(TOKEN_KEY) || "";
 if (savedToken) startSession(savedToken);
@@ -10518,11 +10886,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, payload)
                 return
             record_key = urllib.parse.unquote(suffix.rstrip("/"))
-            node = dashboard_find_bl_node(record_key)
-            if node is None:
+            record = dashboard_find_bl_record(record_key)
+            if record is None:
                 self.send_json(404, {"ok": False, "error": "node not found"})
             else:
-                payload = dashboard_node_detail(record_key, node)
+                payload = dashboard_node_detail(record["key"], record["node"])
                 payload["ok"] = True
                 self.send_json(200, payload)
             return

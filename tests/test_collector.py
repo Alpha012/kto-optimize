@@ -1155,6 +1155,68 @@ class CollectorRegressionTests(unittest.TestCase):
         finally:
             collector.now_ts = original_now
 
+    def test_dashboard_repairs_legacy_storage_key_and_keeps_history(self):
+        node_uuid = str(uuid.uuid4())
+        base_time = 1_800_400_000
+        original_now = collector.now_ts
+
+        def payload(counter_rx, counter_tx, sample_ms):
+            value = self.payload("BL legacy key", node_uuid, "bl")
+            value.update({
+                "cpu_percent": 31,
+                "metrics_ok": True,
+                "ip_stats": [{
+                    "iface": "ens3",
+                    "ip": "203.0.113.71",
+                    "counter_rx_bytes": counter_rx,
+                    "counter_tx_bytes": counter_tx,
+                    "counter_sample_ms": sample_ms,
+                }],
+            })
+            return value
+
+        try:
+            collector.now_ts = lambda: base_time
+            collector.update_node(payload(1_000_000, 1_000_000, 10_000), "203.0.113.71")
+            collector.now_ts = lambda: base_time + 5
+            node = collector.update_node(payload(6_000_000, 3_500_000, 15_000), "203.0.113.71")
+            stable_key = collector.node_record_key(node)
+            collector.NODES["legacy-name-key"] = collector.NODES.pop(stable_key)
+
+            fleet = collector.dashboard_nodes_payload(current=base_time + 5)
+            history = collector.dashboard_history_payload(stable_key, 3600, current=base_time + 5)
+            alias_history = collector.dashboard_history_payload("legacy-name-key", 3600, current=base_time + 5)
+
+            self.assertEqual([stable_key], [item["key"] for item in fleet["nodes"]])
+            self.assertEqual(1, fleet["overview"]["collector_records"])
+            self.assertEqual(8_000_000, history["points"][0]["rx_bps"])
+            self.assertEqual(stable_key, alias_history["key"])
+            self.assertEqual(history["points"], alias_history["points"])
+        finally:
+            collector.now_ts = original_now
+
+    def test_dashboard_uses_hour_average_when_current_delta_is_missing(self):
+        node = {
+            "name": "BL average",
+            "node_kind": "bl",
+            "last_seen": 1_800_500_000,
+            "metrics_ok": True,
+            "ip_stats": [{
+                "iface": "ens3",
+                "ip": "203.0.113.72",
+                "avg_rx_bps_1h": 42_000_000,
+                "avg_tx_bps_1h": 11_000_000,
+                "rate_samples_1h": 8,
+            }],
+        }
+        summary = collector.dashboard_node_summary("average", node, current=1_800_500_001)
+        detail = collector.dashboard_node_detail("average", node, current=1_800_500_001)
+
+        self.assertTrue(summary["rate_valid"])
+        self.assertEqual("hour_average", summary["rate_source"])
+        self.assertEqual(42_000_000, summary["rate_rx_bps"])
+        self.assertEqual("hour_average", detail["interfaces"][0]["rate_display_source"])
+
     def test_remna_top_alert_skips_unlimited_and_limits_above_threshold(self):
         now = int(time.time())
 
