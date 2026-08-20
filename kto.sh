@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v329"
+SCRIPT_BUILD="v330"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -64,6 +64,9 @@ KTO_USER_LIMITS_CONF="/etc/systemd/user.conf.d/99-kto-limits.conf"
 HAPROXY_RESERVED_PORTS_SYSCTL_CONF="/etc/sysctl.d/99-z-kto-haproxy-ports.conf"
 HAPROXY_CONFIG_FILE="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 HAPROXY_BACKUP_DIR="${KTO_HAPROXY_BACKUP_DIR:-/var/backups/kto-haproxy}"
+HAPROXY_FIREWALL_MANAGER="${KTO_HAPROXY_FIREWALL_MANAGER:-/usr/local/sbin/kto-haproxy-firewall}"
+HAPROXY_FIREWALL_UNIT="${KTO_HAPROXY_FIREWALL_UNIT:-/etc/systemd/system/kto-haproxy-firewall.service}"
+HAPROXY_FIREWALL_SERVICE="${KTO_HAPROXY_FIREWALL_SERVICE:-kto-haproxy-firewall.service}"
 HAPROXY_BANDWIDTH_MANAGER="${KTO_HAPROXY_BANDWIDTH_MANAGER:-/usr/local/sbin/kto-haproxy-bandwidth}"
 HAPROXY_BANDWIDTH_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
 HAPROXY_BANDWIDTH_UNIT="${KTO_HAPROXY_BANDWIDTH_UNIT:-/etc/systemd/system/kto-haproxy-bandwidth.service}"
@@ -2938,6 +2941,10 @@ if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
     done < "\$TRUSTED_FILE"
 
     ufw reload >/dev/null 2>&1 || true
+    if [[ -x "${HAPROXY_FIREWALL_MANAGER}" ]]; then
+        "${HAPROXY_FIREWALL_MANAGER}" >> "\$LOG" 2>&1 ||
+            echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to restore HAProxy UFW rules" >> "\$LOG"
+    fi
     echo "\$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] AntiScanner updated via ufw" >> "\$LOG"
 else
     echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to download blacklist" >> "\$LOG"
@@ -3741,8 +3748,11 @@ EOF
 
 opt_firewall() {
     local ssh_port="$1"
-    local anti_rules routes_file="" port target sni source_ip
+    local anti_rules routes_file ports_file ufw_status_file port
     anti_rules="$(antiscanner_rules_count)"
+    routes_file="$(mktemp)"
+    ports_file="$(mktemp)"
+    ufw_status_file="$(mktemp)"
 
     if [[ "${KTO_UFW_RESET:-0}" == "1" ]]; then
         cmd "${SUDO[@]}" ufw --force reset
@@ -3758,39 +3768,62 @@ opt_firewall() {
         remove_ufw_allow_rules_for_port 22
         ensure_global_ssh_ufw_rule "$ssh_port"
     fi
-    if haproxy_mode_supported; then
-        routes_file="$(mktemp)"
-        extract_haproxy_routes > "$routes_file"
-    fi
+    extract_haproxy_routes "$HAPROXY_CONFIG_FILE" > "$routes_file"
+    haproxy_listener_ports "$routes_file" > "$ports_file"
+    "${SUDO[@]}" ufw status > "$ufw_status_file" 2>/dev/null || true
     if [[ "$MACHINE_MODE" == "whitelist" ]]; then
-        if [[ -s "$routes_file" ]]; then
-            while IFS=$'\t' read -r port _target _sni _source _maxconn _listen _send_proxy_v2; do
-                [[ "$port" =~ ^[0-9]+$ ]] || continue
-                cmd "${SUDO[@]}" ufw allow "${port}/tcp"
-            done < "$routes_file"
+        if [[ -s "$ports_file" ]]; then
+            while IFS= read -r port; do
+                if ! ufw_status_rule_open_to_any "${port}/tcp" < "$ufw_status_file"; then
+                    cmd "${SUDO[@]}" ufw allow "${port}/tcp"
+                    printf '%s/tcp ALLOW IN Anywhere\n' "$port" >> "$ufw_status_file"
+                fi
+            done < "$ports_file"
         else
-            cmd "${SUDO[@]}" ufw allow 443/tcp
+            if ! ufw_status_rule_open_to_any "443/tcp" < "$ufw_status_file"; then
+                cmd "${SUDO[@]}" ufw allow 443/tcp
+                printf '443/tcp ALLOW IN Anywhere\n' >> "$ufw_status_file"
+            fi
         fi
     else
-        cmd "${SUDO[@]}" ufw allow 443/tcp
-        if [[ "$MACHINE_MODE" == "node" && -n "$routes_file" && -s "$routes_file" ]]; then
-            while IFS=$'\t' read -r port _target _sni _source _maxconn _listen _send_proxy_v2; do
-                [[ "$port" =~ ^[0-9]+$ ]] || continue
-                cmd "${SUDO[@]}" ufw allow "${port}/tcp"
-            done < "$routes_file"
+        if ! ufw_status_rule_open_to_any "443/tcp" < "$ufw_status_file"; then
+            cmd "${SUDO[@]}" ufw allow 443/tcp
+            printf '443/tcp ALLOW IN Anywhere\n' >> "$ufw_status_file"
+        fi
+        if [[ -s "$ports_file" ]]; then
+            while IFS= read -r port; do
+                [[ "$port" == "443" ]] && continue
+                if ! ufw_status_rule_open_to_any "${port}/tcp" < "$ufw_status_file"; then
+                    cmd "${SUDO[@]}" ufw allow "${port}/tcp"
+                    printf '%s/tcp ALLOW IN Anywhere\n' "$port" >> "$ufw_status_file"
+                fi
+            done < "$ports_file"
         fi
     fi
     if [[ "$MACHINE_MODE" == "node" ]]; then
-        cmd "${SUDO[@]}" ufw allow 443/udp
-        cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
+        if ! ufw_status_rule_open_to_any "443/udp" < "$ufw_status_file"; then
+            cmd "${SUDO[@]}" ufw allow 443/udp
+        fi
+        if ! ufw_status_rule_open_to_any "${NODE_PORT}/tcp" < "$ufw_status_file"; then
+            cmd "${SUDO[@]}" ufw allow "${NODE_PORT}/tcp"
+        fi
     else
         cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
-        if [[ -z "$routes_file" ]] || ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
+        if ! grep -Fqx "$NODE_PORT" "$ports_file"; then
             cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
         fi
     fi
     cmd "${SUDO[@]}" ufw --force enable
-    [[ -z "$routes_file" ]] || rm -f "$routes_file"
+    if ! ensure_haproxy_firewall_guard || ! repair_haproxy_firewall_rules "$routes_file"; then
+        rm -f "$routes_file" "$ports_file" "$ufw_status_file"
+        return 1
+    fi
+    rm -f "$routes_file" "$ports_file" "$ufw_status_file"
+}
+
+opt_haproxy_firewall_final_check() {
+    ensure_haproxy_firewall_guard
+    repair_haproxy_firewall_rules
 }
 
 opt_antiscanner() {
@@ -4162,8 +4195,69 @@ memory_guard_configured() {
         root_file_has_line "$MEMORY_GUARD_SYSCTL_CONF" "vm.page-cluster = 0"
 }
 
+haproxy_config_listener_ports() {
+    local config="${1:-$HAPROXY_CONFIG_FILE}"
+    "${SUDO[@]}" test -s "$config" 2>/dev/null || return 0
+    "${SUDO[@]}" awk '
+        function emit_listener(endpoint, port, host) {
+            gsub(/^"|"$/, "", endpoint)
+            if (endpoint ~ /^(unix@|abns@|fd@)/) return
+            if (endpoint ~ /^[0-9]+$/) {
+                port = endpoint
+                host = "*"
+            } else {
+                port = endpoint
+                sub(/^.*:/, "", port)
+                sub(/[^0-9].*$/, "", port)
+                host = endpoint
+                sub(/:[^:]*$/, "", host)
+                gsub(/^\[/, "", host)
+                gsub(/\]$/, "", host)
+            }
+            if (host == "localhost" || host == "127.0.0.1" || host == "::1") return
+            if (port ~ /^[0-9]+$/ && port + 0 >= 1 && port + 0 <= 65535) print port + 0
+        }
+        $1 == "frontend" { section = "frontend"; next }
+        $1 == "global" || $1 == "defaults" || $1 == "backend" || $1 == "listen" {
+            section = $1
+            next
+        }
+        section == "frontend" && $1 == "bind" {
+            count = split($2, endpoints, ",")
+            for (i = 1; i <= count; i++) emit_listener(endpoints[i])
+        }
+    ' "$config" 2>/dev/null | LC_ALL=C sort -nu
+}
+
+haproxy_listener_ports() {
+    local routes_file="${1:-}" config="${2:-$HAPROXY_CONFIG_FILE}"
+    {
+        if [[ -n "$routes_file" && -s "$routes_file" ]]; then
+            awk -F '\t' '$1 ~ /^[0-9]+$/ && $1 + 0 >= 1 && $1 + 0 <= 65535 { print $1 + 0 }' "$routes_file"
+        fi
+        haproxy_config_listener_ports "$config" || true
+    } | awk '/^[0-9]+$/ && !seen[$1]++ { print $1 }' | LC_ALL=C sort -n
+}
+
+ufw_status_rule_open_to_any() {
+    local rule="$1"
+    awk -v rule="$rule" '
+        $0 !~ /\(v6\)/ && $1 == rule {
+            for (i = 2; i <= NF; i++) {
+                if ($i != "ALLOW") continue
+                if ($(i + 1) == "OUT" || $(i + 1) == "FWD") continue
+                source_field = i + 1
+                if ($source_field == "IN") source_field++
+                if ($source_field == "Anywhere") found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
 ufw_active() {
-    command_exists ufw && "${SUDO[@]}" ufw status 2>/dev/null | grep -q "Status: active"
+    command_exists ufw && "${SUDO[@]}" ufw status 2>/dev/null |
+        awk '$1 == "Status:" && $2 == "active" { active=1 } END { exit active ? 0 : 1 }'
 }
 
 ufw_rule_allowed() {
@@ -4183,19 +4277,193 @@ ufw_rule_allowed() {
 ufw_rule_open_to_any() {
     local rule="$1"
     command_exists ufw || return 1
-    "${SUDO[@]}" ufw status 2>/dev/null \
-        | awk -v rule="$rule" '
-            $0 !~ /\(v6\)/ && $1 == rule {
-                for (i = 2; i <= NF; i++) {
-                    if ($i != "ALLOW") continue
-                    if ($(i + 1) == "OUT" || $(i + 1) == "FWD") continue
-                    source_field = i + 1
-                    if ($source_field == "IN") source_field++
-                    if ($source_field == "Anywhere") found = 1
-                }
+    "${SUDO[@]}" ufw status 2>/dev/null | ufw_status_rule_open_to_any "$rule"
+}
+
+repair_haproxy_firewall_rules() {
+    local routes_file="${1:-}" ports_file status_file port added=0 failed=0 status_failed=0
+
+    ports_file="$(mktemp)"
+    status_file="$(mktemp)"
+    haproxy_listener_ports "$routes_file" > "$ports_file"
+    if [[ ! -s "$ports_file" ]]; then
+        rm -f "$ports_file" "$status_file"
+        return 0
+    fi
+    if ! command_exists ufw ||
+        ! "${SUDO[@]}" ufw status > "$status_file" 2>/dev/null ||
+        ! awk '$1 == "Status:" && $2 == "active" { active=1 } END { exit active ? 0 : 1 }' "$status_file"; then
+        rm -f "$ports_file" "$status_file"
+        fail "HAProxy listener-ы найдены, но UFW не активен"
+        return 1
+    fi
+
+    while IFS= read -r port; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        if ufw_status_rule_open_to_any "${port}/tcp" < "$status_file"; then
+            continue
+        fi
+        if cmd "${SUDO[@]}" ufw allow "${port}/tcp" comment 'kto-haproxy'; then
+            added=$(( added + 1 ))
+        elif cmd "${SUDO[@]}" ufw allow "${port}/tcp"; then
+            added=$(( added + 1 ))
+        fi
+    done < "$ports_file"
+
+    if ! "${SUDO[@]}" ufw status > "$status_file" 2>/dev/null; then
+        failed=1
+        status_failed=1
+    else
+        while IFS= read -r port; do
+            [[ "$port" =~ ^[0-9]+$ ]] || continue
+            if ! ufw_status_rule_open_to_any "${port}/tcp" < "$status_file"; then
+                fail "UFW не создал глобальное IPv4-правило для HAProxy ${port}/tcp"
+                failed=$(( failed + 1 ))
+            fi
+        done < "$ports_file"
+    fi
+    rm -f "$ports_file" "$status_file"
+
+    if (( failed == 0 && added > 0 )); then
+        ok "Восстановлено HAProxy IPv4-правил: ${added}"
+    elif (( status_failed == 1 )); then
+        fail "Не удалось повторно прочитать HAProxy IPv4-правила UFW"
+    elif (( failed > 0 && added > 0 )); then
+        warn "UFW восстановил не все HAProxy IPv4-правила: ${added}"
+    fi
+    (( failed == 0 ))
+}
+
+ensure_haproxy_firewall_guard() {
+    local listener_ports manager_current=0 unit_current=0
+    listener_ports="$(haproxy_config_listener_ports "$HAPROXY_CONFIG_FILE")"
+    [[ -n "$listener_ports" ]] || return 0
+
+    if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v330"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        manager_current=1
+    fi
+    if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
+        "${SUDO[@]}" grep -Fq "ExecStart=${HAPROXY_FIREWALL_MANAGER}" "$HAPROXY_FIREWALL_UNIT" 2>/dev/null; then
+        unit_current=1
+    fi
+
+    if (( manager_current == 0 )); then
+        write_root_file "$HAPROXY_FIREWALL_MANAGER" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+KTO_HAPROXY_FIREWALL_BUILD="v330"
+CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
+
+command -v ufw >/dev/null 2>&1 || exit 0
+[[ -s "$CONFIG" ]] || exit 0
+STATUS_FILE="$(mktemp)"
+PORTS_FILE="$(mktemp)"
+cleanup() { rm -f "$STATUS_FILE" "$PORTS_FILE"; }
+trap cleanup EXIT
+ufw status > "$STATUS_FILE" 2>/dev/null || exit 0
+awk '$1 == "Status:" && $2 == "active" { active=1 } END { exit active ? 0 : 1 }' "$STATUS_FILE" || exit 0
+
+listener_ports() {
+    awk '
+        function emit_listener(endpoint, port, host) {
+            gsub(/^"|"$/, "", endpoint)
+            if (endpoint ~ /^(unix@|abns@|fd@)/) return
+            if (endpoint ~ /^[0-9]+$/) {
+                port = endpoint
+                host = "*"
+            } else {
+                port = endpoint
+                sub(/^.*:/, "", port)
+                sub(/[^0-9].*$/, "", port)
+                host = endpoint
+                sub(/:[^:]*$/, "", host)
+                gsub(/^\[/, "", host)
+                gsub(/\]$/, "", host)
             }
-            END { exit found ? 0 : 1 }
-        '
+            if (host == "localhost" || host == "127.0.0.1" || host == "::1") return
+            if (port ~ /^[0-9]+$/ && port + 0 >= 1 && port + 0 <= 65535) print port + 0
+        }
+        $1 == "frontend" { section = "frontend"; next }
+        $1 == "global" || $1 == "defaults" || $1 == "backend" || $1 == "listen" {
+            section = $1
+            next
+        }
+        section == "frontend" && $1 == "bind" {
+            count = split($2, endpoints, ",")
+            for (i = 1; i <= count; i++) emit_listener(endpoints[i])
+        }
+    ' "$CONFIG" | LC_ALL=C sort -nu
+}
+
+rule_open_to_any() {
+    local rule="$1" status_file="$2"
+    awk -v rule="$rule" '
+        $0 !~ /\(v6\)/ && $1 == rule {
+            for (i = 2; i <= NF; i++) {
+                if ($i != "ALLOW") continue
+                if ($(i + 1) == "OUT" || $(i + 1) == "FWD") continue
+                source_field = i + 1
+                if ($source_field == "IN") source_field++
+                if ($source_field == "Anywhere") found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' "$status_file"
+}
+
+failed=0
+restored=0
+listener_ports > "$PORTS_FILE"
+while IFS= read -r port; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    rule_open_to_any "${port}/tcp" "$STATUS_FILE" && continue
+    if ufw allow "${port}/tcp" comment 'kto-haproxy' >/dev/null 2>&1 ||
+        ufw allow "${port}/tcp" >/dev/null 2>&1; then
+        restored=$(( restored + 1 ))
+    fi
+done < "$PORTS_FILE"
+
+if ! ufw status > "$STATUS_FILE" 2>/dev/null; then
+    echo "kto-haproxy-firewall: failed to read UFW status after repair" >&2
+    failed=1
+else
+    while IFS= read -r port; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        if rule_open_to_any "${port}/tcp" "$STATUS_FILE"; then
+            continue
+        fi
+        echo "kto-haproxy-firewall: failed to restore IPv4 ${port}/tcp" >&2
+        failed=$(( failed + 1 ))
+    done < "$PORTS_FILE"
+fi
+
+(( restored == 0 )) || echo "kto-haproxy-firewall: restored ${restored} rule(s)"
+(( failed == 0 ))
+EOF
+        cmd "${SUDO[@]}" chmod 0755 "$HAPROXY_FIREWALL_MANAGER"
+    fi
+
+    if (( unit_current == 0 )); then
+        write_root_file "$HAPROXY_FIREWALL_UNIT" <<EOF
+[Unit]
+Description=Restore IPv4 UFW rules for HAProxy listeners
+After=network-online.target ufw.service haproxy.service antiscanner-update.service
+Wants=network-online.target
+ConditionPathExists=${HAPROXY_CONFIG_FILE}
+
+[Service]
+Type=oneshot
+ExecStart=${HAPROXY_FIREWALL_MANAGER}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        cmd "${SUDO[@]}" systemctl daemon-reload
+    fi
+    "${SUDO[@]}" systemctl is-enabled --quiet "$HAPROXY_FIREWALL_SERVICE" 2>/dev/null ||
+        cmd "${SUDO[@]}" systemctl enable "$HAPROXY_FIREWALL_SERVICE"
 }
 
 ufw_rule_from_allowed() {
@@ -4559,11 +4827,16 @@ system_check_network_limits() {
 
 system_check_firewall() {
     local ssh_port="$1"
-    local missing=() extra=() routes_file="" port target sni source_ip
+    local missing=() extra=() routes_file ports_file ufw_status_file port
+
+    routes_file="$(mktemp)"
+    ports_file="$(mktemp)"
+    ufw_status_file="$(mktemp)"
 
     if ! command_exists ufw; then
         SYSTEM_CHECK_NEEDS_FIREWALL=1
         system_check_row miss "ufw" "не установлен"
+        rm -f "$routes_file" "$ports_file" "$ufw_status_file"
         return 0
     fi
 
@@ -4578,34 +4851,23 @@ system_check_firewall() {
     if [[ "$ssh_port" != "22" ]] && ufw_rule_allowed "22/tcp"; then
         extra+=("22/tcp")
     fi
-    if haproxy_mode_supported; then
-        routes_file="$(mktemp)"
-        extract_haproxy_routes > "$routes_file"
+    extract_haproxy_routes "$HAPROXY_CONFIG_FILE" > "$routes_file"
+    haproxy_listener_ports "$routes_file" > "$ports_file"
+    if [[ "$MACHINE_MODE" != "whitelist" || ! -s "$ports_file" ]]; then
+        printf '443\n' >> "$ports_file"
     fi
-    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
-        if [[ -s "$routes_file" ]]; then
-            while IFS=$'\t' read -r port _target _sni _source _maxconn _listen _send_proxy_v2; do
-                [[ "$port" =~ ^[0-9]+$ ]] || continue
-                ufw_rule_open_to_any "${port}/tcp" || missing+=("${port}/tcp")
-            done < "$routes_file"
-        else
-            ufw_rule_open_to_any "443/tcp" || missing+=("443/tcp")
-        fi
-    else
-        ufw_rule_open_to_any "443/tcp" || missing+=("443/tcp")
-        if [[ "$MACHINE_MODE" == "node" && -n "$routes_file" && -s "$routes_file" ]]; then
-            while IFS=$'\t' read -r port _target _sni _source _maxconn _listen _send_proxy_v2; do
-                [[ "$port" =~ ^[0-9]+$ ]] || continue
-                ufw_rule_open_to_any "${port}/tcp" || missing+=("${port}/tcp")
-            done < "$routes_file"
-        fi
-    fi
+    LC_ALL=C sort -nu -o "$ports_file" "$ports_file"
+    "${SUDO[@]}" ufw status > "$ufw_status_file" 2>/dev/null || true
+    while IFS= read -r port; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        ufw_status_rule_open_to_any "${port}/tcp" < "$ufw_status_file" || missing+=("${port}/tcp")
+    done < "$ports_file"
     if [[ "$MACHINE_MODE" == "node" ]]; then
-        ufw_rule_open_to_any "443/udp" || missing+=("443/udp")
-        ufw_rule_open_to_any "${NODE_PORT}/tcp" || missing+=("${NODE_PORT}/tcp")
+        ufw_status_rule_open_to_any "443/udp" < "$ufw_status_file" || missing+=("443/udp")
+        ufw_status_rule_open_to_any "${NODE_PORT}/tcp" < "$ufw_status_file" || missing+=("${NODE_PORT}/tcp")
     else
         ufw_rule_allowed "443/udp" && extra+=("443/udp")
-        if [[ -z "$routes_file" ]] || ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
+        if ! grep -Fqx "$NODE_PORT" "$ports_file"; then
             ufw_rule_allowed "${NODE_PORT}/tcp" && extra+=("${NODE_PORT}/tcp")
         fi
     fi
@@ -4622,7 +4884,7 @@ system_check_firewall() {
             system_check_row miss "ufw rules" "лишние: $(system_check_join "${extra[@]}")"
         fi
     fi
-    [[ -z "$routes_file" ]] || rm -f "$routes_file"
+    rm -f "$routes_file" "$ports_file" "$ufw_status_file"
 }
 
 system_check_antiscanner() {
@@ -4698,6 +4960,7 @@ system_check_apply_missing() {
     (( SYSTEM_CHECK_NEEDS_FIREWALL == 1 )) && progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
     (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && progress_step "Подключаю AntiScanner" opt_antiscanner
     (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )) && progress_step "Настраиваю Fail2ban" opt_fail2ban
+    opt_haproxy_firewall_final_check
 
     echo
     duration=$(( $(date +%s) - started_at ))
@@ -4820,7 +5083,7 @@ optimize_system() {
     export NEEDRESTART_MODE=a
     export NEEDRESTART_SUSPEND=1
 
-    progress_start 10
+    progress_start 11
     progress_step "Готовлю систему" opt_prepare_system
     progress_step "Ставлю базовые пакеты" opt_install_fast_packages
     progress_step "Kernel, сеть и память" opt_kernel_network_memory_parallel
@@ -4832,6 +5095,7 @@ optimize_system() {
     progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
     progress_step "Подключаю AntiScanner" opt_antiscanner
     progress_step "Настраиваю Fail2ban" opt_fail2ban
+    progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check
 
     echo
     duration=$(( $(date +%s) - started_at ))
@@ -9556,8 +9820,8 @@ apply_haproxy_bandwidth_limits_cli() {
 
 sync_haproxy_firewall() {
     local routes_file="${1:-}" previous_routes_file="${2:-}"
-    local ssh_port port target sni source_ip generated_routes="" previous_known=0
-    local -A opened_ports=() checked_previous_ports=()
+    local ssh_port port generated_routes="" current_ports_file previous_known=0 failed=0
+    local -A checked_previous_ports=()
     command_exists ufw || return 0
     ufw_active || return 0
 
@@ -9566,29 +9830,21 @@ sync_haproxy_firewall() {
         extract_haproxy_routes > "$generated_routes"
         routes_file="$generated_routes"
     fi
+    current_ports_file="$(mktemp)"
+    haproxy_listener_ports "$routes_file" > "$current_ports_file"
     [[ -n "$previous_routes_file" && -s "$previous_routes_file" ]] && previous_known=1
     if [[ "$MACHINE_MODE" == "whitelist" && "$previous_known" == "0" ]]; then
         ssh_port="$(detect_ssh_port)"
         apply_whitelist_ssh_rules "$ssh_port"
     fi
-    while IFS=$'\t' read -r port _target _sni _source _maxconn _listen _send_proxy_v2; do
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-        [[ -z "${opened_ports[$port]+x}" ]] || continue
-        opened_ports[$port]=1
-        if ufw_rule_open_to_any "${port}/tcp"; then
-            continue
-        fi
-        if ! cmd "${SUDO[@]}" ufw allow "${port}/tcp" comment 'kto-haproxy'; then
-            cmd "${SUDO[@]}" ufw allow "${port}/tcp" || true
-        fi
-    done < "$routes_file"
+    repair_haproxy_firewall_rules "$routes_file" || failed=$(( failed + 1 ))
 
     if [[ -n "$previous_routes_file" && -s "$previous_routes_file" ]]; then
         while IFS=$'\t' read -r port _target _sni _source _maxconn _listen _send_proxy_v2; do
             [[ "$port" =~ ^[0-9]+$ ]] || continue
             [[ -z "${checked_previous_ports[$port]+x}" ]] || continue
             checked_previous_ports[$port]=1
-            if ! haproxy_route_file_has_port "$routes_file" "$port"; then
+            if ! grep -Fqx "$port" "$current_ports_file"; then
                 if [[ "$MACHINE_MODE" == "node" && ( "$port" == "443" || "$port" == "$NODE_PORT" ) ]]; then
                     continue
                 fi
@@ -9599,11 +9855,14 @@ sync_haproxy_firewall() {
 
     if [[ "$MACHINE_MODE" == "whitelist" && "$previous_known" == "0" ]]; then
         cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
-        if ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
+        if ! grep -Fqx "$NODE_PORT" "$current_ports_file"; then
             cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
         fi
     fi
+    ensure_haproxy_firewall_guard || failed=$(( failed + 1 ))
+    rm -f "$current_ports_file"
     [[ -z "$generated_routes" ]] || rm -f "$generated_routes"
+    (( failed == 0 ))
 }
 
 configure_haproxy_backend() {
@@ -9805,6 +10064,21 @@ stabilize_haproxy_interactive() {
     stabilize_haproxy
 }
 
+repair_haproxy_firewall_cli() {
+    local ports ports_label
+    header
+    need_root
+    ports="$(haproxy_config_listener_ports "$HAPROXY_CONFIG_FILE")"
+    if [[ -z "$ports" ]]; then
+        fail "В HAProxy config не найдено внешних frontend bind"
+        return 1
+    fi
+    ensure_haproxy_firewall_guard
+    repair_haproxy_firewall_rules
+    ports_label="$(awk '{ printf "%s%s/tcp", separator, $1; separator=", " } END { print "" }' <<< "$ports")"
+    ok "HAProxy firewall проверен: ${ports_label}"
+}
+
 diagnose_haproxy() {
     header
     require_haproxy_mode
@@ -9909,6 +10183,10 @@ diagnose_haproxy() {
         fi
         seen_ports[$port]=1
     done < "$routes_file"
+    while IFS= read -r port; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        seen_ports[$port]=1
+    done < <(haproxy_config_listener_ports "$HAPROXY_CONFIG_FILE")
     if (( bad_inputs == 0 )); then
         haproxy_diagnostic_row ok "входные IP" "${exact_inputs} точечных, wildcard поддерживается"
     else
@@ -9960,8 +10238,8 @@ diagnose_haproxy() {
         if grep -q 'Status: active' <<< "$ufw_status"; then
             missing_firewall=0
             for port in "${!seen_ports[@]}"; do
-                awk -v rule="${port}/tcp" '$0 ~ /ALLOW/ && $1 == rule { found=1 } END { exit found ? 0 : 1 }' \
-                    <<< "$ufw_status" || missing_firewall=$(( missing_firewall + 1 ))
+                ufw_status_rule_open_to_any "${port}/tcp" <<< "$ufw_status" ||
+                    missing_firewall=$(( missing_firewall + 1 ))
             done
             if (( missing_firewall == 0 )); then
                 haproxy_diagnostic_row ok "firewall" "UFW active, все порты разрешены"
@@ -13325,6 +13603,7 @@ main() {
         haproxy-limit-apply|haproxy-bandwidth-apply|haproxy-limit-reapply) apply_haproxy_bandwidth_limits_cli ;;
         haproxy-limit-status|haproxy-bandwidth-status) show_haproxy_bandwidth_status_cli ;;
         haproxy-diagnose|haproxy-diagnostic|haproxy-diag|haproxy-status) diagnose_haproxy || true ;;
+        haproxy-firewall-repair|haproxy-ufw-repair|repair-haproxy-firewall) repair_haproxy_firewall_cli ;;
         haproxy-stabilize|haproxy-recover) stabilize_haproxy ;;
         mobile443-lte|lte-only) mobile443_lte_menu ;;
         mobile443-lte-enable|lte-only-enable) enable_mobile443_lte ;;
