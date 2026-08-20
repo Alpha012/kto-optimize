@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v324"', KTO)
-        self.assertIn('PUSH_BUILD="v324"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v324"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v324"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v324"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v324"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v324"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v324"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v325"', KTO)
+        self.assertIn('PUSH_BUILD="v325"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v325"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v325"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v325"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v325"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v325"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v325"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2673,6 +2673,8 @@ NODE_PROFILE=hysteria2
         self.assertIn('ssh-keygen -lf "$output_file"', merge_keys)
         self.assertIn('PermitRootLogin prohibit-password', migrate)
         self.assertIn('PasswordAuthentication no', migrate)
+        self.assertIn('awk -v managed_include="$KTO_SSH_MANAGED_CONFIG"', migrate)
+        self.assertNotIn('awk -v include=', migrate)
         self.assertIn('sshd -t', migrate)
         self.assertIn('sshd -T -C user=root', migrate)
         self.assertIn('rollback_ssh_migration', migrate)
