@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v328"', KTO)
-        self.assertIn('PUSH_BUILD="v328"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v328"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v328"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v328"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v328"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v328"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v328"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v329"', KTO)
+        self.assertIn('PUSH_BUILD="v329"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v329"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v329"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v329"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v329"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v329"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v329"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -3278,7 +3278,7 @@ grep -q '^net.ipv4.ip_local_reserved_ports=22,8000-8400,8443,8444$' "$events"
         self.assertIn('extract_haproxy_routes > "$routes_file"', optimize_firewall)
         self.assertIn('ufw allow "${port}/tcp"', optimize_firewall)
         self.assertIn('extract_haproxy_routes > "$routes_file"', check_firewall)
-        self.assertIn('ufw_rule_allowed "${port}/tcp"', check_firewall)
+        self.assertIn('ufw_rule_open_to_any "${port}/tcp"', check_firewall)
         self.assertIn('/^vless_in_[0-9_]+$/', scan)
         self.assertIn("count[$1] += $2", scan)
         self.assertIn("show table %s", scan)
@@ -3307,6 +3307,7 @@ printf '8443\t5.34.179.144:443\tbridge.example.com\tdefault\n' > "$routes"
 printf '443\t89.144.8.3:443\told.example.com\tdefault\n' > "$previous"
 command_exists() { [[ "$1" == ufw ]]; }
 ufw_active() { return 0; }
+ufw_rule_open_to_any() { [[ "$1" == '443/tcp' ]]; }
 apply_whitelist_ssh_rules() { printf 'ssh-filter\n' >> "$events"; }
 cmd() { local IFS=' '; printf '%s\n' "$*" >> "$events"; }
 sync_haproxy_firewall "$routes" "$previous"
@@ -3342,6 +3343,7 @@ printf '443\t89.144.8.3:443\ta.example.com\tdefault\n8443\t5.34.179.144:443\tb.e
 printf '443\t89.144.8.3:443\ta.example.com\tdefault\n8444\t5.34.179.145:443\tc.example.com\tdefault\n' > "$previous"
 command_exists() { [[ "$1" == ufw ]]; }
 ufw_active() { return 0; }
+ufw_rule_open_to_any() { [[ "$1" == '443/tcp' ]]; }
 apply_whitelist_ssh_rules() { printf 'ssh-filter\n' >> "$events"; }
 cmd() { local IFS=' '; printf '%s\n' "$*" >> "$events"; }
 sync_haproxy_firewall "$routes" "$previous"
@@ -3350,6 +3352,96 @@ grep -Fqx 'ufw --force delete allow 8444/tcp' "$events"
 ! grep -q 'ufw allow 443/tcp' "$events"
 ! grep -q 'ssh-filter' "$events"
 [[ "$(wc -l < "$events")" == 2 ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_ufw_helpers_distinguish_ipv4_global_rules_from_ipv6_and_restricted_rules(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+command_exists() { [[ "$1" == ufw ]]; }
+ufw() {
+    [[ "${1:-}" == status ]] || return 1
+    printf 'Status: active\n\nTo Action From\n'
+    case "$UFW_CASE" in
+        v6)
+            printf '443/tcp (v6) ALLOW IN Anywhere (v6)\n'
+            ;;
+        out)
+            printf '443/tcp ALLOW OUT Anywhere\n'
+            ;;
+        restricted)
+            printf '443/tcp ALLOW IN 94.247.129.92\n'
+            ;;
+        global)
+            printf '443/tcp ALLOW IN Anywhere\n'
+            ;;
+    esac
+}
+UFW_CASE=v6
+! ufw_rule_allowed '443/tcp'
+! ufw_rule_open_to_any '443/tcp'
+! ufw_global_allow_exists_for_port 443
+UFW_CASE=out
+! ufw_rule_allowed '443/tcp'
+! ufw_rule_open_to_any '443/tcp'
+! ufw_global_allow_exists_for_port 443
+UFW_CASE=restricted
+ufw_rule_allowed '443/tcp'
+ufw_rule_from_allowed '443/tcp' '94.247.129.92'
+! ufw_rule_open_to_any '443/tcp'
+! ufw_global_allow_exists_for_port 443
+UFW_CASE=global
+ufw_rule_allowed '443/tcp'
+ufw_rule_open_to_any '443/tcp'
+ufw_global_allow_exists_for_port 443
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_firewall_repairs_missing_ipv4_rule_for_existing_route(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+MACHINE_MODE=whitelist
+SUDO=()
+routes=$(mktemp)
+previous=$(mktemp)
+events=$(mktemp)
+trap 'rm -f "$routes" "$previous" "$events"' EXIT
+printf '443\t89.144.8.3:443\ta.example.com\t37.18.15.213\n' > "$routes"
+cp "$routes" "$previous"
+command_exists() { [[ "$1" == ufw ]]; }
+ufw_active() { return 0; }
+ufw_rule_open_to_any() { return 1; }
+apply_whitelist_ssh_rules() { printf 'ssh-filter\n' >> "$events"; }
+cmd() { local IFS=' '; printf '%s\n' "$*" >> "$events"; }
+sync_haproxy_firewall "$routes" "$previous"
+grep -Fqx 'ufw allow 443/tcp comment kto-haproxy' "$events"
+! grep -q 'ssh-filter' "$events"
+[[ "$(wc -l < "$events")" == 1 ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

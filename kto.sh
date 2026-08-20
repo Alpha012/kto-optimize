@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v328"
+SCRIPT_BUILD="v329"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -2153,11 +2153,19 @@ ufw_global_allow_exists_for_port() {
     local port="$1"
     command_exists ufw || return 1
     "${SUDO[@]}" ufw status 2>/dev/null | awk -v port="$port" -v tcp="${port}/tcp" '
-        $0 ~ /ALLOW/ && $0 ~ /Anywhere/ {
+        $0 !~ /\(v6\)/ && $0 ~ /ALLOW/ {
             target = $1
             gsub(/[[:space:]]/, "", target)
-            if (target == tcp || target == port ||
-                (port == "22" && (target == "ssh" || target == "OpenSSH"))) found = 1
+            is_target = (target == tcp || target == port ||
+                (port == "22" && (target == "ssh" || target == "OpenSSH")))
+            if (!is_target) next
+            for (i = 2; i <= NF; i++) {
+                if ($i != "ALLOW") continue
+                if ($(i + 1) == "OUT" || $(i + 1) == "FWD") continue
+                source_field = i + 1
+                if ($source_field == "IN") source_field++
+                if ($source_field == "Anywhere") found = 1
+            }
         }
         END { exit found ? 0 : 1 }
     '
@@ -4162,14 +4170,32 @@ ufw_rule_allowed() {
     local rule="$1"
     command_exists ufw || return 1
     "${SUDO[@]}" ufw status 2>/dev/null \
-        | awk -v rule="$rule" '$0 ~ /ALLOW/ && $1 == rule {found=1} END{exit found ? 0 : 1}'
+        | awk -v rule="$rule" '
+            $0 !~ /\(v6\)/ && $1 == rule {
+                for (i = 2; i <= NF; i++) {
+                    if ($i == "ALLOW" && $(i + 1) != "OUT" && $(i + 1) != "FWD") found = 1
+                }
+            }
+            END { exit found ? 0 : 1 }
+        '
 }
 
 ufw_rule_open_to_any() {
     local rule="$1"
     command_exists ufw || return 1
     "${SUDO[@]}" ufw status 2>/dev/null \
-        | awk -v rule="$rule" '$0 ~ /ALLOW/ && $1 == rule && $3 ~ /^Anywhere/ {found=1} END{exit found ? 0 : 1}'
+        | awk -v rule="$rule" '
+            $0 !~ /\(v6\)/ && $1 == rule {
+                for (i = 2; i <= NF; i++) {
+                    if ($i != "ALLOW") continue
+                    if ($(i + 1) == "OUT" || $(i + 1) == "FWD") continue
+                    source_field = i + 1
+                    if ($source_field == "IN") source_field++
+                    if ($source_field == "Anywhere") found = 1
+                }
+            }
+            END { exit found ? 0 : 1 }
+        '
 }
 
 ufw_rule_from_allowed() {
@@ -4177,7 +4203,18 @@ ufw_rule_from_allowed() {
     local ip="$2"
     command_exists ufw || return 1
     "${SUDO[@]}" ufw status 2>/dev/null \
-        | awk -v rule="$rule" -v ip="$ip" '$0 ~ /ALLOW/ && $1 == rule && $3 == ip {found=1} END{exit found ? 0 : 1}'
+        | awk -v rule="$rule" -v ip="$ip" '
+            $0 !~ /\(v6\)/ && $1 == rule {
+                for (i = 2; i <= NF; i++) {
+                    if ($i != "ALLOW") continue
+                    if ($(i + 1) == "OUT" || $(i + 1) == "FWD") continue
+                    source_field = i + 1
+                    if ($source_field == "IN") source_field++
+                    if ($source_field == ip) found = 1
+                }
+            }
+            END { exit found ? 0 : 1 }
+        '
 }
 
 whitelist_ssh_rules_configured() {
@@ -4549,23 +4586,23 @@ system_check_firewall() {
         if [[ -s "$routes_file" ]]; then
             while IFS=$'\t' read -r port _target _sni _source _maxconn _listen _send_proxy_v2; do
                 [[ "$port" =~ ^[0-9]+$ ]] || continue
-                ufw_rule_allowed "${port}/tcp" || missing+=("${port}/tcp")
+                ufw_rule_open_to_any "${port}/tcp" || missing+=("${port}/tcp")
             done < "$routes_file"
         else
-            ufw_rule_allowed "443/tcp" || missing+=("443/tcp")
+            ufw_rule_open_to_any "443/tcp" || missing+=("443/tcp")
         fi
     else
-        ufw_rule_allowed "443/tcp" || missing+=("443/tcp")
+        ufw_rule_open_to_any "443/tcp" || missing+=("443/tcp")
         if [[ "$MACHINE_MODE" == "node" && -n "$routes_file" && -s "$routes_file" ]]; then
             while IFS=$'\t' read -r port _target _sni _source _maxconn _listen _send_proxy_v2; do
                 [[ "$port" =~ ^[0-9]+$ ]] || continue
-                ufw_rule_allowed "${port}/tcp" || missing+=("${port}/tcp")
+                ufw_rule_open_to_any "${port}/tcp" || missing+=("${port}/tcp")
             done < "$routes_file"
         fi
     fi
     if [[ "$MACHINE_MODE" == "node" ]]; then
-        ufw_rule_allowed "443/udp" || missing+=("443/udp")
-        ufw_rule_allowed "${NODE_PORT}/tcp" || missing+=("${NODE_PORT}/tcp")
+        ufw_rule_open_to_any "443/udp" || missing+=("443/udp")
+        ufw_rule_open_to_any "${NODE_PORT}/tcp" || missing+=("${NODE_PORT}/tcp")
     else
         ufw_rule_allowed "443/udp" && extra+=("443/udp")
         if [[ -z "$routes_file" ]] || ! haproxy_route_file_has_port "$routes_file" "$NODE_PORT"; then
@@ -9538,7 +9575,7 @@ sync_haproxy_firewall() {
         [[ "$port" =~ ^[0-9]+$ ]] || continue
         [[ -z "${opened_ports[$port]+x}" ]] || continue
         opened_ports[$port]=1
-        if (( previous_known == 1 )) && haproxy_route_file_has_port "$previous_routes_file" "$port"; then
+        if ufw_rule_open_to_any "${port}/tcp"; then
             continue
         fi
         if ! cmd "${SUDO[@]}" ufw allow "${port}/tcp" comment 'kto-haproxy'; then

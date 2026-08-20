@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v328"
+PUSH_BUILD="v329"
 KTO_SSH_PORT_FILE="${KTO_SSH_PORT_FILE:-/etc/kto-ssh-port}"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
