@@ -516,7 +516,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         )
         self.assertIn("<b>IP:</b> <code>10.0.0.2</code>", editor_body)
         self.assertIn("<b>Порт:</b> <code>8443/tcp</code>", editor_body)
-        self.assertIn("<b>Backend maxconn:</b> <code>авто, до 25000</code>", editor_body)
+        self.assertIn("<b>Backend maxconn:</b> <code>авто от global и размера пула</code>", editor_body)
         self.assertIn("PROXY protocol v2", editor_body)
         self.assertIn("Выключен", editor_body)
         labels = {button["text"] for row in editor_markup["inline_keyboard"] for button in row}
@@ -647,7 +647,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertIsNone(self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443))
         changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.3", 8443)
         self.assertEqual(changed["source_ip"], "10.0.0.3")
-        self.assertEqual(changed["server_maxconn"], 25000)
+        self.assertEqual(changed["server_maxconn"], "auto")
         self.assertEqual(self.collector.get_haproxy_session(self.token)["selected_ip"], "10.0.0.3")
 
     def test_legacy_output_ip_callback_also_moves_both_sides(self):
@@ -664,11 +664,21 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertEqual(changed["source_ip"], "10.0.0.3")
         self.assertEqual(changed["targets"], ["2.2.2.2:443"])
 
-    def test_route_maxconn_is_fixed_during_normalization(self):
+    def test_route_maxconn_preserves_explicit_override_during_normalization(self):
         legacy = {**self.node["haproxy_routes"][1], "server_maxconn": 10000}
         changed = self.collector.normalize_haproxy_route(legacy)
-        self.assertEqual(changed["server_maxconn"], 25000)
+        self.assertEqual(changed["server_maxconn"], 10000)
         self.assertEqual(changed["sni"], ["extra.example.com"])
+        self.assertEqual(
+            self.collector.haproxy_server_maxconn_label(changed["server_maxconn"]),
+            "потолок 10000 на backend",
+        )
+        legacy["server_maxconn"] = 25000
+        self.assertEqual(self.collector.normalize_haproxy_route(legacy)["server_maxconn"], "auto")
+        self.assertEqual(
+            self.collector.haproxy_server_maxconn_label(legacy["server_maxconn"]),
+            "авто от global и размера пула",
+        )
 
     def test_full_binds_pin_to_route_source_or_primary_ip(self):
         wildcard_routes = [
@@ -693,7 +703,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertEqual(preview, [(8443, "10.0.0.2")])
         self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(pinned, "10.0.0.3", 443))
         self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(pinned, "10.0.0.2", 8443))
-        self.assertTrue(all(route["server_maxconn"] == 25000 for route in pinned))
+        self.assertTrue(all(route["server_maxconn"] == "auto" for route in pinned))
 
     def test_full_bind_confirm_callback_saves_exact_routes(self):
         wildcard = dict(
@@ -750,7 +760,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertEqual(base["targets"], ["1.1.1.1:443"])
         self.assertEqual(extra["targets"], ["3.3.3.3:443", "4.4.4.4:7443"])
         self.assertEqual(extra["sni"], ["*.new.example.com", "new.example.com"])
-        self.assertEqual(extra["server_maxconn"], 25000)
+        self.assertEqual(extra["server_maxconn"], "auto")
 
     def test_add_port_uses_selected_ip_for_input_and_output(self):
         self.collector.update_haproxy_session(self.token, selected_ip="10.0.0.3")

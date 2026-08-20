@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v327"', KTO)
-        self.assertIn('PUSH_BUILD="v327"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v327"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v327"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v327"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v327"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v327"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v327"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v328"', KTO)
+        self.assertIn('PUSH_BUILD="v328"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v328"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v328"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v328"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v328"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v328"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v328"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2674,11 +2674,13 @@ NODE_PROFILE=hysteria2
 
         self.assertIn('KTO_SSH_PORT_MIN="${KTO_SSH_PORT_MIN:-20000}"', KTO)
         self.assertIn('KTO_SSH_PORT_MAX="${KTO_SSH_PORT_MAX:-29999}"', KTO)
+        self.assertIn('KTO_ROOT_BASE_PUBLIC_KEY="ssh-rsa AAAAB3NzaC1yc2E', KTO)
         self.assertIn('marker="$(managed_ssh_port || true)"', choose_port)
         self.assertIn('RANDOM * 32768 + RANDOM', choose_port)
         self.assertIn('/root/.ssh/authorized_keys', merge_keys)
         self.assertIn('getent passwd', merge_keys)
         self.assertIn('/etc/ssh/authorized_keys.d/${user}', merge_keys)
+        self.assertIn('printf \'%s\\n\' "$KTO_ROOT_BASE_PUBLIC_KEY" > "$output_file"', merge_keys)
         self.assertIn('ssh-keygen -lf "$output_file"', merge_keys)
         self.assertNotIn('fail "SSH:', merge_keys)
         self.assertIn('public key не найден; текущие порт, UFW и параметры входа оставлены без изменений', migrate)
@@ -2699,6 +2701,9 @@ NODE_PROFILE=hysteria2
         )
         self.assertIn('restore_optional_ssh_file', rollback)
         self.assertIn('remove_ufw_allow_rules_for_port "$new_port"', rollback)
+        optimize = function_body(KTO, "optimize_system")
+        self.assertIn('ok "SSH-порт: ${ssh_port}/tcp"', optimize)
+        self.assertIn('ok "Подключение: ssh -p ${ssh_port} root@IP"', optimize)
 
     def test_root_ssh_without_public_key_is_a_safe_noop(self):
         bash = bash_executable()
@@ -3011,9 +3016,10 @@ TEST_CPU_COUNT=32
 KTO_HAPROXY_CONNECTIONS_PER_CPU=invalid
 [[ "$(recommended_haproxy_maxconn)" == 64000 ]]
 unset KTO_HAPROXY_CONNECTIONS_PER_CPU
+[[ "$(haproxy_pool_server_maxconn 64000 1 auto)" == 64000 ]]
+[[ "$(haproxy_pool_server_maxconn 64000 21 auto)" == 3048 ]]
 [[ "$(haproxy_pool_server_maxconn 64000 1 25000)" == 25000 ]]
-[[ "$(haproxy_pool_server_maxconn 64000 21 25000)" == 3048 ]]
-[[ "$(haproxy_pool_server_maxconn 4000 1 25000)" == 4000 ]]
+[[ "$(haproxy_pool_server_maxconn 4000 1 auto)" == 4000 ]]
 unset KTO_HAPROXY_NBTHREAD
 TEST_CPU_COUNT=16
 [[ "$(haproxy_thread_count)" == 16 ]]
@@ -3398,12 +3404,12 @@ grep -q '^frontend vless_in_8443$' "$config"
 [[ "$(grep -c '^    stick-table type ip size 100k expire 5m store gpc0,conn_rate(10s)$' "$config")" == 2 ]]
 [[ "$(grep -c '^    tcp-request connection silent-drop if { src_get_gpc0 gt 500 }$' "$config")" == 2 ]]
 [[ "$(grep -c '^    tcp-request connection silent-drop if { src_conn_rate gt 5000 }$' "$config")" == 2 ]]
-grep -q '^    server xray1 89.144.8.3:443 check weight 10 maxconn 25000$' "$config"
-grep -q '^    server xray_8443 5.34.179.144:443 check weight 10 source 185.141.227.93 maxconn 25000$' "$config"
+grep -q '^    server xray1 89.144.8.3:443 check weight 10 maxconn 100000$' "$config"
+grep -q '^    server xray_8443 5.34.179.144:443 check weight 10 source 185.141.227.93 maxconn 100000$' "$config"
 grep -q '^    acl allowed_sni req.ssl_sni -i base.example.com$' "$config"
 grep -q '^    acl allowed_sni req.ssl_sni -m end -i \.rog-self.co.uk$' "$config"
 actual=$(extract_haproxy_routes "$config")
-expected=$'443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\t25000\n8443\t5.34.179.144:443\textra.example.com *.other.example.com\t185.141.227.93\t25000\t185.141.227.93'
+expected=$'443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\tauto\n8443\t5.34.179.144:443\textra.example.com *.other.example.com\t185.141.227.93\tauto\t185.141.227.93'
 [[ "$actual" == "$expected" ]]
 '''
         result = subprocess.run(
@@ -3432,13 +3438,13 @@ parsed=$(mktemp)
 trap 'rm -f "$routes" "$config" "$parsed"' EXIT
 printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n8443\t5.34.179.144:443,5.34.179.145:443\textra.example.com\t185.141.227.93\t10000\t78.159.250.112\t1\n' > "$routes"
 render_haproxy_routes_config "$routes" "$config"
-grep -q '^    server xray1 89.144.8.3:443 check weight 10 maxconn 25000$' "$config"
-grep -q '^    server xray1 5.34.179.144:443 check weight 10 source 78.159.250.112 send-proxy-v2 maxconn 25000$' "$config"
-grep -q '^    server xray2 5.34.179.145:443 check weight 10 source 78.159.250.112 send-proxy-v2 maxconn 25000$' "$config"
+grep -q '^    server xray1 89.144.8.3:443 check weight 10 maxconn 100000$' "$config"
+grep -q '^    server xray1 5.34.179.144:443 check weight 10 source 78.159.250.112 send-proxy-v2 maxconn 10000$' "$config"
+grep -q '^    server xray2 5.34.179.145:443 check weight 10 source 78.159.250.112 send-proxy-v2 maxconn 10000$' "$config"
 extract_haproxy_routes "$config" > "$parsed"
 haproxy_routes_round_trip_equal "$routes" "$parsed"
-[[ "$(tail -n 1 "$parsed")" == $'8443\t5.34.179.144:443,5.34.179.145:443\textra.example.com\t78.159.250.112\t25000\t78.159.250.112\t1' ]]
-[[ "$(print_haproxy_route 9443 1.2.3.4:443 any default default '*' 1)" == $'9443\t1.2.3.4:443\tany\tdefault\t25000\t*\t1' ]]
+[[ "$(tail -n 1 "$parsed")" == $'8443\t5.34.179.144:443,5.34.179.145:443\textra.example.com\t78.159.250.112\t10000\t78.159.250.112\t1' ]]
+[[ "$(print_haproxy_route 9443 1.2.3.4:443 any default default '*' 1)" == $'9443\t1.2.3.4:443\tany\tdefault\tauto\t*\t1' ]]
 [[ "$(ask_haproxy_send_proxy_v2 0 <<< '')" == 0 ]]
 [[ "$(ask_haproxy_send_proxy_v2 0 <<< 'y')" == 1 ]]
 [[ "$(ask_haproxy_send_proxy_v2 1 <<< '')" == 1 ]]
@@ -3478,12 +3484,12 @@ grep -Fq 'tcp-request connection track-sc0 src' <<< "$any_block"
 grep -Fq '# kto-sni-mode allow-list' <<< "$strict_block"
 grep -Fq 'acl allowed_sni req.ssl_sni -i strict.example.com' <<< "$strict_block"
 actual=$(extract_haproxy_routes "$config")
-expected=$'443\t89.144.8.3:443\tany\tdefault\t25000\n8443\t5.34.179.144:443\tstrict.example.com\tdefault\t25000'
+expected=$'443\t89.144.8.3:443\tany\tdefault\tauto\n8443\t5.34.179.144:443\tstrict.example.com\tdefault\tauto'
 [[ "$actual" == "$expected" ]]
 [[ "$(normalize_haproxy_sni_list '')" == any ]]
 [[ "$(normalize_haproxy_sni_list '*')" == any ]]
 ! normalize_haproxy_sni_list 'any strict.example.com'
-[[ "$(print_haproxy_route 9443 1.2.3.4:443 '' default)" == $'9443\t1.2.3.4:443\tany\tdefault\t25000' ]]
+[[ "$(print_haproxy_route 9443 1.2.3.4:443 '' default)" == $'9443\t1.2.3.4:443\tany\tdefault\tauto' ]]
 [[ "$(ask_haproxy_sni_list SNI <<< '')" == any ]]
 [[ "$(ask_haproxy_sni_list SNI old.example.com <<< '')" == any ]]
 [[ "$(ask_haproxy_sni_list SNI old.example.com <<< '=')" == old.example.com ]]
@@ -3528,9 +3534,9 @@ grep -q '^frontend vless_in$' "$config"
 grep -q '^    bind 78.159.250.112:443 backlog 65535$' "$config"
 grep -q '^frontend vless_in_443_217_19_122_48$' "$config"
 grep -q '^    bind 217.19.122.48:443 backlog 65535$' "$config"
-grep -q '^    server xray1 5.34.179.144:443 check weight 10 source 217.19.122.48 maxconn 25000$' "$config"
+grep -q '^    server xray1 5.34.179.144:443 check weight 10 source 217.19.122.48 maxconn 42000$' "$config"
 actual=$(extract_haproxy_routes "$config")
-expected=$'443\t89.144.8.3:443\ta.example.com\t78.159.250.112\t25000\t78.159.250.112\n443\t5.34.179.144:443\tb.example.com\t217.19.122.48\t25000\t217.19.122.48'
+expected=$'443\t89.144.8.3:443\ta.example.com\t78.159.250.112\tauto\t78.159.250.112\n443\t5.34.179.144:443\tb.example.com\t217.19.122.48\tauto\t217.19.122.48'
 [[ "$actual" == "$expected" ]]
 haproxy_route_file_has_endpoint "$routes" 443 78.159.250.112
 haproxy_route_file_has_endpoint "$routes" 443 217.19.122.48
@@ -3570,11 +3576,11 @@ apply_haproxy_routes_config() { return 0; }
 sync_haproxy_firewall() { return 0; }
 haproxy_bandwidth_current_rate() { return 0; }
 edit_haproxy_route "$routes"
-grep -Fqx $'443\t89.144.8.3:443\ta.example.com\t78.159.250.112\t25000\t78.159.250.112' "$routes"
-grep -Fqx $'443\t5.34.179.145:443\tchanged.example.com\t217.19.122.48\t25000\t217.19.122.48' "$routes"
+grep -Fqx $'443\t89.144.8.3:443\ta.example.com\t78.159.250.112\tauto\t78.159.250.112' "$routes"
+grep -Fqx $'443\t5.34.179.145:443\tchanged.example.com\t217.19.122.48\tauto\t217.19.122.48' "$routes"
 delete_haproxy_route "$routes" <<< 'y'
 [[ "$(wc -l < "$routes")" == 1 ]]
-grep -Fqx $'443\t89.144.8.3:443\ta.example.com\t78.159.250.112\t25000\t78.159.250.112' "$routes"
+grep -Fqx $'443\t89.144.8.3:443\ta.example.com\t78.159.250.112\tauto\t78.159.250.112' "$routes"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -3758,13 +3764,13 @@ pool='31.59.140.66:7443,31.77.154.79:7443'
 printf '443\t144.31.128.40:443\t*.rog-self.co.uk\tdefault\n9449\t%s\tdex-yandex.sbs *.dex-yandex.sbs\t78.159.240.211\t10000\n' "$pool" > "$routes"
 before_443=$(grep $'^443\t' "$routes")
 retarget_haproxy_wildcard_route "$routes" 9449 78.159.240.211
-grep -Fqx $'443\t144.31.128.40:443\t*.rog-self.co.uk\tdefault\t25000' "$routes"
-grep -Fqx $'9449\t31.59.140.66:7443,31.77.154.79:7443\tdex-yandex.sbs *.dex-yandex.sbs\t78.159.240.211\t25000\t78.159.240.211' "$routes"
+grep -Fqx $'443\t144.31.128.40:443\t*.rog-self.co.uk\tdefault\tauto' "$routes"
+grep -Fqx $'9449\t31.59.140.66:7443,31.77.154.79:7443\tdex-yandex.sbs *.dex-yandex.sbs\t78.159.240.211\t10000\t78.159.240.211' "$routes"
 ! haproxy_route_file_has_endpoint "$routes" 9449 '*'
 haproxy_route_file_has_endpoint "$routes" 9449 78.159.240.211
 render_haproxy_routes_config "$routes" "$config"
 grep -Fqx '    bind 78.159.240.211:9449 backlog 65535' "$config"
-grep -Fqx '    server xray1 31.59.140.66:7443 check weight 10 source 78.159.240.211 maxconn 25000' "$config"
+grep -Fqx '    server xray1 31.59.140.66:7443 check weight 10 source 78.159.240.211 maxconn 10000' "$config"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -3875,8 +3881,8 @@ cmp -s "$routes" "$snapshot"
 [[ ! -e "$applied" ]]
 prepare_haproxy_multi_ip_config "$routes" <<< 'y'
 [[ "$(wc -l < "$routes")" == 2 ]]
-grep -Fqx $'443\t89.144.8.3:443\tbase.example.com\t78.159.250.112\t25000\t78.159.250.112' "$routes"
-grep -Fqx $'443\t89.144.8.3:443\tbase.example.com\t217.19.122.48\t25000\t217.19.122.48' "$routes"
+grep -Fqx $'443\t89.144.8.3:443\tbase.example.com\t78.159.250.112\t10000\t78.159.250.112' "$routes"
+grep -Fqx $'443\t89.144.8.3:443\tbase.example.com\t217.19.122.48\t10000\t217.19.122.48' "$routes"
 cmp -s "$routes" "$applied"
 [[ "$HAPROXY_PREPARE_WILDCARDS" == 1 ]]
 [[ "$HAPROXY_PREPARE_ROUTES_BEFORE" == 1 ]]
@@ -3929,9 +3935,9 @@ sync_haproxy_firewall() { return 0; }
 check_haproxy_bindings() { return 0; }
 
 build_haproxy_source_pinned_routes "$routes" "$candidate"
-grep -Fqx $'443\t144.31.128.40:443\tbase.example.com\t78.159.250.112\t25000\t78.159.250.112' "$candidate"
-grep -Fqx $'8443\t5.34.179.144:443\t*.bridge.example.com bridge.example.com\t217.19.122.48\t25000\t217.19.122.48' "$candidate"
-grep -Fqx $'8444\t5.34.179.145:443\texact.example.com\t185.141.227.93\t25000\t185.141.227.93' "$candidate"
+grep -Fqx $'443\t144.31.128.40:443\tbase.example.com\t78.159.250.112\tauto\t78.159.250.112' "$candidate"
+grep -Fqx $'8443\t5.34.179.144:443\t*.bridge.example.com bridge.example.com\t217.19.122.48\t10000\t217.19.122.48' "$candidate"
+grep -Fqx $'8444\t5.34.179.145:443\texact.example.com\t185.141.227.93\tauto\t185.141.227.93' "$candidate"
 [[ "$HAPROXY_PIN_WILDCARDS" == 2 ]]
 grep -Fq '*:443 -> 78.159.250.112:443' <<< "$HAPROXY_PIN_PREVIEW"
 grep -Fq '*:8443 -> 217.19.122.48:8443' <<< "$HAPROXY_PIN_PREVIEW"
@@ -3941,8 +3947,8 @@ cmp -s "$routes" "$snapshot"
 [[ ! -e "$applied" ]]
 pin_haproxy_wildcards_to_source_ips "$routes" <<< 'y'
 cmp -s "$routes" "$applied"
-grep -Fqx $'443\t144.31.128.40:443\tbase.example.com\t78.159.250.112\t25000\t78.159.250.112' "$routes"
-grep -Fqx $'8443\t5.34.179.144:443\t*.bridge.example.com bridge.example.com\t217.19.122.48\t25000\t217.19.122.48' "$routes"
+grep -Fqx $'443\t144.31.128.40:443\tbase.example.com\t78.159.250.112\tauto\t78.159.250.112' "$routes"
+grep -Fqx $'8443\t5.34.179.144:443\t*.bridge.example.com bridge.example.com\t217.19.122.48\t10000\t217.19.122.48' "$routes"
 
 printf '443\t144.31.128.40:443\tbase.example.com\tdefault\n443\t5.34.179.144:443\texact.example.com\tdefault\tdefault\t78.159.250.112\n' > "$collision"
 ! build_haproxy_source_pinned_routes "$collision" "$collision_out"
@@ -4075,8 +4081,8 @@ config=$(mktemp)
 trap 'rm -f "$routes" "$config"' EXIT
 printf '443\t89.144.8.3:443\tbase.example.com\n' > "$routes"
 render_haproxy_routes_config "$routes" "$config"
-grep -q '^    server xray1 89.144.8.3:443 check weight 10 maxconn 25000$' "$config"
-[[ "$(extract_haproxy_routes "$config")" == $'443\t89.144.8.3:443\tbase.example.com\tdefault\t25000' ]]
+grep -q '^    server xray1 89.144.8.3:443 check weight 10 maxconn 100000$' "$config"
+[[ "$(extract_haproxy_routes "$config")" == $'443\t89.144.8.3:443\tbase.example.com\tdefault\tauto' ]]
 
 ip() {
     local args
@@ -4146,7 +4152,7 @@ render_haproxy_routes_config "$routes" "$config"
 grep -q '^    server xray1 31.59.140.66:7443 check weight 10 source 217.19.122.109 maxconn 2000$' "$config"
 grep -q '^    server xray21 117.55.203.106:7443 check weight 10 source 217.19.122.109 maxconn 2000$' "$config"
 extract_haproxy_routes "$config" > "$routes2"
-expected=$'443\t89.144.8.3:443\tbase.example.com\tdefault\t25000\n8450\t'"$pool"$'\tdev-yandex.sbs\t217.19.122.109\t25000\t217.19.122.109'
+expected=$'443\t89.144.8.3:443\tbase.example.com\tdefault\tauto\n8450\t'"$pool"$'\tdev-yandex.sbs\t217.19.122.109\t10000\t217.19.122.109'
 [[ "$(cat "$routes2")" == "$expected" ]]
 render_haproxy_routes_config "$routes2" "$config2"
 cmp -s "$config" "$config2"
@@ -4192,8 +4198,8 @@ haproxy_source_label() { printf '%s\n' "$1"; }
 pool='31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443,31.76.113.189:7443,31.76.113.190:7443,144.31.94.40:7443,144.31.94.156:7443,144.31.94.135:7443,144.31.94.233:7443,144.31.94.107:7443,144.31.94.36:7443,144.31.94.153:7443,144.31.2.44:7443,144.31.130.226:7443,144.31.131.232:7443,144.31.129.206:7443,144.31.129.69:7443,144.31.131.228:7443,144.31.131.93:7443,13.143.134.143:7443,117.55.203.106:7443'
 set_haproxy_sequential_routes "$routes" 8450 217.19.122.109 dev-yandex.sbs 10000 "$pool"
 [[ "$(awk -F '\t' '$1 >= 8450 && $1 <= 8470 { count++ } END { print count + 0 }' "$routes")" == 21 ]]
-grep -qx $'8450\t31.59.140.66:7443\tdev-yandex.sbs\t217.19.122.109\t25000\t217.19.122.109' "$routes"
-grep -qx $'8470\t117.55.203.106:7443\tdev-yandex.sbs\t217.19.122.109\t25000\t217.19.122.109' "$routes"
+grep -qx $'8450\t31.59.140.66:7443\tdev-yandex.sbs\t217.19.122.109\t10000\t217.19.122.109' "$routes"
+grep -qx $'8470\t117.55.203.106:7443\tdev-yandex.sbs\t217.19.122.109\t10000\t217.19.122.109' "$routes"
 cp "$routes" "$snapshot"
 set_haproxy_sequential_routes "$routes" 8450 217.19.122.109 dev-yandex.sbs 10000 "$pool"
 cmp -s "$routes" "$snapshot"
@@ -4227,7 +4233,7 @@ apply_haproxy_routes_config() { return 0; }
 sync_haproxy_firewall() { return 0; }
 pool='31.59.140.66:7443,31.77.154.79:7443'
 set_haproxy_pool_route "$routes" 8450 81.94.148.126 '*.dev-yandex.sbs' 10000 "$pool" 81.94.148.126
-grep -Fqx $'8450\t31.59.140.66:7443,31.77.154.79:7443\t*.dev-yandex.sbs\t81.94.148.126\t25000\t81.94.148.126' "$routes"
+grep -Fqx $'8450\t31.59.140.66:7443,31.77.154.79:7443\t*.dev-yandex.sbs\t81.94.148.126\t10000\t81.94.148.126' "$routes"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -4261,7 +4267,7 @@ haproxy_source_label() { printf '%s\n' "$1"; }
 SYNC_CALLS=0
 pool='31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443'
 collapse_haproxy_routes_to_pool "$routes" 8450 8470 217.19.122.109 'dev-yandex.sbs *.dev-yandex.sbs' 10000 "$pool"
-grep -Fqx $'8450\t31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443\tdev-yandex.sbs *.dev-yandex.sbs\t217.19.122.109\t25000\t217.19.122.109' "$routes"
+grep -Fqx $'8450\t31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443\tdev-yandex.sbs *.dev-yandex.sbs\t217.19.122.109\t10000\t217.19.122.109' "$routes"
 ! awk -F '\t' '$1 >= 8451 && $1 <= 8470 { found = 1 } END { exit found ? 0 : 1 }' "$routes"
 grep -q $'^9000\t' "$routes"
 [[ "$SYNC_CALLS" == 2 ]]
@@ -4296,7 +4302,7 @@ ask_haproxy_send_proxy_v2() { printf '0\n'; }
 apply_haproxy_routes_config() { return 0; }
 sync_haproxy_firewall() { return 0; }
 add_haproxy_source_route "$routes"
-grep -qx $'8443\t5.34.179.144:443\textra.example.com\t185.141.227.93\t25000\t185.141.227.93' "$routes"
+grep -qx $'8443\t5.34.179.144:443\textra.example.com\t185.141.227.93\tauto\t185.141.227.93' "$routes"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

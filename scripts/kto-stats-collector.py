@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v327"
+COLLECTOR_BUILD = "v328"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -368,7 +368,8 @@ HAPROXY_MAX_ROUTES = 128
 HAPROXY_MAX_TARGETS = 64
 HAPROXY_MAX_SNI = 64
 HAPROXY_SNI_ANY = "any"
-HAPROXY_BACKEND_MAXCONN = 25_000
+HAPROXY_BACKEND_MAXCONN = "auto"
+HAPROXY_LEGACY_BACKEND_MAXCONN = 25_000
 HAPROXY_MAX_BANDWIDTH_LIMITS = 64
 HAPROXY_MAX_BANDWIDTH_MBIT = 100000
 HAPROXY_MACHINE_PAGE_SIZE = 20
@@ -766,7 +767,16 @@ def normalize_haproxy_server_maxconn(value):
     number = int(value)
     if number < 1 or number > 10_000_000:
         raise ValueError("bad haproxy maxconn")
-    return HAPROXY_BACKEND_MAXCONN
+    if number == HAPROXY_LEGACY_BACKEND_MAXCONN:
+        return HAPROXY_BACKEND_MAXCONN
+    return number
+
+
+def haproxy_server_maxconn_label(value):
+    normalized = normalize_haproxy_server_maxconn(value)
+    if normalized == HAPROXY_BACKEND_MAXCONN:
+        return "авто от global и размера пула"
+    return f"потолок {normalized} на backend"
 
 
 def normalize_haproxy_send_proxy_v2(value):
@@ -6127,7 +6137,7 @@ def haproxy_route_editor_payload(node, token, selected_ip, port):
         detail_line("Машина", node_display_name(node)),
         detail_line("IP", listen_label),
         detail_line("Порт", f"{int(route['port'])}/tcp"),
-        detail_line("Backend maxconn", f"авто, до {HAPROXY_BACKEND_MAXCONN}"),
+        detail_line("Backend maxconn", haproxy_server_maxconn_label(route.get("server_maxconn"))),
         detail_line("PROXY protocol v2", "Включён" if proxy_v2_enabled else "Выключен"),
         detail_line("Статус", haproxy_apply_status_text(node, desired, reported)),
         "",
@@ -7097,7 +7107,7 @@ def handle_haproxy_callback(callback):
                 "Ответь числом от <code>1</code> до <code>65535</code>.\nОтмена: <code>/cancel</code>",
             )
             return True
-        answer_callback(callback_id, f"maxconn: авто, до {HAPROXY_BACKEND_MAXCONN}")
+        answer_callback(callback_id, "maxconn: auto от global и размера пула")
         show_haproxy_route_editor(token, port)
         return True
     if action == "l":

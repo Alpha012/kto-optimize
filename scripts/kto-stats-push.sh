@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v327"
+PUSH_BUILD="v328"
 KTO_SSH_PORT_FILE="${KTO_SSH_PORT_FILE:-/etc/kto-ssh-port}"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -1000,7 +1000,7 @@ apply_collector_haproxy_routes() {
             targets: .targets,
             sni: ((.sni // []) | sort),
             source_ip: (.source_ip // "default"),
-            server_maxconn: (.server_maxconn // "default"),
+            server_maxconn: (.server_maxconn // "auto"),
             listen_ip: (.listen_ip // "*"),
             send_proxy_v2: (.send_proxy_v2 == true)
           })

