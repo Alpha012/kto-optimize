@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
@@ -1070,6 +1071,89 @@ class CollectorRegressionTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+    def test_dashboard_api_is_read_only_authenticated_and_bl_only(self):
+        collector.update_node(
+            self.payload("Обычная машина", str(uuid.uuid4()), "bl"),
+            "203.0.113.61",
+        )
+        collector.update_node(
+            self.payload("Обход №1", str(uuid.uuid4()), "wl"),
+            "203.0.113.62",
+        )
+        server = collector.CollectorHTTPServer(("127.0.0.1", 0), collector.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            with urllib.request.urlopen(f"{base_url}/panel/", timeout=5) as response:
+                page = response.read().decode("utf-8")
+                self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
+            self.assertIn("kto Monitor", page)
+
+            with self.assertRaises(urllib.error.HTTPError) as unauthorized:
+                urllib.request.urlopen(f"{base_url}/api/dashboard/nodes", timeout=5)
+            self.assertEqual(401, unauthorized.exception.code)
+
+            wrong_secret_request = urllib.request.Request(
+                f"{base_url}/api/dashboard/nodes",
+                headers={"Authorization": f"Bearer {collector.SECRET}"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as wrong_secret:
+                urllib.request.urlopen(wrong_secret_request, timeout=5)
+            self.assertEqual(401, wrong_secret.exception.code)
+
+            request = urllib.request.Request(
+                f"{base_url}/api/dashboard/nodes",
+                headers={"Authorization": f"Bearer {collector.DASHBOARD_TOKEN}"},
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read())
+            self.assertEqual(["Обычная машина"], [node["name"] for node in payload["nodes"]])
+            self.assertEqual(1, payload["overview"]["total"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_dashboard_history_uses_existing_network_and_cpu_samples(self):
+        node_uuid = str(uuid.uuid4())
+        base_time = 1_800_300_000
+        original_now = collector.now_ts
+
+        def payload(counter_rx, counter_tx, sample_ms, cpu):
+            value = self.payload("BL график", node_uuid, "bl")
+            value.update({
+                "cpu_percent": cpu,
+                "metrics_ok": True,
+                "ip_stats": [{
+                    "iface": "ens3",
+                    "ip": "203.0.113.70",
+                    "counter_rx_bytes": counter_rx,
+                    "counter_tx_bytes": counter_tx,
+                    "counter_sample_ms": sample_ms,
+                }],
+            })
+            return value
+
+        try:
+            collector.now_ts = lambda: base_time
+            collector.update_node(payload(1_000_000, 2_000_000, 10_000, 20), "203.0.113.70")
+            collector.now_ts = lambda: base_time + 5
+            node = collector.update_node(payload(11_000_000, 7_000_000, 15_000, 40), "203.0.113.70")
+            key = collector.node_record_key(node)
+            history = collector.dashboard_history_payload(key, 3600, current=base_time + 5)
+            detail = collector.dashboard_node_detail(key, node, current=base_time + 5)
+
+            self.assertEqual(1, len(history["points"]))
+            self.assertEqual(16_000_000, history["points"][0]["rx_bps"])
+            self.assertEqual(8_000_000, history["points"][0]["tx_bps"])
+            self.assertEqual(30.0, history["points"][0]["cpu_percent"])
+            self.assertTrue(detail["rate_valid"])
+            self.assertEqual(16_000_000, detail["rate_rx_bps"])
+            self.assertEqual(8_000_000, detail["rate_tx_bps"])
+        finally:
+            collector.now_ts = original_now
 
     def test_remna_top_alert_skips_unlimited_and_limits_above_threshold(self):
         now = int(time.time())

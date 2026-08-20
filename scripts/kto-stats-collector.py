@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v332"
+COLLECTOR_BUILD = "v333"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -91,6 +91,16 @@ ALLOW_INSECURE_UPDATE_URL = str(cfg.get("KTO_ALLOW_INSECURE_UPDATE_URL", "0")).l
 LISTEN_HOST = cfg.get("KTO_COLLECTOR_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(cfg.get("KTO_COLLECTOR_LISTEN_PORT", "1337"))
 SECRET = cfg.get("KTO_COLLECTOR_SECRET", "")
+DASHBOARD_ENABLED = str(cfg.get("KTO_COLLECTOR_DASHBOARD_ENABLED", "1")).strip().lower() in (
+    "1", "true", "yes", "on", "enabled",
+)
+DASHBOARD_TOKEN = str(cfg.get("KTO_COLLECTOR_DASHBOARD_TOKEN", "") or "").strip()
+if not DASHBOARD_TOKEN and SECRET:
+    DASHBOARD_TOKEN = hmac.new(
+        SECRET.encode("utf-8"),
+        b"kto-stats-dashboard-v1",
+        hashlib.sha256,
+    ).hexdigest()[:40]
 BOT_TOKEN = cfg.get("KTO_COLLECTOR_BOT_TOKEN", "")
 CHAT_ID = cfg.get("KTO_COLLECTOR_CHAT_ID", "")
 ALLOWED_USER_ID = str(cfg.get("KTO_COLLECTOR_ALLOWED_USER_ID", "646296998"))
@@ -9169,6 +9179,1246 @@ def authenticate_push(headers, body, current=None):
     return None
 
 
+def dashboard_authorized(headers):
+    if not DASHBOARD_ENABLED or not DASHBOARD_TOKEN:
+        return False
+    value = str(headers.get("Authorization", "") or "").strip()
+    return hmac.compare_digest(value, f"Bearer {DASHBOARD_TOKEN}")
+
+
+def dashboard_rate_snapshot(node):
+    entries = node_ip_stats(node)
+    valid = [entry for entry in entries if normalize_traffic_counter(entry.get("rate_sample_ms")) > 0]
+    return {
+        "rx_bps": sum(normalize_network_rate(entry.get("rate_rx_bps")) for entry in valid),
+        "tx_bps": sum(normalize_network_rate(entry.get("rate_tx_bps")) for entry in valid),
+        "valid": bool(valid),
+    }
+
+
+def dashboard_node_health(node, current=None):
+    current = int(current or now_ts())
+    last_seen = int((node or {}).get("last_seen") or 0)
+    age = max(0, current - last_seen) if last_seen > 0 else current
+    stale_sec = node_stale_sec(node)
+    if last_seen <= 0 or age > stale_sec:
+        return "offline", age, stale_sec
+
+    remna = node.get("remna") if isinstance(node.get("remna"), dict) else {}
+    remna_status = clean_display_text(remna.get("status") or "").strip().lower()
+    remna_errors = int(remna.get("error_count") or 0)
+    warning = bool(
+        clean_display_text(node.get("error") or "").strip()
+        or not bool(node.get("metrics_ok"))
+        or remna_errors > 0
+        or (remna_status and remna_status != "running")
+    )
+    return ("warning" if warning else "online"), age, stale_sec
+
+
+def dashboard_node_summary(record_key, node, current=None):
+    current = int(current or now_ts())
+    status, age, stale_sec = dashboard_node_health(node, current)
+    rates = dashboard_rate_snapshot(node)
+    entries = node_ip_stats(node)
+    primary_ip = normalize_ipv4_text(node.get("ip"))
+    if not primary_ip:
+        primary_ip = next((entry.get("ip") for entry in entries if entry.get("ip")), "")
+    remna = node.get("remna") if isinstance(node.get("remna"), dict) else {}
+    return {
+        "key": str(record_key),
+        "name": node_display_name(node, str(record_key)),
+        "hostname": clean_display_text(node.get("hostname") or ""),
+        "ip": primary_ip,
+        "status": status,
+        "online": status != "offline",
+        "last_seen": int(node.get("last_seen") or 0),
+        "age_sec": age,
+        "stale_after_sec": stale_sec,
+        "cpu_percent": normalize_cpu_percent(node.get("cpu_percent")),
+        "ram_percent": max(0, min(100, int(node.get("ram_percent") or 0))),
+        "day_total": normalize_traffic_counter(node.get("day_total")),
+        "rate_rx_bps": rates["rx_bps"],
+        "rate_tx_bps": rates["tx_bps"],
+        "rate_valid": bool(rates["valid"] and status != "offline"),
+        "ip_count": len([entry for entry in entries if entry.get("ip")]),
+        "push_build": clean_display_text(node.get("push_build") or ""),
+        "remna_status": clean_display_text(remna.get("status") or ""),
+        "stats_muted": bool(node_stats_disabled(node)),
+        "has_error": bool(clean_display_text(node.get("error") or "").strip()),
+    }
+
+
+def dashboard_node_detail(record_key, node, current=None):
+    current = int(current or now_ts())
+    result = dashboard_node_summary(record_key, node, current)
+    interfaces = []
+    for entry in node_ip_stats_by_traffic(node):
+        interfaces.append({
+            "iface": clean_display_text(entry.get("iface") or ""),
+            "ip": normalize_ipv4_text(entry.get("ip")),
+            "rate_source": normalize_network_rate_source(entry.get("rate_source")),
+            "rate_rx_bps": normalize_network_rate(entry.get("rate_rx_bps")),
+            "rate_tx_bps": normalize_network_rate(entry.get("rate_tx_bps")),
+            "rate_valid": normalize_traffic_counter(entry.get("rate_sample_ms")) > 0,
+            "day_rx": normalize_traffic_counter(entry.get("day_rx")),
+            "day_tx": normalize_traffic_counter(entry.get("day_tx")),
+            "day_total": normalize_traffic_counter(entry.get("day_total")),
+            "yesterday_total": normalize_traffic_counter(entry.get("yesterday_total")),
+            "month_total": normalize_traffic_counter(entry.get("month_total")),
+            "error": clean_display_text(entry.get("error") or ""),
+        })
+    remna = normalize_remna_info(node.get("remna"))
+    result.update({
+        "server_time": current,
+        "uptime_sec": max(0, int(node.get("uptime_sec") or 0)),
+        "iface": clean_display_text(node.get("iface") or ""),
+        "metrics_ok": bool(node.get("metrics_ok")),
+        "ram_used": normalize_traffic_counter(node.get("ram_used")),
+        "ram_total": normalize_traffic_counter(node.get("ram_total")),
+        "cpu_avg_1h": normalize_cpu_percent(node.get("cpu_avg_1h")),
+        "traffic": {
+            "day_rx": normalize_traffic_counter(node.get("day_rx")),
+            "day_tx": normalize_traffic_counter(node.get("day_tx")),
+            "day_total": normalize_traffic_counter(node.get("day_total")),
+            "yesterday_total": normalize_traffic_counter(node.get("yesterday_total")),
+            "month_total": normalize_traffic_counter(node.get("month_total")),
+        },
+        "interfaces": interfaces,
+        "remnawave": remna,
+        "haproxy": {
+            "supported": bool(node.get("haproxy_routes_supported")),
+            "managed": bool(node.get("haproxy_routes_managed")),
+            "routes": len(normalize_haproxy_routes(node.get("haproxy_routes"))),
+            "bandwidth_limits": len(normalize_haproxy_bandwidth_limits(node.get("haproxy_bandwidth_limits"))),
+        },
+        "wrong_sni": {
+            "total": max(0, int(node.get("scan_wrong_sni_total") or 0)),
+            "sources": max(0, int(node.get("scan_wrong_sni_sources") or 0)),
+        },
+        "error": clean_display_text(node.get("error") or ""),
+    })
+    return result
+
+
+def dashboard_nodes_payload(current=None):
+    current = int(current or now_ts())
+    with LOCK:
+        nodes = [
+            dashboard_node_summary(record_key, dict(node), current)
+            for record_key, node in NODES.items()
+            if isinstance(node, dict) and not node_is_wl(node)
+        ]
+    status_order = {"online": 0, "warning": 1, "offline": 2}
+    nodes.sort(key=lambda item: (status_order.get(item["status"], 9), natural_sort_key(item["name"])))
+    return {
+        "ok": True,
+        "build": COLLECTOR_BUILD,
+        "server_time": current,
+        "poll_interval_ms": 2000,
+        "overview": {
+            "total": len(nodes),
+            "online": sum(1 for item in nodes if item["status"] == "online"),
+            "warning": sum(1 for item in nodes if item["status"] == "warning"),
+            "offline": sum(1 for item in nodes if item["status"] == "offline"),
+            "day_total": sum(item["day_total"] for item in nodes),
+            "rate_rx_bps": sum(item["rate_rx_bps"] for item in nodes if item["rate_valid"]),
+            "rate_tx_bps": sum(item["rate_tx_bps"] for item in nodes if item["rate_valid"]),
+        },
+        "nodes": nodes,
+    }
+
+
+def dashboard_find_bl_node(record_key):
+    with LOCK:
+        node = NODES.get(str(record_key))
+        if not isinstance(node, dict) or node_is_wl(node):
+            return None
+        return dict(node)
+
+
+def dashboard_history_payload(record_key, seconds=3600, current=None):
+    current = int(current or now_ts())
+    seconds = max(900, min(int(seconds or 3600), NETWORK_RATE_RETENTION_SEC))
+    cutoff = current - seconds
+    node = dashboard_find_bl_node(record_key)
+    if node is None:
+        return None
+    with LOCK:
+        db = network_rate_db()
+        network_rows = db.execute(
+            "SELECT minute, "
+            "sum(CASE WHEN sample_ms > 0 THEN rx_bps_ms / sample_ms ELSE 0 END) AS rx_bps, "
+            "sum(CASE WHEN sample_ms > 0 THEN tx_bps_ms / sample_ms ELSE 0 END) AS tx_bps "
+            "FROM network_rate_minute WHERE node_key = ? AND minute >= ? GROUP BY minute ORDER BY minute",
+            (str(record_key), cutoff),
+        ).fetchall()
+        cpu_rows = db.execute(
+            "SELECT minute, sample_sum / sample_count AS cpu_percent "
+            "FROM cpu_minute WHERE node_key = ? AND minute >= ? AND sample_count > 0 ORDER BY minute",
+            (str(record_key), cutoff),
+        ).fetchall()
+    points = {}
+    for row in network_rows:
+        ts = int(row["minute"] or 0)
+        points.setdefault(ts, {"ts": ts, "rx_bps": None, "tx_bps": None, "cpu_percent": None})
+        points[ts]["rx_bps"] = normalize_network_rate(row["rx_bps"])
+        points[ts]["tx_bps"] = normalize_network_rate(row["tx_bps"])
+    for row in cpu_rows:
+        ts = int(row["minute"] or 0)
+        points.setdefault(ts, {"ts": ts, "rx_bps": None, "tx_bps": None, "cpu_percent": None})
+        points[ts]["cpu_percent"] = normalize_cpu_percent(row["cpu_percent"])
+    return {
+        "ok": True,
+        "key": str(record_key),
+        "server_time": current,
+        "range_sec": seconds,
+        "points": [points[key] for key in sorted(points)],
+    }
+
+
+DASHBOARD_HTML = rf"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#120c19">
+  <title>kto Monitor</title>
+  <link rel="stylesheet" href="/panel/app.css?v={COLLECTOR_BUILD}">
+</head>
+<body>
+  <section class="login-view" id="loginView">
+    <form class="login-panel" id="loginForm" autocomplete="off">
+      <div class="brand brand-login"><span class="brand-mark">K</span><span><strong>kto Monitor</strong><small>BL machines</small></span></div>
+      <div class="login-heading">
+        <h1>Вход в панель</h1>
+        <p>Мониторинг коллектора</p>
+      </div>
+      <label class="field-label" for="tokenInput">Токен доступа</label>
+      <input class="token-input" id="tokenInput" name="token" type="password" required spellcheck="false" autocomplete="current-password">
+      <p class="form-error" id="loginError" role="alert"></p>
+      <button class="primary-button" type="submit">Войти</button>
+    </form>
+  </section>
+
+  <div class="app" id="app" hidden>
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">K</span><span><strong>kto Monitor</strong><small id="buildLabel">collector</small></span></div>
+      <div class="overview" aria-label="Сводка">
+        <span><i class="status-dot online"></i><b id="onlineCount">0</b> живы</span>
+        <span><i class="status-dot warning"></i><b id="warningCount">0</b> внимание</span>
+        <span><i class="status-dot offline"></i><b id="offlineCount">0</b> offline</span>
+      </div>
+      <div class="topbar-actions">
+        <span class="live-state" id="liveState"><i></i><span>Live</span></span>
+        <button class="icon-button" id="refreshButton" type="button" title="Обновить" aria-label="Обновить">↻</button>
+        <button class="logout-button" id="logoutButton" type="button" title="Выйти" aria-label="Выйти">Выйти</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div><span class="eyebrow">Машины</span><strong id="machineCount">0</strong></div>
+          <label class="search-field"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="Поиск" autocomplete="off"></label>
+        </div>
+        <nav class="machine-list" id="machineList" aria-label="Список машин"></nav>
+        <div class="sidebar-total">
+          <span>Трафик сегодня</span>
+          <strong id="fleetTraffic">0 B</strong>
+          <small id="fleetRate">0 bit/s</small>
+        </div>
+      </aside>
+
+      <main class="content" id="content">
+        <section class="empty-state" id="emptyState">
+          <div class="empty-mark">K</div>
+          <h2>Нет данных от BL-машин</h2>
+          <p>Ожидается первый push</p>
+        </section>
+
+        <div class="machine-view" id="machineView" hidden>
+          <section class="machine-header">
+            <div class="machine-title">
+              <span class="eyebrow">Машина</span>
+              <div class="title-line"><h1 id="machineName">—</h1><span class="status-badge" id="machineStatus">—</span></div>
+              <div class="machine-address"><span id="machineIp">—</span><span id="machineHostname">—</span></div>
+            </div>
+            <div class="last-update"><span>Последний push</span><strong id="lastSeen">—</strong><small id="lastSeenExact">—</small></div>
+          </section>
+
+          <section class="metric-strip" aria-label="Краткая информация">
+            <div class="metric-cell"><span>Аптайм</span><strong id="uptimeValue">—</strong></div>
+            <div class="metric-cell"><span>Оперативная память</span><strong id="ramValue">—</strong><small id="ramDetail">—</small></div>
+            <div class="metric-cell"><span>Трафик сегодня</span><strong id="todayTraffic">—</strong><small id="todayDirection">—</small></div>
+            <div class="metric-cell"><span>Remnawave</span><strong id="remnaValue">—</strong><small id="remnaDetail">—</small></div>
+          </section>
+
+          <section class="chart-grid">
+            <article class="chart-panel network-panel">
+              <header class="panel-head">
+                <div><span class="eyebrow">Сеть</span><h2>Пропускная способность</h2></div>
+                <div class="network-now"><span class="rx"><i></i>RX <b id="rxNow">—</b></span><span class="tx"><i></i>TX <b id="txNow">—</b></span></div>
+                <div class="segmented" id="rangeControl" aria-label="Период графиков">
+                  <button type="button" data-range="900">15м</button>
+                  <button type="button" class="active" data-range="3600">1ч</button>
+                </div>
+              </header>
+              <div class="chart-wrap"><canvas id="networkChart" role="img" aria-label="График сетевой скорости"></canvas><div class="chart-empty" id="networkEmpty">Нет данных</div></div>
+            </article>
+
+            <article class="chart-panel cpu-panel">
+              <header class="panel-head">
+                <div><span class="eyebrow">CPU</span><h2>Нагрузка</h2></div>
+                <strong class="cpu-now" id="cpuNow">—</strong>
+              </header>
+              <div class="chart-wrap"><canvas id="cpuChart" role="img" aria-label="График нагрузки процессора"></canvas><div class="chart-empty" id="cpuEmpty">Нет данных</div></div>
+              <div class="cpu-footer"><span>Средняя за час</span><strong id="cpuAverage">—</strong></div>
+            </article>
+          </section>
+
+          <section class="detail-grid">
+            <article class="data-panel interfaces-panel">
+              <header class="section-head"><div><span class="eyebrow">Интерфейсы</span><h2>Сеть машины</h2></div><span id="interfaceCount">0</span></header>
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>Интерфейс</th><th>IP</th><th>RX / TX сейчас</th><th>Сегодня</th><th>Месяц</th></tr></thead>
+                  <tbody id="interfacesBody"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="data-panel health-panel">
+              <header class="section-head"><div><span class="eyebrow">Состояние</span><h2>Сервисы</h2></div></header>
+              <dl class="health-list">
+                <div><dt>Метрики</dt><dd id="metricsHealth">—</dd></div>
+                <div><dt>Push</dt><dd id="pushHealth">—</dd></div>
+                <div><dt>HAProxy</dt><dd id="haproxyHealth">—</dd></div>
+                <div><dt>Wrong SNI</dt><dd id="sniHealth">—</dd></div>
+              </dl>
+              <div class="machine-error" id="machineError" hidden></div>
+            </article>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+  <script src="/panel/app.js?v={COLLECTOR_BUILD}" defer></script>
+</body>
+</html>
+"""
+
+
+DASHBOARD_CSS = r"""
+:root {
+  color-scheme: dark;
+  --bg: #0d0912;
+  --surface: #15101c;
+  --surface-2: #1c1426;
+  --surface-3: #251932;
+  --line: #33253f;
+  --line-strong: #49345b;
+  --text: #f7f2fb;
+  --muted: #9d91a8;
+  --purple: #a778ff;
+  --purple-soft: #c5a7ff;
+  --cyan: #2dd4bf;
+  --blue: #60a5fa;
+  --rose: #fb7185;
+  --amber: #fbbf24;
+  --online: #34d399;
+  --shadow: 0 18px 50px rgba(0, 0, 0, .32);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+html, body { width: 100%; min-width: 320px; min-height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+body { min-height: 100vh; overflow: hidden; }
+button, input { font: inherit; letter-spacing: 0; }
+button { color: inherit; }
+[hidden] { display: none !important; }
+
+.login-view {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: #100b16;
+}
+
+.login-panel {
+  width: min(420px, 100%);
+  padding: 28px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.brand { display: flex; align-items: center; gap: 11px; min-width: max-content; }
+.brand-mark {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #7550a6;
+  border-radius: 7px;
+  color: #efe3ff;
+  background: #281a38;
+  font-size: 16px;
+  font-weight: 800;
+}
+.brand strong, .brand small { display: block; }
+.brand strong { font-size: 14px; line-height: 18px; }
+.brand small { margin-top: 1px; color: var(--muted); font-size: 11px; line-height: 14px; }
+.brand-login { margin-bottom: 42px; }
+.brand-login .brand-mark { width: 42px; height: 42px; }
+.brand-login strong { font-size: 16px; }
+
+.login-heading { margin-bottom: 24px; }
+.login-heading h1 { margin: 0; font-size: 24px; line-height: 32px; letter-spacing: 0; }
+.login-heading p { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+.field-label { display: block; margin-bottom: 8px; color: #d6ccdF; font-size: 12px; font-weight: 650; }
+.token-input {
+  width: 100%;
+  height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  outline: none;
+  background: #0f0b14;
+  color: var(--text);
+}
+.token-input:focus { border-color: var(--purple); box-shadow: 0 0 0 3px rgba(167, 120, 255, .14); }
+.form-error { min-height: 18px; margin: 8px 0; color: var(--rose); font-size: 12px; }
+.primary-button {
+  width: 100%;
+  height: 42px;
+  border: 1px solid #9c6ee8;
+  border-radius: 6px;
+  background: #7546b9;
+  color: #fff;
+  cursor: pointer;
+  font-weight: 700;
+}
+.primary-button:hover { background: #8253c5; }
+.primary-button:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--purple-soft); outline-offset: 2px; }
+
+.app { height: 100vh; display: grid; grid-template-rows: 64px minmax(0, 1fr); }
+.topbar {
+  z-index: 3;
+  display: grid;
+  grid-template-columns: minmax(210px, 320px) minmax(360px, 1fr) auto;
+  align-items: center;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--line);
+  background: #110c17;
+}
+
+.overview { display: flex; justify-content: center; align-items: center; gap: 22px; min-width: 0; color: var(--muted); font-size: 12px; }
+.overview span { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
+.overview b { color: var(--text); font-size: 13px; }
+.status-dot { width: 7px; height: 7px; display: inline-block; border-radius: 50%; background: var(--muted); }
+.status-dot.online { background: var(--online); box-shadow: 0 0 0 3px rgba(52, 211, 153, .12); }
+.status-dot.warning { background: var(--amber); box-shadow: 0 0 0 3px rgba(251, 191, 36, .12); }
+.status-dot.offline { background: var(--rose); box-shadow: 0 0 0 3px rgba(251, 113, 133, .12); }
+
+.topbar-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.live-state { height: 30px; display: inline-flex; align-items: center; gap: 7px; margin-right: 4px; color: var(--muted); font-size: 12px; }
+.live-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--online); }
+.live-state.disconnected i { background: var(--rose); }
+.live-state.syncing i { background: var(--amber); }
+.icon-button, .logout-button {
+  height: 34px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+.icon-button { width: 34px; padding: 0; font-size: 19px; line-height: 1; }
+.logout-button { padding: 0 12px; color: #d9cfdf; font-size: 12px; font-weight: 650; }
+.icon-button:hover, .logout-button:hover { border-color: #664b7f; background: var(--surface-3); }
+
+.workspace { min-height: 0; display: grid; grid-template-columns: 320px minmax(0, 1fr); }
+.sidebar {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  border-right: 1px solid var(--line);
+  background: #120d18;
+}
+.sidebar-head { padding: 18px 16px 14px; border-bottom: 1px solid var(--line); }
+.sidebar-head > div { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.sidebar-head strong { color: var(--muted); font-size: 12px; }
+.eyebrow { display: block; margin-bottom: 4px; color: var(--purple-soft); font-size: 10px; font-weight: 750; line-height: 13px; text-transform: uppercase; }
+.search-field {
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0e0a13;
+  color: var(--muted);
+}
+.search-field input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 12px; }
+.search-field input::placeholder { color: #746a7c; }
+
+.machine-list { min-height: 0; overflow-y: auto; padding: 9px 8px 14px; scrollbar-color: #4b365d transparent; scrollbar-width: thin; }
+.machine-item {
+  width: 100%;
+  min-height: 72px;
+  display: grid;
+  grid-template-columns: 9px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 11px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.machine-item:hover { background: #1a1223; }
+.machine-item.active { border-color: #543b6a; background: #21162c; }
+.machine-item .state-line { width: 3px; height: 34px; border-radius: 2px; background: var(--online); }
+.machine-item.warning .state-line { background: var(--amber); }
+.machine-item.offline .state-line { background: var(--rose); }
+.machine-copy { min-width: 0; }
+.machine-copy strong, .machine-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.machine-copy strong { font-size: 13px; line-height: 18px; }
+.machine-copy span { margin-top: 4px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; }
+.machine-rate { min-width: 58px; text-align: right; }
+.machine-rate strong, .machine-rate small { display: block; }
+.machine-rate strong { color: var(--cyan); font-size: 10px; font-weight: 650; }
+.machine-rate small { margin-top: 4px; color: #776c80; font-size: 9px; }
+.list-empty { padding: 28px 12px; color: var(--muted); font-size: 12px; text-align: center; }
+.sidebar-total { padding: 14px 16px; border-top: 1px solid var(--line); background: #100b16; }
+.sidebar-total span, .sidebar-total strong, .sidebar-total small { display: block; }
+.sidebar-total span { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.sidebar-total strong { margin-top: 5px; font-size: 16px; }
+.sidebar-total small { margin-top: 4px; color: var(--cyan); font-size: 10px; }
+
+.content { min-width: 0; min-height: 0; overflow-y: auto; background: var(--bg); scrollbar-color: #4b365d transparent; scrollbar-width: thin; }
+.machine-view { width: 100%; max-width: 1580px; margin: 0 auto; padding: 24px; }
+.empty-state { min-height: 100%; display: grid; place-content: center; justify-items: center; padding: 40px; text-align: center; }
+.empty-mark { width: 48px; height: 48px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); color: var(--purple-soft); font-weight: 800; }
+.empty-state h2 { margin: 16px 0 4px; font-size: 18px; }
+.empty-state p { margin: 0; color: var(--muted); font-size: 12px; }
+
+.machine-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
+.title-line { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.title-line h1 { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 25px; line-height: 32px; letter-spacing: 0; }
+.status-badge { height: 24px; display: inline-flex; align-items: center; padding: 0 9px; border: 1px solid rgba(52, 211, 153, .35); border-radius: 999px; background: rgba(52, 211, 153, .08); color: #6ee7b7; font-size: 10px; font-weight: 750; text-transform: uppercase; }
+.status-badge.warning { border-color: rgba(251, 191, 36, .35); background: rgba(251, 191, 36, .08); color: #fcd34d; }
+.status-badge.offline { border-color: rgba(251, 113, 133, .35); background: rgba(251, 113, 133, .08); color: #fda4af; }
+.machine-address { display: flex; gap: 10px; margin-top: 7px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
+.machine-address span + span::before { content: "/"; margin-right: 10px; color: #5b5063; }
+.last-update { min-width: 170px; text-align: right; }
+.last-update span, .last-update strong, .last-update small { display: block; }
+.last-update span { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.last-update strong { margin-top: 5px; font-size: 14px; }
+.last-update small { margin-top: 3px; color: #776c80; font-size: 10px; }
+
+.metric-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 16px; border: 1px solid var(--line); background: var(--surface); }
+.metric-cell { min-width: 0; min-height: 86px; padding: 16px 18px; border-right: 1px solid var(--line); }
+.metric-cell:last-child { border-right: 0; }
+.metric-cell span, .metric-cell strong, .metric-cell small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.metric-cell span { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.metric-cell strong { margin-top: 8px; font-size: 17px; line-height: 21px; }
+.metric-cell small { margin-top: 4px; color: #8f8398; font-size: 10px; }
+
+.chart-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); gap: 16px; margin-bottom: 16px; }
+.chart-panel, .data-panel { min-width: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+.chart-panel { min-height: 340px; }
+.panel-head { min-height: 68px; display: flex; align-items: center; gap: 18px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.panel-head h2, .section-head h2 { margin: 0; font-size: 14px; line-height: 18px; letter-spacing: 0; }
+.network-now { display: flex; align-items: center; gap: 14px; margin-left: auto; }
+.network-now span { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10px; }
+.network-now i { width: 7px; height: 2px; background: var(--cyan); }
+.network-now .tx i { background: var(--purple); }
+.network-now b { color: var(--text); font-size: 11px; }
+.segmented { display: inline-flex; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: #0e0a13; }
+.segmented button { min-width: 38px; height: 26px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 700; }
+.segmented button.active { background: var(--surface-3); color: var(--text); }
+.cpu-now { margin-left: auto; color: var(--purple-soft); font-size: 20px; }
+.chart-wrap { position: relative; height: 250px; padding: 8px 10px 10px; }
+.chart-wrap canvas { width: 100%; height: 100%; display: block; }
+.chart-empty { position: absolute; inset: 0; display: grid; place-items: center; color: #756a7d; font-size: 11px; pointer-events: none; }
+.cpu-footer { height: 38px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; }
+.cpu-footer strong { color: var(--text); font-size: 11px; }
+
+.detail-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 16px; padding-bottom: 24px; }
+.section-head { min-height: 62px; display: flex; align-items: center; justify-content: space-between; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+.section-head > span { min-width: 28px; height: 24px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 10px; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th, td { padding: 12px 14px; border-bottom: 1px solid #2a1e34; text-align: left; vertical-align: middle; }
+th { color: #84788d; font-size: 9px; font-weight: 700; text-transform: uppercase; }
+td { color: #dcd3e3; font-size: 11px; }
+th:nth-child(1) { width: 16%; }
+th:nth-child(2) { width: 22%; }
+th:nth-child(3) { width: 24%; }
+th:nth-child(4), th:nth-child(5) { width: 19%; }
+tbody tr:last-child td { border-bottom: 0; }
+.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.rate-pair { white-space: nowrap; }
+.rate-pair .rx { color: var(--cyan); }
+.rate-pair .tx { color: var(--purple-soft); }
+.cell-muted { color: var(--muted); }
+.health-list { margin: 0; padding: 4px 16px; }
+.health-list div { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid #2a1e34; }
+.health-list div:last-child { border-bottom: 0; }
+.health-list dt { color: var(--muted); font-size: 11px; }
+.health-list dd { margin: 0; color: #dcd3e3; font-size: 11px; font-weight: 650; text-align: right; }
+.health-list dd.ok { color: var(--online); }
+.health-list dd.warn { color: var(--amber); }
+.health-list dd.fail { color: var(--rose); }
+.machine-error { margin: 4px 16px 16px; padding: 11px 12px; border-left: 2px solid var(--rose); background: rgba(251, 113, 133, .07); color: #fecdd3; font-size: 10px; line-height: 16px; overflow-wrap: anywhere; }
+
+@media (max-width: 1100px) {
+  .workspace { grid-template-columns: 280px minmax(0, 1fr); }
+  .topbar { grid-template-columns: 280px 1fr auto; }
+  .overview span { font-size: 0; }
+  .overview b { font-size: 12px; }
+  .metric-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-cell:nth-child(2) { border-right: 0; }
+  .metric-cell:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+}
+
+@media (max-width: 860px) {
+  body { overflow: auto; }
+  .app { height: auto; min-height: 100vh; grid-template-rows: auto auto; }
+  .topbar { min-height: 64px; grid-template-columns: 1fr auto; gap: 12px; padding: 10px 14px; }
+  .overview { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; padding-bottom: 2px; }
+  .overview span { font-size: 10px; }
+  .overview b { font-size: 11px; }
+  .workspace { display: block; }
+  .sidebar { max-height: 310px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .machine-list { min-height: 150px; }
+  .content { overflow: visible; }
+  .chart-grid, .detail-grid { grid-template-columns: 1fr; }
+  .machine-view { padding: 18px 14px; }
+}
+
+@media (max-width: 600px) {
+  .topbar-actions .live-state { display: none; }
+  .logout-button { width: 36px; padding: 0; font-size: 0; }
+  .logout-button::before { content: "\21AA"; font-size: 18px; line-height: 1; }
+  .machine-header { align-items: flex-start; }
+  .last-update { min-width: 0; }
+  .last-update small { display: none; }
+  .title-line { align-items: flex-start; flex-direction: column; gap: 7px; }
+  .title-line h1 { font-size: 21px; line-height: 27px; }
+  .machine-address { flex-direction: column; gap: 4px; }
+  .machine-address span + span::before { display: none; }
+  .metric-strip { grid-template-columns: 1fr 1fr; }
+  .metric-cell { min-height: 78px; padding: 13px; }
+  .metric-cell strong { font-size: 14px; }
+  .panel-head { min-height: 76px; flex-wrap: wrap; gap: 10px; }
+  .network-now { order: 3; width: 100%; margin-left: 0; }
+  .segmented { margin-left: auto; }
+  .chart-wrap { height: 220px; }
+  .table-scroll { max-width: calc(100vw - 30px); }
+  table { min-width: 680px; }
+}
+"""
+
+
+DASHBOARD_JS = r"""
+"use strict";
+
+const TOKEN_KEY = "kto.dashboard.token.v1";
+const state = {
+  token: "",
+  nodes: [],
+  overview: {},
+  selectedKey: "",
+  detail: null,
+  history: [],
+  livePoints: [],
+  rangeSec: 3600,
+  pollMs: 2000,
+  timer: 0,
+  polling: false,
+  selectionVersion: 0,
+};
+
+const $ = (id) => document.getElementById(id);
+const loginView = $("loginView");
+const loginForm = $("loginForm");
+const tokenInput = $("tokenInput");
+const loginError = $("loginError");
+const app = $("app");
+const machineView = $("machineView");
+const emptyState = $("emptyState");
+const machineList = $("machineList");
+const searchInput = $("searchInput");
+const networkCanvas = $("networkChart");
+const cpuCanvas = $("cpuChart");
+
+function setText(id, value) {
+  const node = $(id);
+  if (node) node.textContent = value == null || value === "" ? "—" : String(value);
+}
+
+function number(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatBytes(value) {
+  let amount = Math.max(0, number(value));
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 ? 0 : amount >= 100 ? 0 : amount >= 10 ? 1 : 2;
+  return `${amount.toFixed(digits)} ${units[unit]}`;
+}
+
+function formatRate(value) {
+  let amount = Math.max(0, number(value));
+  if (amount >= 1e9) return `${(amount / 1e9).toFixed(amount >= 10e9 ? 1 : 2)} Gbit/s`;
+  if (amount >= 1e6) return `${(amount / 1e6).toFixed(amount >= 100e6 ? 0 : 1)} Mbit/s`;
+  if (amount >= 1e3) return `${(amount / 1e3).toFixed(amount >= 100e3 ? 0 : 1)} Kbit/s`;
+  return `${Math.round(amount)} bit/s`;
+}
+
+function formatPercent(value) {
+  const amount = Math.max(0, number(value));
+  return `${amount >= 10 ? amount.toFixed(0) : amount.toFixed(1)}%`;
+}
+
+function formatDuration(value) {
+  let seconds = Math.max(0, Math.floor(number(value)));
+  const days = Math.floor(seconds / 86400);
+  seconds %= 86400;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days} д ${hours} ч`;
+  if (hours > 0) return `${hours} ч ${minutes} мин`;
+  if (minutes > 0) return `${minutes} мин`;
+  return `${seconds} сек`;
+}
+
+function relativeTime(timestamp, serverTime) {
+  const age = Math.max(0, number(serverTime || Date.now() / 1000) - number(timestamp));
+  if (age < 5) return "сейчас";
+  if (age < 60) return `${Math.floor(age)} сек назад`;
+  if (age < 3600) return `${Math.floor(age / 60)} мин назад`;
+  return `${Math.floor(age / 3600)} ч назад`;
+}
+
+function exactTime(timestamp) {
+  if (!number(timestamp)) return "—";
+  return new Date(number(timestamp) * 1000).toLocaleString("ru-RU", {
+    day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+}
+
+async function api(path) {
+  const response = await fetch(path, {
+    method: "GET",
+    cache: "no-store",
+    headers: { Authorization: `Bearer ${state.token}`, Accept: "application/json" },
+  });
+  let payload = null;
+  try { payload = await response.json(); } catch (_) { payload = null; }
+  if (!response.ok) {
+    const error = new Error(payload && payload.error ? payload.error : `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+function setLive(mode, label) {
+  const live = $("liveState");
+  live.classList.remove("disconnected", "syncing");
+  if (mode) live.classList.add(mode);
+  live.querySelector("span").textContent = label;
+}
+
+function showLogin(message = "") {
+  clearTimeout(state.timer);
+  state.timer = 0;
+  app.hidden = true;
+  loginView.hidden = false;
+  loginError.textContent = message;
+  tokenInput.value = state.token || "";
+  window.setTimeout(() => tokenInput.focus(), 0);
+}
+
+function showApp() {
+  loginView.hidden = true;
+  app.hidden = false;
+}
+
+function applyFleet(payload) {
+  state.nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  state.overview = payload.overview || {};
+  state.pollMs = Math.max(1000, number(payload.poll_interval_ms) || 2000);
+  setText("buildLabel", payload.build || "collector");
+  setText("machineCount", state.nodes.length);
+  setText("onlineCount", state.overview.online || 0);
+  setText("warningCount", state.overview.warning || 0);
+  setText("offlineCount", state.overview.offline || 0);
+  setText("fleetTraffic", formatBytes(state.overview.day_total));
+  setText("fleetRate", `${formatRate(state.overview.rate_rx_bps)} RX · ${formatRate(state.overview.rate_tx_bps)} TX`);
+  renderMachineList();
+
+  if (state.selectedKey && !state.nodes.some((node) => node.key === state.selectedKey)) {
+    state.selectedKey = "";
+    state.detail = null;
+    state.history = [];
+    state.livePoints = [];
+  }
+  if (!state.selectedKey && state.nodes.length) selectNode(state.nodes[0].key);
+  if (!state.nodes.length) {
+    machineView.hidden = true;
+    emptyState.hidden = false;
+  }
+}
+
+function renderMachineList() {
+  const previousScroll = machineList.scrollTop;
+  const query = searchInput.value.trim().toLocaleLowerCase("ru-RU");
+  const filtered = state.nodes.filter((node) => {
+    if (!query) return true;
+    return `${node.name || ""} ${node.ip || ""} ${node.hostname || ""}`.toLocaleLowerCase("ru-RU").includes(query);
+  });
+  machineList.replaceChildren();
+  if (!filtered.length) {
+    const empty = document.createElement("div");
+    empty.className = "list-empty";
+    empty.textContent = query ? "Ничего не найдено" : "Нет машин";
+    machineList.append(empty);
+    return;
+  }
+
+  for (const node of filtered) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `machine-item ${node.status || "offline"}${node.key === state.selectedKey ? " active" : ""}`;
+    button.dataset.key = node.key;
+    button.setAttribute("aria-current", node.key === state.selectedKey ? "true" : "false");
+
+    const line = document.createElement("span");
+    line.className = "state-line";
+    const copy = document.createElement("span");
+    copy.className = "machine-copy";
+    const name = document.createElement("strong");
+    name.textContent = node.name || node.key;
+    const ip = document.createElement("span");
+    ip.textContent = node.ip || node.hostname || "без IP";
+    copy.append(name, ip);
+
+    const rate = document.createElement("span");
+    rate.className = "machine-rate";
+    const rateValue = document.createElement("strong");
+    rateValue.textContent = node.rate_valid ? formatRate(number(node.rate_rx_bps) + number(node.rate_tx_bps)) : "—";
+    const age = document.createElement("small");
+    age.textContent = relativeTime(node.last_seen, Date.now() / 1000);
+    rate.append(rateValue, age);
+    button.append(line, copy, rate);
+    button.addEventListener("click", () => selectNode(node.key));
+    machineList.append(button);
+  }
+  machineList.scrollTop = previousScroll;
+}
+
+function healthText(node, value, tone) {
+  node.textContent = value;
+  node.classList.remove("ok", "warn", "fail");
+  if (tone) node.classList.add(tone);
+}
+
+function renderDetail() {
+  const data = state.detail;
+  if (!data) return;
+  emptyState.hidden = true;
+  machineView.hidden = false;
+  setText("machineName", data.name);
+  setText("machineIp", data.ip || "без IP");
+  setText("machineHostname", data.hostname || "без hostname");
+  const status = $("machineStatus");
+  status.className = `status-badge ${data.status === "online" ? "" : data.status}`.trim();
+  status.textContent = data.status === "online" ? "Online" : data.status === "warning" ? "Внимание" : "Offline";
+  setText("lastSeen", relativeTime(data.last_seen, data.server_time));
+  setText("lastSeenExact", exactTime(data.last_seen));
+  setText("uptimeValue", formatDuration(data.uptime_sec));
+  setText("ramValue", formatPercent(data.ram_percent));
+  setText("ramDetail", `${formatBytes(data.ram_used)} / ${formatBytes(data.ram_total)}`);
+  setText("todayTraffic", formatBytes(data.traffic && data.traffic.day_total));
+  setText("todayDirection", `RX ${formatBytes(data.traffic && data.traffic.day_rx)} · TX ${formatBytes(data.traffic && data.traffic.day_tx)}`);
+
+  const remna = data.remnawave || {};
+  setText("remnaValue", remna.status || "Нет данных");
+  setText("remnaDetail", remna.error_count ? `${remna.error_count} ошибок` : remna.restarts ? `${remna.restarts} рестартов` : "Без ошибок");
+  setText("rxNow", data.rate_valid ? formatRate(data.rate_rx_bps) : "—");
+  setText("txNow", data.rate_valid ? formatRate(data.rate_tx_bps) : "—");
+  setText("cpuNow", data.metrics_ok ? formatPercent(data.cpu_percent) : "—");
+  setText("cpuAverage", data.cpu_samples_1h || data.cpu_avg_1h ? formatPercent(data.cpu_avg_1h) : "—");
+  setText("interfaceCount", Array.isArray(data.interfaces) ? data.interfaces.length : 0);
+
+  healthText($("metricsHealth"), data.metrics_ok ? "Данные получены" : "Нет данных", data.metrics_ok ? "ok" : "warn");
+  healthText($("pushHealth"), `${data.push_build || "build —"} · ${number(data.stale_after_sec)} сек`, data.status === "offline" ? "fail" : "ok");
+  const haproxy = data.haproxy || {};
+  healthText($("haproxyHealth"), haproxy.supported ? `${haproxy.routes} маршрутов` : "Не используется", haproxy.supported ? "ok" : "");
+  const sni = data.wrong_sni || {};
+  healthText($("sniHealth"), sni.total ? `${sni.total} / ${sni.sources} IP` : "Чисто", sni.total ? "warn" : "ok");
+
+  const error = $("machineError");
+  const message = data.error || remna.last_error || "";
+  error.hidden = !message;
+  error.textContent = message;
+  renderInterfaces(data.interfaces || []);
+  appendLivePoint(data);
+  drawCharts();
+}
+
+function renderInterfaces(interfaces) {
+  const body = $("interfacesBody");
+  body.replaceChildren();
+  if (!interfaces.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 5;
+    cell.className = "cell-muted";
+    cell.textContent = "Нет данных по интерфейсам";
+    row.append(cell);
+    body.append(row);
+    return;
+  }
+  for (const item of interfaces) {
+    const row = document.createElement("tr");
+    const iface = document.createElement("td");
+    iface.className = "mono";
+    iface.textContent = item.iface || "—";
+    const ip = document.createElement("td");
+    ip.className = "mono";
+    ip.textContent = item.ip || "—";
+    const rate = document.createElement("td");
+    rate.className = "rate-pair";
+    if (item.rate_valid) {
+      const rx = document.createElement("span");
+      rx.className = "rx";
+      rx.textContent = formatRate(item.rate_rx_bps);
+      const separator = document.createTextNode(" / ");
+      const tx = document.createElement("span");
+      tx.className = "tx";
+      tx.textContent = formatRate(item.rate_tx_bps);
+      rate.append(rx, separator, tx);
+    } else {
+      rate.textContent = "—";
+      rate.classList.add("cell-muted");
+    }
+    const today = document.createElement("td");
+    today.textContent = formatBytes(item.day_total);
+    const month = document.createElement("td");
+    month.textContent = formatBytes(item.month_total);
+    if (item.error) row.title = item.error;
+    row.append(iface, ip, rate, today, month);
+    body.append(row);
+  }
+}
+
+function appendLivePoint(data) {
+  if (!data || !number(data.server_time)) return;
+  const point = {
+    ts: number(data.server_time),
+    rx_bps: data.rate_valid ? number(data.rate_rx_bps) : null,
+    tx_bps: data.rate_valid ? number(data.rate_tx_bps) : null,
+    cpu_percent: data.metrics_ok ? number(data.cpu_percent) : null,
+  };
+  const last = state.livePoints[state.livePoints.length - 1];
+  if (last && last.ts === point.ts) state.livePoints[state.livePoints.length - 1] = point;
+  else state.livePoints.push(point);
+  const cutoff = point.ts - 3700;
+  state.livePoints = state.livePoints.filter((item) => item.ts >= cutoff);
+}
+
+function chartPoints() {
+  const current = number(state.detail && state.detail.server_time) || Date.now() / 1000;
+  const cutoff = current - state.rangeSec;
+  const merged = new Map();
+  for (const point of [...state.history, ...state.livePoints]) {
+    if (number(point.ts) < cutoff) continue;
+    const key = number(point.ts);
+    const old = merged.get(key) || { ts: key, rx_bps: null, tx_bps: null, cpu_percent: null };
+    for (const field of ["rx_bps", "tx_bps", "cpu_percent"]) {
+      if (point[field] !== null && point[field] !== undefined) old[field] = number(point[field]);
+    }
+    merged.set(key, old);
+  }
+  return [...merged.values()].sort((a, b) => a.ts - b.ts);
+}
+
+function canvasContext(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const width = Math.max(220, rect.width);
+  const height = Math.max(160, rect.height);
+  const pixelWidth = Math.round(width * dpr);
+  const pixelHeight = Math.round(height * dpr);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  return { ctx, width, height };
+}
+
+function niceMaximum(value, minimum) {
+  const raw = Math.max(minimum, value);
+  const power = Math.pow(10, Math.floor(Math.log10(raw)));
+  const scaled = raw / power;
+  const nice = scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10;
+  return nice * power;
+}
+
+function drawLineChart(canvas, emptyNode, points, series, options) {
+  const { ctx, width, height } = canvasContext(canvas);
+  const left = 50;
+  const right = 12;
+  const top = 14;
+  const bottom = 28;
+  const plotWidth = Math.max(1, width - left - right);
+  const plotHeight = Math.max(1, height - top - bottom);
+  const usable = points.filter((point) => series.some((item) => point[item.key] !== null && point[item.key] !== undefined));
+  emptyNode.hidden = usable.length > 0;
+  if (!usable.length) return;
+
+  const minTs = usable[0].ts;
+  const maxTs = Math.max(minTs + 1, usable[usable.length - 1].ts);
+  const maximumValue = Math.max(...usable.flatMap((point) => series.map((item) => point[item.key] == null ? 0 : number(point[item.key]))));
+  const maxY = options.maxY ? options.maxY(maximumValue) : niceMaximum(maximumValue, options.minimum || 1);
+  const x = (ts) => left + ((ts - minTs) / (maxTs - minTs)) * plotWidth;
+  const y = (value) => top + plotHeight - (Math.max(0, value) / maxY) * plotHeight;
+
+  ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+  ctx.lineWidth = 1;
+  ctx.textBaseline = "middle";
+  for (let index = 0; index <= 4; index += 1) {
+    const ratio = index / 4;
+    const py = top + ratio * plotHeight;
+    ctx.strokeStyle = "rgba(94, 72, 109, .34)";
+    ctx.beginPath();
+    ctx.moveTo(left, py);
+    ctx.lineTo(width - right, py);
+    ctx.stroke();
+    ctx.fillStyle = "#776c80";
+    ctx.textAlign = "right";
+    ctx.fillText(options.axis(maxY * (1 - ratio)), left - 7, py);
+  }
+  for (let index = 0; index <= 4; index += 1) {
+    const ratio = index / 4;
+    const px = left + ratio * plotWidth;
+    ctx.strokeStyle = "rgba(94, 72, 109, .18)";
+    ctx.beginPath();
+    ctx.moveTo(px, top);
+    ctx.lineTo(px, top + plotHeight);
+    ctx.stroke();
+  }
+
+  for (const item of series) {
+    ctx.strokeStyle = item.color;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    let started = false;
+    for (const point of usable) {
+      const value = point[item.key];
+      if (value === null || value === undefined) {
+        started = false;
+        continue;
+      }
+      const px = x(point.ts);
+      const py = y(number(value));
+      if (!started) {
+        ctx.moveTo(px, py);
+        started = true;
+      } else {
+        ctx.lineTo(px, py);
+      }
+    }
+    ctx.stroke();
+    const last = [...usable].reverse().find((point) => point[item.key] !== null && point[item.key] !== undefined);
+    if (last) {
+      ctx.fillStyle = item.color;
+      ctx.beginPath();
+      ctx.arc(x(last.ts), y(number(last[item.key])), 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  ctx.fillStyle = "#776c80";
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "left";
+  ctx.fillText(new Date(minTs * 1000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }), left, height - 6);
+  ctx.textAlign = "right";
+  ctx.fillText(new Date(maxTs * 1000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }), width - right, height - 6);
+}
+
+function drawCharts() {
+  const points = chartPoints();
+  drawLineChart(networkCanvas, $("networkEmpty"), points, [
+    { key: "rx_bps", color: "#2dd4bf" },
+    { key: "tx_bps", color: "#a778ff" },
+  ], {
+    minimum: 1000,
+    axis: (value) => value >= 1e9 ? `${(value / 1e9).toFixed(1)}G` : value >= 1e6 ? `${(value / 1e6).toFixed(0)}M` : `${(value / 1e3).toFixed(0)}K`,
+  });
+  drawLineChart(cpuCanvas, $("cpuEmpty"), points, [
+    { key: "cpu_percent", color: "#c5a7ff" },
+  ], {
+    maxY: (value) => Math.max(100, Math.ceil(value / 50) * 50),
+    axis: (value) => `${Math.round(value)}%`,
+  });
+}
+
+async function loadHistory(version = state.selectionVersion) {
+  if (!state.selectedKey) return;
+  const key = encodeURIComponent(state.selectedKey);
+  const payload = await api(`/api/dashboard/nodes/${key}/history?seconds=${state.rangeSec}`);
+  if (version !== state.selectionVersion || payload.key !== state.selectedKey) return;
+  state.history = Array.isArray(payload.points) ? payload.points : [];
+  drawCharts();
+}
+
+async function loadDetail(version = state.selectionVersion) {
+  if (!state.selectedKey) return;
+  const key = encodeURIComponent(state.selectedKey);
+  const payload = await api(`/api/dashboard/nodes/${key}`);
+  if (version !== state.selectionVersion || payload.key !== state.selectedKey) return;
+  state.detail = payload;
+  renderDetail();
+}
+
+async function selectNode(key) {
+  if (!key || (key === state.selectedKey && state.detail)) return;
+  state.selectedKey = key;
+  state.selectionVersion += 1;
+  const version = state.selectionVersion;
+  state.detail = null;
+  state.history = [];
+  state.livePoints = [];
+  renderMachineList();
+  machineView.hidden = false;
+  emptyState.hidden = true;
+  setLive("syncing", "Загрузка");
+  try {
+    await Promise.all([loadDetail(version), loadHistory(version)]);
+    setLive("", "Live");
+  } catch (error) {
+    handleApiError(error);
+  }
+}
+
+function handleApiError(error) {
+  if (error && error.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    showLogin("Токен не принят");
+    return;
+  }
+  setLive("disconnected", "Нет связи");
+}
+
+async function poll() {
+  clearTimeout(state.timer);
+  if (state.polling || app.hidden) return;
+  state.polling = true;
+  try {
+    const fleet = await api("/api/dashboard/nodes");
+    applyFleet(fleet);
+    const version = state.selectionVersion;
+    if (state.selectedKey) await loadDetail(version);
+    setLive("", "Live");
+  } catch (error) {
+    handleApiError(error);
+  } finally {
+    state.polling = false;
+    if (!app.hidden) state.timer = window.setTimeout(poll, state.pollMs);
+  }
+}
+
+async function startSession(token) {
+  state.token = token.trim();
+  if (!state.token) {
+    showLogin("Введите токен");
+    return;
+  }
+  loginError.textContent = "";
+  setLive("syncing", "Подключение");
+  try {
+    const fleet = await api("/api/dashboard/nodes");
+    localStorage.setItem(TOKEN_KEY, state.token);
+    showApp();
+    applyFleet(fleet);
+    setLive("", "Live");
+    clearTimeout(state.timer);
+    state.timer = window.setTimeout(poll, state.pollMs);
+  } catch (error) {
+    handleApiError(error);
+  }
+}
+
+loginForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  startSession(tokenInput.value);
+});
+
+$("logoutButton").addEventListener("click", () => {
+  localStorage.removeItem(TOKEN_KEY);
+  state.token = "";
+  state.selectedKey = "";
+  state.detail = null;
+  showLogin();
+});
+
+$("refreshButton").addEventListener("click", async () => {
+  setLive("syncing", "Обновление");
+  await poll();
+  if (state.selectedKey) {
+    try { await loadHistory(state.selectionVersion); } catch (error) { handleApiError(error); }
+  }
+});
+
+searchInput.addEventListener("input", renderMachineList);
+
+$("rangeControl").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-range]");
+  if (!button) return;
+  state.rangeSec = number(button.dataset.range) || 3600;
+  for (const item of $("rangeControl").querySelectorAll("button")) item.classList.toggle("active", item === button);
+  try { await loadHistory(state.selectionVersion); } catch (error) { handleApiError(error); }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !app.hidden) poll();
+});
+
+const resizeObserver = new ResizeObserver(() => {
+  if (!machineView.hidden) drawCharts();
+});
+resizeObserver.observe(networkCanvas);
+resizeObserver.observe(cpuCanvas);
+
+const savedToken = localStorage.getItem(TOKEN_KEY) || "";
+if (savedToken) startSession(savedToken);
+else showLogin();
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
@@ -9177,11 +10427,19 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log(fmt % args)
 
+    def send_common_headers(self, cache_control="no-store"):
+        self.send_header("Cache-Control", cache_control)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+
     def send_json(self, code, data, auth_context=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_common_headers()
         if isinstance(auth_context, dict) and auth_context.get("mode") == "hmac-sha256":
             nonce = str(auth_context.get("nonce") or "")
             signature = hmac_sha256_hex(SECRET, response_signature_payload(nonce, body))
@@ -9191,10 +10449,82 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_asset(self, content, content_type, cache_control="no-cache"):
+        body = content.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_common_headers(cache_control)
+        if content_type.startswith("text/html"):
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; "
+                "img-src 'self' data:; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+            )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_common_headers()
+        self.end_headers()
+
+    def dashboard_api_authorized(self):
+        if dashboard_authorized(self.headers):
+            return True
+        self.send_json(401, {"ok": False, "error": "unauthorized"})
+        return False
+
     def do_GET(self):
-        path = urllib.parse.urlsplit(self.path).path
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
         if path == "/health":
             self.send_json(200, {"ok": True, "build": COLLECTOR_BUILD})
+            return
+        if DASHBOARD_ENABLED and path in ("/", "/panel"):
+            self.send_redirect("/panel/")
+            return
+        if DASHBOARD_ENABLED and path == "/panel/":
+            self.send_asset(DASHBOARD_HTML, "text/html; charset=utf-8")
+            return
+        if DASHBOARD_ENABLED and path == "/panel/app.css":
+            self.send_asset(DASHBOARD_CSS, "text/css; charset=utf-8", "no-cache")
+            return
+        if DASHBOARD_ENABLED and path == "/panel/app.js":
+            self.send_asset(DASHBOARD_JS, "application/javascript; charset=utf-8", "no-cache")
+            return
+        if path == "/api/dashboard/nodes":
+            if not self.dashboard_api_authorized():
+                return
+            self.send_json(200, dashboard_nodes_payload())
+            return
+        if path.startswith("/api/dashboard/nodes/"):
+            if not self.dashboard_api_authorized():
+                return
+            suffix = path[len("/api/dashboard/nodes/"):]
+            if suffix.endswith("/history"):
+                record_key = urllib.parse.unquote(suffix[:-len("/history")].rstrip("/"))
+                query = urllib.parse.parse_qs(parsed.query)
+                try:
+                    seconds = int((query.get("seconds") or ["3600"])[0])
+                except Exception:
+                    seconds = 3600
+                payload = dashboard_history_payload(record_key, seconds)
+                if payload is None:
+                    self.send_json(404, {"ok": False, "error": "node not found"})
+                else:
+                    self.send_json(200, payload)
+                return
+            record_key = urllib.parse.unquote(suffix.rstrip("/"))
+            node = dashboard_find_bl_node(record_key)
+            if node is None:
+                self.send_json(404, {"ok": False, "error": "node not found"})
+            else:
+                payload = dashboard_node_detail(record_key, node)
+                payload["ok"] = True
+                self.send_json(200, payload)
             return
         if path == "/nodes":
             if not authorized(self.headers):
@@ -12120,6 +13450,23 @@ def bot_loop():
             time.sleep(5)
 
 
+def dashboard_cli(argv):
+    if not argv or argv[0] not in ("--dashboard-token", "--dashboard-info"):
+        return None
+    if not DASHBOARD_ENABLED:
+        print("dashboard disabled", file=sys.stderr)
+        return 1
+    if not DASHBOARD_TOKEN:
+        print("dashboard token unavailable", file=sys.stderr)
+        return 1
+    if argv[0] == "--dashboard-token":
+        print(DASHBOARD_TOKEN)
+        return 0
+    print(f"url\thttp://{LISTEN_HOST}:{LISTEN_PORT}/panel/")
+    print(f"token\t{DASHBOARD_TOKEN}")
+    return 0
+
+
 def main():
     if not SECRET:
         raise SystemExit("KTO_COLLECTOR_SECRET is empty")
@@ -12166,7 +13513,9 @@ def main():
 
 
 if __name__ == "__main__":
-    cli_status = connection_alerts_cli(sys.argv[1:])
+    cli_status = dashboard_cli(sys.argv[1:])
+    if cli_status is None:
+        cli_status = connection_alerts_cli(sys.argv[1:])
     if cli_status is None:
         main()
     else:

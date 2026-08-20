@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v332"
+SCRIPT_BUILD="v333"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4334,7 +4334,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v332"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v333"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -4347,7 +4347,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v332"
+KTO_HAPROXY_FIREWALL_BUILD="v333"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -12037,10 +12037,10 @@ install_stats_collector() {
     require_panel_mode
     need_root
 
-    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec wl_offline_confirm_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown scan_alert_delta expected_nodes daily_report_time ssh_base_allowed_ips existing_config=0
+    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec wl_offline_confirm_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown scan_alert_delta expected_nodes daily_report_time ssh_base_allowed_ips dashboard_enabled dashboard_token dashboard_effective_token dashboard_host existing_config=0
     local ip_limit_enabled ip_limit_source ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_drop_enabled ip_limit_penalty_sec
     local remna_api_url remna_api_token remna_api_cache_sec remna_api_insecure remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
-    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_wl_offline_confirm safe_bl_stale safe_bl_offline_confirm safe_bl_stale_fallback safe_bl_push_interval safe_push_miss_window safe_push_miss_threshold safe_push_miss_cooldown safe_scan_alert_delta safe_expected safe_tz safe_daily safe_ssh_base_allowed_ips
+    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_wl_offline_confirm safe_bl_stale safe_bl_offline_confirm safe_bl_stale_fallback safe_bl_push_interval safe_push_miss_window safe_push_miss_threshold safe_push_miss_cooldown safe_scan_alert_delta safe_expected safe_tz safe_daily safe_ssh_base_allowed_ips safe_dashboard_enabled safe_dashboard_token
     local safe_ip_limit_enabled safe_ip_limit_source safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_scan_sec safe_ip_limit_alert_threshold safe_ip_limit_alert_top safe_ip_limit_enforce_enabled safe_ip_limit_drop_enabled safe_ip_limit_penalty_sec
     local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_remna_api_insecure safe_remna_node_alert_enabled safe_remna_node_poll_sec safe_remna_offline_guard_enabled safe_remna_offline_state_max_age_sec safe_remna_offline_log_grace_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
 
@@ -12064,6 +12064,8 @@ install_stats_collector() {
         expected_nodes="$(config_get KTO_COLLECTOR_EXPECTED_NODES "$STATS_COLLECTOR_CONFIG")"
         daily_report_time="$(config_get KTO_COLLECTOR_DAILY_REPORT_TIME "$STATS_COLLECTOR_CONFIG")"
         ssh_base_allowed_ips="$(config_get KTO_COLLECTOR_SSH_BASE_ALLOWED_IPS "$STATS_COLLECTOR_CONFIG")"
+        dashboard_enabled="$(config_get KTO_COLLECTOR_DASHBOARD_ENABLED "$STATS_COLLECTOR_CONFIG")"
+        dashboard_token="$(config_get KTO_COLLECTOR_DASHBOARD_TOKEN "$STATS_COLLECTOR_CONFIG")"
         ip_limit_enabled="$(config_get KTO_COLLECTOR_IP_LIMIT_ENABLED "$STATS_COLLECTOR_CONFIG")"
         ip_limit_source="$(config_get KTO_COLLECTOR_IP_LIMIT_SOURCE "$STATS_COLLECTOR_CONFIG")"
         ip_limit_max_ips="$(config_get KTO_COLLECTOR_IP_LIMIT_MAX_IPS "$STATS_COLLECTOR_CONFIG")"
@@ -12119,6 +12121,7 @@ install_stats_collector() {
         scan_alert_delta="${scan_alert_delta:-$STATS_COLLECTOR_SCAN_ALERT_DELTA_DEFAULT}"
         expected_nodes="${expected_nodes:-$STATS_EXPECTED_NODES_DEFAULT}"
         ssh_base_allowed_ips="${ssh_base_allowed_ips:-$WHITELIST_SSH_ALLOWED_IPS}"
+        dashboard_enabled="${dashboard_enabled:-1}"
         ip_limit_enabled="${ip_limit_enabled:-$IP_LIMIT_ENABLED_DEFAULT}"
         ip_limit_source="${ip_limit_source:-$IP_LIMIT_SOURCE_DEFAULT}"
         ip_limit_max_ips="${ip_limit_max_ips:-$IP_LIMIT_MAX_IPS_DEFAULT}"
@@ -12166,6 +12169,8 @@ install_stats_collector() {
         expected_nodes="$(ask_int "Ожидаемое кол-во обходов" "$STATS_EXPECTED_NODES_DEFAULT" 1 9999)"
         daily_report_time="$(ask_optional_time_hm "Время ежедневного отчёта по МСК (пусто = выключено)")"
         ssh_base_allowed_ips="$WHITELIST_SSH_ALLOWED_IPS"
+        dashboard_enabled="1"
+        dashboard_token=""
         ip_limit_enabled="$IP_LIMIT_ENABLED_DEFAULT"
         ip_limit_source="$IP_LIMIT_SOURCE_DEFAULT"
         ip_limit_max_ips="$IP_LIMIT_MAX_IPS_DEFAULT"
@@ -12196,6 +12201,12 @@ install_stats_collector() {
     fi
     if [[ -n "${KTO_COLLECTOR_SSH_BASE_ALLOWED_IPS:-}" ]]; then
         ssh_base_allowed_ips="$KTO_COLLECTOR_SSH_BASE_ALLOWED_IPS"
+    fi
+    if [[ -n "${KTO_COLLECTOR_DASHBOARD_ENABLED:-}" ]]; then
+        dashboard_enabled="$KTO_COLLECTOR_DASHBOARD_ENABLED"
+    fi
+    if [[ -n "${KTO_COLLECTOR_DASHBOARD_TOKEN:-}" ]]; then
+        dashboard_token="$KTO_COLLECTOR_DASHBOARD_TOKEN"
     fi
     if [[ -n "${KTO_COLLECTOR_REMNA_API_TOKEN:-}" ]]; then
         remna_api_token="$KTO_COLLECTOR_REMNA_API_TOKEN"
@@ -12315,6 +12326,8 @@ install_stats_collector() {
     safe_tz="$(escape_config_value "$STATS_COLLECTOR_TZ_DEFAULT")"
     safe_daily="$(escape_config_value "$daily_report_time")"
     safe_ssh_base_allowed_ips="$(escape_config_value "$ssh_base_allowed_ips")"
+    safe_dashboard_enabled="$(escape_config_value "$dashboard_enabled")"
+    safe_dashboard_token="$(escape_config_value "$dashboard_token")"
     safe_ip_limit_enabled="$(escape_config_value "$ip_limit_enabled")"
     safe_ip_limit_source="$(escape_config_value "$ip_limit_source")"
     safe_ip_limit_max_ips="$(escape_config_value "$ip_limit_max_ips")"
@@ -12369,6 +12382,8 @@ KTO_COLLECTOR_EXPECTED_NODES="$safe_expected"
 KTO_COLLECTOR_TZ="$safe_tz"
 KTO_COLLECTOR_DAILY_REPORT_TIME="$safe_daily"
 KTO_COLLECTOR_SSH_BASE_ALLOWED_IPS="$safe_ssh_base_allowed_ips"
+KTO_COLLECTOR_DASHBOARD_ENABLED="$safe_dashboard_enabled"
+KTO_COLLECTOR_DASHBOARD_TOKEN="$safe_dashboard_token"
 KTO_COLLECTOR_IP_LIMIT_ENABLED="$safe_ip_limit_enabled"
 KTO_COLLECTOR_IP_LIMIT_SOURCE="$safe_ip_limit_source"
 KTO_COLLECTOR_IP_LIMIT_MAX_IPS="$safe_ip_limit_max_ips"
@@ -12409,6 +12424,19 @@ EOF
         ok "Коллектор установлен (${SCRIPT_BUILD})"
     fi
     ok "Адрес: ${listen_host}:${listen_port}"
+    dashboard_effective_token="$("${SUDO[@]}" "$STATS_COLLECTOR_SCRIPT" --dashboard-token 2>/dev/null || true)"
+    dashboard_host="$listen_host"
+    if [[ "$dashboard_host" == "0.0.0.0" || "$dashboard_host" == "::" ]]; then
+        dashboard_host="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+        dashboard_host="${dashboard_host:-<IP-коллектора>}"
+    fi
+    if [[ -n "$dashboard_effective_token" ]]; then
+        ok "BL-панель: http://${dashboard_host}:${listen_port}/panel/"
+        ok "Токен панели: ${dashboard_effective_token}"
+        ok "Показать токен позже: sudo ${STATS_COLLECTOR_SCRIPT} --dashboard-token"
+    else
+        warn "BL-панель: выключена"
+    fi
     ok "Ожидаемо обходов: ${expected_nodes}"
     if (( existing_config == 1 )); then
         ok "Секрет: сохранён"
@@ -12444,11 +12472,13 @@ stats_collector_status() {
     header
     require_panel_mode
     need_root
-    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec stale_sec wl_offline_confirm_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown remna_test_id remna_test_log remna_code remna_probe
+    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec stale_sec wl_offline_confirm_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown remna_test_id remna_test_log remna_code remna_probe dashboard_enabled dashboard_token
     local ip_limit_enabled ip_limit_source ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_max_events asn_lookup_enabled asn_cache_sec
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
     listen_port="$(config_get KTO_COLLECTOR_LISTEN_PORT "$STATS_COLLECTOR_CONFIG")"
+    dashboard_enabled="$(config_get KTO_COLLECTOR_DASHBOARD_ENABLED "$STATS_COLLECTOR_CONFIG")"
+    dashboard_token="$("${SUDO[@]}" "$STATS_COLLECTOR_SCRIPT" --dashboard-token 2>/dev/null || true)"
     remna_api_url="$(config_get KTO_COLLECTOR_REMNA_API_URL "$STATS_COLLECTOR_CONFIG")"
     remna_api_token="$(config_get KTO_COLLECTOR_REMNA_API_TOKEN "$STATS_COLLECTOR_CONFIG")"
     remna_node_alert_enabled="$(config_get KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED "$STATS_COLLECTOR_CONFIG")"
@@ -12485,6 +12515,8 @@ stats_collector_status() {
     print_row "конфиг" "$STATS_COLLECTOR_CONFIG" "$([[ -s "$STATS_COLLECTOR_CONFIG" ]] && echo 1 || echo 0)"
     print_row "данные" "$STATS_COLLECTOR_STATE_DIR" "$([[ -d "$STATS_COLLECTOR_STATE_DIR" ]] && echo 1 || echo 0)"
     print_row "адрес" "${listen_host}:${listen_port}" "$([[ -n "$listen_port" ]] && echo 1 || echo 0)"
+    print_row "BL panel" "/panel/ / enabled ${dashboard_enabled:-1}" "$([[ "${dashboard_enabled:-1}" == "1" && -n "$dashboard_token" ]] && echo 1 || echo 0)"
+    print_row "panel token" "${dashboard_token:-unavailable}" "$([[ -n "$dashboard_token" ]] && echo 1 || echo 0)"
     print_row "wl stale" "${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}s + confirm ${wl_offline_confirm_sec:-$STATS_COLLECTOR_WL_OFFLINE_CONFIRM_SEC_DEFAULT}s" 1
     print_row "bl stale" "${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s + confirm ${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}s" 1
     print_row "bl push" "target ${bl_push_interval_sec:-$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT}s / fallback ${bl_stale_fallback_sec:-$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT}s" 1
