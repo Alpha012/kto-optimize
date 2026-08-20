@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v323"
+SCRIPT_BUILD="v324"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -15,6 +15,17 @@ WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 85.9
 WHITELIST_SSH_ALLOWED_IPS="${KTO_WHITELIST_SSH_ALLOWED_IPS:-$WHITELIST_SSH_ALLOWED_IPS_DEFAULT}"
 WHITELIST_SSH_KEEP_CURRENT="${KTO_WHITELIST_SSH_KEEP_CURRENT:-1}"
 FAIL2BAN_SSH_ALLOWLIST_CONF="/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local"
+KTO_SSH_PORT_FILE="${KTO_SSH_PORT_FILE:-/etc/kto-ssh-port}"
+KTO_SSH_MANAGED_CONFIG="${KTO_SSH_MANAGED_CONFIG:-/etc/ssh/sshd_config.d/00-kto-managed.conf}"
+KTO_SSH_BACKUP_DIR="${KTO_SSH_BACKUP_DIR:-/var/backups/kto-ssh}"
+KTO_SSH_PORT_MIN="${KTO_SSH_PORT_MIN:-20000}"
+KTO_SSH_PORT_MAX="${KTO_SSH_PORT_MAX:-29999}"
+XANMOD_PACKAGE="${KTO_XANMOD_PACKAGE:-linux-xanmod-x64v3}"
+XANMOD_KEY_URL="${KTO_XANMOD_KEY_URL:-https://dl.xanmod.org/archive.key}"
+XANMOD_REPO_URL="${KTO_XANMOD_REPO_URL:-https://deb.xanmod.org}"
+XANMOD_KEYRING="${KTO_XANMOD_KEYRING:-/etc/apt/keyrings/xanmod-archive-keyring.gpg}"
+XANMOD_SOURCE_FILE="${KTO_XANMOD_SOURCE_FILE:-/etc/apt/sources.list.d/xanmod-release.list}"
+XANMOD_GRUB_DEFAULT_FILE="${KTO_XANMOD_GRUB_DEFAULT_FILE:-/etc/default/grub.d/99-kto-xanmod.cfg}"
 MOBILE443_DIR="/opt/mobile443"
 MOBILE443_CONFIG="${MOBILE443_DIR}/config.conf"
 MOBILE443_MANAGER="/usr/local/sbin/kto-mobile443"
@@ -56,6 +67,7 @@ HAPROXY_BANDWIDTH_MANAGER="${KTO_HAPROXY_BANDWIDTH_MANAGER:-/usr/local/sbin/kto-
 HAPROXY_BANDWIDTH_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
 HAPROXY_BANDWIDTH_UNIT="${KTO_HAPROXY_BANDWIDTH_UNIT:-/etc/systemd/system/kto-haproxy-bandwidth.service}"
 HAPROXY_BANDWIDTH_SERVICE="${KTO_HAPROXY_BANDWIDTH_SERVICE:-kto-haproxy-bandwidth.service}"
+HAPROXY_BACKEND_MAXCONN=25000
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
 DNS_GUARD_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-kto-dns.conf"
@@ -1156,23 +1168,145 @@ apt_install_with_update_if_missing() {
     apt_install_quiet "${missing[@]}"
 }
 
-liquorix_installed() {
-    package_installed linux-image-liquorix-amd64 && package_installed linux-headers-liquorix-amd64
+xanmod_kernel_versions() {
+    find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null |
+        grep -E 'xanmod' | LC_ALL=C sort -V
 }
 
-liquorix_source_configured() {
-    grep -RqsE 'damentz.*liquorix|liquorix' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null
+xanmod_latest_version() {
+    xanmod_kernel_versions | tail -n 1
+}
+
+xanmod_installed() {
+    local version
+    package_installed "$XANMOD_PACKAGE" || return 1
+    version="$(xanmod_latest_version)"
+    [[ -n "$version" ]] || return 1
+    [[ -s "/boot/vmlinuz-${version}" && -d "/lib/modules/${version}" ]]
+}
+
+xanmod_source_configured() {
+    [[ -s "$XANMOD_SOURCE_FILE" && -s "$XANMOD_KEYRING" ]] &&
+        grep -Fq "$XANMOD_REPO_URL" "$XANMOD_SOURCE_FILE" 2>/dev/null
+}
+
+xanmod_x64v3_supported() {
+    local loader output flags required flag
+
+    for loader in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2; do
+        [[ -x "$loader" ]] || continue
+        output="$(LC_ALL=C "$loader" --help 2>/dev/null || true)"
+        if grep -Eq 'x86-64-v3[[:space:]]+\(supported' <<< "$output"; then
+            return 0
+        fi
+        if grep -Eq 'x86-64-v3[[:space:]]+\(NOT supported' <<< "$output"; then
+            return 1
+        fi
+    done
+
+    flags=" $(awk -F: '/^flags[[:space:]]*:/ { print $2; exit }' /proc/cpuinfo 2>/dev/null) "
+    required=(avx avx2 bmi1 bmi2 f16c fma movbe xsave)
+    for flag in "${required[@]}"; do
+        [[ "$flags" == *" ${flag} "* ]] || return 1
+    done
+    [[ "$flags" == *" abm "* || "$flags" == *" lzcnt "* ]]
+}
+
+secure_boot_enabled() {
+    local state efivar value
+    if command_exists mokutil; then
+        state="$(LC_ALL=C mokutil --sb-state 2>/dev/null || true)"
+        grep -qi 'SecureBoot enabled' <<< "$state"
+        return
+    fi
+    efivar="$(find /sys/firmware/efi/efivars -maxdepth 1 -type f -name 'SecureBoot-*' 2>/dev/null | head -n 1)"
+    [[ -n "$efivar" ]] || return 1
+    value="$(od -An -t u1 -j 4 -N 1 "$efivar" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$value" == "1" ]]
+}
+
+xanmod_boot_free_mb() {
+    df -Pm /boot 2>/dev/null | awk 'NR == 2 { print $4; exit }'
+}
+
+xanmod_root_free_mb() {
+    df -Pm / 2>/dev/null | awk 'NR == 2 { print $4; exit }'
+}
+
+managed_ssh_port() {
+    local port=""
+    if [[ -r "$KTO_SSH_PORT_FILE" ]]; then
+        port="$(awk 'NR == 1 { print $1; exit }' "$KTO_SSH_PORT_FILE" 2>/dev/null || true)"
+    elif [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        port="$("${SUDO[@]}" awk 'NR == 1 { print $1; exit }' "$KTO_SSH_PORT_FILE" 2>/dev/null || true)"
+    fi
+    if [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )); then
+        printf '%d\n' "$((10#$port))"
+    fi
 }
 
 detect_ssh_port() {
     local port=""
-    if command_exists sshd; then
+    port="$(managed_ssh_port || true)"
+    if [[ -z "$port" ]] && command_exists sshd; then
         port="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)"
     fi
     if [[ -z "$port" && -r /etc/ssh/sshd_config ]]; then
         port="$(awk 'tolower($1)=="port" && $1 !~ /^#/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
     fi
-    echo "${port:-22}"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+        port=22
+    fi
+    printf '%d\n' "$((10#$port))"
+}
+
+ssh_port_is_listening() {
+    local port="$1"
+    command_exists ss || return 1
+    ss -H -ltn 2>/dev/null |
+        awk -v wanted="$port" '
+            {
+                address = $4
+                sub(/^.*:/, "", address)
+                if (address == wanted) found = 1
+            }
+            END { exit found ? 0 : 1 }
+        '
+}
+
+choose_managed_ssh_port() {
+    local current min max candidate attempt marker
+    marker="$(managed_ssh_port || true)"
+    if [[ -n "$marker" ]]; then
+        printf '%s\n' "$marker"
+        return 0
+    fi
+
+    current="$(detect_ssh_port)"
+    if [[ "$current" =~ ^[0-9]+$ ]] && (( current != 22 )) && ssh_port_is_listening "$current"; then
+        printf '%s\n' "$current"
+        return 0
+    fi
+
+    min="$KTO_SSH_PORT_MIN"
+    max="$KTO_SSH_PORT_MAX"
+    [[ "$min" =~ ^[0-9]+$ ]] || min=20000
+    [[ "$max" =~ ^[0-9]+$ ]] || max=29999
+    min=$((10#$min))
+    max=$((10#$max))
+    if (( min < 1024 || max > 65535 || min >= max )); then
+        min=20000
+        max=29999
+    fi
+
+    for (( attempt = 0; attempt < 256; attempt++ )); do
+        candidate=$(( min + (RANDOM * 32768 + RANDOM) % (max - min + 1) ))
+        (( candidate != NODE_PORT )) || continue
+        ssh_port_is_listening "$candidate" && continue
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    return 1
 }
 
 validate_domain() {
@@ -1409,15 +1543,20 @@ haproxy_target_pool_count() {
 }
 
 normalize_haproxy_server_maxconn() {
-    local raw="${1:-default}"
+    local raw="${1:-default}" wanted="$HAPROXY_BACKEND_MAXCONN"
     raw="${raw//[[:space:]]/}"
     case "${raw,,}" in
-        ""|0|auto|default|none) printf 'default\n'; return 0 ;;
+        ""|0|auto|default|none) ;;
+        *)
+            [[ "$raw" =~ ^[0-9]+$ ]] || return 1
+            raw=$((10#$raw))
+            (( raw >= 1 && raw <= 10000000 )) || return 1
+            ;;
     esac
-    [[ "$raw" =~ ^[0-9]+$ ]] || return 1
-    raw=$((10#$raw))
-    (( raw >= 1 && raw <= 10000000 )) || return 1
-    printf '%d\n' "$raw"
+    [[ "$wanted" =~ ^[0-9]+$ ]] || wanted=25000
+    wanted=$((10#$wanted))
+    (( wanted >= 1 && wanted <= 10000000 )) || wanted=25000
+    printf '%d\n' "$wanted"
 }
 
 normalize_haproxy_source_ip() {
@@ -1487,6 +1626,11 @@ print_haproxy_route() {
     server_maxconn="$(normalize_haproxy_server_maxconn "$server_maxconn")" || return 1
     listen_ip="$(normalize_haproxy_listen_ip "$listen_ip")" || return 1
     send_proxy_v2="$(normalize_haproxy_send_proxy_v2 "$send_proxy_v2")" || return 1
+    if [[ "$listen_ip" != "*" ]]; then
+        source_ip="$listen_ip"
+    elif [[ "$source_ip" != "default" ]]; then
+        listen_ip="$source_ip"
+    fi
 
     if [[ "$send_proxy_v2" == "1" ]]; then
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -1926,9 +2070,24 @@ whitelist_ssh_allowed_ips() {
 
 apply_whitelist_ssh_rules() {
     local ssh_port="$1"
-    local ip attempt allowed_ips
+    local ip attempt allowed_ips managed_port
 
     allowed_ips="$(whitelist_ssh_allowed_ips | sort -u)"
+
+    # Once kto has migrated SSH to its persistent random port, that port must
+    # stay globally reachable. Keep the old allowlist behavior only for nodes
+    # which have not gone through the managed root-SSH migration yet.
+    managed_port="$(managed_ssh_port 2>/dev/null || true)"
+    if [[ -n "$managed_port" && "$ssh_port" == "$managed_port" ]]; then
+        while read -r ip; do
+            [[ -n "$ip" ]] || continue
+            for (( attempt = 0; attempt < 16; attempt++ )); do
+                "${SUDO[@]}" ufw --force delete allow proto tcp from "$ip" to any port "$ssh_port" >/dev/null 2>&1 || break
+            done
+        done <<< "$allowed_ips"
+        ensure_global_ssh_ufw_rule "$ssh_port"
+        return 0
+    fi
 
     cmd "${SUDO[@]}" ufw --force delete allow "${ssh_port}/tcp" || true
     cmd "${SUDO[@]}" ufw --force delete allow ssh || true
@@ -1940,6 +2099,306 @@ apply_whitelist_ssh_rules() {
         done
         cmd "${SUDO[@]}" ufw insert 1 allow proto tcp from "$ip" to any port "$ssh_port" comment 'kto-ssh' || true
     done <<< "$allowed_ips"
+}
+
+ssh_service_name() {
+    if systemctl cat ssh.service >/dev/null 2>&1; then
+        printf 'ssh\n'
+    elif systemctl cat sshd.service >/dev/null 2>&1; then
+        printf 'sshd\n'
+    else
+        return 1
+    fi
+}
+
+ufw_allow_rule_numbers_for_port() {
+    local port="$1"
+    command_exists ufw || return 0
+    "${SUDO[@]}" ufw status numbered 2>/dev/null | awk -v port="$port" -v tcp="${port}/tcp" '
+        $0 ~ /ALLOW/ {
+            number = $0
+            sub(/^[[:space:]]*\[[[:space:]]*/, "", number)
+            sub(/\].*$/, "", number)
+            gsub(/[[:space:]]/, "", number)
+            if (number !~ /^[0-9]+$/) next
+
+            target = $0
+            sub(/^[^]]*\][[:space:]]*/, "", target)
+            sub(/[[:space:]]+ALLOW.*/, "", target)
+            gsub(/[[:space:]]/, "", target)
+            is_port = (target == tcp || target == tcp "(v6)" || target == port || target == port "(v6)")
+            is_service = (port == "22" && (target == "ssh" || target == "ssh(v6)" || target == "OpenSSH" || target == "OpenSSH(v6)"))
+            if (is_port || is_service) print number
+        }
+    ' | sort -rn
+}
+
+ufw_global_allow_exists_for_port() {
+    local port="$1"
+    command_exists ufw || return 1
+    "${SUDO[@]}" ufw status 2>/dev/null | awk -v port="$port" -v tcp="${port}/tcp" '
+        $0 ~ /ALLOW/ && $0 ~ /Anywhere/ {
+            target = $1
+            gsub(/[[:space:]]/, "", target)
+            if (target == tcp || target == port ||
+                (port == "22" && (target == "ssh" || target == "OpenSSH"))) found = 1
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+remove_ufw_allow_rules_for_port() {
+    local port="$1" number
+    local -a numbers=()
+    command_exists ufw || return 0
+    mapfile -t numbers < <(ufw_allow_rule_numbers_for_port "$port")
+    for number in "${numbers[@]}"; do
+        [[ "$number" =~ ^[0-9]+$ ]] || continue
+        "${SUDO[@]}" ufw --force delete "$number" >> "$LOG_FILE" 2>&1 || true
+    done
+}
+
+ensure_global_ssh_ufw_rule() {
+    local port="$1"
+    command_exists ufw || return 0
+    if ! ufw_global_allow_exists_for_port "$port"; then
+        cmd "${SUDO[@]}" ufw allow proto tcp to any port "$port" comment 'kto-ssh-open'
+    fi
+}
+
+merge_root_authorized_keys() {
+    local output_file="$1" user home key_file
+    local -a key_files=(/root/.ssh/authorized_keys /home/ubuntu/.ssh/authorized_keys)
+
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root && "$SUDO_USER" != ubuntu ]]; then
+        home="$(getent passwd "$SUDO_USER" 2>/dev/null | awk -F: 'NR == 1 { print $6; exit }')"
+        [[ -z "$home" ]] || key_files+=("${home}/.ssh/authorized_keys")
+    fi
+    : > "$output_file"
+    for key_file in "${key_files[@]}"; do
+        if "${SUDO[@]}" test -s "$key_file" 2>/dev/null; then
+            "${SUDO[@]}" cat "$key_file" 2>> "$LOG_FILE" | awk '
+                {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i ~ /^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-|sk-(ssh-ed25519|ecdsa-sha2-)|rsa-sha2-)/ && (i + 1) <= NF) {
+                            line = $i " " $(i + 1)
+                            for (j = i + 2; j <= NF; j++) line = line " " $j
+                            print line
+                            break
+                        }
+                    }
+                }
+            ' >> "$output_file" || true
+        fi
+    done
+    awk 'NF && !seen[$0]++ { print }' "$output_file" > "${output_file}.dedup"
+    mv "${output_file}.dedup" "$output_file"
+    if [[ ! -s "$output_file" ]] || ! ssh-keygen -lf "$output_file" >/dev/null 2>&1; then
+        fail "SSH: не найден валидный public key у root или ubuntu; root-вход не включён"
+        return 1
+    fi
+}
+
+restore_optional_ssh_file() {
+    local backup="$1" target="$2" existed="$3"
+    if [[ "$existed" == "1" ]]; then
+        "${SUDO[@]}" cp -a "$backup" "$target" >> "$LOG_FILE" 2>&1 || true
+    else
+        "${SUDO[@]}" rm -f "$target" >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
+rollback_ssh_migration() {
+    local backup_dir="$1" had_main="$2" had_managed="$3" had_root_keys="$4" had_marker="$5"
+    local service="$6" socket_was_enabled="$7" socket_was_active="$8" new_port="$9" new_rule_existed="${10}"
+
+    restore_optional_ssh_file "${backup_dir}/sshd_config" /etc/ssh/sshd_config "$had_main"
+    restore_optional_ssh_file "${backup_dir}/managed.conf" "$KTO_SSH_MANAGED_CONFIG" "$had_managed"
+    restore_optional_ssh_file "${backup_dir}/authorized_keys" /root/.ssh/authorized_keys "$had_root_keys"
+    restore_optional_ssh_file "${backup_dir}/port" "$KTO_SSH_PORT_FILE" "$had_marker"
+    run_systemctl_bounded 15 daemon-reload >> "$LOG_FILE" 2>&1 || true
+    if [[ "$socket_was_enabled" == "1" ]]; then
+        run_systemctl_bounded 15 enable ssh.socket >> "$LOG_FILE" 2>&1 || true
+    fi
+    if [[ "$socket_was_active" == "1" ]]; then
+        run_systemctl_bounded 15 start ssh.socket >> "$LOG_FILE" 2>&1 || true
+    fi
+    run_systemctl_bounded 15 restart "$service" >> "$LOG_FILE" 2>&1 || true
+    if [[ "$new_rule_existed" == "0" ]]; then
+        remove_ufw_allow_rules_for_port "$new_port"
+    fi
+}
+
+ssh_root_access_configured() {
+    local port service effective
+    port="$(managed_ssh_port || true)"
+    [[ -n "$port" ]] || return 1
+    [[ -s "$KTO_SSH_MANAGED_CONFIG" && -s /root/.ssh/authorized_keys ]] || return 1
+    grep -Fqx "Port ${port}" "$KTO_SSH_MANAGED_CONFIG" 2>/dev/null || return 1
+    grep -Fqx 'PermitRootLogin prohibit-password' "$KTO_SSH_MANAGED_CONFIG" 2>/dev/null || return 1
+    service="$(ssh_service_name 2>/dev/null || true)"
+    [[ -n "$service" ]] || return 1
+    run_systemctl_bounded 3 is-active --quiet "$service" 2>/dev/null || return 1
+    ssh_port_is_listening "$port" || return 1
+    if command_exists ufw && "${SUDO[@]}" ufw status 2>/dev/null | grep -q 'Status: active'; then
+        ufw_global_allow_exists_for_port "$port" || return 1
+    fi
+    effective="$("${SUDO[@]}" sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null || true)"
+    grep -Fqx 'permitrootlogin without-password' <<< "$effective" ||
+        grep -Fqx 'permitrootlogin prohibit-password' <<< "$effective"
+}
+
+opt_ssh_root_access() {
+    local old_port new_port service timestamp backup_dir main_tmp keys_tmp effective
+    local had_main=0 had_managed=0 had_root_keys=0 had_marker=0 new_rule_existed=0
+    local socket_was_enabled=0 socket_was_active=0 attempt
+
+    command_exists sshd || {
+        fail "OpenSSH server не установлен"
+        return 1
+    }
+    command_exists ssh-keygen || apt_install_quiet openssh-client || return 1
+    service="$(ssh_service_name 2>/dev/null || true)"
+    [[ -n "$service" ]] || {
+        fail "SSH systemd service не найден"
+        return 1
+    }
+    old_port="$(detect_ssh_port)"
+    new_port="$(choose_managed_ssh_port 2>/dev/null || true)"
+    [[ "$new_port" =~ ^[0-9]+$ ]] || {
+        fail "Не удалось выбрать свободный случайный SSH-порт"
+        return 1
+    }
+
+    timestamp="$(date -u +%Y%m%d-%H%M%S-%N)"
+    backup_dir="${KTO_SSH_BACKUP_DIR}/${timestamp}-${BASHPID:-$$}-${RANDOM}"
+    cmd "${SUDO[@]}" mkdir -p "$backup_dir" /etc/ssh/sshd_config.d /root/.ssh /run/sshd
+    cmd "${SUDO[@]}" chmod 0700 "$KTO_SSH_BACKUP_DIR" "$backup_dir" /root/.ssh
+    if "${SUDO[@]}" test -e /etc/ssh/sshd_config; then
+        had_main=1
+        "${SUDO[@]}" cp -a /etc/ssh/sshd_config "${backup_dir}/sshd_config"
+    fi
+    if "${SUDO[@]}" test -e "$KTO_SSH_MANAGED_CONFIG"; then
+        had_managed=1
+        "${SUDO[@]}" cp -a "$KTO_SSH_MANAGED_CONFIG" "${backup_dir}/managed.conf"
+    fi
+    if "${SUDO[@]}" test -e /root/.ssh/authorized_keys; then
+        had_root_keys=1
+        "${SUDO[@]}" cp -a /root/.ssh/authorized_keys "${backup_dir}/authorized_keys"
+    fi
+    if "${SUDO[@]}" test -e "$KTO_SSH_PORT_FILE"; then
+        had_marker=1
+        "${SUDO[@]}" cp -a "$KTO_SSH_PORT_FILE" "${backup_dir}/port"
+    fi
+    run_systemctl_bounded 3 is-enabled --quiet ssh.socket 2>/dev/null && socket_was_enabled=1 || true
+    run_systemctl_bounded 3 is-active --quiet ssh.socket 2>/dev/null && socket_was_active=1 || true
+    ufw_global_allow_exists_for_port "$new_port" && new_rule_existed=1 || true
+
+    keys_tmp="$(mktemp)"
+    main_tmp="$(mktemp)"
+    if ! merge_root_authorized_keys "$keys_tmp"; then
+        rm -f "$keys_tmp" "$main_tmp"
+        return 1
+    fi
+    if (( had_main == 1 )); then
+        {
+            printf 'Include %s\n' "$KTO_SSH_MANAGED_CONFIG"
+            "${SUDO[@]}" cat /etc/ssh/sshd_config | awk -v include="$KTO_SSH_MANAGED_CONFIG" '
+                !($1 == "Include" && $2 == include) { print }
+            '
+        } > "$main_tmp"
+    else
+        printf 'Include %s\n' "$KTO_SSH_MANAGED_CONFIG" > "$main_tmp"
+    fi
+
+    if ! "${SUDO[@]}" install -m 0600 -o root -g root "$keys_tmp" /root/.ssh/authorized_keys >> "$LOG_FILE" 2>&1 ||
+        ! write_root_file_mode 0644 "$KTO_SSH_MANAGED_CONFIG" <<EOF
+# Managed by kto. Root login is key-only; password authentication stays disabled.
+Port ${new_port}
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+    then
+        rm -f "$keys_tmp" "$main_tmp"
+        rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
+            "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
+        return 1
+    fi
+    rm -f "$keys_tmp"
+    if ! "${SUDO[@]}" install -m 0644 "$main_tmp" /etc/ssh/sshd_config >> "$LOG_FILE" 2>&1; then
+        rm -f "$main_tmp"
+        rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
+            "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
+        return 1
+    fi
+    rm -f "$main_tmp"
+
+    effective="$("${SUDO[@]}" sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>> "$LOG_FILE" || true)"
+    if ! "${SUDO[@]}" sshd -t >> "$LOG_FILE" 2>&1 ||
+        ! grep -Fqx "port ${new_port}" <<< "$effective" ||
+        ! grep -Fqx 'pubkeyauthentication yes' <<< "$effective" ||
+        { ! grep -Fqx 'permitrootlogin without-password' <<< "$effective" &&
+          ! grep -Fqx 'permitrootlogin prohibit-password' <<< "$effective"; }; then
+        rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
+            "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
+        fail "SSH candidate не прошёл проверку; старый config восстановлен"
+        return 1
+    fi
+    if grep -Eq '^denyusers .*([^[:alnum:]_]|^)root([^[:alnum:]_]|$)' <<< "$effective" ||
+        { grep -q '^allowusers ' <<< "$effective" && ! grep -Eq '^allowusers .*([^[:alnum:]_]|^)root(@[^ ]+)?([[:space:]]|$)' <<< "$effective"; }; then
+        rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
+            "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
+        fail "SSH AllowUsers/DenyUsers запрещает root; config восстановлен"
+        return 1
+    fi
+
+    ensure_global_ssh_ufw_rule "$new_port" || {
+        rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
+            "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
+        return 1
+    }
+    run_systemctl_bounded 15 disable --now ssh.socket >> "$LOG_FILE" 2>&1 || true
+    if ! run_systemctl_bounded 15 enable "$service" >> "$LOG_FILE" 2>&1 ||
+        ! run_systemctl_bounded 15 restart "$service" >> "$LOG_FILE" 2>&1; then
+        rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
+            "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
+        fail "SSH не перезапустился на новом порту; выполнен откат"
+        return 1
+    fi
+    for (( attempt = 0; attempt < 20; attempt++ )); do
+        ssh_port_is_listening "$new_port" && break
+        sleep 0.25
+    done
+    if ! run_systemctl_bounded 3 is-active --quiet "$service" 2>/dev/null || ! ssh_port_is_listening "$new_port"; then
+        rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
+            "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
+        fail "SSH listener ${new_port}/tcp не поднялся; выполнен откат"
+        return 1
+    fi
+
+    if ! write_root_file_mode 0600 "$KTO_SSH_PORT_FILE" <<EOF
+${new_port}
+EOF
+    then
+        rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
+            "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
+        fail "Не удалось сохранить управляемый SSH-порт; выполнен откат"
+        return 1
+    fi
+    if [[ "$old_port" != "$new_port" ]]; then
+        remove_ufw_allow_rules_for_port "$old_port"
+    fi
+    if [[ "$new_port" != "22" ]]; then
+        remove_ufw_allow_rules_for_port 22
+    fi
+    ensure_global_ssh_ufw_rule "$new_port"
+    "${SUDO[@]}" ufw reload >> "$LOG_FILE" 2>&1 || true
+
+    ok "SSH: root по ключу, порт ${new_port}/tcp открыт для всех"
+    ok "Подключение: ssh -p ${new_port} root@IP"
+    ok "SSH backup: ${backup_dir}"
 }
 
 write_whitelist_fail2ban_allowlist() {
@@ -2397,7 +2856,8 @@ if ! command -v ufw >/dev/null 2>&1; then
     exit 1
 fi
 
-SSH_PORT="\$(sshd -T 2>/dev/null | awk '/^port / {print \$2; exit}' || true)"
+SSH_PORT="\$(awk 'NR == 1 {print \$1; exit}' '${KTO_SSH_PORT_FILE}' 2>/dev/null || true)"
+[[ "\$SSH_PORT" =~ ^[0-9]+\$ ]] || SSH_PORT="\$(sshd -T 2>/dev/null | awk '/^port / {print \$2; exit}' || true)"
 SSH_PORT="\${SSH_PORT:-22}"
 ufw status 2>/dev/null | awk '
     /ALLOW/ && /# kto-ssh/ {
@@ -2813,73 +3273,231 @@ EOF
     cmd "${SUDO[@]}" sysctl --system || true
 }
 
-opt_liquorix_kernel() {
-    local attempt installed=0
+configure_xanmod_repository() {
+    local key_tmp keyring_tmp codename fingerprint
+
+    codename="$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/"/, "", $2); print $2; exit }' /etc/os-release 2>/dev/null || true)"
+    [[ -n "$codename" ]] || {
+        fail "XanMod: не удалось определить Ubuntu codename"
+        return 1
+    }
+    command_exists gpg || apt_install_quiet gnupg2 || return 1
+    key_tmp="$(mktemp)"
+    keyring_tmp="$(mktemp)"
+    if command_exists curl; then
+        if ! curl -fsSL --connect-timeout 10 --max-time 60 "$XANMOD_KEY_URL" -o "$key_tmp"; then
+            rm -f "$key_tmp" "$keyring_tmp"
+            fail "XanMod: не удалось скачать официальный signing key"
+            return 1
+        fi
+    elif command_exists wget; then
+        if ! wget -q --timeout=60 -O "$key_tmp" "$XANMOD_KEY_URL"; then
+            rm -f "$key_tmp" "$keyring_tmp"
+            fail "XanMod: не удалось скачать официальный signing key"
+            return 1
+        fi
+    else
+        rm -f "$key_tmp" "$keyring_tmp"
+        fail "XanMod: curl/wget не найден"
+        return 1
+    fi
+    fingerprint="$(gpg --batch --show-keys --with-colons "$key_tmp" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
+    if [[ ! "$fingerprint" =~ ^[A-Fa-f0-9]{40,64}$ ]] ||
+        ! gpg --batch --yes --dearmor --output "$keyring_tmp" "$key_tmp" >/dev/null 2>&1 ||
+        [[ ! -s "$keyring_tmp" ]]; then
+        rm -f "$key_tmp" "$keyring_tmp"
+        fail "XanMod: официальный signing key не прошёл проверку"
+        return 1
+    fi
+    cmd "${SUDO[@]}" mkdir -p /etc/apt/keyrings
+    if ! "${SUDO[@]}" install -m 0644 "$keyring_tmp" "$XANMOD_KEYRING" >> "$LOG_FILE" 2>&1; then
+        rm -f "$key_tmp" "$keyring_tmp"
+        fail "XanMod: не удалось установить signing key"
+        return 1
+    fi
+    rm -f "$key_tmp" "$keyring_tmp"
+
+    write_root_file "$XANMOD_SOURCE_FILE" <<EOF
+deb [signed-by=${XANMOD_KEYRING}] ${XANMOD_REPO_URL} ${codename} main
+EOF
+    APT_UPDATED=0
+    if ! apt_update_force; then
+        fail "XanMod: apt update после подключения репозитория не прошёл"
+        return 1
+    fi
+    printf 'XanMod signing key fingerprint: %s\n' "$fingerprint" >> "$LOG_FILE"
+}
+
+xanmod_release_available() {
+    local codename="$1" release_url
+    release_url="${XANMOD_REPO_URL%/}/dists/${codename}/InRelease"
+
+    if command_exists curl; then
+        curl -fsSIL --retry 2 --retry-delay 2 --connect-timeout 10 --max-time 30 \
+            "$release_url" >/dev/null 2>&1 && return 0
+    fi
+    if command_exists wget; then
+        wget -q --spider --timeout=30 --tries=2 "$release_url" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+select_xanmod_grub_entry() {
+    local version submenu_id entry_id saved_entry
+    version="$(xanmod_latest_version)"
+    [[ -n "$version" ]] || return 1
+
+    if [[ ! -s "/boot/initrd.img-${version}" ]]; then
+        cmd "${SUDO[@]}" update-initramfs -c -k "$version" || return 1
+    else
+        cmd "${SUDO[@]}" update-initramfs -u -k "$version" || return 1
+    fi
+    command_exists update-grub || {
+        fail "XanMod: update-grub не найден"
+        return 1
+    }
+    write_root_file "$XANMOD_GRUB_DEFAULT_FILE" <<'EOF'
+# Managed by kto. Keep the selected XanMod entry across package updates.
+GRUB_DEFAULT=saved
+GRUB_SAVEDEFAULT=false
+EOF
+    cmd "${SUDO[@]}" update-grub || return 1
+
+    if ! command_exists grub-set-default || [[ ! -s /boot/grub/grub.cfg ]]; then
+        warn "XanMod установлен, но grub-set-default недоступен; GRUB выберет самое новое ядро автоматически."
+        return 0
+    fi
+    submenu_id="$(awk '
+        /^submenu / && /gnulinux-advanced/ {
+            line = $0
+            sub(/^.*--id[[:space:]]+\047/, "", line)
+            sub(/\047.*$/, "", line)
+            print line
+            exit
+        }
+    ' /boot/grub/grub.cfg 2>/dev/null || true)"
+    entry_id="$(awk -v version="$version" '
+        /^[[:space:]]*menuentry / && index($0, version) && $0 !~ /recovery mode/ {
+            line = $0
+            sub(/^.*--id[[:space:]]+\047/, "", line)
+            sub(/\047.*$/, "", line)
+            print line
+            exit
+        }
+    ' /boot/grub/grub.cfg 2>/dev/null || true)"
+    if [[ -z "$entry_id" ]]; then
+        warn "XanMod установлен, но его GRUB entry не найден; оставляю безопасный автоматический выбор нового ядра."
+        return 0
+    fi
+    saved_entry="$entry_id"
+    [[ -z "$submenu_id" ]] || saved_entry="${submenu_id}>${entry_id}"
+    if ! cmd "${SUDO[@]}" grub-set-default "$saved_entry"; then
+        fail "XanMod: не удалось выбрать kernel в GRUB"
+        return 1
+    fi
+    printf 'XanMod GRUB saved entry: %s\n' "$saved_entry" >> "$LOG_FILE"
+}
+
+opt_xanmod_kernel() {
+    local attempt installed=0 free_mb root_free_mb version codename
 
     if [[ "$(uname -m)" != "x86_64" ]] || ! grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
-        echo "Liquorix skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
+        echo "XanMod skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
+        return 0
+    fi
+    if ! xanmod_x64v3_supported; then
+        fail "XanMod x64v3 не поддерживается этим CPU. Текущее ядро оставлено без изменений."
+        return 1
+    fi
+    if secure_boot_enabled; then
+        fail "XanMod: Secure Boot включён. Отключи его у провайдера перед установкой неподписанного kernel."
+        return 1
+    fi
+    free_mb="$(xanmod_boot_free_mb)"
+    if [[ "$free_mb" =~ ^[0-9]+$ ]] && (( free_mb < 300 )); then
+        fail "XanMod: в /boot свободно ${free_mb} MB, нужно минимум 300 MB"
+        return 1
+    fi
+
+    if xanmod_installed; then
+        select_xanmod_grub_entry || return 1
+        echo "XanMod skipped: x64v3 package and boot artifacts already installed" >> "$LOG_FILE"
         return 0
     fi
 
-    if liquorix_installed; then
-        echo "Liquorix skipped: packages already installed" >> "$LOG_FILE"
-        return 0
+    root_free_mb="$(xanmod_root_free_mb)"
+    if [[ "$root_free_mb" =~ ^[0-9]+$ ]] && (( root_free_mb < 1500 )); then
+        fail "XanMod: на / свободно ${root_free_mb} MB, для безопасной установки нужно минимум 1500 MB"
+        return 1
     fi
 
-    if liquorix_source_configured; then
-        apt_update_quiet || echo "Liquorix apt update failed, trying current apt cache" >> "$LOG_FILE"
-    else
-        if ! cmd "${SUDO[@]}" add-apt-repository ppa:damentz/liquorix -y; then
-            warn "Liquorix: не смог добавить PPA."
-            return 1
-        fi
-        if ! apt_update_force; then
-            warn "Liquorix: apt update после PPA не прошёл."
-            return 1
-        fi
+    codename="$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/"/, "", $2); print $2; exit }' /etc/os-release 2>/dev/null || true)"
+    if [[ -z "$codename" ]] ||
+        { ! apt-cache show "$XANMOD_PACKAGE" >/dev/null 2>&1 && ! xanmod_release_available "$codename"; }; then
+        fail "XanMod: официальный репозиторий не публикует Ubuntu ${codename:-unknown}. Текущее ядро оставлено без изменений."
+        return 1
+    fi
+    if ! xanmod_source_configured; then
+        configure_xanmod_repository || return 1
     fi
 
-    for attempt in 1 2 3 4; do
+    apt_update_quiet || echo "XanMod apt update failed, trying current apt cache" >> "$LOG_FILE"
+    for attempt in 1 2 3; do
         if (( attempt > 1 )); then
-            echo "Liquorix install retry ${attempt}" >> "$LOG_FILE"
+            printf 'XanMod install retry %s\n' "$attempt" >> "$LOG_FILE"
             cmd "${SUDO[@]}" dpkg --configure -a || true
             apt_update_force || true
         fi
-        if apt_install_quiet linux-image-liquorix-amd64 linux-headers-liquorix-amd64 && liquorix_installed; then
+        if package_installed "$XANMOD_PACKAGE"; then
+            if "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 \
+                install --reinstall -y "$XANMOD_PACKAGE" >> "$LOG_FILE" 2>&1 && xanmod_installed; then
+                installed=1
+                break
+            fi
+        elif apt_install_quiet "$XANMOD_PACKAGE" && xanmod_installed; then
             installed=1
             break
         fi
         sleep $(( attempt * 2 ))
     done
-
     if (( installed == 0 )); then
-        warn "Liquorix: пакеты kernel не поставились после повторов."
+        fail "XanMod x64v3 не установился после повторов; текущее ядро и GRUB не изменены"
         return 1
     fi
 
-    return 0
+    version="$(xanmod_latest_version)"
+    if [[ -z "$version" || ! -s "/boot/vmlinuz-${version}" || ! -d "/lib/modules/${version}" ]]; then
+        fail "XanMod: после установки отсутствуют kernel или modules"
+        return 1
+    fi
+    select_xanmod_grub_entry || return 1
+    ok "XanMod x64v3 ${version} установлен и выбран для следующей загрузки"
+    if grep -RqsE 'damentz.*liquorix|liquorix' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+        warn "Liquorix оставлен установленным как аварийный fallback; активным после reboot будет XanMod."
+    fi
 }
 
 opt_kernel_final_check() {
     if [[ "$(uname -m)" != "x86_64" ]] || ! grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
         return 0
     fi
-    if liquorix_installed; then
-        echo "Liquorix final check: packages installed" >> "$LOG_FILE"
+    if xanmod_installed; then
+        select_xanmod_grub_entry || warn "XanMod установлен, но не удалось повторно проверить GRUB selection."
+        echo "XanMod final check: package and boot artifacts installed" >> "$LOG_FILE"
         return 0
     fi
-    warn "Liquorix: не установлен после первого этапа, повторяю отдельно."
-    if opt_liquorix_kernel && liquorix_installed; then
-        ok "Liquorix kernel установлен. После оптимизации нужен reboot."
+    warn "XanMod x64v3 не установлен после первого этапа, повторяю отдельно."
+    if opt_xanmod_kernel && xanmod_installed; then
+        ok "XanMod x64v3 установлен. После оптимизации нужен reboot."
         return 0
     fi
-    warn "Liquorix kernel не удалось установить. Остальная оптимизация продолжена; смотри лог: $LOG_FILE"
+    warn "XanMod x64v3 не удалось установить. Остальная оптимизация продолжена; смотри лог: $LOG_FILE"
     return 0
 }
 
 opt_kernel_network_memory_parallel() {
     parallel_run_tasks \
-        "kernel" opt_liquorix_kernel \
+        "kernel" opt_xanmod_kernel \
         "network limits" opt_network_limits \
         "memory guard" opt_memory_guard
 }
@@ -3062,10 +3680,10 @@ opt_firewall() {
     fi
     cmd "${SUDO[@]}" ufw default deny incoming
     cmd "${SUDO[@]}" ufw default allow outgoing
-    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
-        apply_whitelist_ssh_rules "$ssh_port"
-    else
-        cmd "${SUDO[@]}" ufw allow "${ssh_port}/tcp"
+    ensure_global_ssh_ufw_rule "$ssh_port"
+    if [[ "$ssh_port" != "22" ]]; then
+        remove_ufw_allow_rules_for_port 22
+        ensure_global_ssh_ufw_rule "$ssh_port"
     fi
     if haproxy_mode_supported; then
         routes_file="$(mktemp)"
@@ -3107,10 +3725,13 @@ opt_antiscanner() {
 }
 
 opt_fail2ban() {
+    local ssh_port
+    ssh_port="$(detect_ssh_port)"
     apt_install_quiet fail2ban || true
-    write_root_file /etc/fail2ban/jail.d/99-kto-sshd.conf <<'EOF'
+    write_root_file /etc/fail2ban/jail.d/99-kto-sshd.conf <<EOF
 [sshd]
 enabled = true
+port = ${ssh_port}
 bantime = 1h
 findtime = 10m
 maxretry = 5
@@ -3259,6 +3880,7 @@ SYSTEM_CHECK_WARNINGS=0
 SYSTEM_CHECK_NEEDS_PREPARE=0
 SYSTEM_CHECK_NEEDS_PACKAGES=0
 SYSTEM_CHECK_NEEDS_KERNEL=0
+SYSTEM_CHECK_NEEDS_SSH=0
 SYSTEM_CHECK_NEEDS_NETWORK=0
 SYSTEM_CHECK_NEEDS_FIREWALL=0
 SYSTEM_CHECK_NEEDS_ANTISCANNER=0
@@ -3273,6 +3895,7 @@ system_check_reset() {
     SYSTEM_CHECK_NEEDS_PREPARE=0
     SYSTEM_CHECK_NEEDS_PACKAGES=0
     SYSTEM_CHECK_NEEDS_KERNEL=0
+    SYSTEM_CHECK_NEEDS_SSH=0
     SYSTEM_CHECK_NEEDS_NETWORK=0
     SYSTEM_CHECK_NEEDS_FIREWALL=0
     SYSTEM_CHECK_NEEDS_ANTISCANNER=0
@@ -3552,24 +4175,43 @@ system_check_kernel() {
     kernel="$(uname -r)"
 
     if [[ "$(uname -m)" != "x86_64" ]] || ! grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
-        system_check_row skip "liquorix" "не Ubuntu amd64"
+        system_check_row skip "xanmod x64v3" "не Ubuntu amd64"
+        return 0
+    fi
+    if ! xanmod_x64v3_supported; then
+        system_check_row warn "xanmod x64v3" "CPU не поддерживает x86-64-v3; kernel не меняю"
+        return 0
+    fi
+    if secure_boot_enabled; then
+        system_check_row warn "xanmod x64v3" "Secure Boot включён; установка заблокирована"
         return 0
     fi
 
-    if liquorix_installed; then
-        if [[ "$kernel" == *liquorix* ]]; then
-            system_check_row ok "liquorix" "$kernel"
+    if xanmod_installed; then
+        if [[ "$kernel" == *xanmod* ]]; then
+            system_check_row ok "xanmod x64v3" "$kernel"
         else
-            system_check_row warn "liquorix" "пакеты стоят, текущее ядро: $kernel; нужен reboot"
+            system_check_row warn "xanmod x64v3" "установлен $(xanmod_latest_version), текущее ядро: $kernel; нужен reboot"
         fi
         return 0
     fi
 
     SYSTEM_CHECK_NEEDS_KERNEL=1
-    if liquorix_source_configured; then
-        system_check_row miss "liquorix" "repo есть, пакеты не установлены"
+    if xanmod_source_configured; then
+        system_check_row miss "xanmod x64v3" "repo есть, kernel не установлен"
     else
-        system_check_row miss "liquorix" "repo и пакеты не установлены"
+        system_check_row miss "xanmod x64v3" "официальный repo и kernel не установлены"
+    fi
+}
+
+system_check_ssh_root_access() {
+    local port
+    port="$(detect_ssh_port)"
+    if ssh_root_access_configured; then
+        system_check_row ok "ssh root" "key-only, ${port}/tcp открыт для всех"
+    else
+        SYSTEM_CHECK_NEEDS_SSH=1
+        system_check_row miss "ssh root" "нужен стабильный случайный порт и root key-only"
     fi
 }
 
@@ -3828,10 +4470,9 @@ system_check_firewall() {
         system_check_row miss "ufw" "не active"
     fi
 
-    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
-        whitelist_ssh_rules_configured "$ssh_port" || missing+=("ssh allowlist")
-    else
-        ufw_rule_allowed "${ssh_port}/tcp" || missing+=("${ssh_port}/tcp")
+    ufw_global_allow_exists_for_port "$ssh_port" || missing+=("${ssh_port}/tcp global")
+    if [[ "$ssh_port" != "22" ]] && ufw_rule_allowed "22/tcp"; then
+        extra+=("22/tcp")
     fi
     if haproxy_mode_supported; then
         routes_file="$(mktemp)"
@@ -3922,6 +4563,7 @@ system_check_apply_missing() {
     (( SYSTEM_CHECK_NEEDS_PREPARE == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_PACKAGES == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_KERNEL == 1 )) && steps=$(( steps + 1 ))
+    (( SYSTEM_CHECK_NEEDS_SSH == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_NETWORK == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_FIREWALL == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && steps=$(( steps + 1 ))
@@ -3941,7 +4583,11 @@ system_check_apply_missing() {
     progress_start "$steps"
     (( SYSTEM_CHECK_NEEDS_PREPARE == 1 )) && progress_step "Готовлю систему" opt_prepare_system
     (( SYSTEM_CHECK_NEEDS_PACKAGES == 1 )) && progress_step "Ставлю пакеты" opt_install_packages
-    (( SYSTEM_CHECK_NEEDS_KERNEL == 1 )) && progress_step "Обновляю kernel" opt_liquorix_kernel
+    (( SYSTEM_CHECK_NEEDS_KERNEL == 1 )) && progress_step "Ставлю XanMod x64v3" opt_xanmod_kernel
+    if (( SYSTEM_CHECK_NEEDS_SSH == 1 )); then
+        progress_step "Настраиваю root SSH" opt_ssh_root_access
+        ssh_port="$(detect_ssh_port)"
+    fi
     (( SYSTEM_CHECK_NEEDS_NETWORK == 1 )) && progress_step "Настраиваю сеть" opt_network_limits
     (( SYSTEM_CHECK_NEEDS_STORAGE == 1 )) && progress_step "Настраиваю хранение" opt_storage_guard
     (( SYSTEM_CHECK_NEEDS_MEMORY_GUARD == 1 )) && progress_step "Настраиваю память" opt_memory_guard
@@ -3989,6 +4635,7 @@ system_check() {
     system_check_prepare_state
     system_check_packages
     system_check_kernel
+    system_check_ssh_root_access
     system_check_network_limits
     system_check_firewall "$ssh_port"
     system_check_antiscanner
@@ -4069,12 +4716,15 @@ optimize_system() {
     export NEEDRESTART_MODE=a
     export NEEDRESTART_SUSPEND=1
 
-    progress_start 8
+    progress_start 10
     progress_step "Готовлю систему" opt_prepare_system
     progress_step "Ставлю базовые пакеты" opt_install_fast_packages
     progress_step "Kernel, сеть и память" opt_kernel_network_memory_parallel
     progress_step "Проверяю kernel" opt_kernel_final_check
+    progress_step "Настраиваю root SSH" opt_ssh_root_access
+    ssh_port="$(detect_ssh_port)"
     progress_step "Настраиваю хранение" opt_storage_guard
+    progress_step "Мигрирую HAProxy" upgrade_haproxy_if_configured
     progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
     progress_step "Подключаю AntiScanner" opt_antiscanner
     progress_step "Настраиваю Fail2ban" opt_fail2ban
@@ -7060,6 +7710,11 @@ canonicalize_haproxy_routes() {
         normalized_listen_ip="$(normalize_haproxy_listen_ip "${listen_ip:-*}" 2>/dev/null || true)"
         normalized_send_proxy_v2="$(normalize_haproxy_send_proxy_v2 "${send_proxy_v2:-0}" 2>/dev/null || true)"
         [[ -n "$normalized_target_pool" && -n "$normalized_sni" && -n "$normalized_source_ip" && -n "$normalized_server_maxconn" && -n "$normalized_listen_ip" && -n "$normalized_send_proxy_v2" ]] || return 1
+        if [[ "$normalized_listen_ip" != "*" ]]; then
+            normalized_source_ip="$normalized_listen_ip"
+        elif [[ "$normalized_source_ip" != "default" ]]; then
+            normalized_listen_ip="$normalized_source_ip"
+        fi
         canonical_sni="$(printf '%s\n' "$normalized_sni" | tr ' ' '\n' | awk 'NF' | LC_ALL=C sort -u | paste -sd' ' -)"
         [[ -n "$canonical_sni" ]] || return 1
         printf -v route_line '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
@@ -7350,26 +8005,19 @@ haproxy_remote_apply_json() {
             fail "Слишком большой SNI allow-list у ${listen_ip:-*}:${port}"
             return 1
         }
-        source_ip="$(normalize_haproxy_source_ip "${source_ip:-default}" 2>/dev/null || true)"
+        source_ip="$(canonicalize_haproxy_runtime_source_ip "${source_ip:-default}" 2>/dev/null || true)"
         server_maxconn="$(normalize_haproxy_server_maxconn "${server_maxconn:-default}" 2>/dev/null || true)"
-        listen_ip="$(normalize_haproxy_listen_ip "${listen_ip:-*}" 2>/dev/null || true)"
+        listen_ip="$(haproxy_route_ip_for_source "$source_ip" 2>/dev/null || true)"
         send_proxy_v2="$(normalize_haproxy_send_proxy_v2 "${send_proxy_v2:-0}" 2>/dev/null || true)"
         [[ -n "$source_ip" && -n "$server_maxconn" && -n "$listen_ip" && -n "$send_proxy_v2" ]] || {
             rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
             fail "Некорректные параметры HAProxy-маршрута"
             return 1
         }
-        if [[ "$listen_ip" != "*" ]] && ! haproxy_input_ip_available "$listen_ip"; then
+        if [[ -z "$listen_ip" ]]; then
             rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
-            fail "Входной IP ${listen_ip} не настроен на этой машине"
+            fail "Для выходного IP ${source_ip} нет рабочего локального source-route"
             return 1
-        fi
-        if [[ "$source_ip" != "default" ]]; then
-            if ! haproxy_input_ip_available "$source_ip" || ! ip -4 route get 1.1.1.1 from "$source_ip" >/dev/null 2>&1; then
-                rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
-                fail "Для выходного IP ${source_ip} нет рабочего source-route"
-                return 1
-            fi
         fi
         print_haproxy_route "$port" "$target_pool" "$sni" "$source_ip" "$server_maxconn" "$listen_ip" "$send_proxy_v2" >> "$routes_file"
     done < <(jq -r '
@@ -7753,7 +8401,7 @@ render_haproxy_routes_config() {
     local routes_file="$1" output_file="$2"
     local port backend_target_pool allowed_sni source_ip server_maxconn listen_ip send_proxy_v2
     local normalized_target_pool normalized_sni normalized_source_ip normalized_server_maxconn normalized_listen_ip normalized_send_proxy_v2
-    local frontend_name backend_name server_name source_clause maxconn_clause proxy_protocol_clause target index
+    local frontend_name backend_name server_name source_clause proxy_protocol_clause target index
     local endpoint_key bind_address route_index name_suffix
     local haproxy_threads haproxy_maxconn route_count=0
     local -a backend_targets=()
@@ -7779,6 +8427,11 @@ render_haproxy_routes_config() {
             fail "Некорректный HAProxy маршрут на порту $port"
             return 1
         }
+        if [[ "$normalized_listen_ip" != "*" ]]; then
+            normalized_source_ip="$normalized_listen_ip"
+        elif [[ "$normalized_source_ip" != "default" ]]; then
+            normalized_listen_ip="$normalized_source_ip"
+        fi
         endpoint_key="${normalized_listen_ip}|${port}"
         [[ -z "${seen_endpoints[$endpoint_key]+x}" ]] || {
             fail "HAProxy listener ${normalized_listen_ip}:${port} указан дважды"
@@ -7826,9 +8479,9 @@ defaults
     retries 2
     timeout connect 4s
     timeout queue 4s
-    timeout client 2h
-    timeout server 2h
-    timeout tunnel 2h
+    timeout client 1m
+    timeout server 1m
+    timeout tunnel 15m
     timeout client-fin 30s
     timeout server-fin 30s
     timeout check 3s
@@ -7847,12 +8500,15 @@ EOF
         server_maxconn="$(normalize_haproxy_server_maxconn "${server_maxconn:-default}")"
         listen_ip="$(normalize_haproxy_listen_ip "${listen_ip:-*}")"
         send_proxy_v2="$(normalize_haproxy_send_proxy_v2 "${send_proxy_v2:-0}")"
+        if [[ "$listen_ip" != "*" ]]; then
+            source_ip="$listen_ip"
+        elif [[ "$source_ip" != "default" ]]; then
+            listen_ip="$source_ip"
+        fi
         bind_address="$listen_ip"
         source_clause=""
-        maxconn_clause=""
         proxy_protocol_clause=""
         [[ "$source_ip" == default ]] || source_clause=" source ${source_ip}"
-        [[ "$server_maxconn" == default ]] || maxconn_clause=" maxconn ${server_maxconn}"
         [[ "$send_proxy_v2" == "1" ]] && proxy_protocol_clause=" send-proxy-v2"
         backend_targets=()
         IFS=',' read -r -a backend_targets <<< "$backend_target_pool"
@@ -7878,6 +8534,9 @@ EOF
 frontend ${frontend_name}
     bind ${bind_address}:${port} backlog 65535
     stick-table type ip size 100k expire 30m store gpc0,conn_rate(10s)
+    tcp-request connection track-sc0 src
+    tcp-request connection silent-drop if { src_get_gpc0 gt 10 }
+    tcp-request connection silent-drop if { src_conn_rate gt 150 }
     tcp-request inspect-delay 5s
     acl clienthello req.ssl_hello_type 1
 EOF
@@ -7894,7 +8553,6 @@ EOF
 EOF
             render_haproxy_sni_acl_lines "$allowed_sni" >> "$output_file"
             cat >> "$output_file" <<EOF
-    tcp-request content track-sc0 src if clienthello !allowed_sni
     tcp-request content sc-inc-gpc0(0) if clienthello !allowed_sni
     tcp-request content track-sc1 req.ssl_sni,lower table wrong_sni_names if clienthello has_sni !allowed_sni
     tcp-request content sc-inc-gpc0(1) if clienthello has_sni !allowed_sni
@@ -7922,8 +8580,8 @@ EOF
             else
                 server_name="xray$(( index + 1 ))"
             fi
-            printf '    server %s %s check weight 10%s%s%s\n' \
-                "$server_name" "$target" "$maxconn_clause" "$source_clause" "$proxy_protocol_clause" >> "$output_file"
+            printf '    server %s %s check weight 10%s%s maxconn %s\n' \
+                "$server_name" "$target" "$source_clause" "$proxy_protocol_clause" "$server_maxconn" >> "$output_file"
         done
     done < "$routes_file"
 }
@@ -8277,21 +8935,73 @@ haproxy_input_ip_available() {
         awk -F '\t' -v wanted="$wanted" '$1 == wanted { found = 1 } END { exit found ? 0 : 1 }'
 }
 
-haproxy_default_listen_ip_for_source() {
-    local source_ip default_ip
+haproxy_route_ip_for_source() {
+    local source_ip actual_ip
 
-    source_ip="$(normalize_haproxy_source_ip "${1:-default}" 2>/dev/null || printf 'default')"
-    if [[ "$source_ip" != "default" ]] && haproxy_input_ip_available "$source_ip"; then
-        printf '%s\n' "$source_ip"
-        return 0
-    fi
-
-    default_ip="$(haproxy_default_source_ip)"
-    if validate_ipv4 "$default_ip" && haproxy_input_ip_available "$default_ip"; then
-        printf '%s\n' "$default_ip"
+    source_ip="$(canonicalize_haproxy_runtime_source_ip "${1:-default}" 2>/dev/null || true)"
+    [[ -n "$source_ip" ]] || return 1
+    if [[ "$source_ip" == "default" ]]; then
+        actual_ip="$(haproxy_default_source_ip)"
     else
-        printf '*\n'
+        actual_ip="$source_ip"
     fi
+    validate_ipv4 "$actual_ip" || return 1
+    haproxy_input_ip_available "$actual_ip" || return 1
+    ip -4 route get 1.1.1.1 from "$actual_ip" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$actual_ip"
+}
+
+haproxy_default_listen_ip_for_source() {
+    haproxy_route_ip_for_source "${1:-default}"
+}
+
+select_haproxy_route_source_ip() {
+    local routes_file="${1:-}" current_source="${2:-}" current_ip="" default_ip
+    local row source_ip interface kind choice index used_count marker
+    local -a rows=()
+
+    mapfile -t rows < <(list_test_source_ipv4s)
+    (( ${#rows[@]} > 0 )) || {
+        fail "Не найдено IPv4 с рабочим source-route"
+        return 1
+    }
+    default_ip="$(haproxy_default_source_ip)"
+    if [[ -n "$current_source" ]]; then
+        current_ip="$(haproxy_route_ip_for_source "$current_source" 2>/dev/null || true)"
+    fi
+
+    printf 'Выберите IP HAProxy (вход и выход будут одинаковыми):\n' >&2
+    for index in "${!rows[@]}"; do
+        IFS=$'\t' read -r source_ip interface kind <<< "${rows[$index]}"
+        used_count=0
+        if [[ -n "$routes_file" && -s "$routes_file" ]]; then
+            used_count="$(awk -F '\t' -v wanted="$source_ip" -v default_ip="$default_ip" '
+                {
+                    source = ($4 == "" || $4 == "default" ? default_ip : $4)
+                    if (source == wanted) count++
+                }
+                END { print count + 0 }
+            ' "$routes_file")"
+        fi
+        marker=""
+        [[ "$source_ip" == "$current_ip" ]] && marker=" | текущий"
+        printf ' %d) %s | %s | %s | маршрутов: %s%s\n' \
+            "$(( index + 1 ))" "$source_ip" "$interface" "$kind" "$used_count" "$marker" >&2
+    done
+
+    while true; do
+        printf '> ' >&2
+        read -r choice || return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            choice=$((10#$choice))
+            if (( choice >= 1 && choice <= ${#rows[@]} )); then
+                IFS=$'\t' read -r source_ip interface kind <<< "${rows[$(( choice - 1 ))]}"
+                canonicalize_haproxy_runtime_source_ip "$source_ip"
+                return
+            fi
+        fi
+        fail "Неверный выбор"
+    done
 }
 
 select_haproxy_route_listen_ip() {
@@ -8727,10 +9437,10 @@ configure_haproxy_backend() {
     header
     require_haproxy_mode
     need_root
-    local backend_target allowed_sni default_listen_ip listen_ip send_proxy_v2 routes_file previous_routes_file base_port
+    local backend_target allowed_sni source_ip listen_ip send_proxy_v2 routes_file previous_routes_file base_port
     base_port="$(haproxy_base_port)"
-    default_listen_ip="$(haproxy_default_listen_ip_for_source default)"
-    listen_ip="$(select_haproxy_route_listen_ip "$default_listen_ip")" || return 1
+    source_ip="$(select_haproxy_route_source_ip)" || return 1
+    listen_ip="$(haproxy_route_ip_for_source "$source_ip")" || return 1
     if haproxy_tcp_port_listening "$base_port" "$listen_ip"; then
         fail "TCP listener ${listen_ip}:${base_port} уже занят. HAProxy config не изменён."
         if [[ "$MACHINE_MODE" == "node" ]]; then
@@ -8745,11 +9455,13 @@ configure_haproxy_backend() {
     routes_file="$(mktemp)"
     previous_routes_file="$(mktemp)"
     extract_haproxy_routes > "$previous_routes_file"
-    print_haproxy_route "$base_port" "$backend_target" "$allowed_sni" default default "$listen_ip" "$send_proxy_v2" > "$routes_file"
+    print_haproxy_route "$base_port" "$backend_target" "$allowed_sni" "$source_ip" \
+        "$HAPROXY_BACKEND_MAXCONN" "$listen_ip" "$send_proxy_v2" > "$routes_file"
 
     if apply_haproxy_routes_config "$routes_file"; then
         sync_haproxy_firewall "$routes_file" "$previous_routes_file"
         ok "HAProxy установлен: ${listen_ip}:${base_port}/tcp -> ${backend_target}"
+        ok "Входной и исходящий IP: ${listen_ip}"
         ok "Разрешенный SNI: $(haproxy_sni_label "$allowed_sni")"
         ok "send-proxy-v2: $(haproxy_send_proxy_v2_label "$send_proxy_v2")"
     else
@@ -8761,10 +9473,11 @@ configure_haproxy_backend() {
 
 print_haproxy_routes() {
     local routes_file="$1" port target_pool sni source_ip server_maxconn listen_ip send_proxy_v2
-    local source_label target_label pool_count
+    local source_label target_label pool_count shown=0
     echo -e "${BOLD}${PURPLE}[ МАРШРУТЫ ]${NC}"
     while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip send_proxy_v2; do
         [[ -n "$port" ]] || continue
+        shown=$(( shown + 1 ))
         listen_ip="$(haproxy_route_listen_ip "$listen_ip")"
         source_label="$(haproxy_source_label "${source_ip:-default}")"
         pool_count="$(haproxy_target_pool_count "$target_pool" 2>/dev/null || printf '0')"
@@ -8777,6 +9490,7 @@ print_haproxy_routes() {
             "$listen_ip" "$port" "$target_label" "$(haproxy_sni_label "$sni")" "$source_label" \
             "$(haproxy_send_proxy_v2_label "${send_proxy_v2:-0}")"
     done < "$routes_file"
+    (( shown > 0 )) || printf ' Маршрутов пока нет.\n'
 }
 
 check_haproxy_bindings() {
@@ -9325,20 +10039,22 @@ haproxy_tcp_port_listening() {
 }
 
 add_haproxy_route_with_source() {
-    local routes_file="$1" source_ip="${2:-default}"
-    local default_listen_ip listen_ip default_port port backend_target allowed_sni send_proxy_v2 next_file
+    local routes_file="$1" source_ip="${2:-auto}"
+    local listen_ip default_port port backend_target allowed_sni send_proxy_v2 next_file
+    if [[ "$source_ip" == "auto" ]]; then
+        source_ip="$(select_haproxy_route_source_ip "$routes_file")" || return 1
+    fi
     source_ip="$(canonicalize_haproxy_runtime_source_ip "$source_ip" 2>/dev/null || true)"
     if [[ -z "$source_ip" ]]; then
         fail "Некорректный исходящий IP"
         return 1
     fi
-    if [[ "$source_ip" != default ]] && ! haproxy_additional_source_ip_available "$source_ip"; then
-        fail "Исходящий IP ${source_ip} больше не доступен через отдельный интерфейс"
+    listen_ip="$(haproxy_route_ip_for_source "$source_ip" 2>/dev/null || true)"
+    if [[ -z "$listen_ip" ]]; then
+        fail "Для IP $(haproxy_source_label "$source_ip") нет рабочего локального source-route"
         return 1
     fi
 
-    default_listen_ip="$(haproxy_default_listen_ip_for_source "$source_ip")"
-    listen_ip="$(select_haproxy_route_listen_ip "$default_listen_ip")" || return 1
     default_port="$(default_haproxy_extra_port "$routes_file" "$listen_ip")" || {
         fail "Нет свободного HAProxy-порта"
         return 1
@@ -9365,14 +10081,15 @@ add_haproxy_route_with_source() {
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 0)"
     next_file="$(mktemp)"
     cp "$routes_file" "$next_file"
-    print_haproxy_route "$port" "$backend_target" "$allowed_sni" "$source_ip" default "$listen_ip" "$send_proxy_v2" >> "$next_file"
+    print_haproxy_route "$port" "$backend_target" "$allowed_sni" "$source_ip" \
+        "$HAPROXY_BACKEND_MAXCONN" "$listen_ip" "$send_proxy_v2" >> "$next_file"
 
     if apply_haproxy_routes_config "$next_file"; then
         sync_haproxy_firewall "$next_file" "$routes_file"
         mv "$next_file" "$routes_file"
         ok "Добавлен HAProxy listener ${listen_ip}:${port}: ${backend_target}"
-        ok "Входной IP: ${listen_ip}"
-        ok "Исходящий IP: $(haproxy_source_label "$source_ip")"
+        ok "Входной и исходящий IP: ${listen_ip}"
+        ok "maxconn на backend: ${HAPROXY_BACKEND_MAXCONN}"
         ok "send-proxy-v2: $(haproxy_send_proxy_v2_label "$send_proxy_v2")"
         return 0
     fi
@@ -9381,15 +10098,11 @@ add_haproxy_route_with_source() {
 }
 
 add_haproxy_route() {
-    add_haproxy_route_with_source "$1" default
+    add_haproxy_route_with_source "$1" auto
 }
 
 add_haproxy_source_route() {
-    local routes_file="$1" source_ip
-    source_ip="$(select_haproxy_additional_source_ip "$routes_file")" || return 1
-    echo
-    stage "Новый HAProxy-маршрут будет выходить через ${source_ip}"
-    add_haproxy_route_with_source "$routes_file" "$source_ip"
+    add_haproxy_route_with_source "$1" auto
 }
 
 set_haproxy_pool_route() {
@@ -9412,7 +10125,7 @@ set_haproxy_pool_route() {
     normalized_sni="$(normalize_haproxy_sni_list "$allowed_sni" 2>/dev/null || true)"
     normalized_maxconn="$(normalize_haproxy_server_maxconn "$server_maxconn" 2>/dev/null || true)"
     normalized_pool="$(normalize_haproxy_target_pool "$target_pool" 2>/dev/null || true)"
-    normalized_listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
+    normalized_listen_ip="$(haproxy_route_ip_for_source "$normalized_source_ip" 2>/dev/null || true)"
     if [[ "$send_proxy_v2" == "preserve" && -n "$normalized_listen_ip" ]]; then
         send_proxy_v2="$(awk -F '\t' -v port="$port" -v listen_ip="$normalized_listen_ip" '
             {
@@ -9433,12 +10146,8 @@ set_haproxy_pool_route() {
         fail "Некорректный HAProxy backend-пул"
         return 1
     fi
-    if [[ "$normalized_source_ip" != default ]] && ! haproxy_additional_source_ip_available "$normalized_source_ip"; then
-        fail "Исходящий IP ${normalized_source_ip} не найден среди рабочих дополнительных IP"
-        return 1
-    fi
-    if [[ "$normalized_listen_ip" != "*" ]] && ! haproxy_input_ip_available "$normalized_listen_ip"; then
-        fail "Входной IP ${normalized_listen_ip} не найден на машине"
+    if [[ -z "$normalized_listen_ip" ]]; then
+        fail "Для выходного IP $(haproxy_source_label "$normalized_source_ip") нет рабочего локального source-route"
         return 1
     fi
     if ! haproxy_route_file_has_endpoint "$routes_file" "$port" "$normalized_listen_ip"; then
@@ -9531,8 +10240,8 @@ retarget_haproxy_wildcard_route() {
 add_haproxy_pool_route() {
     local routes_file="$1" listen_ip default_port port source_ip allowed_sni server_maxconn send_proxy_v2 raw_targets target_pool
 
-    source_ip="$(ask_text "Исходящий IP (default или IPv4)" default)"
-    listen_ip="$(select_haproxy_route_listen_ip "$(haproxy_default_listen_ip_for_source "$source_ip")")" || return 1
+    source_ip="$(select_haproxy_route_source_ip "$routes_file")" || return 1
+    listen_ip="$(haproxy_route_ip_for_source "$source_ip")" || return 1
     default_port="$(default_haproxy_extra_port "$routes_file" "$listen_ip")" || {
         fail "Нет свободного HAProxy-порта"
         return 1
@@ -9540,7 +10249,7 @@ add_haproxy_pool_route() {
     port="$(ask_int "Входной HAProxy порт" "$default_port" 1 65535)"
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 0)"
-    server_maxconn="$(ask_int "maxconn на каждый backend" 10000 1 10000000)"
+    server_maxconn="$HAPROXY_BACKEND_MAXCONN"
     raw_targets="$(ask_text "Backend IP[:порт] через пробел или запятую")"
     target_pool="$(normalize_haproxy_target_pool "$raw_targets" 2>/dev/null || true)"
     [[ -n "$target_pool" ]] || {
@@ -9555,7 +10264,7 @@ set_haproxy_pool_route_cli() {
     require_haproxy_mode
     need_root
     local port="${1:-}" source_ip="${2:-}" allowed_sni="${3:-}" server_maxconn="${4:-}"
-    local routes_file target target_pool="" listen_ip="" normalized_listen_ip
+    local routes_file target target_pool="" listen_ip="" normalized_listen_ip requested_listen_ip
     local listen_ip_explicit=0
 
     if (( $# < 4 )) || [[ -z "$port" || -z "$source_ip" || -z "$server_maxconn" ]]; then
@@ -9579,18 +10288,23 @@ set_haproxy_pool_route_cli() {
             shift
             ;;
     esac
-    if (( listen_ip_explicit == 0 )); then
-        listen_ip="$(haproxy_default_listen_ip_for_source "$source_ip")"
-    fi
     if (( $# < 2 )); then
         fail "Использование: haproxy-pool-set PORT SOURCE_IP SNI|any MAXCONN [--listen-ip IP] BACKEND1 BACKEND2 [...]"
         return 1
     fi
-    normalized_listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
+    source_ip="$(canonicalize_haproxy_runtime_source_ip "$source_ip" 2>/dev/null || true)"
+    normalized_listen_ip="$(haproxy_route_ip_for_source "$source_ip" 2>/dev/null || true)"
     [[ -n "$normalized_listen_ip" ]] || {
-        fail "Некорректный входной IP HAProxy: ${listen_ip:-пусто}"
+        fail "Для исходящего IP ${source_ip:-пусто} нет рабочего локального source-route"
         return 1
     }
+    if (( listen_ip_explicit == 1 )); then
+        requested_listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
+        if [[ "$requested_listen_ip" != "$normalized_listen_ip" ]]; then
+            fail "Раздельные входной и выходной IP больше не поддерживаются: нужен ${normalized_listen_ip}"
+            return 1
+        fi
+    fi
     listen_ip="$normalized_listen_ip"
     for target in "$@"; do
         target_pool+="${target_pool:+,}${target}"
@@ -9625,13 +10339,22 @@ set_haproxy_pool_route_cli() {
 
 collapse_haproxy_routes_to_pool() {
     local routes_file="$1" start_port="$2" end_port="$3" source_ip="$4" allowed_sni="$5"
-    local server_maxconn="$6" target_pool="$7" listen_ip="${8:-*}" filtered_file removed_count
+    local server_maxconn="$6" target_pool="$7" requested_listen_ip="${8:-}" filtered_file removed_count
+    local normalized_source_ip listen_ip canonical_file
 
-    listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
-    [[ -n "$listen_ip" ]] || {
-        fail "Некорректный входной IP HAProxy"
+    normalized_source_ip="$(canonicalize_haproxy_runtime_source_ip "$source_ip" 2>/dev/null || true)"
+    listen_ip="$(haproxy_route_ip_for_source "$normalized_source_ip" 2>/dev/null || true)"
+    [[ -n "$normalized_source_ip" && -n "$listen_ip" ]] || {
+        fail "Для выбранного IP нет рабочего локального source-route"
         return 1
     }
+    if [[ -n "$requested_listen_ip" && "$requested_listen_ip" != "*" ]]; then
+        requested_listen_ip="$(normalize_haproxy_listen_ip "$requested_listen_ip" 2>/dev/null || true)"
+        if [[ "$requested_listen_ip" != "$listen_ip" ]]; then
+            fail "Раздельные входной и выходной IP больше не поддерживаются: нужен ${listen_ip}"
+            return 1
+        fi
+    fi
 
     [[ "$start_port" =~ ^[0-9]+$ && "$end_port" =~ ^[0-9]+$ ]] || {
         fail "Некорректный диапазон HAProxy-портов"
@@ -9643,6 +10366,16 @@ collapse_haproxy_routes_to_pool() {
         fail "Некорректный диапазон HAProxy-портов: ${start_port}-${end_port}"
         return 1
     }
+
+    # Canonicalize first so legacy *:PORT + default/source routes cannot survive
+    # a pool rewrite and recreate the old split input/output model.
+    canonical_file="$(mktemp)"
+    if ! build_haproxy_upgraded_routes "$routes_file" "$canonical_file"; then
+        rm -f "$canonical_file"
+        return 1
+    fi
+    cp "$canonical_file" "$routes_file"
+    rm -f "$canonical_file"
 
     removed_count="$(awk -F '\t' -v start="$start_port" -v end="$end_port" -v listen_ip="$listen_ip" '
         {
@@ -9659,7 +10392,7 @@ collapse_haproxy_routes_to_pool() {
         }
     ' "$routes_file" > "$filtered_file"
 
-    if set_haproxy_pool_route "$filtered_file" "$start_port" "$source_ip" "$allowed_sni" "$server_maxconn" "$target_pool" "$listen_ip"; then
+    if set_haproxy_pool_route "$filtered_file" "$start_port" "$normalized_source_ip" "$allowed_sni" "$server_maxconn" "$target_pool" "$listen_ip"; then
         sync_haproxy_firewall "$filtered_file" "$routes_file"
         mv "$filtered_file" "$routes_file"
         ok "Порты ${listen_ip}:${start_port}-${end_port} собраны в один пул на ${listen_ip}:${start_port}/tcp"
@@ -9724,7 +10457,7 @@ set_haproxy_sequential_routes() {
     normalized_sni="$(normalize_haproxy_sni_list "$allowed_sni" 2>/dev/null || true)"
     normalized_maxconn="$(normalize_haproxy_server_maxconn "$server_maxconn" 2>/dev/null || true)"
     normalized_pool="$(normalize_haproxy_target_pool "$target_pool" 2>/dev/null || true)"
-    normalized_listen_ip="$(normalize_haproxy_listen_ip "$listen_ip" 2>/dev/null || true)"
+    normalized_listen_ip="$(haproxy_route_ip_for_source "$normalized_source_ip" 2>/dev/null || true)"
     while IFS=$'\t' read -r existing_port _existing_pool _existing_sni _existing_source _existing_maxconn existing_listen existing_send_proxy_v2; do
         [[ "$existing_port" =~ ^[0-9]+$ ]] || continue
         existing_listen="${existing_listen:-*}"
@@ -9758,12 +10491,8 @@ set_haproxy_sequential_routes() {
         fail "Диапазон HAProxy портов ${start_port}-${end_port} выходит за 1-65535"
         return 1
     }
-    if [[ "$normalized_source_ip" != default ]] && ! haproxy_additional_source_ip_available "$normalized_source_ip"; then
-        fail "Исходящий IP ${normalized_source_ip} не найден среди рабочих дополнительных IP"
-        return 1
-    fi
-    if [[ "$normalized_listen_ip" != "*" ]] && ! haproxy_input_ip_available "$normalized_listen_ip"; then
-        fail "Входной IP ${normalized_listen_ip} не найден на машине"
+    if [[ -z "$normalized_listen_ip" ]]; then
+        fail "Для выходного IP $(haproxy_source_label "$normalized_source_ip") нет рабочего локального source-route"
         return 1
     fi
     for (( port = start_port; port <= end_port; port++ )); do
@@ -9828,8 +10557,8 @@ set_haproxy_sequential_routes() {
 add_haproxy_sequential_routes() {
     local routes_file="$1" listen_ip default_port start_port source_ip allowed_sni server_maxconn send_proxy_v2 raw_targets target_pool
 
-    source_ip="$(ask_text "Исходящий IP (default или IPv4)" default)"
-    listen_ip="$(select_haproxy_route_listen_ip "$(haproxy_default_listen_ip_for_source "$source_ip")")" || return 1
+    source_ip="$(select_haproxy_route_source_ip "$routes_file")" || return 1
+    listen_ip="$(haproxy_route_ip_for_source "$source_ip")" || return 1
     default_port="$(default_haproxy_extra_port "$routes_file" "$listen_ip")" || {
         fail "Нет свободного HAProxy-порта"
         return 1
@@ -9837,7 +10566,7 @@ add_haproxy_sequential_routes() {
     start_port="$(ask_int "Первый входной HAProxy порт" "$default_port" 1 65535)"
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 0)"
-    server_maxconn="$(ask_int "maxconn на каждый backend" 10000 1 10000000)"
+    server_maxconn="$HAPROXY_BACKEND_MAXCONN"
     raw_targets="$(ask_text "Backend IP[:порт] по порядку через пробел или запятую")"
     target_pool="$(normalize_haproxy_target_pool "$raw_targets" 2>/dev/null || true)"
     [[ -n "$target_pool" ]] || {
@@ -9885,7 +10614,7 @@ set_haproxy_sequential_routes_cli() {
 
 edit_haproxy_route() {
     local routes_file="$1" selection port current_listen current_line current_target_pool current_sni
-    local current_source current_maxconn current_send_proxy_v2 listen_ip backend_target_pool allowed_sni send_proxy_v2 next_file filtered_file
+    local current_source current_maxconn current_send_proxy_v2 source_ip listen_ip backend_target_pool allowed_sni send_proxy_v2 next_file filtered_file
     local row_port row_pool row_sni row_source row_maxconn row_listen row_send_proxy_v2 replaced=0
 
     selection="$(select_haproxy_route "$routes_file")" || return 1
@@ -9901,11 +10630,12 @@ edit_haproxy_route() {
     current_maxconn="$(normalize_haproxy_server_maxconn "${current_maxconn:-default}")"
     current_send_proxy_v2="$(normalize_haproxy_send_proxy_v2 "${current_send_proxy_v2:-0}")"
 
-    listen_ip="$(select_haproxy_route_listen_ip "$current_listen")" || return 1
-    if [[ "$listen_ip" != "*" ]] && ! haproxy_input_ip_available "$listen_ip"; then
-        fail "Входной IP ${listen_ip} не найден на машине"
+    source_ip="$(select_haproxy_route_source_ip "$routes_file" "$current_source")" || return 1
+    listen_ip="$(haproxy_route_ip_for_source "$source_ip" 2>/dev/null || true)"
+    [[ -n "$listen_ip" ]] || {
+        fail "Для выбранного IP нет рабочего source-route"
         return 1
-    fi
+    }
     filtered_file="$(mktemp)"
     awk -F '\t' -v port="$port" -v listen_ip="$current_listen" '
         {
@@ -9929,7 +10659,7 @@ edit_haproxy_route() {
         row_listen="$(haproxy_route_listen_ip "$row_listen")"
         if [[ "$row_port" == "$port" && "$row_listen" == "$current_listen" ]]; then
             print_haproxy_route "$port" "$backend_target_pool" "$allowed_sni" \
-                "$current_source" "$current_maxconn" "$listen_ip" "$send_proxy_v2" >> "$next_file"
+                "$source_ip" "$HAPROXY_BACKEND_MAXCONN" "$listen_ip" "$send_proxy_v2" >> "$next_file"
             replaced=1
         else
             print_haproxy_route "$row_port" "$row_pool" "$row_sni" \
@@ -9946,6 +10676,7 @@ edit_haproxy_route() {
         sync_haproxy_firewall "$next_file" "$routes_file"
         mv "$next_file" "$routes_file"
         ok "Маршрут ${listen_ip}:${port}/tcp обновлён"
+        ok "Входной и исходящий IP: ${listen_ip}"
         return 0
     fi
     rm -f "$next_file"
@@ -10109,17 +10840,138 @@ delete_haproxy_route() {
     return 1
 }
 
+HAPROXY_UPGRADE_MOVED=0
+
+build_haproxy_upgraded_routes() {
+    local routes_file="$1" output_file="$2"
+    local port target_pool sni source_ip server_maxconn listen_ip send_proxy_v2
+    local desired_source desired_listen key sorted_file route_count=0
+    local -A emitted=()
+
+    HAPROXY_UPGRADE_MOVED=0
+    : > "$output_file"
+    while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip send_proxy_v2; do
+        [[ "$port" =~ ^[0-9]+$ ]] || {
+            fail "Некорректный HAProxy-порт в существующем config: ${port:-пусто}"
+            return 1
+        }
+        port=$((10#$port))
+        (( port >= 1 && port <= 65535 )) || return 1
+        listen_ip="$(normalize_haproxy_listen_ip "${listen_ip:-*}" 2>/dev/null || true)"
+        source_ip="$(canonicalize_haproxy_runtime_source_ip "${source_ip:-default}" 2>/dev/null || true)"
+        [[ -n "$listen_ip" && -n "$source_ip" ]] || {
+            fail "Некорректный IP у HAProxy-маршрута на порту ${port}"
+            return 1
+        }
+
+        # An exact listener is the public endpoint clients already use, so keep
+        # it and align egress to it. A legacy wildcard is pinned to its source.
+        if [[ "$listen_ip" != "*" ]]; then
+            desired_source="$(canonicalize_haproxy_runtime_source_ip "$listen_ip" 2>/dev/null || true)"
+        else
+            desired_source="$source_ip"
+        fi
+        desired_listen="$(haproxy_route_ip_for_source "$desired_source" 2>/dev/null || true)"
+        if [[ -z "$desired_source" || -z "$desired_listen" ]]; then
+            fail "Маршрут ${listen_ip}:${port}: для выбранного IP нет рабочего source-route"
+            return 1
+        fi
+        key="${desired_listen}|${port}"
+        if [[ -n "${emitted[$key]+x}" ]]; then
+            fail "Миграция создаёт дубликат ${desired_listen}:${port}; текущий config не изменён"
+            return 1
+        fi
+        emitted[$key]=1
+        if [[ "$listen_ip" != "$desired_listen" || "$source_ip" != "$desired_source" ]]; then
+            HAPROXY_UPGRADE_MOVED=$(( HAPROXY_UPGRADE_MOVED + 1 ))
+        fi
+        print_haproxy_route "$port" "$target_pool" "$sni" "$desired_source" \
+            "$HAPROXY_BACKEND_MAXCONN" "$desired_listen" "${send_proxy_v2:-0}" >> "$output_file" || {
+            fail "Не удалось канонизировать HAProxy-маршрут ${desired_listen}:${port}"
+            return 1
+        }
+        route_count=$(( route_count + 1 ))
+    done < "$routes_file"
+
+    (( route_count > 0 )) || {
+        fail "HAProxy-маршруты не найдены"
+        return 1
+    }
+    sorted_file="$(mktemp)"
+    LC_ALL=C sort -s -t $'\t' -k6,6V -k1,1n "$output_file" > "$sorted_file"
+    mv "$sorted_file" "$output_file"
+}
+
+upgrade_haproxy_routes_transaction() {
+    local routes_file="$1" candidate_file rendered_file parsed_file
+
+    candidate_file="$(mktemp)"
+    rendered_file="$(mktemp)"
+    parsed_file="$(mktemp)"
+    if ! build_haproxy_upgraded_routes "$routes_file" "$candidate_file" ||
+        ! render_haproxy_routes_config "$candidate_file" "$rendered_file"; then
+        rm -f "$candidate_file" "$rendered_file" "$parsed_file"
+        return 1
+    fi
+    ensure_haproxy_package || {
+        rm -f "$candidate_file" "$rendered_file" "$parsed_file"
+        return 1
+    }
+    if ! "${SUDO[@]}" haproxy -c -f "$rendered_file" >> "$LOG_FILE" 2>&1; then
+        rm -f "$candidate_file" "$rendered_file" "$parsed_file"
+        fail "HAProxy upgrade candidate не прошёл haproxy -c; текущий config не изменён"
+        return 1
+    fi
+    extract_haproxy_routes "$rendered_file" > "$parsed_file"
+    if ! haproxy_routes_round_trip_equal "$candidate_file" "$parsed_file"; then
+        rm -f "$candidate_file" "$rendered_file" "$parsed_file"
+        fail "HAProxy upgrade candidate не прошёл round-trip; текущий config не изменён"
+        return 1
+    fi
+    rm -f "$rendered_file" "$parsed_file"
+
+    if apply_haproxy_routes_config "$candidate_file"; then
+        sync_haproxy_firewall "$candidate_file" "$routes_file"
+        cp "$candidate_file" "$routes_file"
+        rm -f "$candidate_file"
+        ok "HAProxy обновлён: маршруты сохранены, input=output, backend maxconn=${HAPROXY_BACKEND_MAXCONN}"
+        (( HAPROXY_UPGRADE_MOVED == 0 )) || ok "Приведено к единому IP маршрутов: ${HAPROXY_UPGRADE_MOVED}"
+        return 0
+    fi
+    rm -f "$candidate_file"
+    return 1
+}
+
+upgrade_haproxy_if_configured() {
+    local routes_file rc
+
+    haproxy_mode_supported || return 0
+    "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null || return 0
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+    if [[ ! -s "$routes_file" ]]; then
+        rm -f "$routes_file"
+        warn "HAProxy config существует, но маршруты не распознаны; автоматическая миграция пропущена"
+        return 0
+    fi
+    if upgrade_haproxy_routes_transaction "$routes_file"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "$routes_file"
+    return "$rc"
+}
+
 update_haproxy_existing_config() {
     header
     require_haproxy_mode
     need_root
-    local routes_file base_port
-    base_port="$(haproxy_base_port)"
+    local routes_file rc
 
-    if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
-        warn "HAProxy config не найден, создаю базовый порт ${base_port}."
-        configure_haproxy_backend
-        return
+    if ! "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null; then
+        warn "HAProxy config ещё не создан. Открой меню HAProxy и выбери «Добавить маршрут»."
+        return 0
     fi
 
     routes_file="$(mktemp)"
@@ -10129,15 +10981,13 @@ update_haproxy_existing_config() {
         fail "Не смог распознать маршруты в текущем HAProxy config. Конфиг не изменён."
         return 1
     fi
-
-    if apply_haproxy_routes_config "$routes_file"; then
-        sync_haproxy_firewall "$routes_file" "$routes_file"
-        ok "HAProxy обновлён без повторного ввода, маршруты сохранены"
-        rm -f "$routes_file"
-        return 0
+    if upgrade_haproxy_routes_transaction "$routes_file"; then
+        rc=0
+    else
+        rc=$?
     fi
     rm -f "$routes_file"
-    return 1
+    return "$rc"
 }
 
 HAPROXY_PREPARE_IP_COUNT=0
@@ -10529,44 +11379,34 @@ haproxy_menu() {
     header
     require_haproxy_mode
     need_root
-    local routes_file choice base_port
-    base_port="$(haproxy_base_port)"
+    local routes_file choice
     routes_file="$(mktemp)"
 
-    if ! "${SUDO[@]}" test -s /etc/haproxy/haproxy.cfg 2>/dev/null; then
-        warn "HAProxy ещё не настроен. Сначала создаю базовый порт ${base_port}."
-        if ! configure_haproxy_backend; then
+    if "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null; then
+        extract_haproxy_routes > "$routes_file"
+        if [[ ! -s "$routes_file" ]]; then
             rm -f "$routes_file"
+            fail "Текущий HAProxy config не распознан. Автоматически перезаписывать его не буду."
             return 1
         fi
-    fi
-
-    extract_haproxy_routes > "$routes_file"
-    if [[ ! -s "$routes_file" ]]; then
-        rm -f "$routes_file"
-        fail "Текущий HAProxy config не распознан. Автоматически перезаписывать его не буду."
-        return 1
     fi
 
     while true; do
         header
         print_haproxy_routes "$routes_file"
         echo
-        echo -e "1) Изменить маршрут, backend, SNI или входной IP"
-        echo -e "2) Добавить маршрут через основной выходной IP"
-        echo -e "3) Добавить маршрут через другой выходной IP"
-        echo -e "4) Удалить маршрут"
-        echo -e "5) Заменить SNI у всех маршрутов"
-        echo -e "6) Обновить HAProxy, сохранив маршруты"
-        echo -e "7) Добавить или заменить backend-пул"
-        echo -e "8) Массово добавить backend по следующим портам"
-        echo -e "9) Ограничить скорость по входному IP"
-        echo -e "10) Проверить и подготовить config для отдельных IP:порт"
-        echo -e "11) Восстановить HAProxy backup"
-        echo -e "12) Проверить бинды"
-        echo -e "13) Перенести все FULL-бинды на выходные IP"
-        echo -e "14) Полная диагностика HAProxy"
-        echo -e "15) Аварийно стабилизировать HAProxy"
+        echo -e "1) Изменить маршрут, backend, SNI или IP"
+        echo -e "2) Добавить маршрут (входной IP = выходному IP)"
+        echo -e "3) Удалить маршрут"
+        echo -e "4) Заменить SNI у всех маршрутов"
+        echo -e "5) Обновить HAProxy, сохранив маршруты"
+        echo -e "6) Добавить или заменить backend-пул"
+        echo -e "7) Массово добавить backend по следующим портам"
+        echo -e "8) Ограничить скорость по входному IP"
+        echo -e "9) Восстановить HAProxy backup"
+        echo -e "10) Проверить бинды"
+        echo -e "11) Полная диагностика HAProxy"
+        echo -e "12) Аварийно стабилизировать HAProxy"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -10574,24 +11414,22 @@ haproxy_menu() {
         case "$choice" in
             1) edit_haproxy_route "$routes_file" || true ;;
             2) add_haproxy_route "$routes_file" || true ;;
-            3) add_haproxy_source_route "$routes_file" || true ;;
-            4) delete_haproxy_route "$routes_file" || true ;;
-            5) replace_all_haproxy_sni "$routes_file" || true ;;
-            6)
-                if apply_haproxy_routes_config "$routes_file"; then
-                    sync_haproxy_firewall "$routes_file" "$routes_file"
-                    ok "HAProxy обновлён, все маршруты сохранены"
+            3) delete_haproxy_route "$routes_file" || true ;;
+            4) replace_all_haproxy_sni "$routes_file" || true ;;
+            5)
+                if [[ -s "$routes_file" ]]; then
+                    upgrade_haproxy_routes_transaction "$routes_file" || true
+                else
+                    warn "Сначала добавь хотя бы один маршрут"
                 fi
                 ;;
-            7) add_haproxy_pool_route "$routes_file" || true ;;
-            8) add_haproxy_sequential_routes "$routes_file" || true ;;
-            9) haproxy_bandwidth_menu || true ;;
-            10) prepare_haproxy_multi_ip_config "$routes_file" || true ;;
-            11) restore_haproxy_backup "$routes_file" || true ;;
-            12) check_haproxy_bindings "$routes_file" || true ;;
-            13) pin_haproxy_wildcards_to_source_ips "$routes_file" || true ;;
-            14) diagnose_haproxy || true ;;
-            15) stabilize_haproxy_interactive || true ;;
+            6) add_haproxy_pool_route "$routes_file" || true ;;
+            7) add_haproxy_sequential_routes "$routes_file" || true ;;
+            8) haproxy_bandwidth_menu || true ;;
+            9) restore_haproxy_backup "$routes_file" || true ;;
+            10) check_haproxy_bindings "$routes_file" || true ;;
+            11) diagnose_haproxy || true ;;
+            12) stabilize_haproxy_interactive || true ;;
             0)
                 rm -f "$routes_file"
                 return 0
@@ -11984,7 +12822,7 @@ print_kernel_status() {
     local kernel="$1"
     echo
     echo -e "${BOLD}${PURPLE}[ ЯДРО ]${NC}"
-    if [[ "$kernel" == *liquorix* ]]; then
+    if [[ "$kernel" == *xanmod* ]]; then
         print_row "kernel" "$kernel" 1
     else
         print_row "kernel" "$kernel" 0

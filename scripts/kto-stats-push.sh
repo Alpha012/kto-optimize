@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v323"
+PUSH_BUILD="v324"
+KTO_SSH_PORT_FILE="${KTO_SSH_PORT_FILE:-/etc/kto-ssh-port}"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
@@ -374,13 +375,26 @@ normalize_haproxy_target() {
 
 detect_ssh_port() {
     local port=""
-    if command -v sshd >/dev/null 2>&1; then
+    if [[ -r "$KTO_SSH_PORT_FILE" ]]; then
+        port="$(awk 'NR == 1 {print $1; exit}' "$KTO_SSH_PORT_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -z "$port" ]] && command -v sshd >/dev/null 2>&1; then
         port="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}' || true)"
     fi
     if [[ -z "$port" && -r /etc/ssh/sshd_config ]]; then
         port="$(awk 'tolower($1)=="port" && $1 !~ /^#/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
     fi
-    echo "${port:-22}"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+        port=22
+    fi
+    printf '%d\n' "$((10#$port))"
+}
+
+managed_ssh_port_enabled() {
+    local port
+    [[ -r "$KTO_SSH_PORT_FILE" ]] || return 1
+    port="$(awk 'NR == 1 {print $1; exit}' "$KTO_SSH_PORT_FILE" 2>/dev/null || true)"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
 }
 
 ufw_active() {
@@ -497,6 +511,7 @@ apply_collector_ssh_ips() {
 
     [[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
+    managed_ssh_port_enabled && return 0
 
     ssh_port="$(detect_ssh_port)"
     rule="${ssh_port}/tcp"
@@ -523,6 +538,18 @@ apply_collector_ssh_firewall_mode() {
 
     [[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
+    if managed_ssh_port_enabled; then
+        ufw_active || return 0
+        ssh_port="$(detect_ssh_port)"
+        if ! ufw_ssh_open_rule_exists "$ssh_port"; then
+            if ufw insert 1 allow proto tcp to any port "$ssh_port" comment 'kto-ssh-open' >/dev/null 2>&1; then
+                echo "push ${PUSH_BUILD}: managed ssh firewall opened port=${ssh_port}"
+            else
+                echo "push ${PUSH_BUILD}: failed to open managed ssh port=${ssh_port}" >&2
+            fi
+        fi
+        return 0
+    fi
     desired="$(printf '%s' "$response" | jq -r '
         if (.ssh_firewall_open | type) == "boolean" then
             if .ssh_firewall_open then "open" else "whitelist" end
@@ -2023,7 +2050,7 @@ status_panel_rows_json() {
 
     section="ЯДРО"
     kernel="$(uname -r 2>/dev/null || echo "-")"
-    append_status_panel_row "$rows_file" "$section" "kernel" "$kernel" "$([[ "$kernel" == *liquorix* ]] && echo ok || echo fail)"
+    append_status_panel_row "$rows_file" "$section" "kernel" "$kernel" "$([[ "$kernel" == *xanmod* ]] && echo ok || echo fail)"
 
     jq -R -s -c '
         split("\n")

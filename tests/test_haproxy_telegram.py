@@ -60,7 +60,7 @@ class TelegramHaproxyTests(unittest.TestCase):
                     "targets": ["2.2.2.2:443"],
                     "sni": ["extra.example.com"],
                     "source_ip": "10.0.0.2",
-                    "server_maxconn": 10000,
+                    "server_maxconn": 25000,
                 },
             ],
         }
@@ -171,7 +171,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertEqual(rows[0][0]["text"], "10.0.0.2 · 2")
         self.assertEqual(rows[0][1]["text"], "10.0.0.3 · 0")
         self.assertEqual(rows[1][0]["text"], "10.0.0.4 · 0")
-        self.assertTrue(any(button["text"] == "FULL → точечные бинды" for row in rows for button in row))
+        self.assertFalse(any(button["text"] == "FULL → точечные бинды" for row in rows for button in row))
 
     def test_ip_buttons_sort_by_route_count_then_numeric_address(self):
         node = dict(
@@ -514,13 +514,17 @@ class TelegramHaproxyTests(unittest.TestCase):
             "10.0.0.2",
             8443,
         )
-        self.assertIn("10.0.0.2:8443/tcp", editor_body)
+        self.assertIn("<b>IP:</b> <code>10.0.0.2</code>", editor_body)
+        self.assertIn("<b>Порт:</b> <code>8443/tcp</code>", editor_body)
+        self.assertIn("<b>Backend maxconn:</b> <code>25000</code>", editor_body)
         self.assertIn("PROXY protocol v2", editor_body)
         self.assertIn("Выключен", editor_body)
         labels = {button["text"] for row in editor_markup["inline_keyboard"] for button in row}
         self.assertTrue(
-            {"Backend", "SNI", "Входной IP", "Входной порт", "Выходной IP", "Maxconn", "PROXY v2: OFF", "Удалить маршрут"}.issubset(labels)
+            {"Backend", "SNI", "IP", "Входной порт", "PROXY v2: OFF", "Удалить маршрут"}.issubset(labels)
         )
+        self.assertNotIn("Выходной IP", labels)
+        self.assertNotIn("Maxconn", labels)
 
     def test_proxy_v2_button_toggles_only_selected_route(self):
         callback = {
@@ -631,7 +635,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         pending = self.collector.peek_pending_haproxy(self.chat_id, self.from_id)
         self.assertEqual(pending["action"], "route_port")
 
-    def test_route_input_ip_button_moves_bind_and_keeps_output(self):
+    def test_route_ip_button_moves_input_and_output_atomically(self):
         callback = {
             "id": "move-input",
             "data": f"hpx:h:{self.token}:8443|10.0.0.3",
@@ -642,10 +646,11 @@ class TelegramHaproxyTests(unittest.TestCase):
         routes = self.collector.desired_haproxy_routes_for_node(self.node)
         self.assertIsNone(self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443))
         changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.3", 8443)
-        self.assertEqual(changed["source_ip"], "10.0.0.2")
+        self.assertEqual(changed["source_ip"], "10.0.0.3")
+        self.assertEqual(changed["server_maxconn"], 25000)
         self.assertEqual(self.collector.get_haproxy_session(self.token)["selected_ip"], "10.0.0.3")
 
-    def test_route_output_ip_button_changes_only_source(self):
+    def test_legacy_output_ip_callback_also_moves_both_sides(self):
         callback = {
             "id": "move-output",
             "data": f"hpx:u:{self.token}:8443|10.0.0.3",
@@ -654,22 +659,14 @@ class TelegramHaproxyTests(unittest.TestCase):
         }
         self.assertTrue(self.collector.handle_haproxy_callback(callback))
         routes = self.collector.desired_haproxy_routes_for_node(self.node)
-        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443)
+        self.assertIsNone(self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443))
+        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.3", 8443)
         self.assertEqual(changed["source_ip"], "10.0.0.3")
         self.assertEqual(changed["targets"], ["2.2.2.2:443"])
 
-    def test_route_maxconn_edit_preserves_route(self):
-        self.collector.set_pending_haproxy(
-            self.chat_id,
-            self.from_id,
-            "route_maxconn",
-            self.token,
-            listen_ip="10.0.0.2",
-            port=8443,
-        )
-        self.assertTrue(self.collector.handle_pending_haproxy(self.chat_id, self.from_id, "25000"))
-        routes = self.collector.desired_haproxy_routes_for_node(self.node)
-        changed = self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 8443)
+    def test_route_maxconn_is_fixed_during_normalization(self):
+        legacy = {**self.node["haproxy_routes"][1], "server_maxconn": 10000}
+        changed = self.collector.normalize_haproxy_route(legacy)
         self.assertEqual(changed["server_maxconn"], 25000)
         self.assertEqual(changed["sni"], ["extra.example.com"])
 
@@ -693,9 +690,10 @@ class TelegramHaproxyTests(unittest.TestCase):
             },
         ]
         pinned, preview = self.collector.build_haproxy_source_pinned_routes(self.node, wildcard_routes)
-        self.assertEqual(preview, [(443, "10.0.0.3"), (8443, "10.0.0.2")])
+        self.assertEqual(preview, [(8443, "10.0.0.2")])
         self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(pinned, "10.0.0.3", 443))
         self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(pinned, "10.0.0.2", 8443))
+        self.assertTrue(all(route["server_maxconn"] == 25000 for route in pinned))
 
     def test_full_bind_confirm_callback_saves_exact_routes(self):
         wildcard = dict(
@@ -706,7 +704,7 @@ class TelegramHaproxyTests(unittest.TestCase):
                     "port": 443,
                     "targets": ["1.1.1.1:443"],
                     "sni": ["one.example.com"],
-                    "source_ip": "10.0.0.3",
+                    "source_ip": "default",
                     "server_maxconn": "default",
                 }
             ],
@@ -720,7 +718,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         }
         self.assertTrue(self.collector.handle_haproxy_callback(callback))
         routes = self.collector.desired_haproxy_routes_for_node(wildcard)
-        self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(routes, "10.0.0.3", 443))
+        self.assertIsNotNone(self.collector.haproxy_route_for_endpoint(routes, "10.0.0.2", 443))
 
     def test_edit_targets_additional_port_only(self):
         self.collector.set_pending_haproxy(
@@ -752,7 +750,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         self.assertEqual(base["targets"], ["1.1.1.1:443"])
         self.assertEqual(extra["targets"], ["3.3.3.3:443", "4.4.4.4:7443"])
         self.assertEqual(extra["sni"], ["*.new.example.com", "new.example.com"])
-        self.assertEqual(extra["server_maxconn"], 10000)
+        self.assertEqual(extra["server_maxconn"], 25000)
 
     def test_add_port_uses_selected_ip_for_input_and_output(self):
         self.collector.update_haproxy_session(self.token, selected_ip="10.0.0.3")
