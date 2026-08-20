@@ -114,6 +114,23 @@ class CollectorRegressionTests(unittest.TestCase):
         collector.update_node(self.payload("Тест", second, "bl"), "203.0.113.30")
         self.assertEqual(2, len(collector.NODES))
 
+    def test_offline_heartbeat_requires_sustained_push_loss(self):
+        wl_node = {"node_kind": "wl", "push_interval_sec": 5}
+        bl_node = {"node_kind": "bl", "push_interval_sec": 2}
+        legacy_bl_node = {"node_kind": "bl", "push_interval_sec": 0}
+
+        self.assertEqual(60, collector.node_stale_sec(wl_node))
+        self.assertEqual(15, collector.node_offline_confirm_sec(wl_node))
+        self.assertEqual(30, collector.node_stale_sec(bl_node))
+        self.assertEqual(15, collector.node_offline_confirm_sec(bl_node))
+        self.assertEqual(90, collector.node_stale_sec(legacy_bl_node))
+        self.assertEqual(2, collector.desired_push_interval_sec(bl_node))
+        self.assertEqual(5, collector.OFFLINE_LOOP_SEC)
+
+        bl_node["push_history"] = list(range(942, 1001, 2))
+        self.assertFalse(collector.node_push_miss_exceeded(bl_node, 1030))
+        self.assertTrue(collector.node_push_miss_exceeded(bl_node, 1032))
+
     def test_rename_is_scoped_by_uuid_and_repairs_shared_hostname_leak(self):
         identities = [
             ("Обход №1", str(uuid.uuid4()), "203.0.113.31"),
@@ -315,7 +332,7 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertNotIn("185.141.227.94", rich)
         self.assertLess(rich.index("185.141.227.93"), rich.index("217.19.122.109"))
         self.assertIn(
-            f'colspan="9"><b>Общий трафик: {collector.format_bytes(3300)}</b></td>',
+            f'colspan="7"><b>Общий трафик: {collector.format_bytes(3300)}</b></td>',
             rich,
         )
 
@@ -362,8 +379,8 @@ class CollectorRegressionTests(unittest.TestCase):
             self.assertEqual(80_000_000, entry["avg_tx_bps_1h"])
             self.assertEqual("80 | 160 Mbit/s", collector.average_rate_table_text(entry))
             rich = collector.aggregate_wl_rich_message()
-            self.assertIn("Сред. ↑/↓ (1ч)", rich)
-            self.assertIn("80 | 160 Mbit/s", rich)
+            self.assertNotIn("Сред. ↑/↓ (1ч)", rich)
+            self.assertNotIn("80 | 160 Mbit/s", rich)
 
             collector.now_ts = lambda: base_time + 15
             third = collector.update_node(rate_payload(1_120_000_000, 2_060_000_000, 25_000), "203.0.113.80")
@@ -602,8 +619,7 @@ class CollectorRegressionTests(unittest.TestCase):
             next_minute = collector.update_node(cpu_payload(60), "203.0.113.90")
             self.assertEqual(45.0, next_minute["cpu_avg_1h"])
             rich = collector.aggregate_wl_rich_message()
-            self.assertIn("CPU ср. (1ч)", rich)
-            self.assertIn("45%", rich)
+            self.assertNotIn("CPU ср. (1ч)", rich)
 
             collector.now_ts = lambda: base_time + collector.NETWORK_RATE_RETENTION_SEC + 61
             expired = collector.update_node(cpu_payload(80), "203.0.113.90")
@@ -626,8 +642,10 @@ class CollectorRegressionTests(unittest.TestCase):
         self.assertIn("203.0.113.31", rich)
         self.assertIn("203.0.113.32", rich)
         self.assertLess(rich.index("203.0.113.32"), rich.index("203.0.113.31"))
-        self.assertIn("CPU ср. (1ч)", rich)
-        self.assertIn('colspan="11"', rich)
+        self.assertNotIn("Сред. ↑/↓ (1ч)", rich)
+        self.assertNotIn("CPU ср. (1ч)", rich)
+        self.assertNotIn(">CPU</th>", rich)
+        self.assertIn('colspan="8"', rich)
 
     def test_rich_tables_show_separate_centered_traffic_totals(self):
         exact_payload = self.payload("Обход №2", str(uuid.uuid4()), "wl")
@@ -646,15 +664,15 @@ class CollectorRegressionTests(unittest.TestCase):
 
         self.assertEqual(2, wl_rich.count("Общий трафик:"))
         self.assertIn(
-            f'align="center" colspan="9"><b>Общий трафик: {collector.format_bytes(300)}</b>',
+            f'align="center" colspan="7"><b>Общий трафик: {collector.format_bytes(300)}</b>',
             wl_rich,
         )
         self.assertIn(
-            f'align="center" colspan="9"><b>Общий трафик: {collector.format_bytes(900)}</b>',
+            f'align="center" colspan="7"><b>Общий трафик: {collector.format_bytes(900)}</b>',
             wl_rich,
         )
         self.assertIn(
-            f'align="center" colspan="11"><b>Общий трафик: {collector.format_bytes(3000)}</b>',
+            f'align="center" colspan="8"><b>Общий трафик: {collector.format_bytes(3000)}</b>',
             bl_rich,
         )
         self.assertNotIn("Объем трафика:", wl_rich + bl_rich)

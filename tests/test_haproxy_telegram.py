@@ -516,7 +516,7 @@ class TelegramHaproxyTests(unittest.TestCase):
         )
         self.assertIn("<b>IP:</b> <code>10.0.0.2</code>", editor_body)
         self.assertIn("<b>Порт:</b> <code>8443/tcp</code>", editor_body)
-        self.assertIn("<b>Backend maxconn:</b> <code>25000</code>", editor_body)
+        self.assertIn("<b>Backend maxconn:</b> <code>авто, до 25000</code>", editor_body)
         self.assertIn("PROXY protocol v2", editor_body)
         self.assertIn("Выключен", editor_body)
         labels = {button["text"] for row in editor_markup["inline_keyboard"] for button in row}

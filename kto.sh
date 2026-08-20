@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v325"
+SCRIPT_BUILD="v326"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -68,6 +68,9 @@ HAPROXY_BANDWIDTH_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandw
 HAPROXY_BANDWIDTH_UNIT="${KTO_HAPROXY_BANDWIDTH_UNIT:-/etc/systemd/system/kto-haproxy-bandwidth.service}"
 HAPROXY_BANDWIDTH_SERVICE="${KTO_HAPROXY_BANDWIDTH_SERVICE:-kto-haproxy-bandwidth.service}"
 HAPROXY_BACKEND_MAXCONN=25000
+HAPROXY_CONNECTIONS_PER_CPU_DEFAULT=2000
+HAPROXY_WRONG_SNI_GPC_LIMIT_DEFAULT=500
+HAPROXY_SOURCE_CONN_RATE_LIMIT_DEFAULT=5000
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 MEMORY_GUARD_SYSCTL_CONF="/etc/sysctl.d/zz-kto-memory.conf"
 DNS_GUARD_RESOLVED_CONF="/etc/systemd/resolved.conf.d/99-kto-dns.conf"
@@ -91,12 +94,13 @@ STATS_COLLECTOR_PORT_DEFAULT="${KTO_STATS_COLLECTOR_PORT_DEFAULT:-1337}"
 STATS_COLLECTOR_URL_DEFAULT="${KTO_STATS_COLLECTOR_URL_DEFAULT:-http://${PANEL_IP}:${STATS_COLLECTOR_PORT_DEFAULT}}"
 STATS_PUSH_INTERVAL_DEFAULT="${KTO_STATS_PUSH_INTERVAL_DEFAULT:-5}"
 STATS_COLLECTOR_STALE_SEC_DEFAULT="60"
-STATS_COLLECTOR_BL_STALE_SEC_DEFAULT="${KTO_COLLECTOR_BL_STALE_SEC_DEFAULT:-15}"
-STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT="${KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT:-5}"
-STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT="${KTO_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT:-45}"
-STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT="${KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT:-1}"
+STATS_COLLECTOR_WL_OFFLINE_CONFIRM_SEC_DEFAULT="${KTO_COLLECTOR_WL_OFFLINE_CONFIRM_SEC_DEFAULT:-15}"
+STATS_COLLECTOR_BL_STALE_SEC_DEFAULT="${KTO_COLLECTOR_BL_STALE_SEC_DEFAULT:-30}"
+STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT="${KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT:-15}"
+STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT="${KTO_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT:-90}"
+STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT="${KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT:-2}"
 STATS_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT="${KTO_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT:-60}"
-STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT="${KTO_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT:-30}"
+STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT="${KTO_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT:-15}"
 STATS_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT="${KTO_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT:-300}"
 STATS_COLLECTOR_SCAN_ALERT_DELTA_DEFAULT="${KTO_COLLECTOR_SCAN_ALERT_DELTA_DEFAULT:-0}"
 STATS_COLLECTOR_TZ_DEFAULT="Europe/Moscow"
@@ -8315,6 +8319,7 @@ haproxy_nofile_limit() {
 recommended_haproxy_maxconn() {
     local override="${KTO_HAPROXY_MAXCONN:-}"
     local total_mb maxconn nofile_limit fds_per_connection fd_reserve fd_cap
+    local cpus per_cpu cpu_cap
     local conntrack_max conntrack_cap
 
     if [[ "$override" =~ ^[0-9]+$ ]]; then
@@ -8329,8 +8334,21 @@ recommended_haproxy_maxconn() {
         [[ "$total_mb" =~ ^[0-9]+$ ]] || total_mb=0
         (( total_mb > 0 )) || total_mb=2048
         maxconn=$(( total_mb * 16 ))
+
+        cpus="$(cpu_count)"
+        [[ "$cpus" =~ ^[0-9]+$ ]] || cpus=1
+        cpus=$((10#$cpus))
+        (( cpus >= 1 )) || cpus=1
+        per_cpu="${KTO_HAPROXY_CONNECTIONS_PER_CPU:-$HAPROXY_CONNECTIONS_PER_CPU_DEFAULT}"
+        [[ "$per_cpu" =~ ^[0-9]+$ ]] || per_cpu="$HAPROXY_CONNECTIONS_PER_CPU_DEFAULT"
+        per_cpu=$((10#$per_cpu))
+        if (( per_cpu < 500 || per_cpu > 10000 )); then
+            per_cpu="$HAPROXY_CONNECTIONS_PER_CPU_DEFAULT"
+        fi
+        cpu_cap=$(( cpus * per_cpu ))
+        (( maxconn <= cpu_cap )) || maxconn="$cpu_cap"
     fi
-    (( maxconn < 10000 )) && maxconn=10000
+    (( maxconn < 1000 )) && maxconn=1000
     (( maxconn > 500000 )) && maxconn=500000
 
     nofile_limit="$(haproxy_nofile_limit)"
@@ -8370,6 +8388,44 @@ recommended_haproxy_maxconn() {
     echo "$maxconn"
 }
 
+haproxy_pool_server_maxconn() {
+    local global_maxconn="${1:-0}" target_count="${2:-0}" ceiling="${3:-$HAPROXY_BACKEND_MAXCONN}"
+    local share
+
+    [[ "$global_maxconn" =~ ^[0-9]+$ ]] || return 1
+    [[ "$target_count" =~ ^[0-9]+$ ]] || return 1
+    [[ "$ceiling" =~ ^[0-9]+$ ]] || return 1
+    global_maxconn=$((10#$global_maxconn))
+    target_count=$((10#$target_count))
+    ceiling=$((10#$ceiling))
+    (( global_maxconn >= 1 && target_count >= 1 && ceiling >= 1 )) || return 1
+
+    share=$(( (global_maxconn + target_count - 1) / target_count ))
+    (( share <= ceiling )) || share="$ceiling"
+    (( share >= 1 )) || share=1
+    printf '%d\n' "$share"
+}
+
+haproxy_wrong_sni_gpc_limit() {
+    local value="${KTO_HAPROXY_WRONG_SNI_GPC_LIMIT:-$HAPROXY_WRONG_SNI_GPC_LIMIT_DEFAULT}"
+    [[ "$value" =~ ^[0-9]+$ ]] || value="$HAPROXY_WRONG_SNI_GPC_LIMIT_DEFAULT"
+    value=$((10#$value))
+    if (( value < 10 || value > 100000 )); then
+        value="$HAPROXY_WRONG_SNI_GPC_LIMIT_DEFAULT"
+    fi
+    printf '%d\n' "$value"
+}
+
+haproxy_source_conn_rate_limit() {
+    local value="${KTO_HAPROXY_SOURCE_CONN_RATE_LIMIT:-$HAPROXY_SOURCE_CONN_RATE_LIMIT_DEFAULT}"
+    [[ "$value" =~ ^[0-9]+$ ]] || value="$HAPROXY_SOURCE_CONN_RATE_LIMIT_DEFAULT"
+    value=$((10#$value))
+    if (( value < 100 || value > 100000 )); then
+        value="$HAPROXY_SOURCE_CONN_RATE_LIMIT_DEFAULT"
+    fi
+    printf '%d\n' "$value"
+}
+
 haproxy_thread_count() {
     local override="${KTO_HAPROXY_NBTHREAD:-auto}"
     local auto_max="${KTO_HAPROXY_AUTO_THREADS_MAX:-32}"
@@ -8403,7 +8459,7 @@ render_haproxy_routes_config() {
     local normalized_target_pool normalized_sni normalized_source_ip normalized_server_maxconn normalized_listen_ip normalized_send_proxy_v2
     local frontend_name backend_name server_name source_clause proxy_protocol_clause target index
     local endpoint_key bind_address route_index name_suffix
-    local haproxy_threads haproxy_maxconn route_count=0
+    local haproxy_threads haproxy_maxconn wrong_sni_gpc_limit source_conn_rate_limit effective_server_maxconn route_count=0
     local -a backend_targets=()
     local -A seen_endpoints=() seen_port_any=() seen_port_wildcard=() rendered_ports=()
 
@@ -8454,6 +8510,8 @@ render_haproxy_routes_config() {
 
     haproxy_threads="$(haproxy_thread_count)"
     haproxy_maxconn="$(recommended_haproxy_maxconn)"
+    wrong_sni_gpc_limit="$(haproxy_wrong_sni_gpc_limit)"
+    source_conn_rate_limit="$(haproxy_source_conn_rate_limit)"
 
     cat > "$output_file" <<EOF
 # Managed by kto. Edit routes through the HAProxy menu.
@@ -8533,10 +8591,10 @@ EOF
 # -------------------------
 frontend ${frontend_name}
     bind ${bind_address}:${port} backlog 65535
-    stick-table type ip size 100k expire 30m store gpc0,conn_rate(10s)
+    stick-table type ip size 100k expire 5m store gpc0,conn_rate(10s)
     tcp-request connection track-sc0 src
-    tcp-request connection silent-drop if { src_get_gpc0 gt 10 }
-    tcp-request connection silent-drop if { src_conn_rate gt 150 }
+    tcp-request connection silent-drop if { src_get_gpc0 gt ${wrong_sni_gpc_limit} }
+    tcp-request connection silent-drop if { src_conn_rate gt ${source_conn_rate_limit} }
     tcp-request inspect-delay 5s
     acl clienthello req.ssl_hello_type 1
 EOF
@@ -8569,6 +8627,10 @@ backend ${backend_name}
     balance leastconn
 
 EOF
+        effective_server_maxconn="$(haproxy_pool_server_maxconn "$haproxy_maxconn" "${#backend_targets[@]}" "$server_maxconn")" || {
+            fail "Не удалось рассчитать maxconn backend для ${listen_ip}:${port}"
+            return 1
+        }
         for index in "${!backend_targets[@]}"; do
             target="${backend_targets[$index]}"
             if (( ${#backend_targets[@]} == 1 )); then
@@ -8581,7 +8643,7 @@ EOF
                 server_name="xray$(( index + 1 ))"
             fi
             printf '    server %s %s check weight 10%s%s maxconn %s\n' \
-                "$server_name" "$target" "$source_clause" "$proxy_protocol_clause" "$server_maxconn" >> "$output_file"
+                "$server_name" "$target" "$source_clause" "$proxy_protocol_clause" "$effective_server_maxconn" >> "$output_file"
         done
     done < "$routes_file"
 }
@@ -10089,7 +10151,7 @@ add_haproxy_route_with_source() {
         mv "$next_file" "$routes_file"
         ok "Добавлен HAProxy listener ${listen_ip}:${port}: ${backend_target}"
         ok "Входной и исходящий IP: ${listen_ip}"
-        ok "maxconn на backend: ${HAPROXY_BACKEND_MAXCONN}"
+        ok "maxconn backend: авто, потолок ${HAPROXY_BACKEND_MAXCONN}"
         ok "send-proxy-v2: $(haproxy_send_proxy_v2_label "$send_proxy_v2")"
         return 0
     fi
@@ -10194,7 +10256,7 @@ set_haproxy_pool_route() {
         ok "Входной IP: ${normalized_listen_ip}"
         ok "SNI: $(haproxy_sni_label "$normalized_sni")"
         ok "Исходящий IP: $(haproxy_source_label "$normalized_source_ip")"
-        ok "maxconn на backend: ${normalized_maxconn}"
+        ok "maxconn backend: авто, потолок ${normalized_maxconn}"
         ok "send-proxy-v2: $(haproxy_send_proxy_v2_label "$normalized_send_proxy_v2")"
         return 0
     fi
@@ -10542,7 +10604,7 @@ set_haproxy_sequential_routes() {
         ok "Входной IP: ${normalized_listen_ip}"
         ok "SNI: $(haproxy_sni_label "$normalized_sni")"
         ok "Исходящий IP: $(haproxy_source_label "$normalized_source_ip")"
-        ok "maxconn на backend: ${normalized_maxconn}"
+        ok "maxconn backend: авто, потолок ${normalized_maxconn}"
         if [[ "$normalized_send_proxy_v2" == "preserve" ]]; then
             ok "send-proxy-v2: сохранено для каждого существующего маршрута; новые OFF"
         else
@@ -10934,7 +10996,7 @@ upgrade_haproxy_routes_transaction() {
         sync_haproxy_firewall "$candidate_file" "$routes_file"
         cp "$candidate_file" "$routes_file"
         rm -f "$candidate_file"
-        ok "HAProxy обновлён: маршруты сохранены, input=output, backend maxconn=${HAPROXY_BACKEND_MAXCONN}"
+        ok "HAProxy обновлён: маршруты сохранены, input=output, backend maxconn=auto (до ${HAPROXY_BACKEND_MAXCONN})"
         (( HAPROXY_UPGRADE_MOVED == 0 )) || ok "Приведено к единому IP маршрутов: ${HAPROXY_UPGRADE_MOVED}"
         return 0
     fi
@@ -11597,10 +11659,10 @@ install_stats_collector() {
     require_panel_mode
     need_root
 
-    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec scan_alert_delta expected_nodes daily_report_time ssh_base_allowed_ips existing_config=0
+    local listen_host listen_port secret bot_token chat_id allowed_user stale_sec wl_offline_confirm_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown scan_alert_delta expected_nodes daily_report_time ssh_base_allowed_ips existing_config=0
     local ip_limit_enabled ip_limit_source ip_limit_max_ips ip_limit_max_events ip_limit_window_sec ip_limit_alert_cooldown ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_enforce_enabled ip_limit_drop_enabled ip_limit_penalty_sec
     local remna_api_url remna_api_token remna_api_cache_sec remna_api_insecure remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec asn_lookup_enabled asn_cache_sec asn_timeout_sec
-    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_bl_stale safe_bl_offline_confirm safe_bl_stale_fallback safe_bl_push_interval safe_scan_alert_delta safe_expected safe_tz safe_daily safe_ssh_base_allowed_ips
+    local safe_host safe_port safe_secret safe_bot safe_chat safe_user safe_stale safe_wl_offline_confirm safe_bl_stale safe_bl_offline_confirm safe_bl_stale_fallback safe_bl_push_interval safe_push_miss_window safe_push_miss_threshold safe_push_miss_cooldown safe_scan_alert_delta safe_expected safe_tz safe_daily safe_ssh_base_allowed_ips
     local safe_ip_limit_enabled safe_ip_limit_source safe_ip_limit_max_ips safe_ip_limit_max_events safe_ip_limit_window safe_ip_limit_cooldown safe_ip_limit_scan_sec safe_ip_limit_alert_threshold safe_ip_limit_alert_top safe_ip_limit_enforce_enabled safe_ip_limit_drop_enabled safe_ip_limit_penalty_sec
     local safe_remna_api_url safe_remna_api_token safe_remna_api_cache_sec safe_remna_api_insecure safe_remna_node_alert_enabled safe_remna_node_poll_sec safe_remna_offline_guard_enabled safe_remna_offline_state_max_age_sec safe_remna_offline_log_grace_sec safe_asn_lookup_enabled safe_asn_cache_sec safe_asn_timeout_sec
 
@@ -11612,6 +11674,7 @@ install_stats_collector() {
         chat_id="$(config_get KTO_COLLECTOR_CHAT_ID "$STATS_COLLECTOR_CONFIG")"
         allowed_user="$(config_get KTO_COLLECTOR_ALLOWED_USER_ID "$STATS_COLLECTOR_CONFIG")"
         stale_sec="$(config_get KTO_COLLECTOR_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
+        wl_offline_confirm_sec="$(config_get KTO_COLLECTOR_WL_OFFLINE_CONFIRM_SEC "$STATS_COLLECTOR_CONFIG")"
         bl_stale_sec="$(config_get KTO_COLLECTOR_BL_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
         bl_offline_confirm_sec="$(config_get KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC "$STATS_COLLECTOR_CONFIG")"
         bl_stale_fallback_sec="$(config_get KTO_COLLECTOR_BL_STALE_FALLBACK_SEC "$STATS_COLLECTOR_CONFIG")"
@@ -11659,15 +11722,21 @@ install_stats_collector() {
         listen_port="${listen_port:-$STATS_COLLECTOR_PORT_DEFAULT}"
         allowed_user="${allowed_user:-$STATS_ALLOWED_USER_ID_DEFAULT}"
         stale_sec="${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}"
+        wl_offline_confirm_sec="${wl_offline_confirm_sec:-$STATS_COLLECTOR_WL_OFFLINE_CONFIRM_SEC_DEFAULT}"
         bl_stale_sec="${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}"
         bl_offline_confirm_sec="${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}"
         bl_stale_fallback_sec="${bl_stale_fallback_sec:-$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT}"
         bl_push_interval_sec="${bl_push_interval_sec:-$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT}"
-        if [[ "$bl_push_interval_sec" == "5" ]]; then
+        # Migrate only values that were hard-coded defaults in older builds.
+        [[ "$bl_stale_sec" == "15" ]] && bl_stale_sec="$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT"
+        [[ "$bl_offline_confirm_sec" == "5" ]] && bl_offline_confirm_sec="$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT"
+        [[ "$bl_stale_fallback_sec" == "45" ]] && bl_stale_fallback_sec="$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT"
+        if [[ "$bl_push_interval_sec" == "1" || "$bl_push_interval_sec" == "5" ]]; then
             bl_push_interval_sec="$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT"
         fi
         push_miss_window_sec="${push_miss_window_sec:-$STATS_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT}"
         push_miss_threshold="${push_miss_threshold:-$STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT}"
+        [[ "$push_miss_threshold" == "30" ]] && push_miss_threshold="$STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT"
         push_miss_alert_cooldown="${push_miss_alert_cooldown:-$STATS_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT}"
         scan_alert_delta="${scan_alert_delta:-$STATS_COLLECTOR_SCAN_ALERT_DELTA_DEFAULT}"
         expected_nodes="${expected_nodes:-$STATS_EXPECTED_NODES_DEFAULT}"
@@ -11707,6 +11776,7 @@ install_stats_collector() {
         chat_id="$(ask_text "Введите Telegram Chat ID")"
         allowed_user="$(ask_int "Разрешенный Telegram user id" "$STATS_ALLOWED_USER_ID_DEFAULT" 1 999999999999)"
         stale_sec="$(ask_int "Алерт offline после секунд" "$STATS_COLLECTOR_STALE_SEC_DEFAULT" 30 86400)"
+        wl_offline_confirm_sec="$STATS_COLLECTOR_WL_OFFLINE_CONFIRM_SEC_DEFAULT"
         bl_stale_sec="$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT"
         bl_offline_confirm_sec="$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT"
         bl_stale_fallback_sec="$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT"
@@ -11775,6 +11845,9 @@ install_stats_collector() {
     fi
     if [[ -n "${KTO_COLLECTOR_BL_STALE_SEC:-}" ]]; then
         bl_stale_sec="$KTO_COLLECTOR_BL_STALE_SEC"
+    fi
+    if [[ -n "${KTO_COLLECTOR_WL_OFFLINE_CONFIRM_SEC:-}" ]]; then
+        wl_offline_confirm_sec="$KTO_COLLECTOR_WL_OFFLINE_CONFIRM_SEC"
     fi
     if [[ -n "${KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC:-}" ]]; then
         bl_offline_confirm_sec="$KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC"
@@ -11851,6 +11924,7 @@ install_stats_collector() {
     safe_chat="$(escape_config_value "$chat_id")"
     safe_user="$(escape_config_value "$allowed_user")"
     safe_stale="$(escape_config_value "$stale_sec")"
+    safe_wl_offline_confirm="$(escape_config_value "$wl_offline_confirm_sec")"
     safe_bl_stale="$(escape_config_value "$bl_stale_sec")"
     safe_bl_offline_confirm="$(escape_config_value "$bl_offline_confirm_sec")"
     safe_bl_stale_fallback="$(escape_config_value "$bl_stale_fallback_sec")"
@@ -11904,6 +11978,7 @@ KTO_COLLECTOR_CHAT_ID="$safe_chat"
 KTO_COLLECTOR_ALLOWED_USER_ID="$safe_user"
 KTO_COLLECTOR_STATE_DIR="$STATS_COLLECTOR_STATE_DIR"
 KTO_COLLECTOR_STALE_SEC="$safe_stale"
+KTO_COLLECTOR_WL_OFFLINE_CONFIRM_SEC="$safe_wl_offline_confirm"
 KTO_COLLECTOR_BL_STALE_SEC="$safe_bl_stale"
 KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC="$safe_bl_offline_confirm"
 KTO_COLLECTOR_BL_STALE_FALLBACK_SEC="$safe_bl_stale_fallback"
@@ -11968,6 +12043,7 @@ EOF
     else
         ok "Ежедневный отчёт: выключен"
     fi
+    ok "WL offline alert: ${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}s + confirm ${wl_offline_confirm_sec:-$STATS_COLLECTOR_WL_OFFLINE_CONFIRM_SEC_DEFAULT}s"
     ok "BL offline alert: ${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s + confirm ${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}s"
     ok "BL push target: ${bl_push_interval_sec:-$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT}s, miss >${push_miss_threshold:-$STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT}/${push_miss_window_sec:-$STATS_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT}s"
     if [[ -n "$remna_api_token" ]]; then
@@ -11990,7 +12066,7 @@ stats_collector_status() {
     header
     require_panel_mode
     need_root
-    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown remna_test_id remna_test_log remna_code remna_probe
+    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec stale_sec wl_offline_confirm_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown remna_test_id remna_test_log remna_code remna_probe
     local ip_limit_enabled ip_limit_source ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_max_events asn_lookup_enabled asn_cache_sec
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
@@ -12002,6 +12078,8 @@ stats_collector_status() {
     remna_offline_guard_enabled="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED "$STATS_COLLECTOR_CONFIG")"
     remna_offline_state_max_age_sec="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_STATE_MAX_AGE_SEC "$STATS_COLLECTOR_CONFIG")"
     remna_offline_log_grace_sec="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_LOG_GRACE_SEC "$STATS_COLLECTOR_CONFIG")"
+    stale_sec="$(config_get KTO_COLLECTOR_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
+    wl_offline_confirm_sec="$(config_get KTO_COLLECTOR_WL_OFFLINE_CONFIRM_SEC "$STATS_COLLECTOR_CONFIG")"
     bl_stale_sec="$(config_get KTO_COLLECTOR_BL_STALE_SEC "$STATS_COLLECTOR_CONFIG")"
     bl_offline_confirm_sec="$(config_get KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC "$STATS_COLLECTOR_CONFIG")"
     bl_stale_fallback_sec="$(config_get KTO_COLLECTOR_BL_STALE_FALLBACK_SEC "$STATS_COLLECTOR_CONFIG")"
@@ -12029,6 +12107,7 @@ stats_collector_status() {
     print_row "конфиг" "$STATS_COLLECTOR_CONFIG" "$([[ -s "$STATS_COLLECTOR_CONFIG" ]] && echo 1 || echo 0)"
     print_row "данные" "$STATS_COLLECTOR_STATE_DIR" "$([[ -d "$STATS_COLLECTOR_STATE_DIR" ]] && echo 1 || echo 0)"
     print_row "адрес" "${listen_host}:${listen_port}" "$([[ -n "$listen_port" ]] && echo 1 || echo 0)"
+    print_row "wl stale" "${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}s + confirm ${wl_offline_confirm_sec:-$STATS_COLLECTOR_WL_OFFLINE_CONFIRM_SEC_DEFAULT}s" 1
     print_row "bl stale" "${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s + confirm ${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}s" 1
     print_row "bl push" "target ${bl_push_interval_sec:-$STATS_COLLECTOR_BL_PUSH_INTERVAL_SEC_DEFAULT}s / fallback ${bl_stale_fallback_sec:-$STATS_COLLECTOR_BL_STALE_FALLBACK_SEC_DEFAULT}s" 1
     print_row "push miss" ">${push_miss_threshold:-$STATS_COLLECTOR_PUSH_MISS_THRESHOLD_DEFAULT}/${push_miss_window_sec:-$STATS_COLLECTOR_PUSH_MISS_WINDOW_SEC_DEFAULT}s cooldown ${push_miss_alert_cooldown:-$STATS_COLLECTOR_PUSH_MISS_ALERT_COOLDOWN_DEFAULT}s" 1

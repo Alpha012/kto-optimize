@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v325"', KTO)
-        self.assertIn('PUSH_BUILD="v325"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v325"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v325"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v325"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v325"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v325"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v325"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v326"', KTO)
+        self.assertIn('PUSH_BUILD="v326"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v326"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v326"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v326"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v326"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v326"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v326"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2943,9 +2943,9 @@ KTO_HAPROXY_NOFILE_LIMIT=1048576
 KTO_HAPROXY_FDS_PER_CONNECTION=3
 KTO_HAPROXY_FD_RESERVE=8192
 unset KTO_HAPROXY_MAXCONN
-[[ "$(recommended_haproxy_maxconn)" == 262000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 32000 ]]
 KTO_HAPROXY_MAXCONN=invalid
-[[ "$(recommended_haproxy_maxconn)" == 262000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 32000 ]]
 KTO_HAPROXY_MAXCONN=500000
 [[ "$(recommended_haproxy_maxconn)" == 346000 ]]
 KTO_HAPROXY_MAXCONN=200000
@@ -2959,7 +2959,25 @@ KTO_HAPROXY_NOFILE_LIMIT=65536
 unset KTO_HAPROXY_MAXCONN
 [[ "$(recommended_haproxy_maxconn)" == 19000 ]]
 KTO_HAPROXY_NOFILE_LIMIT=1048576
+TEST_MEMORY_MB=65536
+TEST_CPU_COUNT=2
+[[ "$(recommended_haproxy_maxconn)" == 4000 ]]
+TEST_CPU_COUNT=4
+[[ "$(recommended_haproxy_maxconn)" == 8000 ]]
+TEST_CPU_COUNT=8
+[[ "$(recommended_haproxy_maxconn)" == 16000 ]]
+TEST_CPU_COUNT=16
+[[ "$(recommended_haproxy_maxconn)" == 32000 ]]
+TEST_CPU_COUNT=32
+[[ "$(recommended_haproxy_maxconn)" == 64000 ]]
+KTO_HAPROXY_CONNECTIONS_PER_CPU=invalid
+[[ "$(recommended_haproxy_maxconn)" == 64000 ]]
+unset KTO_HAPROXY_CONNECTIONS_PER_CPU
+[[ "$(haproxy_pool_server_maxconn 64000 1 25000)" == 25000 ]]
+[[ "$(haproxy_pool_server_maxconn 64000 21 25000)" == 3048 ]]
+[[ "$(haproxy_pool_server_maxconn 4000 1 25000)" == 4000 ]]
 unset KTO_HAPROXY_NBTHREAD
+TEST_CPU_COUNT=16
 [[ "$(haproxy_thread_count)" == 16 ]]
 TEST_CPU_COUNT=32
 [[ "$(haproxy_thread_count)" == 32 ]]
@@ -3339,8 +3357,9 @@ grep -q '^    default-server inter 10s fastinter 2s downinter 10s fall 3 rise 2$
 grep -q '^frontend vless_in$' "$config"
 grep -q '^frontend vless_in_8443$' "$config"
 [[ "$(grep -c '^    tcp-request connection track-sc0 src$' "$config")" == 2 ]]
-[[ "$(grep -c '^    tcp-request connection silent-drop if { src_get_gpc0 gt 10 }$' "$config")" == 2 ]]
-[[ "$(grep -c '^    tcp-request connection silent-drop if { src_conn_rate gt 150 }$' "$config")" == 2 ]]
+[[ "$(grep -c '^    stick-table type ip size 100k expire 5m store gpc0,conn_rate(10s)$' "$config")" == 2 ]]
+[[ "$(grep -c '^    tcp-request connection silent-drop if { src_get_gpc0 gt 500 }$' "$config")" == 2 ]]
+[[ "$(grep -c '^    tcp-request connection silent-drop if { src_conn_rate gt 5000 }$' "$config")" == 2 ]]
 grep -q '^    server xray1 89.144.8.3:443 check weight 10 maxconn 25000$' "$config"
 grep -q '^    server xray_8443 5.34.179.144:443 check weight 10 source 185.141.227.93 maxconn 25000$' "$config"
 grep -q '^    acl allowed_sni req.ssl_sni -i base.example.com$' "$config"
@@ -3368,6 +3387,7 @@ expected=$'443\t89.144.8.3:443\tbase.example.com *.rog-self.co.uk\tdefault\t2500
 source <(sed '/^main /d' kto.sh)
 set -u
 SUDO=()
+KTO_HAPROXY_MAXCONN=100000
 routes=$(mktemp)
 config=$(mktemp)
 parsed=$(mktemp)
@@ -3459,6 +3479,7 @@ expected=$'443\t89.144.8.3:443\tany\tdefault\t25000\n8443\t5.34.179.144:443\tstr
         harness = r'''
 source <(sed '/^main /d' kto.sh)
 SUDO=()
+KTO_HAPROXY_MAXCONN=42000
 routes=$(mktemp)
 config=$(mktemp)
 conflict=$(mktemp)
@@ -3691,6 +3712,7 @@ grep -Fqx 'sync' "$events"
 
         harness = r'''
 source <(sed '/^main /d' kto.sh)
+KTO_HAPROXY_MAXCONN=50000
 routes=$(mktemp)
 config=$(mktemp)
 trap 'rm -f "$routes" "$config"' EXIT
@@ -4009,6 +4031,7 @@ verify_haproxy_backup "$HAPROXY_LAST_BACKUP"
         harness = r'''
 source <(sed '/^main /d' kto.sh)
 SUDO=()
+KTO_HAPROXY_MAXCONN=100000
 routes=$(mktemp)
 config=$(mktemp)
 trap 'rm -f "$routes" "$config"' EXIT
@@ -4072,6 +4095,7 @@ list_haproxy_additional_source_ips() { printf '185.141.227.93\twan2\n217.19.122.
         harness = r'''
 source <(sed '/^main /d' kto.sh)
 SUDO=()
+KTO_HAPROXY_MAXCONN=42000
 routes=$(mktemp)
 config=$(mktemp)
 config2=$(mktemp)
@@ -4081,8 +4105,8 @@ pool='31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443,31.76.113.189:7443,
 printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n8450\t%s\tdev-yandex.sbs\t217.19.122.109\t10000\n' "$pool" > "$routes"
 render_haproxy_routes_config "$routes" "$config"
 [[ "$(awk '$1 == "backend" { active = ($2 == "vless_pool_8450"); next } active && $1 == "server" { count++ } END { print count + 0 }' "$config")" == 21 ]]
-grep -q '^    server xray1 31.59.140.66:7443 check weight 10 source 217.19.122.109 maxconn 25000$' "$config"
-grep -q '^    server xray21 117.55.203.106:7443 check weight 10 source 217.19.122.109 maxconn 25000$' "$config"
+grep -q '^    server xray1 31.59.140.66:7443 check weight 10 source 217.19.122.109 maxconn 2000$' "$config"
+grep -q '^    server xray21 117.55.203.106:7443 check weight 10 source 217.19.122.109 maxconn 2000$' "$config"
 extract_haproxy_routes "$config" > "$routes2"
 expected=$'443\t89.144.8.3:443\tbase.example.com\tdefault\t25000\n8450\t'"$pool"$'\tdev-yandex.sbs\t217.19.122.109\t25000\t217.19.122.109'
 [[ "$(cat "$routes2")" == "$expected" ]]

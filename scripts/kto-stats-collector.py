@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v325"
+COLLECTOR_BUILD = "v326"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -99,6 +99,11 @@ RICH_STATS_ENABLED = str(cfg.get("KTO_COLLECTOR_RICH_STATS_ENABLED", "0")).strip
 STALE_SEC = int(cfg.get("KTO_COLLECTOR_STALE_SEC", "60"))
 CHECK_INTERVAL = int(cfg.get("KTO_COLLECTOR_CHECK_INTERVAL", "30"))
 try:
+    WL_OFFLINE_CONFIRM_SEC = int(cfg.get("KTO_COLLECTOR_WL_OFFLINE_CONFIRM_SEC", "15") or "15")
+except Exception:
+    WL_OFFLINE_CONFIRM_SEC = 15
+WL_OFFLINE_CONFIRM_SEC = max(0, min(WL_OFFLINE_CONFIRM_SEC, 120))
+try:
     AUTH_MAX_SKEW_SEC = int(cfg.get("KTO_COLLECTOR_AUTH_MAX_SKEW_SEC", "300") or "300")
 except Exception:
     AUTH_MAX_SKEW_SEC = 300
@@ -109,29 +114,29 @@ except Exception:
     NODES_FLUSH_SEC = 5.0
 NODES_FLUSH_SEC = max(1.0, min(NODES_FLUSH_SEC, 60.0))
 try:
-    BL_STALE_SEC = int(cfg.get("KTO_COLLECTOR_BL_STALE_SEC", "15") or "15")
+    BL_STALE_SEC = int(cfg.get("KTO_COLLECTOR_BL_STALE_SEC", "30") or "30")
 except Exception:
-    BL_STALE_SEC = 15
+    BL_STALE_SEC = 30
 if BL_STALE_SEC < 5:
     BL_STALE_SEC = 5
 try:
-    BL_OFFLINE_CONFIRM_SEC = int(cfg.get("KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC", "5") or "5")
+    BL_OFFLINE_CONFIRM_SEC = int(cfg.get("KTO_COLLECTOR_BL_OFFLINE_CONFIRM_SEC", "15") or "15")
 except Exception:
-    BL_OFFLINE_CONFIRM_SEC = 5
+    BL_OFFLINE_CONFIRM_SEC = 15
 if BL_OFFLINE_CONFIRM_SEC < 0:
     BL_OFFLINE_CONFIRM_SEC = 0
 if BL_OFFLINE_CONFIRM_SEC > 60:
     BL_OFFLINE_CONFIRM_SEC = 60
 try:
-    BL_STALE_FALLBACK_SEC = int(cfg.get("KTO_COLLECTOR_BL_STALE_FALLBACK_SEC", "45") or "45")
+    BL_STALE_FALLBACK_SEC = int(cfg.get("KTO_COLLECTOR_BL_STALE_FALLBACK_SEC", "90") or "90")
 except Exception:
-    BL_STALE_FALLBACK_SEC = 45
+    BL_STALE_FALLBACK_SEC = 90
 if BL_STALE_FALLBACK_SEC < BL_STALE_SEC:
     BL_STALE_FALLBACK_SEC = BL_STALE_SEC
 try:
-    BL_PUSH_INTERVAL_SEC = int(cfg.get("KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC", "1") or "1")
+    BL_PUSH_INTERVAL_SEC = int(cfg.get("KTO_COLLECTOR_BL_PUSH_INTERVAL_SEC", "2") or "2")
 except Exception:
-    BL_PUSH_INTERVAL_SEC = 1
+    BL_PUSH_INTERVAL_SEC = 2
 if BL_PUSH_INTERVAL_SEC < 1:
     BL_PUSH_INTERVAL_SEC = 1
 if BL_PUSH_INTERVAL_SEC > 3600:
@@ -145,9 +150,9 @@ if PUSH_MISS_WINDOW_SEC < 10:
 if PUSH_MISS_WINDOW_SEC > 3600:
     PUSH_MISS_WINDOW_SEC = 3600
 try:
-    PUSH_MISS_THRESHOLD = int(cfg.get("KTO_COLLECTOR_PUSH_MISS_THRESHOLD", "30") or "30")
+    PUSH_MISS_THRESHOLD = int(cfg.get("KTO_COLLECTOR_PUSH_MISS_THRESHOLD", "15") or "15")
 except Exception:
-    PUSH_MISS_THRESHOLD = 30
+    PUSH_MISS_THRESHOLD = 15
 if PUSH_MISS_THRESHOLD < 1:
     PUSH_MISS_THRESHOLD = 1
 try:
@@ -156,9 +161,7 @@ except Exception:
     PUSH_MISS_ALERT_COOLDOWN = 300
 if PUSH_MISS_ALERT_COOLDOWN < 0:
     PUSH_MISS_ALERT_COOLDOWN = 0
-OFFLINE_LOOP_SEC = CHECK_INTERVAL
-if BL_STALE_SEC < CHECK_INTERVAL:
-    OFFLINE_LOOP_SEC = max(1, min(5, BL_STALE_SEC, CHECK_INTERVAL))
+OFFLINE_LOOP_SEC = max(1, min(5, CHECK_INTERVAL))
 TZ_NAME = cfg.get("KTO_COLLECTOR_TZ", "Europe/Moscow")
 DAILY_REPORT_TIME = cfg.get("KTO_COLLECTOR_DAILY_REPORT_TIME", "").strip()
 try:
@@ -4403,17 +4406,17 @@ def node_stale_sec(node):
         if push_interval <= 0:
             return max(BL_STALE_SEC, BL_STALE_FALLBACK_SEC)
         if push_interval <= 2:
-            return max(BL_STALE_SEC, PUSH_MISS_THRESHOLD + 1)
-        return max(BL_STALE_SEC, push_interval * 3)
+            return max(BL_STALE_SEC, push_interval * 10)
+        return max(BL_STALE_SEC, push_interval * 6)
     except Exception:
         return STALE_SEC
 
 
 def node_offline_confirm_sec(node):
     try:
-        return 0 if node_is_wl(node) else BL_OFFLINE_CONFIRM_SEC
+        return WL_OFFLINE_CONFIRM_SEC if node_is_wl(node) else BL_OFFLINE_CONFIRM_SEC
     except Exception:
-        return 0
+        return WL_OFFLINE_CONFIRM_SEC
 
 
 def desired_push_interval_sec(node):
@@ -4834,7 +4837,6 @@ def rich_wl_rows(nodes, ts):
             traffic_rows = [normalized_traffic_entry(node, node.get("iface"), node.get("ip"))]
         rowspan = len(traffic_rows)
         node_error = clean_display_text(node.get("error") or "")
-        cpu_average = cpu_average_table_text(node)
         sni = "-" if node_error else wrong_sni_table_text(node)
         status = node_status_text(node, ts)
         if status == "OK" and any(clean_display_text(entry.get("error") or "") for entry in traffic_rows):
@@ -4865,11 +4867,9 @@ def rich_wl_rows(nodes, ts):
                 (today, "right"),
                 (yesterday, "right"),
                 (month, "right"),
-                (average_rate_table_text(entry), "right"),
             ])
             if index == 0:
                 row.extend([
-                    {**shared, "value": cpu_average, "align": "right"},
                     {**shared, "value": sni, "align": "left"},
                     {**shared, "value": status, "align": "center"},
                 ])
@@ -4922,7 +4922,7 @@ def aggregate_wl_rich_message():
         return "<h3>Статистика обходов</h3><p>Нет данных от машин.</p>"
     nodes.sort(key=node_natural_sort_key)
     other_nodes.sort(key=wl_other_node_sort_key)
-    headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "Сред. ↑/↓ (1ч)", "CPU ср. (1ч)", "SNI", "Статус"]
+    headers = ["Обход", "IP", "Сегодня", "Вчера", "Месяц", "SNI", "Статус"]
     parts = [
         "<h3>Статистика обходов</h3>",
         rich_table(headers, rich_wl_rows(nodes, ts), footer=rich_traffic_total_text(nodes)),
@@ -4979,8 +4979,6 @@ def rich_bl_rows(nodes, ts):
         node_error = clean_display_text(node.get("error") or "")
         metrics_ok = bool(node.get("metrics_ok"))
         ram = f"{int(node.get('ram_percent', 0) or 0)}%" if metrics_ok else "-"
-        cpu = format_percent(node.get("cpu_percent", 0)) if metrics_ok else "-"
-        cpu_average = cpu_average_table_text(node)
         status = node_status_text(node, ts)
         if status == "OK" and any(clean_display_text(entry.get("error") or "") for entry in traffic_rows):
             status = "WARN"
@@ -5007,13 +5005,10 @@ def rich_bl_rows(nodes, ts):
                 (today, "right"),
                 (yesterday, "right"),
                 (month, "right"),
-                (average_rate_table_text(entry), "right"),
             ])
             if index == 0:
                 row.extend([
                     {**shared, "value": ram, "align": "right"},
-                    {**shared, "value": cpu, "align": "right"},
-                    {**shared, "value": cpu_average, "align": "right"},
                     {**shared, "value": remna_table_text(node), "align": "left"},
                     {**shared, "value": status, "align": "center"},
                 ])
@@ -5049,7 +5044,7 @@ def bl_nodes_rich_section(group_name, group_nodes, ts=None):
     if not group_nodes:
         return f"<h4>{rich_text(group_name)}</h4><p>Нет машин в группе.</p>"
     ts = now_ts() if ts is None else int(ts)
-    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "Сред. ↑/↓ (1ч)", "RAM", "CPU", "CPU ср. (1ч)", "Remnawave", "Статус"]
+    headers = ["Машина", "IP", "Сегодня", "Вчера", "Месяц", "RAM", "Remnawave", "Статус"]
     parts = [
         f"<h4>{rich_text(group_name)}</h4>",
         rich_table(headers, rich_bl_rows(group_nodes, ts), footer=rich_traffic_total_text(group_nodes)),
@@ -6132,7 +6127,7 @@ def haproxy_route_editor_payload(node, token, selected_ip, port):
         detail_line("Машина", node_display_name(node)),
         detail_line("IP", listen_label),
         detail_line("Порт", f"{int(route['port'])}/tcp"),
-        detail_line("Backend maxconn", HAPROXY_BACKEND_MAXCONN),
+        detail_line("Backend maxconn", f"авто, до {HAPROXY_BACKEND_MAXCONN}"),
         detail_line("PROXY protocol v2", "Включён" if proxy_v2_enabled else "Выключен"),
         detail_line("Статус", haproxy_apply_status_text(node, desired, reported)),
         "",
@@ -7102,7 +7097,7 @@ def handle_haproxy_callback(callback):
                 "Ответь числом от <code>1</code> до <code>65535</code>.\nОтмена: <code>/cancel</code>",
             )
             return True
-        answer_callback(callback_id, f"maxconn зафиксирован: {HAPROXY_BACKEND_MAXCONN}")
+        answer_callback(callback_id, f"maxconn: авто, до {HAPROXY_BACKEND_MAXCONN}")
         show_haproxy_route_editor(token, port)
         return True
     if action == "l":
