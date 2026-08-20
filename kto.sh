@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v330"
+SCRIPT_BUILD="v331"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -72,7 +72,8 @@ HAPROXY_BANDWIDTH_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandw
 HAPROXY_BANDWIDTH_UNIT="${KTO_HAPROXY_BANDWIDTH_UNIT:-/etc/systemd/system/kto-haproxy-bandwidth.service}"
 HAPROXY_BANDWIDTH_SERVICE="${KTO_HAPROXY_BANDWIDTH_SERVICE:-kto-haproxy-bandwidth.service}"
 HAPROXY_BACKEND_MAXCONN=auto
-HAPROXY_CONNECTIONS_PER_CPU_DEFAULT=2000
+HAPROXY_BACKEND_MIN_MAXCONN_DEFAULT=10000
+HAPROXY_CONNECTIONS_PER_CPU_DEFAULT=10000
 HAPROXY_WRONG_SNI_GPC_LIMIT_DEFAULT=500
 HAPROXY_SOURCE_CONN_RATE_LIMIT_DEFAULT=5000
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
@@ -1572,7 +1573,7 @@ haproxy_server_maxconn_label() {
     local value
     value="$(normalize_haproxy_server_maxconn "${1:-auto}")" || return 1
     if [[ "$value" == auto ]]; then
-        printf 'auto от global и размера пула\n'
+        printf 'auto, минимум %s на backend\n' "$HAPROXY_BACKEND_MIN_MAXCONN_DEFAULT"
     else
         printf 'потолок %s на backend\n' "$value"
     fi
@@ -4340,7 +4341,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v330"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v331"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -4353,7 +4354,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v330"
+KTO_HAPROXY_FIREWALL_BUILD="v331"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -8720,7 +8721,7 @@ recommended_haproxy_maxconn() {
         cpu_cap=$(( cpus * per_cpu ))
         (( maxconn <= cpu_cap )) || maxconn="$cpu_cap"
     fi
-    (( maxconn < 1000 )) && maxconn=1000
+    (( maxconn < 10000 )) && maxconn=10000
     (( maxconn > 500000 )) && maxconn=500000
 
     nofile_limit="$(haproxy_nofile_limit)"
@@ -8762,7 +8763,7 @@ recommended_haproxy_maxconn() {
 
 haproxy_pool_server_maxconn() {
     local global_maxconn="${1:-0}" target_count="${2:-0}" ceiling="${3:-$HAPROXY_BACKEND_MAXCONN}"
-    local share
+    local share minimum
 
     [[ "$global_maxconn" =~ ^[0-9]+$ ]] || return 1
     [[ "$target_count" =~ ^[0-9]+$ ]] || return 1
@@ -8771,6 +8772,14 @@ haproxy_pool_server_maxconn() {
     (( global_maxconn >= 1 && target_count >= 1 )) || return 1
 
     share=$(( (global_maxconn + target_count - 1) / target_count ))
+    minimum="${KTO_HAPROXY_BACKEND_MIN_MAXCONN:-$HAPROXY_BACKEND_MIN_MAXCONN_DEFAULT}"
+    [[ "$minimum" =~ ^[0-9]+$ ]] || minimum="$HAPROXY_BACKEND_MIN_MAXCONN_DEFAULT"
+    minimum=$((10#$minimum))
+    if (( minimum < 1 || minimum > 10000000 )); then
+        minimum="$HAPROXY_BACKEND_MIN_MAXCONN_DEFAULT"
+    fi
+    (( share >= minimum )) || share="$minimum"
+
     ceiling="$(normalize_haproxy_server_maxconn "$ceiling")" || return 1
     if [[ "$ceiling" != auto ]]; then
         ceiling=$((10#$ceiling))
@@ -11385,7 +11394,7 @@ upgrade_haproxy_routes_transaction() {
         sync_haproxy_firewall "$candidate_file" "$routes_file"
         cp "$candidate_file" "$routes_file"
         rm -f "$candidate_file"
-        ok "HAProxy обновлён: маршруты сохранены, input=output, backend maxconn=auto от global и размера пула"
+        ok "HAProxy обновлён: маршруты сохранены, input=output, backend maxconn=auto (минимум ${HAPROXY_BACKEND_MIN_MAXCONN_DEFAULT})"
         (( HAPROXY_UPGRADE_MOVED == 0 )) || ok "Приведено к единому IP маршрутов: ${HAPROXY_UPGRADE_MOVED}"
         return 0
     fi

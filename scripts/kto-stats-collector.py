@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v330"
+COLLECTOR_BUILD = "v331"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -369,6 +369,7 @@ HAPROXY_MAX_TARGETS = 64
 HAPROXY_MAX_SNI = 64
 HAPROXY_SNI_ANY = "any"
 HAPROXY_BACKEND_MAXCONN = "auto"
+HAPROXY_BACKEND_MIN_MAXCONN = 10_000
 HAPROXY_LEGACY_BACKEND_MAXCONN = 25_000
 HAPROXY_MAX_BANDWIDTH_LIMITS = 64
 HAPROXY_MAX_BANDWIDTH_MBIT = 100000
@@ -775,7 +776,7 @@ def normalize_haproxy_server_maxconn(value):
 def haproxy_server_maxconn_label(value):
     normalized = normalize_haproxy_server_maxconn(value)
     if normalized == HAPROXY_BACKEND_MAXCONN:
-        return "авто от global и размера пула"
+        return f"авто, минимум {HAPROXY_BACKEND_MIN_MAXCONN} на backend"
     return f"потолок {normalized} на backend"
 
 
@@ -7107,7 +7108,7 @@ def handle_haproxy_callback(callback):
                 "Ответь числом от <code>1</code> до <code>65535</code>.\nОтмена: <code>/cancel</code>",
             )
             return True
-        answer_callback(callback_id, "maxconn: auto от global и размера пула")
+        answer_callback(callback_id, f"maxconn: auto, минимум {HAPROXY_BACKEND_MIN_MAXCONN} на backend")
         show_haproxy_route_editor(token, port)
         return True
     if action == "l":

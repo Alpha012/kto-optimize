@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v330"', KTO)
-        self.assertIn('PUSH_BUILD="v330"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v330"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v330"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v330"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v330"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v330"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v330"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v331"', KTO)
+        self.assertIn('PUSH_BUILD="v331"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v331"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v331"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v331"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v331"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v331"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v331"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2986,9 +2986,9 @@ KTO_HAPROXY_NOFILE_LIMIT=1048576
 KTO_HAPROXY_FDS_PER_CONNECTION=3
 KTO_HAPROXY_FD_RESERVE=8192
 unset KTO_HAPROXY_MAXCONN
-[[ "$(recommended_haproxy_maxconn)" == 32000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 160000 ]]
 KTO_HAPROXY_MAXCONN=invalid
-[[ "$(recommended_haproxy_maxconn)" == 32000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 160000 ]]
 KTO_HAPROXY_MAXCONN=500000
 [[ "$(recommended_haproxy_maxconn)" == 346000 ]]
 KTO_HAPROXY_MAXCONN=200000
@@ -3004,22 +3004,31 @@ unset KTO_HAPROXY_MAXCONN
 KTO_HAPROXY_NOFILE_LIMIT=1048576
 TEST_MEMORY_MB=65536
 TEST_CPU_COUNT=2
-[[ "$(recommended_haproxy_maxconn)" == 4000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 20000 ]]
 TEST_CPU_COUNT=4
-[[ "$(recommended_haproxy_maxconn)" == 8000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 40000 ]]
 TEST_CPU_COUNT=8
-[[ "$(recommended_haproxy_maxconn)" == 16000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 80000 ]]
 TEST_CPU_COUNT=16
-[[ "$(recommended_haproxy_maxconn)" == 32000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 160000 ]]
 TEST_CPU_COUNT=32
-[[ "$(recommended_haproxy_maxconn)" == 64000 ]]
+[[ "$(recommended_haproxy_maxconn)" == 320000 ]]
 KTO_HAPROXY_CONNECTIONS_PER_CPU=invalid
+[[ "$(recommended_haproxy_maxconn)" == 320000 ]]
+KTO_HAPROXY_CONNECTIONS_PER_CPU=2000
 [[ "$(recommended_haproxy_maxconn)" == 64000 ]]
 unset KTO_HAPROXY_CONNECTIONS_PER_CPU
 [[ "$(haproxy_pool_server_maxconn 64000 1 auto)" == 64000 ]]
-[[ "$(haproxy_pool_server_maxconn 64000 21 auto)" == 3048 ]]
+[[ "$(haproxy_pool_server_maxconn 64000 21 auto)" == 10000 ]]
 [[ "$(haproxy_pool_server_maxconn 64000 1 25000)" == 25000 ]]
-[[ "$(haproxy_pool_server_maxconn 4000 1 auto)" == 4000 ]]
+[[ "$(haproxy_pool_server_maxconn 16000 18 auto)" == 10000 ]]
+[[ "$(haproxy_pool_server_maxconn 42000 21 10000)" == 10000 ]]
+[[ "$(haproxy_pool_server_maxconn 4000 1 auto)" == 10000 ]]
+KTO_HAPROXY_BACKEND_MIN_MAXCONN=15000
+[[ "$(haproxy_pool_server_maxconn 64000 21 auto)" == 15000 ]]
+KTO_HAPROXY_BACKEND_MIN_MAXCONN=invalid
+[[ "$(haproxy_pool_server_maxconn 64000 21 auto)" == 10000 ]]
+unset KTO_HAPROXY_BACKEND_MIN_MAXCONN
 unset KTO_HAPROXY_NBTHREAD
 TEST_CPU_COUNT=16
 [[ "$(haproxy_thread_count)" == 16 ]]
@@ -3535,7 +3544,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v330"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v331"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 
@@ -4442,8 +4451,8 @@ pool='31.59.140.66:7443,31.77.154.79:7443,31.76.113.188:7443,31.76.113.189:7443,
 printf '443\t89.144.8.3:443\tbase.example.com\tdefault\n8450\t%s\tdev-yandex.sbs\t217.19.122.109\t10000\n' "$pool" > "$routes"
 render_haproxy_routes_config "$routes" "$config"
 [[ "$(awk '$1 == "backend" { active = ($2 == "vless_pool_8450"); next } active && $1 == "server" { count++ } END { print count + 0 }' "$config")" == 21 ]]
-grep -q '^    server xray1 31.59.140.66:7443 check weight 10 source 217.19.122.109 maxconn 2000$' "$config"
-grep -q '^    server xray21 117.55.203.106:7443 check weight 10 source 217.19.122.109 maxconn 2000$' "$config"
+grep -q '^    server xray1 31.59.140.66:7443 check weight 10 source 217.19.122.109 maxconn 10000$' "$config"
+grep -q '^    server xray21 117.55.203.106:7443 check weight 10 source 217.19.122.109 maxconn 10000$' "$config"
 extract_haproxy_routes "$config" > "$routes2"
 expected=$'443\t89.144.8.3:443\tbase.example.com\tdefault\tauto\n8450\t'"$pool"$'\tdev-yandex.sbs\t217.19.122.109\t10000\t217.19.122.109'
 [[ "$(cat "$routes2")" == "$expected" ]]
