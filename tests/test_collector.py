@@ -1072,7 +1072,7 @@ class CollectorRegressionTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-    def test_dashboard_api_is_read_only_authenticated_and_bl_only(self):
+    def test_dashboard_api_is_read_only_authenticated_and_wl_only(self):
         collector.update_node(
             self.payload("Обычная машина", str(uuid.uuid4()), "bl"),
             "203.0.113.61",
@@ -1109,8 +1109,9 @@ class CollectorRegressionTests(unittest.TestCase):
             )
             with urllib.request.urlopen(request, timeout=5) as response:
                 payload = json.loads(response.read())
-            self.assertEqual(["Обычная машина"], [node["name"] for node in payload["nodes"]])
+            self.assertEqual(["Обход №1"], [node["name"] for node in payload["nodes"]])
             self.assertEqual(1, payload["overview"]["total"])
+            self.assertEqual(1, payload["overview"]["filtered_bl"])
         finally:
             server.shutdown()
             server.server_close()
@@ -1122,7 +1123,7 @@ class CollectorRegressionTests(unittest.TestCase):
         original_now = collector.now_ts
 
         def payload(counter_rx, counter_tx, sample_ms, cpu):
-            value = self.payload("BL график", node_uuid, "bl")
+            value = self.payload("Обход №7", node_uuid, "wl")
             value.update({
                 "cpu_percent": cpu,
                 "metrics_ok": True,
@@ -1161,7 +1162,7 @@ class CollectorRegressionTests(unittest.TestCase):
         original_now = collector.now_ts
 
         def payload(counter_rx, counter_tx, sample_ms):
-            value = self.payload("BL legacy key", node_uuid, "bl")
+            value = self.payload("Обход №8 (legacy)", node_uuid, "wl")
             value.update({
                 "cpu_percent": 31,
                 "metrics_ok": True,
@@ -1197,8 +1198,8 @@ class CollectorRegressionTests(unittest.TestCase):
 
     def test_dashboard_uses_hour_average_when_current_delta_is_missing(self):
         node = {
-            "name": "BL average",
-            "node_kind": "bl",
+            "name": "Обход №9",
+            "node_kind": "wl",
             "last_seen": 1_800_500_000,
             "metrics_ok": True,
             "ip_stats": [{

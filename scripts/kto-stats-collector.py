@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v334"
+COLLECTOR_BUILD = "v335"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -9335,23 +9335,23 @@ def dashboard_node_aliases(storage_key, node):
     return aliases
 
 
-def dashboard_bl_records_snapshot():
+def dashboard_wl_records_snapshot():
     with LOCK:
         raw_records = [(str(key), dict(node)) for key, node in NODES.items() if isinstance(node, dict)]
 
     records = {}
     diagnostics = {
         "collector_records": len(raw_records),
-        "filtered_wl": 0,
+        "filtered_bl": 0,
         "filtered_disabled": 0,
         "duplicates": 0,
     }
     for storage_key, node in raw_records:
+        if not node_is_wl(node):
+            diagnostics["filtered_bl"] += 1
+            continue
         if node_stats_disabled(node):
             diagnostics["filtered_disabled"] += 1
-            continue
-        if node_is_wl(node):
-            diagnostics["filtered_wl"] += 1
             continue
         stable_key = str(node_record_key(node) or node_canonical_key(node) or storage_key).strip()[:200]
         aliases = dashboard_node_aliases(storage_key, node)
@@ -9370,7 +9370,7 @@ def dashboard_bl_records_snapshot():
 
 def dashboard_nodes_payload(current=None):
     current = int(current or now_ts())
-    records, diagnostics = dashboard_bl_records_snapshot()
+    records, diagnostics = dashboard_wl_records_snapshot()
     nodes = [dashboard_node_summary(record["key"], record["node"], current) for record in records]
     status_order = {"online": 0, "warning": 1, "offline": 2}
     nodes.sort(key=lambda item: (status_order.get(item["status"], 9), natural_sort_key(item["name"])))
@@ -9393,17 +9393,17 @@ def dashboard_nodes_payload(current=None):
     }
 
 
-def dashboard_find_bl_record(record_key):
+def dashboard_find_wl_record(record_key):
     requested = str(record_key or "").strip()
-    records, _ = dashboard_bl_records_snapshot()
+    records, _ = dashboard_wl_records_snapshot()
     for record in records:
         if requested == record["key"] or requested in record["aliases"]:
             return record
     return None
 
 
-def dashboard_find_bl_node(record_key):
-    record = dashboard_find_bl_record(record_key)
+def dashboard_find_wl_node(record_key):
+    record = dashboard_find_wl_record(record_key)
     return dict(record["node"]) if record is not None else None
 
 
@@ -9411,7 +9411,7 @@ def dashboard_history_payload(record_key, seconds=3600, current=None):
     current = int(current or now_ts())
     seconds = max(900, min(int(seconds or 3600), NETWORK_RATE_RETENTION_SEC))
     cutoff = current - seconds
-    record = dashboard_find_bl_record(record_key)
+    record = dashboard_find_wl_record(record_key)
     if record is None:
         return None
     aliases = record["aliases"] or [record["key"]]
@@ -9479,7 +9479,7 @@ DASHBOARD_HTML = rf"""<!doctype html>
 <body>
   <section class="login-view" id="loginView">
     <form class="login-panel" id="loginForm" autocomplete="off">
-      <div class="brand brand-login"><span class="brand-mark">K</span><span><strong>kto Monitor</strong><small>BL machines</small></span></div>
+      <div class="brand brand-login"><span class="brand-mark">K</span><span><strong>kto Monitor</strong><small>WL-обходы</small></span></div>
       <div class="login-heading">
         <h1>Вход в панель</h1>
         <p>Мониторинг коллектора</p>
@@ -9523,11 +9523,11 @@ DASHBOARD_HTML = rf"""<!doctype html>
       <main class="content" id="content">
         <section class="empty-state" id="emptyState">
           <div class="empty-mark"><span>K</span></div>
-          <h2>Нет данных от BL-машин</h2>
+          <h2>Нет данных от WL-обходов</h2>
           <p id="emptyMessage">Проверяю данные коллектора</p>
           <div class="empty-diagnostics" id="emptyDiagnostics" hidden>
             <span>В collector: <b id="collectorRecordCount">0</b></span>
-            <span>WL: <b id="filteredWlCount">0</b></span>
+            <span>Другие: <b id="filteredBlCount">0</b></span>
             <span>Stats off: <b id="filteredDisabledCount">0</b></span>
           </div>
         </section>
@@ -9651,22 +9651,22 @@ button { color: inherit; }
   box-shadow: var(--shadow);
 }
 
-.brand { display: flex; align-items: center; gap: 11px; min-width: max-content; }
+.brand { display: flex; align-items: center; gap: 13px; min-width: max-content; }
 .brand-mark {
-  width: 36px;
-  height: 36px;
+  width: 42px;
+  height: 42px;
   display: grid;
   place-items: center;
   border: 1px solid #7550a6;
   border-radius: 7px;
   color: #efe3ff;
   background: #281a38;
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 800;
 }
 .brand strong, .brand small { display: block; }
-.brand strong { font-size: 14px; line-height: 18px; }
-.brand small { margin-top: 1px; color: var(--muted); font-size: 11px; line-height: 14px; }
+.brand strong { font-size: 17px; line-height: 22px; }
+.brand small { margin-top: 1px; color: var(--muted); font-size: 13px; line-height: 16px; }
 .brand-login { margin-bottom: 42px; }
 .brand-login .brand-mark { width: 42px; height: 42px; }
 .brand-login strong { font-size: 16px; }
@@ -9700,42 +9700,42 @@ button { color: inherit; }
 .primary-button:hover { background: #8253c5; }
 .primary-button:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--purple-soft); outline-offset: 2px; }
 
-.app { height: 100vh; display: grid; grid-template-rows: 64px minmax(0, 1fr); }
+.app { height: 100vh; display: grid; grid-template-rows: 76px minmax(0, 1fr); }
 .topbar {
   z-index: 3;
   display: grid;
-  grid-template-columns: minmax(210px, 320px) minmax(360px, 1fr) auto;
+  grid-template-columns: minmax(240px, 360px) minmax(420px, 1fr) auto;
   align-items: center;
-  padding: 0 18px;
+  padding: 0 24px;
   border-bottom: 1px solid var(--line);
   background: #110c17;
 }
 
-.overview { display: flex; justify-content: center; align-items: center; gap: 22px; min-width: 0; color: var(--muted); font-size: 12px; }
+.overview { display: flex; justify-content: center; align-items: center; gap: 26px; min-width: 0; color: var(--muted); font-size: 14px; }
 .overview span { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
-.overview b { color: var(--text); font-size: 13px; }
+.overview b { color: var(--text); font-size: 15px; }
 .status-dot { width: 7px; height: 7px; display: inline-block; border-radius: 50%; background: var(--muted); }
 .status-dot.online { background: var(--online); box-shadow: 0 0 0 3px rgba(52, 211, 153, .12); }
 .status-dot.warning { background: var(--amber); box-shadow: 0 0 0 3px rgba(251, 191, 36, .12); }
 .status-dot.offline { background: var(--rose); box-shadow: 0 0 0 3px rgba(251, 113, 133, .12); }
 
 .topbar-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
-.live-state { height: 30px; display: inline-flex; align-items: center; gap: 7px; margin-right: 4px; color: var(--muted); font-size: 12px; }
+.live-state { height: 38px; display: inline-flex; align-items: center; gap: 8px; margin-right: 5px; color: var(--muted); font-size: 14px; }
 .live-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--online); }
 .live-state.disconnected i { background: var(--rose); }
 .live-state.syncing i { background: var(--amber); }
 .icon-button, .logout-button {
-  height: 34px;
+  height: 40px;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
   background: var(--surface-2);
   cursor: pointer;
 }
-.icon-button { width: 34px; padding: 0; font-size: 19px; line-height: 1; }
-.logout-button { padding: 0 12px; color: #d9cfdf; font-size: 12px; font-weight: 650; }
+.icon-button { width: 40px; padding: 0; font-size: 21px; line-height: 1; }
+.logout-button { padding: 0 15px; color: #d9cfdf; font-size: 14px; font-weight: 650; }
 .icon-button:hover, .logout-button:hover { border-color: #664b7f; background: var(--surface-3); }
 
-.workspace { min-height: 0; display: grid; grid-template-columns: 320px minmax(0, 1fr); }
+.workspace { min-height: 0; display: grid; grid-template-columns: 360px minmax(0, 1fr); }
 .sidebar {
   min-height: 0;
   display: grid;
@@ -9743,33 +9743,33 @@ button { color: inherit; }
   border-right: 1px solid var(--line);
   background: #120d18;
 }
-.sidebar-head { padding: 18px 16px 14px; border-bottom: 1px solid var(--line); }
+.sidebar-head { padding: 22px 18px 17px; border-bottom: 1px solid var(--line); }
 .sidebar-head > div { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-.sidebar-head strong { color: var(--muted); font-size: 12px; }
-.eyebrow { display: block; margin-bottom: 4px; color: var(--purple-soft); font-size: 10px; font-weight: 750; line-height: 13px; text-transform: uppercase; }
+.sidebar-head strong { color: var(--muted); font-size: 14px; }
+.eyebrow { display: block; margin-bottom: 5px; color: var(--purple-soft); font-size: 11px; font-weight: 750; line-height: 14px; text-transform: uppercase; }
 .search-field {
-  height: 36px;
+  height: 44px;
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 0 10px;
+  gap: 9px;
+  padding: 0 13px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #0e0a13;
   color: var(--muted);
 }
-.search-field input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 12px; }
+.search-field input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 14px; }
 .search-field input::placeholder { color: #746a7c; }
 
-.machine-list { min-height: 0; overflow-y: auto; padding: 9px 8px 14px; scrollbar-color: #4b365d transparent; scrollbar-width: thin; }
+.machine-list { min-height: 0; overflow-y: auto; padding: 12px 10px 18px; scrollbar-color: #4b365d transparent; scrollbar-width: thin; }
 .machine-item {
   width: 100%;
-  min-height: 72px;
+  min-height: 86px;
   display: grid;
-  grid-template-columns: 9px minmax(0, 1fr) auto;
-  gap: 10px;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  gap: 12px;
   align-items: center;
-  padding: 10px 11px;
+  padding: 13px 14px;
   border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
@@ -9778,81 +9778,81 @@ button { color: inherit; }
 }
 .machine-item:hover { background: #1a1223; }
 .machine-item.active { border-color: #543b6a; background: #21162c; }
-.machine-item .state-line { width: 3px; height: 34px; border-radius: 2px; background: var(--online); }
+.machine-item .state-line { width: 4px; height: 42px; border-radius: 2px; background: var(--online); }
 .machine-item.warning .state-line { background: var(--amber); }
 .machine-item.offline .state-line { background: var(--rose); }
 .machine-copy { min-width: 0; }
 .machine-copy strong, .machine-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.machine-copy strong { font-size: 13px; line-height: 18px; }
-.machine-copy span { margin-top: 4px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; }
-.machine-rate { min-width: 58px; text-align: right; }
+.machine-copy strong { font-size: 15px; line-height: 21px; }
+.machine-copy span { margin-top: 5px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+.machine-rate { min-width: 72px; text-align: right; }
 .machine-rate strong, .machine-rate small { display: block; }
-.machine-rate strong { color: var(--cyan); font-size: 10px; font-weight: 650; }
-.machine-rate small { margin-top: 4px; color: #776c80; font-size: 9px; }
-.list-empty { padding: 28px 12px; color: var(--muted); font-size: 12px; text-align: center; }
-.sidebar-total { padding: 14px 16px; border-top: 1px solid var(--line); background: #100b16; }
+.machine-rate strong { color: var(--cyan); font-size: 12px; font-weight: 650; }
+.machine-rate small { margin-top: 5px; color: #776c80; font-size: 11px; }
+.list-empty { padding: 32px 14px; color: var(--muted); font-size: 14px; text-align: center; }
+.sidebar-total { padding: 18px; border-top: 1px solid var(--line); background: #100b16; }
 .sidebar-total span, .sidebar-total strong, .sidebar-total small { display: block; }
-.sidebar-total span { color: var(--muted); font-size: 10px; text-transform: uppercase; }
-.sidebar-total strong { margin-top: 5px; font-size: 16px; }
-.sidebar-total small { margin-top: 4px; color: var(--cyan); font-size: 10px; }
+.sidebar-total span { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+.sidebar-total strong { margin-top: 6px; font-size: 20px; }
+.sidebar-total small { margin-top: 5px; color: var(--cyan); font-size: 12px; }
 
 .content { min-width: 0; min-height: 0; overflow-y: auto; background: var(--bg); scrollbar-color: #4b365d transparent; scrollbar-width: thin; }
-.machine-view { width: 100%; max-width: 1580px; margin: 0 auto; padding: 24px; }
+.machine-view { width: 100%; max-width: 1720px; margin: 0 auto; padding: 32px; }
 .empty-state { min-height: 100%; display: grid; place-content: center; justify-items: center; padding: 40px; text-align: center; }
-.empty-mark { width: 48px; height: 48px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); color: var(--purple-soft); font-weight: 800; }
-.empty-state h2 { margin: 16px 0 4px; font-size: 18px; }
-.empty-state p { margin: 0; color: var(--muted); font-size: 12px; }
+.empty-mark { width: 64px; height: 64px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-2); color: var(--purple-soft); font-size: 20px; font-weight: 800; }
+.empty-state h2 { margin: 20px 0 6px; font-size: 24px; }
+.empty-state p { margin: 0; color: var(--muted); font-size: 14px; }
 
-.machine-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
+.machine-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; margin-bottom: 26px; }
 .title-line { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.title-line h1 { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 25px; line-height: 32px; letter-spacing: 0; }
-.status-badge { height: 24px; display: inline-flex; align-items: center; padding: 0 9px; border: 1px solid rgba(52, 211, 153, .35); border-radius: 999px; background: rgba(52, 211, 153, .08); color: #6ee7b7; font-size: 10px; font-weight: 750; text-transform: uppercase; }
+.title-line h1 { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 32px; line-height: 40px; letter-spacing: 0; }
+.status-badge { height: 28px; display: inline-flex; align-items: center; padding: 0 11px; border: 1px solid rgba(52, 211, 153, .35); border-radius: 999px; background: rgba(52, 211, 153, .08); color: #6ee7b7; font-size: 11px; font-weight: 750; text-transform: uppercase; }
 .status-badge.warning { border-color: rgba(251, 191, 36, .35); background: rgba(251, 191, 36, .08); color: #fcd34d; }
 .status-badge.offline { border-color: rgba(251, 113, 133, .35); background: rgba(251, 113, 133, .08); color: #fda4af; }
-.machine-address { display: flex; gap: 10px; margin-top: 7px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
+.machine-address { display: flex; gap: 12px; margin-top: 9px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 13px; }
 .machine-address span + span::before { content: "/"; margin-right: 10px; color: #5b5063; }
 .last-update { min-width: 170px; text-align: right; }
 .last-update span, .last-update strong, .last-update small { display: block; }
-.last-update span { color: var(--muted); font-size: 10px; text-transform: uppercase; }
-.last-update strong { margin-top: 5px; font-size: 14px; }
-.last-update small { margin-top: 3px; color: #776c80; font-size: 10px; }
+.last-update span { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+.last-update strong { margin-top: 6px; font-size: 16px; }
+.last-update small { margin-top: 4px; color: #776c80; font-size: 12px; }
 
-.metric-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 16px; border: 1px solid var(--line); background: var(--surface); }
-.metric-cell { min-width: 0; min-height: 86px; padding: 16px 18px; border-right: 1px solid var(--line); }
+.metric-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 20px; border: 1px solid var(--line); background: var(--surface); }
+.metric-cell { min-width: 0; min-height: 106px; padding: 20px 22px; border-right: 1px solid var(--line); }
 .metric-cell:last-child { border-right: 0; }
 .metric-cell span, .metric-cell strong, .metric-cell small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.metric-cell span { color: var(--muted); font-size: 10px; text-transform: uppercase; }
-.metric-cell strong { margin-top: 8px; font-size: 17px; line-height: 21px; }
-.metric-cell small { margin-top: 4px; color: #8f8398; font-size: 10px; }
+.metric-cell span { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+.metric-cell strong { margin-top: 9px; font-size: 22px; line-height: 27px; }
+.metric-cell small { margin-top: 5px; color: #8f8398; font-size: 12px; }
 
-.chart-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); gap: 16px; margin-bottom: 16px; }
+.chart-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(340px, 1fr); gap: 20px; margin-bottom: 20px; }
 .chart-panel, .data-panel { min-width: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
-.chart-panel { min-height: 340px; }
-.panel-head { min-height: 68px; display: flex; align-items: center; gap: 18px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
-.panel-head h2, .section-head h2 { margin: 0; font-size: 14px; line-height: 18px; letter-spacing: 0; }
+.chart-panel { min-height: 400px; }
+.panel-head { min-height: 80px; display: flex; align-items: center; gap: 20px; padding: 17px 20px; border-bottom: 1px solid var(--line); }
+.panel-head h2, .section-head h2 { margin: 0; font-size: 17px; line-height: 22px; letter-spacing: 0; }
 .network-now { display: flex; align-items: center; gap: 14px; margin-left: auto; }
-.network-now span { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10px; }
+.network-now span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 .network-now i { width: 7px; height: 2px; background: var(--cyan); }
 .network-now .tx i { background: var(--purple); }
-.network-now b { color: var(--text); font-size: 11px; }
+.network-now b { color: var(--text); font-size: 13px; }
 .segmented { display: inline-flex; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: #0e0a13; }
-.segmented button { min-width: 38px; height: 26px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 700; }
+.segmented button { min-width: 44px; height: 32px; padding: 0 10px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 700; }
 .segmented button.active { background: var(--surface-3); color: var(--text); }
-.cpu-now { margin-left: auto; color: var(--purple-soft); font-size: 20px; }
-.chart-wrap { position: relative; height: 250px; padding: 8px 10px 10px; }
+.cpu-now { margin-left: auto; color: var(--purple-soft); font-size: 27px; }
+.chart-wrap { position: relative; height: 295px; padding: 10px 12px 12px; }
 .chart-wrap canvas { width: 100%; height: 100%; display: block; }
-.chart-empty { position: absolute; inset: 0; display: grid; place-items: center; color: #756a7d; font-size: 11px; pointer-events: none; }
-.cpu-footer { height: 38px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; }
-.cpu-footer strong { color: var(--text); font-size: 11px; }
+.chart-empty { position: absolute; inset: 0; display: grid; place-items: center; color: #756a7d; font-size: 13px; pointer-events: none; }
+.cpu-footer { height: 46px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.cpu-footer strong { color: var(--text); font-size: 13px; }
 
-.detail-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 16px; padding-bottom: 24px; }
-.section-head { min-height: 62px; display: flex; align-items: center; justify-content: space-between; padding: 13px 16px; border-bottom: 1px solid var(--line); }
-.section-head > span { min-width: 28px; height: 24px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 10px; }
+.detail-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr); gap: 20px; padding-bottom: 32px; }
+.section-head { min-height: 72px; display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+.section-head > span { min-width: 32px; height: 28px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 11px; }
 .table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-th, td { padding: 12px 14px; border-bottom: 1px solid #2a1e34; text-align: left; vertical-align: middle; }
-th { color: #84788d; font-size: 9px; font-weight: 700; text-transform: uppercase; }
-td { color: #dcd3e3; font-size: 11px; }
+th, td { padding: 15px 18px; border-bottom: 1px solid #2a1e34; text-align: left; vertical-align: middle; }
+th { color: #84788d; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+td { color: #dcd3e3; font-size: 13px; }
 th:nth-child(1) { width: 16%; }
 th:nth-child(2) { width: 22%; }
 th:nth-child(3) { width: 24%; }
@@ -9864,20 +9864,20 @@ tbody tr:last-child td { border-bottom: 0; }
 .rate-pair .tx { color: var(--purple-soft); }
 .cell-muted { color: var(--muted); }
 .health-list { margin: 0; padding: 4px 16px; }
-.health-list div { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid #2a1e34; }
+.health-list div { min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border-bottom: 1px solid #2a1e34; }
 .health-list div:last-child { border-bottom: 0; }
-.health-list dt { color: var(--muted); font-size: 11px; }
-.health-list dd { margin: 0; color: #dcd3e3; font-size: 11px; font-weight: 650; text-align: right; }
+.health-list dt { color: var(--muted); font-size: 13px; }
+.health-list dd { margin: 0; color: #dcd3e3; font-size: 13px; font-weight: 650; text-align: right; }
 .health-list dd.ok { color: var(--online); }
 .health-list dd.warn { color: var(--amber); }
 .health-list dd.fail { color: var(--rose); }
-.machine-error { margin: 4px 16px 16px; padding: 11px 12px; border-left: 2px solid var(--rose); background: rgba(251, 113, 133, .07); color: #fecdd3; font-size: 10px; line-height: 16px; overflow-wrap: anywhere; }
+.machine-error { margin: 5px 20px 20px; padding: 13px 14px; border-left: 2px solid var(--rose); background: rgba(251, 113, 133, .07); color: #fecdd3; font-size: 12px; line-height: 18px; overflow-wrap: anywhere; }
 
 @media (max-width: 1100px) {
-  .workspace { grid-template-columns: 280px minmax(0, 1fr); }
-  .topbar { grid-template-columns: 280px 1fr auto; }
+  .workspace { grid-template-columns: 320px minmax(0, 1fr); }
+  .topbar { grid-template-columns: 320px 1fr auto; }
   .overview span { font-size: 0; }
-  .overview b { font-size: 12px; }
+  .overview b { font-size: 14px; }
   .metric-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metric-cell:nth-child(2) { border-right: 0; }
   .metric-cell:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
@@ -9886,16 +9886,16 @@ tbody tr:last-child td { border-bottom: 0; }
 @media (max-width: 860px) {
   body { overflow: auto; }
   .app { height: auto; min-height: 100vh; grid-template-rows: auto auto; }
-  .topbar { min-height: 64px; grid-template-columns: 1fr auto; gap: 12px; padding: 10px 14px; }
+  .topbar { min-height: 72px; grid-template-columns: 1fr auto; gap: 12px; padding: 12px 16px; }
   .overview { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; padding-bottom: 2px; }
-  .overview span { font-size: 10px; }
-  .overview b { font-size: 11px; }
+  .overview span { font-size: 11px; }
+  .overview b { font-size: 13px; }
   .workspace { display: block; }
   .sidebar { max-height: 310px; border-right: 0; border-bottom: 1px solid var(--line); }
   .machine-list { min-height: 150px; }
   .content { overflow: visible; }
   .chart-grid, .detail-grid { grid-template-columns: 1fr; }
-  .machine-view { padding: 18px 14px; }
+  .machine-view { padding: 22px 16px; }
 }
 
 @media (max-width: 600px) {
@@ -9906,18 +9906,18 @@ tbody tr:last-child td { border-bottom: 0; }
   .last-update { min-width: 0; }
   .last-update small { display: none; }
   .title-line { align-items: flex-start; flex-direction: column; gap: 7px; }
-  .title-line h1 { font-size: 21px; line-height: 27px; }
+  .title-line h1 { font-size: 27px; line-height: 34px; }
   .machine-address { flex-direction: column; gap: 4px; }
   .machine-address span + span::before { display: none; }
   .metric-strip { grid-template-columns: 1fr 1fr; }
-  .metric-cell { min-height: 78px; padding: 13px; }
-  .metric-cell strong { font-size: 14px; }
+  .metric-cell { min-height: 90px; padding: 15px; }
+  .metric-cell strong { font-size: 18px; }
   .panel-head { min-height: 76px; flex-wrap: wrap; gap: 10px; }
   .network-now { order: 3; width: 100%; margin-left: 0; }
   .segmented { margin-left: auto; }
-  .chart-wrap { height: 220px; }
+  .chart-wrap { height: 250px; }
   .table-scroll { max-width: calc(100vw - 30px); }
-  table { min-width: 680px; }
+  table { min-width: 740px; }
 }
 
 /* Neon glass finish. Kept gradient-free so the data stays crisp. */
@@ -10070,7 +10070,7 @@ body::before {
 .panel-head, .section-head, .cpu-footer { border-color: rgba(180, 124, 255, .13); }
 .network-now i { box-shadow: 0 0 10px rgba(57, 245, 208, .85); }
 .network-now .tx i { box-shadow: 0 0 10px rgba(180, 124, 255, .85); }
-.network-now small { padding-left: 4px; color: #756a7f; font-size: 9px; text-transform: uppercase; }
+.network-now small { padding-left: 5px; color: #8d8097; font-size: 11px; text-transform: uppercase; }
 .cpu-now { text-shadow: 0 0 18px rgba(180, 124, 255, .36); }
 .segmented { border-color: rgba(180, 124, 255, .2); background: rgba(6, 4, 9, .55); }
 .segmented button { transition: color .18s ease, background .18s ease, box-shadow .18s ease; }
@@ -10100,7 +10100,7 @@ tbody tr:hover { background: rgba(180, 124, 255, .035); }
   border-radius: 8px;
   animation: empty-ring 2.4s ease-in-out infinite;
 }
-.empty-diagnostics { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 14px; margin-top: 15px; color: #766b80; font-size: 10px; }
+.empty-diagnostics { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px 16px; margin-top: 18px; color: #766b80; font-size: 12px; }
 .empty-diagnostics b { color: #b9acc3; }
 
 @keyframes login-enter { from { opacity: 0; transform: translateY(14px) scale(.985); } to { opacity: 1; transform: none; } }
@@ -10130,14 +10130,14 @@ tbody tr:hover { background: rgba(180, 124, 255, .035); }
   }
   .machine-list::-webkit-scrollbar { display: none; }
   .machine-item {
-    width: min(270px, calc(100vw - 56px));
-    min-width: min(270px, calc(100vw - 56px));
+    width: min(300px, calc(100vw - 56px));
+    min-width: min(300px, calc(100vw - 56px));
     margin: 0;
     scroll-snap-align: start;
   }
   .machine-item:hover { transform: translateY(-1px); }
   .sidebar-total {
-    min-height: 62px;
+    min-height: 70px;
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-content: center;
@@ -10287,7 +10287,7 @@ function applyFleet(payload) {
   state.overview = payload.overview || {};
   state.diagnostics = {
     collectorRecords: number(state.overview.collector_records),
-    filteredWl: number(state.overview.filtered_wl),
+    filteredBl: number(state.overview.filtered_bl),
     filteredDisabled: number(state.overview.filtered_disabled),
     duplicates: number(state.overview.duplicates),
   };
@@ -10300,7 +10300,7 @@ function applyFleet(payload) {
   setText("fleetTraffic", formatBytes(state.overview.day_total));
   setText("fleetRate", `${formatRate(state.overview.rate_rx_bps)} RX · ${formatRate(state.overview.rate_tx_bps)} TX`);
   setText("collectorRecordCount", state.diagnostics.collectorRecords);
-  setText("filteredWlCount", state.diagnostics.filteredWl);
+  setText("filteredBlCount", state.diagnostics.filteredBl);
   setText("filteredDisabledCount", state.diagnostics.filteredDisabled);
   renderMachineList();
 
@@ -10318,12 +10318,15 @@ function applyFleet(payload) {
     diagnostics.hidden = state.diagnostics.collectorRecords <= 0;
     if (state.diagnostics.collectorRecords <= 0) {
       setText("emptyMessage", "Коллектор ещё не получил ни одного push");
-    } else if (state.diagnostics.filteredDisabled >= state.diagnostics.collectorRecords) {
+    } else if (
+      state.diagnostics.collectorRecords > state.diagnostics.filteredBl &&
+      state.diagnostics.filteredDisabled >= state.diagnostics.collectorRecords - state.diagnostics.filteredBl
+    ) {
       setText("emptyMessage", "Все найденные машины исключены через stats_off");
-    } else if (state.diagnostics.filteredWl > 0) {
-      setText("emptyMessage", "Коллектор видит машины, но среди них нет BL-нод");
+    } else if (state.diagnostics.filteredBl >= state.diagnostics.collectorRecords) {
+      setText("emptyMessage", "Коллектор видит машины, но среди них нет WL-обходов");
     } else {
-      setText("emptyMessage", "BL-записи не прошли дедупликацию, обнови страницу");
+      setText("emptyMessage", "WL-записи не прошли дедупликацию, обнови страницу");
     }
   }
 }
@@ -10886,7 +10889,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(200, payload)
                 return
             record_key = urllib.parse.unquote(suffix.rstrip("/"))
-            record = dashboard_find_bl_record(record_key)
+            record = dashboard_find_wl_record(record_key)
             if record is None:
                 self.send_json(404, {"ok": False, "error": "node not found"})
             else:
