@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-DPI_PREFLIGHT_BUILD = "v331"
+DPI_PREFLIGHT_BUILD = "v332"
 SCHEMA_VERSION = 1
 
 
