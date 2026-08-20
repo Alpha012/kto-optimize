@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v326"', KTO)
-        self.assertIn('PUSH_BUILD="v326"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v326"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v326"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v326"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v326"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v326"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v326"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v327"', KTO)
+        self.assertIn('PUSH_BUILD="v327"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v327"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v327"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v327"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v327"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v327"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v327"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2631,6 +2631,7 @@ NODE_PROFILE=hysteria2
         cpu_check = function_body(KTO, "xanmod_x64v3_supported")
         install = function_body(KTO, "opt_xanmod_kernel")
         grub = function_body(KTO, "select_xanmod_grub_entry")
+        grub_state = function_body(KTO, "prepare_xanmod_grub_state")
 
         self.assertIn('XANMOD_PACKAGE="${KTO_XANMOD_PACKAGE:-linux-xanmod-x64v3}"', KTO)
         self.assertIn('https://dl.xanmod.org/archive.key', KTO)
@@ -2652,6 +2653,12 @@ NODE_PROFILE=hysteria2
         self.assertIn('xanmod_release_available "$codename"', install)
         self.assertLess(install.index('if xanmod_installed; then'), install.index('xanmod_release_available "$codename"'))
         self.assertIn('select_xanmod_grub_entry', install)
+        self.assertIn('mkdir -p /boot/grub', grub_state)
+        self.assertIn('$2 == "/boot"', grub_state)
+        self.assertIn('mount /boot', grub_state)
+        self.assertIn('grub-editenv /boot/grub/grubenv create', grub_state)
+        self.assertIn('prepare_xanmod_grub_state', grub)
+        self.assertLess(grub.index('prepare_xanmod_grub_state'), grub.index('update-initramfs'))
         self.assertIn('update-initramfs', grub)
         self.assertIn('GRUB_DEFAULT=saved', grub)
         self.assertIn('update-grub', grub)
@@ -2669,8 +2676,12 @@ NODE_PROFILE=hysteria2
         self.assertIn('KTO_SSH_PORT_MAX="${KTO_SSH_PORT_MAX:-29999}"', KTO)
         self.assertIn('marker="$(managed_ssh_port || true)"', choose_port)
         self.assertIn('RANDOM * 32768 + RANDOM', choose_port)
-        self.assertIn('/root/.ssh/authorized_keys /home/ubuntu/.ssh/authorized_keys', merge_keys)
+        self.assertIn('/root/.ssh/authorized_keys', merge_keys)
+        self.assertIn('getent passwd', merge_keys)
+        self.assertIn('/etc/ssh/authorized_keys.d/${user}', merge_keys)
         self.assertIn('ssh-keygen -lf "$output_file"', merge_keys)
+        self.assertNotIn('fail "SSH:', merge_keys)
+        self.assertIn('public key не найден; текущие порт, UFW и параметры входа оставлены без изменений', migrate)
         self.assertIn('PermitRootLogin prohibit-password', migrate)
         self.assertIn('PasswordAuthentication no', migrate)
         self.assertIn('awk -v managed_include="$KTO_SSH_MANAGED_CONFIG"', migrate)
@@ -2688,6 +2699,33 @@ NODE_PROFILE=hysteria2
         )
         self.assertIn('restore_optional_ssh_file', rollback)
         self.assertIn('remove_ufw_allow_rules_for_port "$new_port"', rollback)
+
+    def test_root_ssh_without_public_key_is_a_safe_noop(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+LOG_FILE=/dev/null
+command_exists() { return 0; }
+ssh_service_name() { printf 'ssh\n'; }
+merge_root_authorized_keys() { : > "$1"; return 1; }
+output="$(opt_ssh_root_access 2>&1)"
+grep -Fq 'public key не найден' <<< "$output"
+grep -Fq 'оставлены без изменений' <<< "$output"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_managed_root_ssh_stays_global_during_haproxy_firewall_sync(self):
         bash = bash_executable()

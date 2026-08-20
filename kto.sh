@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v326"
+SCRIPT_BUILD="v327"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -2171,13 +2171,21 @@ ensure_global_ssh_ufw_rule() {
 }
 
 merge_root_authorized_keys() {
-    local output_file="$1" user home key_file
-    local -a key_files=(/root/.ssh/authorized_keys /home/ubuntu/.ssh/authorized_keys)
+    local output_file="$1" user uid home key_file
+    local -a key_files=(/root/.ssh/authorized_keys /root/.ssh/authorized_keys2)
 
-    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root && "$SUDO_USER" != ubuntu ]]; then
-        home="$(getent passwd "$SUDO_USER" 2>/dev/null | awk -F: 'NR == 1 { print $6; exit }')"
-        [[ -z "$home" ]] || key_files+=("${home}/.ssh/authorized_keys")
-    fi
+    while IFS=: read -r user _ uid _ _ home _; do
+        [[ -n "$user" && -n "$home" ]] || continue
+        if [[ "$user" == "root" || "$uid" =~ ^[0-9]+$ && "$uid" -ge 1000 && "$uid" -lt 65534 ]]; then
+            key_files+=(
+                "${home}/.ssh/authorized_keys"
+                "${home}/.ssh/authorized_keys2"
+                "/etc/ssh/authorized_keys/${user}"
+                "/etc/ssh/authorized_keys.d/${user}"
+            )
+        fi
+    done < <(getent passwd 2>/dev/null || true)
+
     : > "$output_file"
     for key_file in "${key_files[@]}"; do
         if "${SUDO[@]}" test -s "$key_file" 2>/dev/null; then
@@ -2198,9 +2206,17 @@ merge_root_authorized_keys() {
     awk 'NF && !seen[$0]++ { print }' "$output_file" > "${output_file}.dedup"
     mv "${output_file}.dedup" "$output_file"
     if [[ ! -s "$output_file" ]] || ! ssh-keygen -lf "$output_file" >/dev/null 2>&1; then
-        fail "SSH: не найден валидный public key у root или ubuntu; root-вход не включён"
         return 1
     fi
+}
+
+root_public_key_available() {
+    local tmp rc=0
+    command_exists ssh-keygen || return 1
+    tmp="$(mktemp)"
+    merge_root_authorized_keys "$tmp" || rc=$?
+    rm -f "$tmp" "${tmp}.dedup"
+    return "$rc"
 }
 
 restore_optional_ssh_file() {
@@ -2267,9 +2283,19 @@ opt_ssh_root_access() {
         fail "SSH systemd service не найден"
         return 1
     }
+
+    keys_tmp="$(mktemp)"
+    if ! merge_root_authorized_keys "$keys_tmp"; then
+        rm -f "$keys_tmp" "${keys_tmp}.dedup"
+        warn "SSH: public key не найден; текущие порт, UFW и параметры входа оставлены без изменений."
+        warn "Чтобы включить root key-only, сначала добавь свой ключ в ~/.ssh/authorized_keys и повтори оптимизацию."
+        return 0
+    fi
+
     old_port="$(detect_ssh_port)"
     new_port="$(choose_managed_ssh_port 2>/dev/null || true)"
     [[ "$new_port" =~ ^[0-9]+$ ]] || {
+        rm -f "$keys_tmp" "${keys_tmp}.dedup"
         fail "Не удалось выбрать свободный случайный SSH-порт"
         return 1
     }
@@ -2298,12 +2324,7 @@ opt_ssh_root_access() {
     run_systemctl_bounded 3 is-active --quiet ssh.socket 2>/dev/null && socket_was_active=1 || true
     ufw_global_allow_exists_for_port "$new_port" && new_rule_existed=1 || true
 
-    keys_tmp="$(mktemp)"
     main_tmp="$(mktemp)"
-    if ! merge_root_authorized_keys "$keys_tmp"; then
-        rm -f "$keys_tmp" "$main_tmp"
-        return 1
-    fi
     if (( had_main == 1 )); then
         {
             printf 'Include %s\n' "$KTO_SSH_MANAGED_CONFIG"
@@ -3346,20 +3367,48 @@ xanmod_release_available() {
     return 1
 }
 
+prepare_xanmod_grub_state() {
+    command_exists update-grub || {
+        fail "XanMod: update-grub не найден"
+        return 1
+    }
+
+    if awk '
+        /^[[:space:]]*#/ || NF < 2 { next }
+        $2 == "/boot" { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' /etc/fstab 2>/dev/null &&
+        ! awk '$2 == "/boot" { found = 1 } END { exit found ? 0 : 1 }' /proc/mounts 2>/dev/null; then
+        warn "XanMod: /boot указан в fstab, но не смонтирован; пробую смонтировать перед изменением загрузчика."
+        cmd "${SUDO[@]}" mkdir -p /boot
+        if ! cmd "${SUDO[@]}" mount /boot; then
+            fail "XanMod: отдельный /boot не удалось смонтировать; загрузчик оставлен без изменений"
+            return 1
+        fi
+    fi
+
+    if ! cmd "${SUDO[@]}" mkdir -p /boot/grub; then
+        fail "XanMod: не удалось подготовить /boot/grub"
+        return 1
+    fi
+    if command_exists grub-editenv && [[ ! -e /boot/grub/grubenv ]]; then
+        if ! cmd "${SUDO[@]}" grub-editenv /boot/grub/grubenv create; then
+            warn "XanMod: grubenv не создался; попробую обновить grub.cfg без сохранённого entry."
+        fi
+    fi
+}
+
 select_xanmod_grub_entry() {
     local version submenu_id entry_id saved_entry
     version="$(xanmod_latest_version)"
     [[ -n "$version" ]] || return 1
 
+    prepare_xanmod_grub_state || return 1
     if [[ ! -s "/boot/initrd.img-${version}" ]]; then
         cmd "${SUDO[@]}" update-initramfs -c -k "$version" || return 1
     else
         cmd "${SUDO[@]}" update-initramfs -u -k "$version" || return 1
     fi
-    command_exists update-grub || {
-        fail "XanMod: update-grub не найден"
-        return 1
-    }
     write_root_file "$XANMOD_GRUB_DEFAULT_FILE" <<'EOF'
 # Managed by kto. Keep the selected XanMod entry across package updates.
 GRUB_DEFAULT=saved
@@ -4213,6 +4262,8 @@ system_check_ssh_root_access() {
     port="$(detect_ssh_port)"
     if ssh_root_access_configured; then
         system_check_row ok "ssh root" "key-only, ${port}/tcp открыт для всех"
+    elif ! root_public_key_available; then
+        system_check_row warn "ssh root" "нет public key; текущий SSH не будет изменён"
     else
         SYSTEM_CHECK_NEEDS_SSH=1
         system_check_row miss "ssh root" "нужен стабильный случайный порт и root key-only"
