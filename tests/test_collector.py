@@ -1090,6 +1090,17 @@ class CollectorRegressionTests(unittest.TestCase):
                 page = response.read().decode("utf-8")
                 self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
             self.assertIn("kto Monitor", page)
+            self.assertIn('id="statusFilter"', page)
+            self.assertIn('id="sortSelect"', page)
+            self.assertIn('id="networkTooltip"', page)
+            self.assertNotIn("Wrong SNI", page)
+            self.assertNotIn("<h2>Сервисы</h2>", page)
+
+            with urllib.request.urlopen(f"{base_url}/panel/app.js", timeout=5) as response:
+                dashboard_script = response.read().decode("utf-8")
+            self.assertIn("state.machineElements", dashboard_script)
+            self.assertIn("showChartTooltip", dashboard_script)
+            self.assertNotIn("function healthText", dashboard_script)
 
             with self.assertRaises(urllib.error.HTTPError) as unauthorized:
                 urllib.request.urlopen(f"{base_url}/api/dashboard/nodes", timeout=5)
@@ -1116,6 +1127,20 @@ class CollectorRegressionTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+    def test_dashboard_nodes_keep_natural_name_order_across_statuses(self):
+        ten = self.payload("Обход №10", str(uuid.uuid4()), "wl")
+        two = self.payload("Обход №2", str(uuid.uuid4()), "wl")
+        three = self.payload("Обход №3", str(uuid.uuid4()), "wl")
+        two["error"] = "temporary warning"
+        three["last_seen"] = 1
+        collector.update_node(ten, "203.0.113.70")
+        collector.update_node(two, "203.0.113.71")
+        collector.update_node(three, "203.0.113.72")
+
+        payload = collector.dashboard_nodes_payload(current=int(time.time()))
+
+        self.assertEqual(["Обход №2", "Обход №3", "Обход №10"], [node["name"] for node in payload["nodes"]])
 
     def test_dashboard_history_uses_existing_network_and_cpu_samples(self):
         node_uuid = str(uuid.uuid4())

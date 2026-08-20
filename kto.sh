@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v335"
+SCRIPT_BUILD="v336"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4334,7 +4334,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v335"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v336"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -4347,7 +4347,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v335"
+KTO_HAPROXY_FIREWALL_BUILD="v336"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -12431,11 +12431,11 @@ EOF
         dashboard_host="${dashboard_host:-<IP-коллектора>}"
     fi
     if [[ -n "$dashboard_effective_token" ]]; then
-        ok "BL-панель: http://${dashboard_host}:${listen_port}/panel/"
+        ok "WL-панель: http://${dashboard_host}:${listen_port}/panel/"
         ok "Токен панели: ${dashboard_effective_token}"
         ok "Показать токен позже: sudo ${STATS_COLLECTOR_SCRIPT} --dashboard-token"
     else
-        warn "BL-панель: выключена"
+        warn "WL-панель: выключена"
     fi
     ok "Ожидаемо обходов: ${expected_nodes}"
     if (( existing_config == 1 )); then
@@ -12515,7 +12515,7 @@ stats_collector_status() {
     print_row "конфиг" "$STATS_COLLECTOR_CONFIG" "$([[ -s "$STATS_COLLECTOR_CONFIG" ]] && echo 1 || echo 0)"
     print_row "данные" "$STATS_COLLECTOR_STATE_DIR" "$([[ -d "$STATS_COLLECTOR_STATE_DIR" ]] && echo 1 || echo 0)"
     print_row "адрес" "${listen_host}:${listen_port}" "$([[ -n "$listen_port" ]] && echo 1 || echo 0)"
-    print_row "BL panel" "/panel/ / enabled ${dashboard_enabled:-1}" "$([[ "${dashboard_enabled:-1}" == "1" && -n "$dashboard_token" ]] && echo 1 || echo 0)"
+    print_row "WL panel" "/panel/ / enabled ${dashboard_enabled:-1}" "$([[ "${dashboard_enabled:-1}" == "1" && -n "$dashboard_token" ]] && echo 1 || echo 0)"
     print_row "panel token" "${dashboard_token:-unavailable}" "$([[ -n "$dashboard_token" ]] && echo 1 || echo 0)"
     print_row "wl stale" "${stale_sec:-$STATS_COLLECTOR_STALE_SEC_DEFAULT}s + confirm ${wl_offline_confirm_sec:-$STATS_COLLECTOR_WL_OFFLINE_CONFIRM_SEC_DEFAULT}s" 1
     print_row "bl stale" "${bl_stale_sec:-$STATS_COLLECTOR_BL_STALE_SEC_DEFAULT}s + confirm ${bl_offline_confirm_sec:-$STATS_COLLECTOR_BL_OFFLINE_CONFIRM_SEC_DEFAULT}s" 1

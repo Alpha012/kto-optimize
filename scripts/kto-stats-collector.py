@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v335"
+COLLECTOR_BUILD = "v336"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -9372,8 +9372,7 @@ def dashboard_nodes_payload(current=None):
     current = int(current or now_ts())
     records, diagnostics = dashboard_wl_records_snapshot()
     nodes = [dashboard_node_summary(record["key"], record["node"], current) for record in records]
-    status_order = {"online": 0, "warning": 1, "offline": 2}
-    nodes.sort(key=lambda item: (status_order.get(item["status"], 9), natural_sort_key(item["name"])))
+    nodes.sort(key=lambda item: (natural_sort_key(item["name"]), item["key"]))
     return {
         "ok": True,
         "build": COLLECTOR_BUILD,
@@ -9509,8 +9508,20 @@ DASHBOARD_HTML = rf"""<!doctype html>
     <div class="workspace">
       <aside class="sidebar">
         <div class="sidebar-head">
-          <div><span class="eyebrow">Машины</span><strong id="machineCount">0</strong></div>
+          <div class="sidebar-summary"><span class="eyebrow">Машины</span><strong id="machineCount">0</strong></div>
           <label class="search-field"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="Поиск" autocomplete="off"></label>
+          <div class="list-tools">
+            <div class="list-filter" id="statusFilter" aria-label="Фильтр машин">
+              <button type="button" class="active" data-filter="all">Все</button>
+              <button type="button" data-filter="online">Живые</button>
+              <button type="button" data-filter="issues">Проблемы</button>
+            </div>
+            <select class="sort-select" id="sortSelect" aria-label="Сортировка машин" title="Сортировка машин">
+              <option value="name">По имени</option>
+              <option value="traffic">По трафику</option>
+              <option value="status">По статусу</option>
+            </select>
+          </div>
         </div>
         <nav class="machine-list" id="machineList" aria-label="Список машин"></nav>
         <div class="sidebar-total">
@@ -9559,7 +9570,7 @@ DASHBOARD_HTML = rf"""<!doctype html>
                   <button type="button" class="active" data-range="3600">1ч</button>
                 </div>
               </header>
-              <div class="chart-wrap"><canvas id="networkChart" role="img" aria-label="График сетевой скорости"></canvas><div class="chart-empty" id="networkEmpty">Собираю точки графика</div></div>
+              <div class="chart-wrap"><canvas id="networkChart" role="img" aria-label="График сетевой скорости"></canvas><div class="chart-tooltip" id="networkTooltip" hidden></div><div class="chart-empty" id="networkEmpty">Собираю точки графика</div></div>
             </article>
 
             <article class="chart-panel cpu-panel">
@@ -9567,7 +9578,7 @@ DASHBOARD_HTML = rf"""<!doctype html>
                 <div><span class="eyebrow">CPU</span><h2>Нагрузка</h2></div>
                 <strong class="cpu-now" id="cpuNow">—</strong>
               </header>
-              <div class="chart-wrap"><canvas id="cpuChart" role="img" aria-label="График нагрузки процессора"></canvas><div class="chart-empty" id="cpuEmpty">Собираю точки графика</div></div>
+              <div class="chart-wrap"><canvas id="cpuChart" role="img" aria-label="График нагрузки процессора"></canvas><div class="chart-tooltip" id="cpuTooltip" hidden></div><div class="chart-empty" id="cpuEmpty">Собираю точки графика</div></div>
               <div class="cpu-footer"><span>Средняя за час</span><strong id="cpuAverage">—</strong></div>
             </article>
           </section>
@@ -9581,17 +9592,6 @@ DASHBOARD_HTML = rf"""<!doctype html>
                   <tbody id="interfacesBody"></tbody>
                 </table>
               </div>
-            </article>
-
-            <article class="data-panel health-panel">
-              <header class="section-head"><div><span class="eyebrow">Состояние</span><h2>Сервисы</h2></div></header>
-              <dl class="health-list">
-                <div><dt>Метрики</dt><dd id="metricsHealth">—</dd></div>
-                <div><dt>Push</dt><dd id="pushHealth">—</dd></div>
-                <div><dt>HAProxy</dt><dd id="haproxyHealth">—</dd></div>
-                <div><dt>Wrong SNI</dt><dd id="sniHealth">—</dd></div>
-              </dl>
-              <div class="machine-error" id="machineError" hidden></div>
             </article>
           </section>
         </div>
@@ -9623,15 +9623,20 @@ DASHBOARD_CSS = r"""
   --amber: #fbbf24;
   --online: #34d399;
   --shadow: 0 18px 50px rgba(0, 0, 0, .32);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-sans: Inter, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-display: Inter, "SF Pro Display", "Segoe UI Variable Display", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, ui-monospace, monospace;
+  font-family: var(--font-sans);
   font-synthesis: none;
 }
 
 * { box-sizing: border-box; }
 html, body { width: 100%; min-width: 320px; min-height: 100%; margin: 0; background: var(--bg); color: var(--text); }
-body { min-height: 100vh; overflow: hidden; }
-button, input { font: inherit; letter-spacing: 0; }
+body { min-height: 100vh; overflow: hidden; font-family: var(--font-sans); line-height: 1.45; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+button, input, select { font: inherit; letter-spacing: 0; }
 button { color: inherit; }
+[id$="Count"], [id$="Value"], [id$="Traffic"], [id$="Rate"], .machine-rate, .mono, td { font-variant-numeric: tabular-nums; }
+h1, h2, .brand strong, .metric-cell strong { font-family: var(--font-display); }
 [hidden] { display: none !important; }
 
 .login-view {
@@ -9744,7 +9749,7 @@ button { color: inherit; }
   background: #120d18;
 }
 .sidebar-head { padding: 22px 18px 17px; border-bottom: 1px solid var(--line); }
-.sidebar-head > div { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.sidebar-summary { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .sidebar-head strong { color: var(--muted); font-size: 14px; }
 .eyebrow { display: block; margin-bottom: 5px; color: var(--purple-soft); font-size: 11px; font-weight: 750; line-height: 14px; text-transform: uppercase; }
 .search-field {
@@ -9760,13 +9765,21 @@ button { color: inherit; }
 }
 .search-field input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 14px; }
 .search-field input::placeholder { color: #746a7c; }
+.list-tools { display: grid; grid-template-columns: minmax(0, 1fr) 112px; gap: 8px; margin-top: 10px; }
+.list-filter { min-width: 0; display: grid; grid-template-columns: .8fr 1fr 1.25fr; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: #0e0a13; }
+.list-filter button { min-width: 0; height: 34px; padding: 0 6px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 700; }
+.list-filter button:hover { color: var(--text); }
+.list-filter button.active { background: var(--surface-3); color: var(--text); }
+.sort-select { min-width: 0; height: 40px; padding: 0 28px 0 10px; border: 1px solid var(--line); border-radius: 6px; outline: 0; background: #0e0a13; color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 700; }
+.sort-select:focus-visible { outline: 2px solid var(--purple-soft); outline-offset: 2px; }
+.sort-select option { background: #17101f; color: var(--text); }
 
 .machine-list { min-height: 0; overflow-y: auto; padding: 12px 10px 18px; scrollbar-color: #4b365d transparent; scrollbar-width: thin; }
 .machine-item {
   width: 100%;
   min-height: 86px;
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr) auto;
+  grid-template-columns: 6px minmax(0, 1fr) 100px;
   gap: 12px;
   align-items: center;
   padding: 13px 14px;
@@ -9783,9 +9796,9 @@ button { color: inherit; }
 .machine-item.offline .state-line { background: var(--rose); }
 .machine-copy { min-width: 0; }
 .machine-copy strong, .machine-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.machine-copy strong { font-size: 15px; line-height: 21px; }
-.machine-copy span { margin-top: 5px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
-.machine-rate { min-width: 72px; text-align: right; }
+.machine-copy strong { font-family: var(--font-display); font-size: 15px; font-weight: 680; line-height: 21px; }
+.machine-copy span { margin-top: 5px; color: var(--muted); font-family: var(--font-mono); font-size: 12px; }
+.machine-rate { width: 100px; min-width: 100px; text-align: right; }
 .machine-rate strong, .machine-rate small { display: block; }
 .machine-rate strong { color: var(--cyan); font-size: 12px; font-weight: 650; }
 .machine-rate small { margin-top: 5px; color: #776c80; font-size: 11px; }
@@ -9805,11 +9818,11 @@ button { color: inherit; }
 
 .machine-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; margin-bottom: 26px; }
 .title-line { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.title-line h1 { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 32px; line-height: 40px; letter-spacing: 0; }
+.title-line h1 { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 32px; font-weight: 720; line-height: 40px; letter-spacing: 0; }
 .status-badge { height: 28px; display: inline-flex; align-items: center; padding: 0 11px; border: 1px solid rgba(52, 211, 153, .35); border-radius: 999px; background: rgba(52, 211, 153, .08); color: #6ee7b7; font-size: 11px; font-weight: 750; text-transform: uppercase; }
 .status-badge.warning { border-color: rgba(251, 191, 36, .35); background: rgba(251, 191, 36, .08); color: #fcd34d; }
 .status-badge.offline { border-color: rgba(251, 113, 133, .35); background: rgba(251, 113, 133, .08); color: #fda4af; }
-.machine-address { display: flex; gap: 12px; margin-top: 9px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 13px; }
+.machine-address { display: flex; gap: 12px; margin-top: 9px; color: var(--muted); font-family: var(--font-mono); font-size: 13px; }
 .machine-address span + span::before { content: "/"; margin-right: 10px; color: #5b5063; }
 .last-update { min-width: 170px; text-align: right; }
 .last-update span, .last-update strong, .last-update small { display: block; }
@@ -9829,7 +9842,7 @@ button { color: inherit; }
 .chart-panel, .data-panel { min-width: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
 .chart-panel { min-height: 400px; }
 .panel-head { min-height: 80px; display: flex; align-items: center; gap: 20px; padding: 17px 20px; border-bottom: 1px solid var(--line); }
-.panel-head h2, .section-head h2 { margin: 0; font-size: 17px; line-height: 22px; letter-spacing: 0; }
+.panel-head h2, .section-head h2 { margin: 0; font-size: 18px; font-weight: 690; line-height: 24px; letter-spacing: 0; }
 .network-now { display: flex; align-items: center; gap: 14px; margin-left: auto; }
 .network-now span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 .network-now i { width: 7px; height: 2px; background: var(--cyan); }
@@ -9842,10 +9855,31 @@ button { color: inherit; }
 .chart-wrap { position: relative; height: 295px; padding: 10px 12px 12px; }
 .chart-wrap canvas { width: 100%; height: 100%; display: block; }
 .chart-empty { position: absolute; inset: 0; display: grid; place-items: center; color: #756a7d; font-size: 13px; pointer-events: none; }
+.chart-tooltip {
+  position: absolute;
+  z-index: 5;
+  min-width: 156px;
+  max-width: min(230px, calc(100% - 24px));
+  padding: 10px 12px;
+  border: 1px solid rgba(180, 124, 255, .34);
+  border-radius: 6px;
+  background: rgba(11, 7, 16, .96);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, .42), 0 0 22px rgba(180, 124, 255, .12);
+  color: var(--text);
+  pointer-events: none;
+  transform: translate(calc(-100% - 14px), -50%);
+  backdrop-filter: blur(14px);
+}
+.chart-tooltip.place-right { transform: translate(14px, -50%); }
+.chart-tooltip > strong { display: block; margin-bottom: 7px; color: #c9bfd1; font-family: var(--font-mono); font-size: 11px; font-weight: 600; }
+.chart-tooltip-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; align-items: center; gap: 7px; min-height: 22px; font-size: 12px; }
+.chart-tooltip-row i { width: 7px; height: 7px; border-radius: 50%; box-shadow: 0 0 9px currentColor; }
+.chart-tooltip-row span { color: var(--muted); }
+.chart-tooltip-row b { font-weight: 700; font-variant-numeric: tabular-nums; }
 .cpu-footer { height: 46px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .cpu-footer strong { color: var(--text); font-size: 13px; }
 
-.detail-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr); gap: 20px; padding-bottom: 32px; }
+.detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; padding-bottom: 32px; }
 .section-head { min-height: 72px; display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--line); }
 .section-head > span { min-width: 32px; height: 28px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 11px; }
 .table-scroll { overflow-x: auto; }
@@ -9858,20 +9892,11 @@ th:nth-child(2) { width: 22%; }
 th:nth-child(3) { width: 24%; }
 th:nth-child(4), th:nth-child(5) { width: 19%; }
 tbody tr:last-child td { border-bottom: 0; }
-.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.mono { font-family: var(--font-mono); }
 .rate-pair { white-space: nowrap; }
 .rate-pair .rx { color: var(--cyan); }
 .rate-pair .tx { color: var(--purple-soft); }
 .cell-muted { color: var(--muted); }
-.health-list { margin: 0; padding: 4px 16px; }
-.health-list div { min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border-bottom: 1px solid #2a1e34; }
-.health-list div:last-child { border-bottom: 0; }
-.health-list dt { color: var(--muted); font-size: 13px; }
-.health-list dd { margin: 0; color: #dcd3e3; font-size: 13px; font-weight: 650; text-align: right; }
-.health-list dd.ok { color: var(--online); }
-.health-list dd.warn { color: var(--amber); }
-.health-list dd.fail { color: var(--rose); }
-.machine-error { margin: 5px 20px 20px; padding: 13px 14px; border-left: 2px solid var(--rose); background: rgba(251, 113, 133, .07); color: #fecdd3; font-size: 12px; line-height: 18px; overflow-wrap: anywhere; }
 
 @media (max-width: 1100px) {
   .workspace { grid-template-columns: 320px minmax(0, 1fr); }
@@ -10000,6 +10025,10 @@ body::before {
 .sidebar-head, .sidebar-total { border-color: rgba(180, 124, 255, .14); background: rgba(12, 8, 18, .5); }
 .search-field { border-color: rgba(180, 124, 255, .18); background: rgba(5, 4, 8, .5); transition: border-color .2s ease, box-shadow .2s ease; }
 .search-field:focus-within { border-color: rgba(57, 245, 208, .42); box-shadow: 0 0 18px rgba(57, 245, 208, .08); }
+.list-filter, .sort-select { border-color: rgba(180, 124, 255, .18); background-color: rgba(5, 4, 8, .5); }
+.list-filter button { transition: color .18s ease, background .18s ease, box-shadow .18s ease; }
+.list-filter button.active { background: rgba(67, 39, 91, .86); box-shadow: 0 0 14px rgba(180, 124, 255, .12); }
+.sort-select:hover { border-color: rgba(180, 124, 255, .42); color: var(--text); }
 
 .status-dot.online, .live-state i { box-shadow: 0 0 11px rgba(66, 245, 167, .72); animation: signal-pulse 2.2s ease-in-out infinite; }
 .status-dot.warning { box-shadow: 0 0 11px rgba(251, 191, 36, .62); }
@@ -10013,6 +10042,8 @@ body::before {
   margin-bottom: 5px;
   border-color: transparent;
   transition: transform .2s ease, border-color .2s ease, background .2s ease, box-shadow .2s ease;
+}
+.machine-item.entering {
   animation: list-enter .36s cubic-bezier(.2, .8, .2, 1) both;
   animation-delay: calc(min(var(--item-index, 0), 12) * 28ms);
 }
@@ -10083,8 +10114,6 @@ tbody tr { transition: background .18s ease; }
 tbody tr:hover { background: rgba(180, 124, 255, .035); }
 .rate-pair .rx { text-shadow: 0 0 10px rgba(57, 245, 208, .22); }
 .rate-pair .tx { text-shadow: 0 0 10px rgba(180, 124, 255, .22); }
-.health-list div { border-color: rgba(180, 124, 255, .1); }
-
 .empty-state { animation: view-enter .4s ease both; }
 .empty-mark {
   position: relative;
@@ -10153,6 +10182,10 @@ DASHBOARD_JS = r"""
 "use strict";
 
 const TOKEN_KEY = "kto.dashboard.token.v1";
+const LIST_FILTER_KEY = "kto.dashboard.filter.v1";
+const LIST_SORT_KEY = "kto.dashboard.sort.v1";
+const savedListFilter = localStorage.getItem(LIST_FILTER_KEY) || "all";
+const savedListSort = localStorage.getItem(LIST_SORT_KEY) || "name";
 const state = {
   token: "",
   nodes: [],
@@ -10167,6 +10200,11 @@ const state = {
   timer: 0,
   polling: false,
   selectionVersion: 0,
+  listFilter: ["all", "online", "issues"].includes(savedListFilter) ? savedListFilter : "all",
+  listSort: ["name", "traffic", "status"].includes(savedListSort) ? savedListSort : "name",
+  machineElements: new Map(),
+  listSignature: "",
+  chartFrame: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -10179,8 +10217,13 @@ const machineView = $("machineView");
 const emptyState = $("emptyState");
 const machineList = $("machineList");
 const searchInput = $("searchInput");
+const statusFilter = $("statusFilter");
+const sortSelect = $("sortSelect");
 const networkCanvas = $("networkChart");
 const cpuCanvas = $("cpuChart");
+const networkTooltip = $("networkTooltip");
+const cpuTooltip = $("cpuTooltip");
+const machineCollator = new Intl.Collator("ru-RU", { numeric: true, sensitivity: "base" });
 
 function setText(id, value) {
   const node = $(id);
@@ -10331,58 +10374,107 @@ function applyFleet(payload) {
   }
 }
 
+function machineStatus(node) {
+  return ["online", "warning", "offline"].includes(node.status) ? node.status : "offline";
+}
+
+function compareMachines(left, right) {
+  const byName = () => machineCollator.compare(left.name || left.key || "", right.name || right.key || "") ||
+    machineCollator.compare(left.key || "", right.key || "");
+  if (state.listSort === "traffic") {
+    const traffic = number(right.day_total) - number(left.day_total);
+    return traffic || byName();
+  }
+  if (state.listSort === "status") {
+    const order = { online: 0, warning: 1, offline: 2 };
+    const status = order[machineStatus(left)] - order[machineStatus(right)];
+    return status || byName();
+  }
+  return byName();
+}
+
+function createMachineButton(key, index) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "machine-item entering";
+  button.dataset.key = key;
+  button.style.setProperty("--item-index", index);
+
+  const line = document.createElement("span");
+  line.className = "state-line";
+  const copy = document.createElement("span");
+  copy.className = "machine-copy";
+  const name = document.createElement("strong");
+  const ip = document.createElement("span");
+  copy.append(name, ip);
+  const rate = document.createElement("span");
+  rate.className = "machine-rate";
+  const rateValue = document.createElement("strong");
+  const age = document.createElement("small");
+  rate.append(rateValue, age);
+  button.append(line, copy, rate);
+  button._parts = { name, ip, rateValue, age };
+  button.addEventListener("click", () => selectNode(button.dataset.key));
+  window.setTimeout(() => button.classList.remove("entering"), 800);
+  return button;
+}
+
+function updateMachineButton(button, node) {
+  const status = machineStatus(node);
+  button.dataset.key = node.key;
+  button.classList.toggle("online", status === "online");
+  button.classList.toggle("warning", status === "warning");
+  button.classList.toggle("offline", status === "offline");
+  button.classList.toggle("active", node.key === state.selectedKey);
+  button.setAttribute("aria-current", node.key === state.selectedKey ? "true" : "false");
+  button._parts.name.textContent = node.name || node.key;
+  button._parts.ip.textContent = node.ip || node.hostname || "без IP";
+  button._parts.rateValue.textContent = node.rate_valid ? formatRate(number(node.rate_rx_bps) + number(node.rate_tx_bps)) : "—";
+  button._parts.age.textContent = relativeTime(node.last_seen, Date.now() / 1000);
+}
+
 function renderMachineList() {
   const previousScroll = machineList.scrollTop;
   const query = searchInput.value.trim().toLocaleLowerCase("ru-RU");
-  const filtered = state.nodes.filter((node) => {
-    if (!query) return true;
-    return `${node.name || ""} ${node.ip || ""} ${node.hostname || ""}`.toLocaleLowerCase("ru-RU").includes(query);
-  });
-  machineList.replaceChildren();
-  if (!filtered.length) {
-    const empty = document.createElement("div");
-    empty.className = "list-empty";
-    empty.textContent = query ? "Ничего не найдено" : "Нет машин";
-    machineList.append(empty);
-    return;
+  const currentKeys = new Set(state.nodes.map((node) => node.key));
+  for (const [key, button] of state.machineElements) {
+    if (currentKeys.has(key)) continue;
+    button.remove();
+    state.machineElements.delete(key);
   }
 
-  filtered.forEach((node, index) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `machine-item ${node.status || "offline"}${node.key === state.selectedKey ? " active" : ""}`;
-    button.dataset.key = node.key;
-    button.style.setProperty("--item-index", index);
-    button.setAttribute("aria-current", node.key === state.selectedKey ? "true" : "false");
+  const filtered = state.nodes.filter((node) => {
+    const status = machineStatus(node);
+    if (state.listFilter === "online" && status !== "online") return false;
+    if (state.listFilter === "issues" && status === "online") return false;
+    if (!query) return true;
+    return `${node.name || ""} ${node.ip || ""} ${node.hostname || ""}`.toLocaleLowerCase("ru-RU").includes(query);
+  }).sort(compareMachines);
 
-    const line = document.createElement("span");
-    line.className = "state-line";
-    const copy = document.createElement("span");
-    copy.className = "machine-copy";
-    const name = document.createElement("strong");
-    name.textContent = node.name || node.key;
-    const ip = document.createElement("span");
-    ip.textContent = node.ip || node.hostname || "без IP";
-    copy.append(name, ip);
-
-    const rate = document.createElement("span");
-    rate.className = "machine-rate";
-    const rateValue = document.createElement("strong");
-    rateValue.textContent = node.rate_valid ? formatRate(number(node.rate_rx_bps) + number(node.rate_tx_bps)) : "—";
-    const age = document.createElement("small");
-    age.textContent = relativeTime(node.last_seen, Date.now() / 1000);
-    rate.append(rateValue, age);
-    button.append(line, copy, rate);
-    button.addEventListener("click", () => selectNode(node.key));
-    machineList.append(button);
+  const buttons = filtered.map((node, index) => {
+    let button = state.machineElements.get(node.key);
+    if (!button) {
+      button = createMachineButton(node.key, index);
+      state.machineElements.set(node.key, button);
+    }
+    updateMachineButton(button, node);
+    return button;
   });
-  machineList.scrollTop = previousScroll;
-}
-
-function healthText(node, value, tone) {
-  node.textContent = value;
-  node.classList.remove("ok", "warn", "fail");
-  if (tone) node.classList.add(tone);
+  const signature = buttons.length ? buttons.map((button) => button.dataset.key).join("\u0000") : `empty:${query ? "search" : "fleet"}:${state.listFilter}`;
+  if (signature !== state.listSignature) {
+    if (buttons.length) {
+      const fragment = document.createDocumentFragment();
+      for (const button of buttons) fragment.append(button);
+      machineList.replaceChildren(fragment);
+    } else {
+      const empty = document.createElement("div");
+      empty.className = "list-empty";
+      empty.textContent = query ? "Ничего не найдено" : state.listFilter === "all" ? "Нет машин" : "В этой группе пусто";
+      machineList.replaceChildren(empty);
+    }
+    state.listSignature = signature;
+    machineList.scrollTop = previousScroll;
+  }
 }
 
 function renderDetail() {
@@ -10413,18 +10505,6 @@ function renderDetail() {
   setText("cpuNow", data.metrics_ok ? formatPercent(data.cpu_percent) : "—");
   setText("cpuAverage", data.cpu_samples_1h || data.cpu_avg_1h ? formatPercent(data.cpu_avg_1h) : "—");
   setText("interfaceCount", Array.isArray(data.interfaces) ? data.interfaces.length : 0);
-
-  healthText($("metricsHealth"), data.metrics_ok ? "Данные получены" : "Нет данных", data.metrics_ok ? "ok" : "warn");
-  healthText($("pushHealth"), `${data.push_build || "build —"} · ${number(data.stale_after_sec)} сек`, data.status === "offline" ? "fail" : "ok");
-  const haproxy = data.haproxy || {};
-  healthText($("haproxyHealth"), haproxy.supported ? `${haproxy.routes} маршрутов` : "Не используется", haproxy.supported ? "ok" : "");
-  const sni = data.wrong_sni || {};
-  healthText($("sniHealth"), sni.total ? `${sni.total} / ${sni.sources} IP` : "Чисто", sni.total ? "warn" : "ok");
-
-  const error = $("machineError");
-  const message = data.error || remna.last_error || "";
-  error.hidden = !message;
-  error.textContent = message;
   renderInterfaces(data.interfaces || []);
   appendLivePoint(data);
   drawCharts();
@@ -10543,7 +10623,12 @@ function drawLineChart(canvas, emptyNode, points, series, options) {
   const plotHeight = Math.max(1, height - top - bottom);
   const usable = points.filter((point) => series.some((item) => point[item.key] !== null && point[item.key] !== undefined));
   emptyNode.hidden = usable.length > 0;
-  if (!usable.length) return;
+  if (!usable.length) {
+    canvas._chartModel = null;
+    const tooltip = canvas === networkCanvas ? networkTooltip : cpuTooltip;
+    if (tooltip) tooltip.hidden = true;
+    return;
+  }
 
   const minTs = usable[0].ts;
   const maxTs = Math.max(minTs + 1, usable[usable.length - 1].ts);
@@ -10551,6 +10636,7 @@ function drawLineChart(canvas, emptyNode, points, series, options) {
   const maxY = options.maxY ? options.maxY(maximumValue) : niceMaximum(maximumValue, options.minimum || 1);
   const x = (ts) => left + ((ts - minTs) / (maxTs - minTs)) * plotWidth;
   const y = (value) => top + plotHeight - (Math.max(0, value) / maxY) * plotHeight;
+  canvas._chartModel = { usable, series, left, right, top, bottom, width, height, plotWidth, plotHeight, minTs, maxTs, x, y };
 
   ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
   ctx.lineWidth = 1;
@@ -10621,6 +10707,36 @@ function drawLineChart(canvas, emptyNode, points, series, options) {
     }
   }
 
+  if (canvas._hoverTs !== null && canvas._hoverTs !== undefined) {
+    const hovered = usable.reduce((closest, point) => (
+      Math.abs(point.ts - canvas._hoverTs) < Math.abs(closest.ts - canvas._hoverTs) ? point : closest
+    ), usable[0]);
+    const hoverX = x(hovered.ts);
+    ctx.save();
+    ctx.strokeStyle = "rgba(231, 217, 248, .34)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 5]);
+    ctx.beginPath();
+    ctx.moveTo(hoverX, top);
+    ctx.lineTo(hoverX, top + plotHeight);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    for (const item of series) {
+      if (hovered[item.key] === null || hovered[item.key] === undefined) continue;
+      ctx.fillStyle = item.color;
+      ctx.strokeStyle = "rgba(10, 7, 14, .95)";
+      ctx.lineWidth = 2;
+      ctx.shadowColor = item.color;
+      ctx.shadowBlur = 12;
+      ctx.beginPath();
+      ctx.arc(hoverX, y(number(hovered[item.key])), 4.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   ctx.fillStyle = "#776c80";
   ctx.textBaseline = "alphabetic";
   ctx.textAlign = "left";
@@ -10632,18 +10748,97 @@ function drawLineChart(canvas, emptyNode, points, series, options) {
 function drawCharts() {
   const points = chartPoints();
   drawLineChart(networkCanvas, $("networkEmpty"), points, [
-    { key: "rx_bps", color: "#2dd4bf" },
-    { key: "tx_bps", color: "#a778ff" },
+    { key: "rx_bps", label: "RX", color: "#2dd4bf", format: formatRate },
+    { key: "tx_bps", label: "TX", color: "#a778ff", format: formatRate },
   ], {
     minimum: 1000,
     axis: (value) => value >= 1e9 ? `${(value / 1e9).toFixed(1)}G` : value >= 1e6 ? `${(value / 1e6).toFixed(0)}M` : `${(value / 1e3).toFixed(0)}K`,
   });
   drawLineChart(cpuCanvas, $("cpuEmpty"), points, [
-    { key: "cpu_percent", color: "#c5a7ff" },
+    { key: "cpu_percent", label: "CPU", color: "#c5a7ff", format: formatPercent },
   ], {
     maxY: (value) => Math.max(100, Math.ceil(value / 50) * 50),
     axis: (value) => `${Math.round(value)}%`,
   });
+}
+
+function scheduleChartDraw() {
+  if (state.chartFrame) return;
+  state.chartFrame = window.requestAnimationFrame(() => {
+    state.chartFrame = 0;
+    if (!machineView.hidden) drawCharts();
+  });
+}
+
+function showChartTooltip(canvas, tooltip, event) {
+  const model = canvas._chartModel;
+  if (!model || !model.usable.length) {
+    tooltip.hidden = true;
+    return;
+  }
+  const canvasRect = canvas.getBoundingClientRect();
+  const cursorX = event.clientX - canvasRect.left;
+  const cursorY = event.clientY - canvasRect.top;
+  if (cursorX < model.left || cursorX > model.width - model.right || cursorY < model.top || cursorY > model.top + model.plotHeight) {
+    tooltip.hidden = true;
+    return;
+  }
+  const ratio = Math.max(0, Math.min(1, (cursorX - model.left) / model.plotWidth));
+  const targetTs = model.minTs + ratio * (model.maxTs - model.minTs);
+  const point = model.usable.reduce((closest, item) => (
+    Math.abs(item.ts - targetTs) < Math.abs(closest.ts - targetTs) ? item : closest
+  ), model.usable[0]);
+
+  const time = document.createElement("strong");
+  time.textContent = new Date(point.ts * 1000).toLocaleTimeString("ru-RU", {
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const rows = [];
+  for (const item of model.series) {
+    if (point[item.key] === null || point[item.key] === undefined) continue;
+    const row = document.createElement("div");
+    row.className = "chart-tooltip-row";
+    const marker = document.createElement("i");
+    marker.style.backgroundColor = item.color;
+    marker.style.color = item.color;
+    const label = document.createElement("span");
+    label.textContent = item.label || item.key;
+    const value = document.createElement("b");
+    value.textContent = item.format ? item.format(point[item.key]) : String(point[item.key]);
+    row.append(marker, label, value);
+    rows.push(row);
+  }
+  tooltip.replaceChildren(time, ...rows);
+  tooltip.hidden = false;
+
+  const wrapRect = canvas.parentElement.getBoundingClientRect();
+  const localX = event.clientX - wrapRect.left;
+  const localY = event.clientY - wrapRect.top;
+  tooltip.style.left = `${localX}px`;
+  tooltip.style.top = `${Math.max(48, Math.min(wrapRect.height - 48, localY))}px`;
+  tooltip.classList.toggle("place-right", localX < 190 && wrapRect.width - localX > 180);
+  if (canvas._hoverTs !== point.ts) {
+    canvas._hoverTs = point.ts;
+    scheduleChartDraw();
+  }
+}
+
+function bindChartTooltip(canvas, tooltip) {
+  canvas.addEventListener("pointermove", (event) => showChartTooltip(canvas, tooltip, event), { passive: true });
+  canvas.addEventListener("pointerleave", () => {
+    tooltip.hidden = true;
+    if (canvas._hoverTs !== null && canvas._hoverTs !== undefined) {
+      canvas._hoverTs = null;
+      scheduleChartDraw();
+    }
+  }, { passive: true });
+}
+
+function hideChartTooltips() {
+  for (const [canvas, tooltip] of [[networkCanvas, networkTooltip], [cpuCanvas, cpuTooltip]]) {
+    tooltip.hidden = true;
+    canvas._hoverTs = null;
+  }
 }
 
 async function loadHistory(version = state.selectionVersion) {
@@ -10666,6 +10861,7 @@ async function loadDetail(version = state.selectionVersion) {
 
 async function selectNode(key) {
   if (!key || (key === state.selectedKey && state.detail)) return;
+  hideChartTooltips();
   state.selectedKey = key;
   state.selectionVersion += 1;
   const version = state.selectionVersion;
@@ -10760,6 +10956,21 @@ $("refreshButton").addEventListener("click", async () => {
 
 searchInput.addEventListener("input", renderMachineList);
 
+statusFilter.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-filter]");
+  if (!button) return;
+  state.listFilter = button.dataset.filter;
+  localStorage.setItem(LIST_FILTER_KEY, state.listFilter);
+  for (const item of statusFilter.querySelectorAll("button[data-filter]")) item.classList.toggle("active", item === button);
+  renderMachineList();
+});
+
+sortSelect.addEventListener("change", () => {
+  state.listSort = sortSelect.value;
+  localStorage.setItem(LIST_SORT_KEY, state.listSort);
+  renderMachineList();
+});
+
 $("rangeControl").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-range]");
   if (!button) return;
@@ -10783,6 +10994,13 @@ if ("ResizeObserver" in window) {
     if (!machineView.hidden) drawCharts();
   }, { passive: true });
 }
+
+sortSelect.value = state.listSort;
+for (const button of statusFilter.querySelectorAll("button[data-filter]")) {
+  button.classList.toggle("active", button.dataset.filter === state.listFilter);
+}
+bindChartTooltip(networkCanvas, networkTooltip);
+bindChartTooltip(cpuCanvas, cpuTooltip);
 
 const savedToken = localStorage.getItem(TOKEN_KEY) || "";
 if (savedToken) startSession(savedToken);

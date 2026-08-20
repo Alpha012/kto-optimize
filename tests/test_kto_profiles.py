@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v335"', KTO)
-        self.assertIn('PUSH_BUILD="v335"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v335"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v335"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v335"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v335"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v335"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v335"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v336"', KTO)
+        self.assertIn('PUSH_BUILD="v336"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v336"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v336"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v336"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v336"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v336"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v336"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -3544,7 +3544,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v335"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v336"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 
