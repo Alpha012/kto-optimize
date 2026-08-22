@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v336"
+PUSH_BUILD="v337"
 KTO_SSH_PORT_FILE="${KTO_SSH_PORT_FILE:-/etc/kto-ssh-port}"
+KTO_UFW_LOCK_FILE="${KTO_UFW_LOCK_FILE:-/run/lock/kto-ufw.lock}"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 KTO_FAIL2BAN_SSH_ALLOWLIST_CONF="${KTO_FAIL2BAN_SSH_ALLOWLIST_CONF:-/etc/fail2ban/jail.d/99-kto-ssh-allowlist.local}"
@@ -446,6 +447,40 @@ remove_ufw_ssh_open_rules() {
     printf '%s\n' "$removed"
 }
 
+UFW_SSH_OPEN_REPAIRED=0
+ensure_ufw_ssh_open_rule_first() {
+    local ssh_port="$1" number lock_fd=""
+    local numbers=()
+    UFW_SSH_OPEN_REPAIRED=0
+
+    if command -v flock >/dev/null 2>&1 && mkdir -p "$(dirname "$KTO_UFW_LOCK_FILE")" 2>/dev/null; then
+        if exec {lock_fd}>"$KTO_UFW_LOCK_FILE"; then
+            if ! flock -w 2 "$lock_fd"; then
+                exec {lock_fd}>&-
+                return 0
+            fi
+        fi
+    fi
+
+    mapfile -t numbers < <(ufw_ssh_open_rule_numbers "$ssh_port")
+    if printf '%s\n' "${numbers[@]}" | grep -qx '1'; then
+        [[ -z "$lock_fd" ]] || exec {lock_fd}>&-
+        return 0
+    fi
+
+    for number in "${numbers[@]}"; do
+        [[ "$number" =~ ^[0-9]+$ ]] || continue
+        ufw --force delete "$number" >/dev/null 2>&1 || true
+    done
+    if ufw insert 1 allow proto tcp to any port "$ssh_port" comment 'kto-ssh-open' >/dev/null 2>&1; then
+        UFW_SSH_OPEN_REPAIRED=1
+        [[ -z "$lock_fd" ]] || exec {lock_fd}>&-
+        return 0
+    fi
+    [[ -z "$lock_fd" ]] || exec {lock_fd}>&-
+    return 1
+}
+
 collector_ssh_allowed_ips() {
     local response="$1" ip
     while read -r ip; do
@@ -541,12 +576,12 @@ apply_collector_ssh_firewall_mode() {
     if managed_ssh_port_enabled; then
         ufw_active || return 0
         ssh_port="$(detect_ssh_port)"
-        if ! ufw_ssh_open_rule_exists "$ssh_port"; then
-            if ufw insert 1 allow proto tcp to any port "$ssh_port" comment 'kto-ssh-open' >/dev/null 2>&1; then
+        if ensure_ufw_ssh_open_rule_first "$ssh_port"; then
+            if (( UFW_SSH_OPEN_REPAIRED == 1 )); then
                 echo "push ${PUSH_BUILD}: managed ssh firewall opened port=${ssh_port}"
-            else
-                echo "push ${PUSH_BUILD}: failed to open managed ssh port=${ssh_port}" >&2
             fi
+        else
+            echo "push ${PUSH_BUILD}: failed to open managed ssh port=${ssh_port}" >&2
         fi
         return 0
     fi
@@ -565,12 +600,12 @@ apply_collector_ssh_firewall_mode() {
 
     ssh_port="$(detect_ssh_port)"
     if [[ "$desired" == "open" ]]; then
-        if ! ufw_ssh_open_rule_exists "$ssh_port"; then
-            if ufw insert 1 allow proto tcp to any port "$ssh_port" comment 'kto-ssh-open' >/dev/null 2>&1; then
+        if ensure_ufw_ssh_open_rule_first "$ssh_port"; then
+            if (( UFW_SSH_OPEN_REPAIRED == 1 )); then
                 echo "push ${PUSH_BUILD}: ssh firewall opened port=${ssh_port}"
-            else
-                echo "push ${PUSH_BUILD}: failed to open ssh firewall port=${ssh_port}" >&2
             fi
+        else
+            echo "push ${PUSH_BUILD}: failed to open ssh firewall port=${ssh_port}" >&2
         fi
         return 0
     fi

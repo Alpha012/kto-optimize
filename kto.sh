@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v336"
+SCRIPT_BUILD="v337"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -20,6 +20,12 @@ KTO_SSH_MANAGED_CONFIG="${KTO_SSH_MANAGED_CONFIG:-/etc/ssh/sshd_config.d/00-kto-
 KTO_SSH_BACKUP_DIR="${KTO_SSH_BACKUP_DIR:-/var/backups/kto-ssh}"
 KTO_SSH_PORT_MIN="${KTO_SSH_PORT_MIN:-20000}"
 KTO_SSH_PORT_MAX="${KTO_SSH_PORT_MAX:-29999}"
+KTO_UFW_LOCK_FILE="${KTO_UFW_LOCK_FILE:-/run/lock/kto-ufw.lock}"
+KTO_SSH_FIREWALL_GUARD="${KTO_SSH_FIREWALL_GUARD:-/usr/local/sbin/kto-ssh-firewall-guard}"
+KTO_SSH_FIREWALL_GUARD_UNIT="${KTO_SSH_FIREWALL_GUARD_UNIT:-/etc/systemd/system/kto-ssh-firewall-guard.service}"
+KTO_SSH_FIREWALL_GUARD_TIMER_UNIT="${KTO_SSH_FIREWALL_GUARD_TIMER_UNIT:-/etc/systemd/system/kto-ssh-firewall-guard.timer}"
+KTO_SSH_FIREWALL_GUARD_SERVICE="${KTO_SSH_FIREWALL_GUARD_SERVICE:-kto-ssh-firewall-guard.service}"
+KTO_SSH_FIREWALL_GUARD_TIMER="${KTO_SSH_FIREWALL_GUARD_TIMER:-kto-ssh-firewall-guard.timer}"
 KTO_ROOT_BASE_PUBLIC_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC8Drz6C97zQtb5mA5u6uVWccuWgRAWmfp5pwbQV9kf+L8V+7FrMQ9mmwMbwFKXuopKj95cyv9CyzKXOG20Z7WTaI7zq1YybluzBNTRLEhkLubkjkwJ7bN+NHxet5KT+gZIEtbJ2L4C+eYkHGfG6ucBylX0r6pY5LU0Nm+ym8vEkhT9BHiGQVU4JMDtAENyFYCew8MMLIYy9IeW20OwCK6YrG90YbIokzf8wsq5invYTAqdjytqneP5GAopAZUwkp7jIhg69xhG+WTD2h8fgZs9pSkGvKJLBxn80reJ/jQdXJulfoFeb7jCh5CyLfkluev+xh+kvkRgZklM5XruWOln Generated-by-Nova"
 XANMOD_PACKAGE="${KTO_XANMOD_PACKAGE:-linux-xanmod-x64v3}"
 XANMOD_KEY_URL="${KTO_XANMOD_KEY_URL:-https://dl.xanmod.org/archive.key}"
@@ -2168,6 +2174,28 @@ ufw_global_allow_exists_for_port() {
     '
 }
 
+ufw_global_allow_rule_numbers_for_port() {
+    local port="$1"
+    command_exists ufw || return 0
+    "${SUDO[@]}" ufw status numbered 2>/dev/null | awk -v port="$port" -v tcp="${port}/tcp" '
+        $0 ~ /ALLOW/ && $0 ~ /Anywhere/ {
+            number = $0
+            sub(/^[[:space:]]*\[[[:space:]]*/, "", number)
+            sub(/\].*$/, "", number)
+            gsub(/[[:space:]]/, "", number)
+            if (number !~ /^[0-9]+$/) next
+
+            target = $0
+            sub(/^[^]]*\][[:space:]]*/, "", target)
+            sub(/[[:space:]]+ALLOW.*/, "", target)
+            gsub(/[[:space:]]/, "", target)
+            is_port = (target == tcp || target == tcp "(v6)" || target == port || target == port "(v6)")
+            is_service = (port == "22" && (target == "ssh" || target == "ssh(v6)" || target == "OpenSSH" || target == "OpenSSH(v6)"))
+            if (is_port || is_service) print number
+        }
+    ' | sort -rn
+}
+
 remove_ufw_allow_rules_for_port() {
     local port="$1" number
     local -a numbers=()
@@ -2180,11 +2208,126 @@ remove_ufw_allow_rules_for_port() {
 }
 
 ensure_global_ssh_ufw_rule() {
-    local port="$1"
+    local port="$1" number
+    local -a numbers=()
     command_exists ufw || return 0
-    if ! ufw_global_allow_exists_for_port "$port"; then
-        cmd "${SUDO[@]}" ufw allow proto tcp to any port "$port" comment 'kto-ssh-open'
+    mapfile -t numbers < <(ufw_global_allow_rule_numbers_for_port "$port")
+    if printf '%s\n' "${numbers[@]}" | grep -qx '1'; then
+        return 0
     fi
+
+    # AntiScanner adds deny rules with `insert 1`. Recreate the managed SSH
+    # allow at the very top so a matching blacklist entry cannot lock us out.
+    for number in "${numbers[@]}"; do
+        [[ "$number" =~ ^[0-9]+$ ]] || continue
+        "${SUDO[@]}" ufw --force delete "$number" >> "$LOG_FILE" 2>&1 || true
+    done
+    cmd "${SUDO[@]}" ufw insert 1 allow proto tcp to any port "$port" comment 'kto-ssh-open'
+}
+
+install_ssh_firewall_guard() {
+    local managed_port
+    managed_port="$(managed_ssh_port 2>/dev/null || true)"
+    [[ -n "$managed_port" ]] || return 0
+    command_exists ufw || return 0
+
+    write_root_file_mode 0755 "$KTO_SSH_FIREWALL_GUARD" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+PORT_FILE='${KTO_SSH_PORT_FILE}'
+LOCK_FILE='${KTO_UFW_LOCK_FILE}'
+SSH_PORT="\$(awk 'NR == 1 {print \$1; exit}' "\$PORT_FILE" 2>/dev/null || true)"
+[[ "\$SSH_PORT" =~ ^[0-9]+\$ ]] && (( 10#\$SSH_PORT >= 1 && 10#\$SSH_PORT <= 65535 )) || exit 0
+command -v ufw >/dev/null 2>&1 || exit 0
+ufw status 2>/dev/null | grep -q '^Status: active' || exit 0
+
+mkdir -p "\$(dirname "\$LOCK_FILE")"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"\$LOCK_FILE"
+    flock -w 30 9 || exit 0
+fi
+
+global_rule_numbers() {
+    ufw status numbered 2>/dev/null | awk -v port="\$SSH_PORT" -v tcp="\${SSH_PORT}/tcp" '
+        \$0 ~ /ALLOW/ && \$0 ~ /Anywhere/ {
+            number = \$0
+            sub(/^[[:space:]]*\[[[:space:]]*/, "", number)
+            sub(/\].*\$/, "", number)
+            gsub(/[[:space:]]/, "", number)
+            if (number !~ /^[0-9]+\$/) next
+            target = \$0
+            sub(/^[^]]*\][[:space:]]*/, "", target)
+            sub(/[[:space:]]+ALLOW.*/, "", target)
+            gsub(/[[:space:]]/, "", target)
+            is_port = (target == tcp || target == tcp "(v6)" || target == port || target == port "(v6)")
+            is_service = (port == "22" && (target == "ssh" || target == "ssh(v6)" || target == "OpenSSH" || target == "OpenSSH(v6)"))
+            if (is_port || is_service) print number
+        }
+    ' | sort -rn
+}
+
+mapfile -t rules < <(global_rule_numbers)
+if printf '%s\n' "\${rules[@]}" | grep -qx '1'; then
+    exit 0
+fi
+for number in "\${rules[@]}"; do
+    [[ "\$number" =~ ^[0-9]+\$ ]] || continue
+    ufw --force delete "\$number" >/dev/null 2>&1 || true
+done
+if ufw insert 1 allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1; then
+    logger -t kto-ssh-firewall-guard "restored global SSH allow at rule 1 for port \${SSH_PORT}"
+else
+    logger -t kto-ssh-firewall-guard "failed to restore SSH allow for port \${SSH_PORT}"
+    exit 1
+fi
+EOF
+
+    write_root_file "$KTO_SSH_FIREWALL_GUARD_UNIT" <<EOF
+[Unit]
+Description=Keep kto managed SSH reachable through UFW
+After=ufw.service ssh.service sshd.service antiscanner-update.service
+
+[Service]
+Type=oneshot
+ExecStart=${KTO_SSH_FIREWALL_GUARD}
+EOF
+
+    write_root_file "$KTO_SSH_FIREWALL_GUARD_TIMER_UNIT" <<EOF
+[Unit]
+Description=Periodically verify kto managed SSH firewall rule
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=${KTO_SSH_FIREWALL_GUARD_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    cmd "${SUDO[@]}" systemctl daemon-reload
+    cmd "${SUDO[@]}" systemctl enable --now "$KTO_SSH_FIREWALL_GUARD_TIMER"
+    run_systemctl_bounded 15 start "$KTO_SSH_FIREWALL_GUARD_SERVICE" >> "$LOG_FILE" 2>&1 || true
+}
+
+repair_ssh_firewall_cli() {
+    local ssh_port
+    header
+    need_root
+    ssh_port="$(managed_ssh_port 2>/dev/null || true)"
+    if [[ -z "$ssh_port" ]]; then
+        fail "Управляемый SSH-порт не найден в ${KTO_SSH_PORT_FILE}"
+        return 1
+    fi
+    ensure_global_ssh_ufw_rule "$ssh_port"
+    install_ssh_firewall_guard
+    ok "SSH ${ssh_port}/tcp открыт глобально правилом UFW №1"
+    ok "Защита от ночного сброса включена: ${KTO_SSH_FIREWALL_GUARD_TIMER}"
 }
 
 merge_root_authorized_keys() {
@@ -2437,6 +2580,7 @@ EOF
     fi
     ensure_global_ssh_ufw_rule "$new_port"
     "${SUDO[@]}" ufw reload >> "$LOG_FILE" 2>&1 || true
+    install_ssh_firewall_guard
 
     ok "SSH: root по ключу, порт ${new_port}/tcp открыт для всех"
     ok "Подключение: ssh -p ${new_port} root@IP"
@@ -2875,9 +3019,10 @@ install_antiscanner() {
     local existing_rules=0
     existing_rules="$(antiscanner_rules_count)"
 
-    apt_install_quiet curl ufw cron || true
+    apt_install_quiet curl ufw cron util-linux || true
     cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y iptables-persistent || true
     cmd "${SUDO[@]}" systemctl enable --now cron || true
+    install_ssh_firewall_guard || true
 
     write_root_file "$ANTISCANNER_SCRIPT" <<EOF
 #!/usr/bin/env bash
@@ -2887,6 +3032,9 @@ URL="${ANTISCANNER_URL}"
 TEMP_FILE="\$(mktemp)"
 TRUSTED_FILE="\$(mktemp)"
 LOG="/var/log/antiscanner_update.log"
+LOCK_FILE="${KTO_UFW_LOCK_FILE}"
+SSH_GUARD="${KTO_SSH_FIREWALL_GUARD}"
+UFW_LOCKED=0
 
 cleanup() {
     rm -f "\$TEMP_FILE" "\$TRUSTED_FILE"
@@ -2898,9 +3046,59 @@ if ! command -v ufw >/dev/null 2>&1; then
     exit 1
 fi
 
+mkdir -p "\$(dirname "\$LOCK_FILE")"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"\$LOCK_FILE"
+    if ! flock -w 120 9; then
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] timed out waiting for UFW lock" >> "\$LOG"
+        exit 1
+    fi
+    UFW_LOCKED=1
+fi
+
 SSH_PORT="\$(awk 'NR == 1 {print \$1; exit}' '${KTO_SSH_PORT_FILE}' 2>/dev/null || true)"
 [[ "\$SSH_PORT" =~ ^[0-9]+\$ ]] || SSH_PORT="\$(sshd -T 2>/dev/null | awk '/^port / {print \$2; exit}' || true)"
 SSH_PORT="\${SSH_PORT:-22}"
+MANAGED_SSH=0
+
+global_ssh_rule_numbers() {
+    ufw status numbered 2>/dev/null | awk -v port="\$SSH_PORT" -v tcp="\${SSH_PORT}/tcp" '
+        \$0 ~ /ALLOW/ && \$0 ~ /Anywhere/ {
+            number = \$0
+            sub(/^[[:space:]]*\[[[:space:]]*/, "", number)
+            sub(/\].*\$/, "", number)
+            gsub(/[[:space:]]/, "", number)
+            if (number !~ /^[0-9]+\$/) next
+            target = \$0
+            sub(/^[^]]*\][[:space:]]*/, "", target)
+            sub(/[[:space:]]+ALLOW.*/, "", target)
+            gsub(/[[:space:]]/, "", target)
+            is_port = (target == tcp || target == tcp "(v6)" || target == port || target == port "(v6)")
+            is_service = (port == "22" && (target == "ssh" || target == "ssh(v6)" || target == "OpenSSH" || target == "OpenSSH(v6)"))
+            if (is_port || is_service) print number
+        }
+    ' | sort -rn
+}
+
+prioritize_managed_ssh() {
+    local number
+    local -a rules=()
+    [[ -r '${KTO_SSH_PORT_FILE}' ]] || return 1
+    [[ "\$SSH_PORT" =~ ^[0-9]+\$ ]] && (( 10#\$SSH_PORT >= 1 && 10#\$SSH_PORT <= 65535 )) || return 1
+    mapfile -t rules < <(global_ssh_rule_numbers)
+    if printf '%s\n' "\${rules[@]}" | grep -qx '1'; then
+        return 0
+    fi
+    for number in "\${rules[@]}"; do
+        [[ "\$number" =~ ^[0-9]+\$ ]] || continue
+        ufw --force delete "\$number" >/dev/null 2>&1 || true
+    done
+    ufw insert 1 allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1
+}
+
+if prioritize_managed_ssh; then
+    MANAGED_SSH=1
+fi
 ufw status 2>/dev/null | awk '
     /ALLOW/ && /# kto-ssh/ {
         for (i = 3; i <= NF; i++) {
@@ -2922,22 +3120,34 @@ if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
         [[ -z "\$subnet" || "\$subnet" == "#"* ]] && continue
 
         if [[ "\$subnet" =~ \. || "\$subnet" =~ : ]]; then
-            ufw insert 1 deny from "\$subnet" comment 'AntiScanner-Block' >/dev/null 2>&1 || true
+            ufw insert "\$((MANAGED_SSH + 1))" deny from "\$subnet" comment 'AntiScanner-Block' >/dev/null 2>&1 || true
         fi
     done < "\$TEMP_FILE"
 
-    while IFS= read -r trusted_ip; do
-        [[ "\$trusted_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]] || continue
-        for _ in {1..16}; do
-            ufw --force delete allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" >/dev/null 2>&1 || break
-        done
-        ufw insert 1 allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 || true
-    done < "\$TRUSTED_FILE"
+    if (( MANAGED_SSH == 0 )); then
+        while IFS= read -r trusted_ip; do
+            [[ "\$trusted_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]] || continue
+            for _ in {1..16}; do
+                ufw --force delete allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" >/dev/null 2>&1 || break
+            done
+            ufw insert 1 allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 || true
+        done < "\$TRUSTED_FILE"
+    else
+        prioritize_managed_ssh || true
+    fi
 
     ufw reload >/dev/null 2>&1 || true
     if [[ -x "${HAPROXY_FIREWALL_MANAGER}" ]]; then
         "${HAPROXY_FIREWALL_MANAGER}" >> "\$LOG" 2>&1 ||
             echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to restore HAProxy UFW rules" >> "\$LOG"
+    fi
+    if (( UFW_LOCKED == 1 )); then
+        flock -u 9 || true
+        UFW_LOCKED=0
+    fi
+    if [[ -x "\$SSH_GUARD" ]]; then
+        "\$SSH_GUARD" >> "\$LOG" 2>&1 ||
+            echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to restore managed SSH UFW rule" >> "\$LOG"
     fi
     echo "\$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] AntiScanner updated via ufw" >> "\$LOG"
 else
@@ -3808,6 +4018,7 @@ opt_firewall() {
         fi
     fi
     cmd "${SUDO[@]}" ufw --force enable
+    install_ssh_firewall_guard
     if ! ensure_haproxy_firewall_guard || ! repair_haproxy_firewall_rules "$routes_file"; then
         rm -f "$routes_file" "$ports_file" "$ufw_status_file"
         return 1
@@ -4334,7 +4545,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v336"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v337"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -4347,7 +4558,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v336"
+KTO_HAPROXY_FIREWALL_BUILD="v337"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -4821,7 +5032,7 @@ system_check_network_limits() {
 
 system_check_firewall() {
     local ssh_port="$1"
-    local missing=() extra=() routes_file ports_file ufw_status_file port
+    local missing=() extra=() routes_file ports_file ufw_status_file port managed_port priority_rules
 
     routes_file="$(mktemp)"
     ports_file="$(mktemp)"
@@ -4842,6 +5053,13 @@ system_check_firewall() {
     fi
 
     ufw_global_allow_exists_for_port "$ssh_port" || missing+=("${ssh_port}/tcp global")
+    managed_port="$(managed_ssh_port 2>/dev/null || true)"
+    if [[ -n "$managed_port" && "$managed_port" == "$ssh_port" ]]; then
+        priority_rules="$(ufw_global_allow_rule_numbers_for_port "$ssh_port")"
+        grep -qx '1' <<< "$priority_rules" || missing+=("${ssh_port}/tcp priority")
+        "${SUDO[@]}" systemctl is-enabled --quiet "$KTO_SSH_FIREWALL_GUARD_TIMER" 2>/dev/null ||
+            missing+=("ssh guard")
+    fi
     if [[ "$ssh_port" != "22" ]] && ufw_rule_allowed "22/tcp"; then
         extra+=("22/tcp")
     fi
@@ -13625,6 +13843,7 @@ main() {
         haproxy-limit-status|haproxy-bandwidth-status) show_haproxy_bandwidth_status_cli ;;
         haproxy-diagnose|haproxy-diagnostic|haproxy-diag|haproxy-status) diagnose_haproxy || true ;;
         haproxy-firewall-repair|haproxy-ufw-repair|repair-haproxy-firewall) repair_haproxy_firewall_cli ;;
+        ssh-firewall-repair|ssh-ufw-repair|repair-ssh-firewall|ssh-guard) repair_ssh_firewall_cli ;;
         haproxy-stabilize|haproxy-recover) stabilize_haproxy ;;
         mobile443-lte|lte-only) mobile443_lte_menu ;;
         mobile443-lte-enable|lte-only-enable) enable_mobile443_lte ;;
