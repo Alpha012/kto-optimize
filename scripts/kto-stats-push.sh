@@ -571,8 +571,6 @@ apply_collector_ssh_ips() {
 apply_collector_ssh_firewall_mode() {
     local response="$1" desired ssh_port removed=0
 
-    [[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0
-    command -v jq >/dev/null 2>&1 || return 0
     if managed_ssh_port_enabled; then
         ufw_active || return 0
         ssh_port="$(detect_ssh_port)"
@@ -585,6 +583,8 @@ apply_collector_ssh_firewall_mode() {
         fi
         return 0
     fi
+    [[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
     desired="$(printf '%s' "$response" | jq -r '
         if (.ssh_firewall_open | type) == "boolean" then
             if .ssh_firewall_open then "open" else "whitelist" end

@@ -2316,7 +2316,7 @@ EOF
 }
 
 repair_ssh_firewall_cli() {
-    local ssh_port
+    local ssh_port anti_rules
     header
     need_root
     ssh_port="$(managed_ssh_port 2>/dev/null || true)"
@@ -2326,6 +2326,11 @@ repair_ssh_firewall_cli() {
     fi
     ensure_global_ssh_ufw_rule "$ssh_port"
     install_ssh_firewall_guard
+    anti_rules="$(antiscanner_rules_count 2>/dev/null || true)"
+    if [[ -x "$ANTISCANNER_SCRIPT" || "$anti_rules" =~ ^[0-9]+$ && "$anti_rules" -gt 0 ]]; then
+        install_antiscanner
+        ensure_global_ssh_ufw_rule "$ssh_port"
+    fi
     ok "SSH ${ssh_port}/tcp открыт глобально правилом UFW №1"
     ok "Защита от ночного сброса включена: ${KTO_SSH_FIREWALL_GUARD_TIMER}"
 }

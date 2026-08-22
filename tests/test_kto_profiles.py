@@ -2896,7 +2896,12 @@ grep -Fq 'flock -u 9' "$ANTISCANNER_SCRIPT"
         self.assertIn('flock -w 120 9', KTO)
         self.assertIn('ufw insert "\\$((MANAGED_SSH + 1))" deny', KTO)
         self.assertIn('ensure_ufw_ssh_open_rule_first "$ssh_port"', push_mode)
+        self.assertLess(
+            push_mode.index('if managed_ssh_port_enabled; then'),
+            push_mode.index('[[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0'),
+        )
         self.assertIn("grep -qx '1'", push_priority)
+        self.assertIn('install_antiscanner', function_body(KTO, "repair_ssh_firewall_cli"))
         self.assertIn("write_whitelist_fail2ban_allowlist", fail2ban)
         self.assertIn("unban_whitelist_ssh_ips", fail2ban)
         self.assertIn("ufw insert 1 allow proto tcp from \"\\$trusted_ip\"", KTO)
