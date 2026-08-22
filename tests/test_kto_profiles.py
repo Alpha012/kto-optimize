@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v338"', KTO)
-        self.assertIn('PUSH_BUILD="v338"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v338"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v338"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v338"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v338"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v338"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v338"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v339"', KTO)
+        self.assertIn('PUSH_BUILD="v339"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v339"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v339"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v339"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v339"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v339"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v339"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -990,6 +990,7 @@ grep -Fqx 'arg1=|arg2=|xdg=/tmp/kto-btop-xdg' "$events"
         runner = function_body(KTO, "run_multi_ip_cpu_monitor")
         listing = function_body(KTO, "list_multi_ip_monitor_interfaces")
         formatter = function_body(KTO, "multi_ip_monitor_format_rate")
+        byte_formatter = function_body(KTO, "multi_ip_monitor_format_bytes")
         main = function_body(KTO, "main")
 
         self.assertIn('labels+=("Монитор всех IP + CPU")', menu)
@@ -1006,6 +1007,9 @@ grep -Fqx 'arg1=|arg2=|xdg=/tmp/kto-btop-xdg' "$events"
         self.assertIn("printf '\\033[?1049h", runner)
         self.assertIn('ips[interface] = ips[interface] ", "', listing)
         self.assertIn('Gb/s', formatter)
+        self.assertIn('TB', byte_formatter)
+        self.assertIn('interface_total', runner)
+        self.assertIn('ПРОГНАНО', runner)
 
         bash = bash_executable()
         if bash is None:
@@ -1030,6 +1034,10 @@ multi_ip_monitor_format_rate value 125000000
 [[ "$value" == '125.0 Mb/s' ]]
 multi_ip_monitor_format_rate value 999
 [[ "$value" == '999 b/s' ]]
+multi_ip_monitor_format_bytes value 1536
+[[ "$value" == '1.5 KB' ]]
+multi_ip_monitor_format_bytes value 1610612736
+[[ "$value" == '1.5 GB' ]]
 multi_ip_monitor_make_bar value 50 10
 [[ "$value" == '#####-----' ]]
 multi_ip_monitor_fit_text value 123456 4
@@ -3742,7 +3750,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v338"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v339"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 

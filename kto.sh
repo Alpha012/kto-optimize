@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v338"
+SCRIPT_BUILD="v339"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -1960,6 +1960,37 @@ multi_ip_monitor_format_rate() {
     printf -v "$output_name" '%s' "$formatted"
 }
 
+multi_ip_monitor_format_bytes() {
+    local output_name="$1" bytes="${2:-0}" divisor=1 unit="B" whole tenth formatted
+
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    if (( bytes >= 1125899906842624 )); then
+        divisor=1125899906842624
+        unit="PB"
+    elif (( bytes >= 1099511627776 )); then
+        divisor=1099511627776
+        unit="TB"
+    elif (( bytes >= 1073741824 )); then
+        divisor=1073741824
+        unit="GB"
+    elif (( bytes >= 1048576 )); then
+        divisor=1048576
+        unit="MB"
+    elif (( bytes >= 1024 )); then
+        divisor=1024
+        unit="KB"
+    fi
+
+    if (( divisor == 1 )); then
+        formatted="${bytes} B"
+    else
+        whole=$(( bytes / divisor ))
+        tenth=$(( (bytes % divisor) * 10 / divisor ))
+        formatted="${whole}.${tenth} ${unit}"
+    fi
+    printf -v "$output_name" '%s' "$formatted"
+}
+
 multi_ip_monitor_fit_text() {
     local output_name="$1" text="$2" width="$3" fitted
 
@@ -2001,21 +2032,21 @@ run_multi_ip_cpu_monitor() {
 
     local refresh_sec="${KTO_MULTI_IP_MONITOR_REFRESH_SEC:-1}"
     local row interface ip_list kind rx tx previous delta elapsed_ms now_ms previous_ms
-    local rx_bps tx_bps activity max_activity total_rx_bps total_tx_bps
+    local rx_bps tx_bps activity max_activity total_rx_bps total_tx_bps total_traffic_bytes
     local label user nice system idle iowait irq softirq steal total idle_total
     local previous_total previous_idle total_delta idle_delta busy_delta percent core
     local cpu_average=0 core_count=0 load1="-" load5="-" load15="-"
-    local cols lines ip_width interface_width rate_width show_peaks show_activity activity_width
+    local cols lines ip_width interface_width rate_width traffic_width show_peaks show_activity activity_width
     local network_count visible_network_count hidden_network_count network_index
     local cpu_columns cpu_cell_width cpu_bar_width cpu_rows max_cpu_columns available_cpu_rows needed_cpu_columns
-    local screen line header_text ip_text rx_text tx_text peak_rx_text peak_tx_text bar cpu_color
+    local screen line header_text ip_text rx_text tx_text traffic_text peak_rx_text peak_tx_text bar cpu_color
     local cell padding timestamp key="" alias_interfaces=0 monitor_stop=0
     local saved_int saved_term saved_hup saved_exit lower_key
     local purple=$'\033[38;5;141m' cyan=$'\033[38;5;45m' green=$'\033[38;5;48m'
     local yellow=$'\033[38;5;220m' red=$'\033[38;5;203m' dim=$'\033[2m'
     local bold=$'\033[1m' reset=$'\033[0m'
     local -a monitor_rows=() refreshed_rows=() core_percent=()
-    local -A previous_rx=() previous_tx=() current_rx=() current_tx=()
+    local -A previous_rx=() previous_tx=() current_rx=() current_tx=() interface_total=()
     local -A peak_rx=() peak_tx=() cpu_previous_total=() cpu_previous_idle=()
 
     if [[ ! -t 0 || ! -t 1 ]]; then
@@ -2112,6 +2143,7 @@ run_multi_ip_cpu_monitor() {
         current_tx=()
         total_rx_bps=0
         total_tx_bps=0
+        total_traffic_bytes=0
         max_activity=0
 
         for row in "${monitor_rows[@]}"; do
@@ -2138,10 +2170,12 @@ run_multi_ip_cpu_monitor() {
             previous_tx["$interface"]="$tx"
             current_rx["$interface"]="$rx_bps"
             current_tx["$interface"]="$tx_bps"
+            interface_total["$interface"]=$(( rx + tx ))
             (( rx_bps > ${peak_rx[$interface]:-0} )) && peak_rx["$interface"]="$rx_bps"
             (( tx_bps > ${peak_tx[$interface]:-0} )) && peak_tx["$interface"]="$tx_bps"
             total_rx_bps=$(( total_rx_bps + rx_bps ))
             total_tx_bps=$(( total_tx_bps + tx_bps ))
+            total_traffic_bytes=$(( total_traffic_bytes + rx + tx ))
             activity=$(( rx_bps + tx_bps ))
             (( activity > max_activity )) && max_activity="$activity"
         done
@@ -2214,33 +2248,34 @@ run_multi_ip_cpu_monitor() {
         ip_width=22
         interface_width=9
         rate_width=11
+        traffic_width=11
         show_peaks=0
         show_activity=0
         activity_width=12
-        if (( cols >= 100 )); then
+        if (( cols >= 105 )); then
             ip_width=27
             interface_width=10
             show_peaks=1
         fi
-        if (( cols >= 132 )); then
+        if (( cols >= 145 )); then
             ip_width=30
             rate_width=12
             show_activity=1
-            activity_width=$(( cols - ip_width - interface_width - rate_width * 4 - 10 ))
+            activity_width=$(( cols - ip_width - interface_width - rate_width * 4 - traffic_width - 11 ))
             (( activity_width >= 8 )) || activity_width=8
             (( activity_width <= 24 )) || activity_width=24
         fi
 
         printf -v timestamp '%(%H:%M:%S)T' -1
         screen="${bold}${purple}kto LIVE${reset}  ${bold}Все IP + CPU${reset}  ${dim}${timestamp} · обновление ${refresh_sec}с${reset}"$'\n'
-        screen+="${dim}Скорость считается по интерфейсам; пики — с момента запуска этого экрана.${reset}"$'\n\n'
+        screen+="${dim}Скорость считается по интерфейсам; ПРОГНАНО — RX + TX с момента запуска интерфейса.${reset}"$'\n\n'
         screen+="${bold}${cyan}СЕТЬ${reset}  ${dim}${network_count} интерфейс(ов)${reset}"$'\n'
         if (( show_peaks == 1 )); then
-            printf -v header_text "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s %${rate_width}s %${rate_width}s" \
-                "IP" "ИНТЕРФЕЙС" "DOWN" "UP" "ПИК DOWN" "ПИК UP"
+            printf -v header_text "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s %${traffic_width}s %${rate_width}s %${rate_width}s" \
+                "IP" "ИНТЕРФЕЙС" "DOWN" "UP" "ПРОГНАНО" "ПИК DOWN" "ПИК UP"
         else
-            printf -v header_text "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s" \
-                "IP" "ИНТЕРФЕЙС" "DOWN" "UP"
+            printf -v header_text "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s %${traffic_width}s" \
+                "IP" "ИНТЕРФЕЙС" "DOWN" "UP" "ПРОГНАНО"
         fi
         if (( show_activity == 1 )); then
             printf -v line " %-${activity_width}s" "АКТИВНОСТЬ"
@@ -2260,14 +2295,15 @@ run_multi_ip_cpu_monitor() {
             multi_ip_monitor_fit_text ip_text "$ip_list" "$ip_width"
             multi_ip_monitor_format_rate rx_text "${current_rx[$interface]:-0}"
             multi_ip_monitor_format_rate tx_text "${current_tx[$interface]:-0}"
+            multi_ip_monitor_format_bytes traffic_text "${interface_total[$interface]:-0}"
             if (( show_peaks == 1 )); then
                 multi_ip_monitor_format_rate peak_rx_text "${peak_rx[$interface]:-0}"
                 multi_ip_monitor_format_rate peak_tx_text "${peak_tx[$interface]:-0}"
-                printf -v line "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s %${rate_width}s %${rate_width}s" \
-                    "$ip_text" "$interface" "$rx_text" "$tx_text" "$peak_rx_text" "$peak_tx_text"
+                printf -v line "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s %${traffic_width}s %${rate_width}s %${rate_width}s" \
+                    "$ip_text" "$interface" "$rx_text" "$tx_text" "$traffic_text" "$peak_rx_text" "$peak_tx_text"
             else
-                printf -v line "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s" \
-                    "$ip_text" "$interface" "$rx_text" "$tx_text"
+                printf -v line "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s %${traffic_width}s" \
+                    "$ip_text" "$interface" "$rx_text" "$tx_text" "$traffic_text"
             fi
             if (( show_activity == 1 )); then
                 activity=$(( ${current_rx[$interface]:-0} + ${current_tx[$interface]:-0} ))
@@ -2287,7 +2323,8 @@ run_multi_ip_cpu_monitor() {
         fi
         multi_ip_monitor_format_rate rx_text "$total_rx_bps"
         multi_ip_monitor_format_rate tx_text "$total_tx_bps"
-        screen+="${bold}ИТОГО: ↓ ${rx_text}  ↑ ${tx_text}${reset}"$'\n'
+        multi_ip_monitor_format_bytes traffic_text "$total_traffic_bytes"
+        screen+="${bold}ИТОГО СЕЙЧАС: ↓ ${rx_text}  ↑ ${tx_text}  ·  ПРОГНАНО: ${traffic_text}${reset}"$'\n'
         if (( alias_interfaces > 0 )); then
             screen+="${yellow}На ${alias_interfaces} интерфейс(ах) несколько IP — для них показан общий трафик интерфейса.${reset}"$'\n'
         fi
@@ -4967,7 +5004,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v338"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v339"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -4980,7 +5017,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v338"
+KTO_HAPROXY_FIREWALL_BUILD="v339"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
