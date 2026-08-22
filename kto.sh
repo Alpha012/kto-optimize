@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v337"
+SCRIPT_BUILD="v338"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -1913,6 +1913,423 @@ run_btop_for_ip() {
         fail "btop завершился с кодом ${rc}"
         return "$rc"
     fi
+    return 0
+}
+
+list_multi_ip_monitor_interfaces() {
+    list_test_source_ipv4s |
+        awk -F '\t' '
+            NF >= 2 && $1 != "" && $2 != "" {
+                interface = $2
+                if (!(interface in position)) {
+                    position[interface] = ++count
+                    order[count] = interface
+                    kind[interface] = $3
+                }
+                if (ips[interface] != "") ips[interface] = ips[interface] ", "
+                ips[interface] = ips[interface] $1
+            }
+            END {
+                for (row_number = 1; row_number <= count; row_number++) {
+                    interface = order[row_number]
+                    printf "%s\t%s\t%s\n", interface, ips[interface], kind[interface]
+                }
+            }
+        '
+}
+
+multi_ip_monitor_format_rate() {
+    local output_name="$1" bps="${2:-0}" whole tenth formatted
+
+    [[ "$bps" =~ ^[0-9]+$ ]] || bps=0
+    if (( bps >= 1000000000 )); then
+        whole=$(( bps / 1000000000 ))
+        tenth=$(( (bps % 1000000000) / 100000000 ))
+        formatted="${whole}.${tenth} Gb/s"
+    elif (( bps >= 1000000 )); then
+        whole=$(( bps / 1000000 ))
+        tenth=$(( (bps % 1000000) / 100000 ))
+        formatted="${whole}.${tenth} Mb/s"
+    elif (( bps >= 1000 )); then
+        whole=$(( bps / 1000 ))
+        tenth=$(( (bps % 1000) / 100 ))
+        formatted="${whole}.${tenth} Kb/s"
+    else
+        formatted="${bps} b/s"
+    fi
+    printf -v "$output_name" '%s' "$formatted"
+}
+
+multi_ip_monitor_fit_text() {
+    local output_name="$1" text="$2" width="$3" fitted
+
+    if (( width <= 0 )); then
+        fitted=""
+    elif (( ${#text} > width )); then
+        if (( width == 1 )); then
+            fitted="~"
+        else
+            fitted="${text:0:$(( width - 1 ))}~"
+        fi
+    else
+        fitted="$text"
+    fi
+    printf -v "$output_name" '%s' "$fitted"
+}
+
+multi_ip_monitor_make_bar() {
+    local output_name="$1" percent="${2:-0}" width="${3:-1}" filled empty result
+
+    [[ "$percent" =~ ^[0-9]+$ ]] || percent=0
+    (( percent < 0 )) && percent=0
+    (( percent > 100 )) && percent=100
+    (( width < 1 )) && width=1
+    filled=$(( (percent * width + 50) / 100 ))
+    (( filled > width )) && filled="$width"
+    empty=$(( width - filled ))
+    printf -v result '%*s' "$filled" ''
+    result="${result// /#}"
+    printf -v empty '%*s' "$empty" ''
+    empty="${empty// /-}"
+    result+="$empty"
+    printf -v "$output_name" '%s' "$result"
+}
+
+run_multi_ip_cpu_monitor() {
+    header
+    require_whitelist_mode
+
+    local refresh_sec="${KTO_MULTI_IP_MONITOR_REFRESH_SEC:-1}"
+    local row interface ip_list kind rx tx previous delta elapsed_ms now_ms previous_ms
+    local rx_bps tx_bps activity max_activity total_rx_bps total_tx_bps
+    local label user nice system idle iowait irq softirq steal total idle_total
+    local previous_total previous_idle total_delta idle_delta busy_delta percent core
+    local cpu_average=0 core_count=0 load1="-" load5="-" load15="-"
+    local cols lines ip_width interface_width rate_width show_peaks show_activity activity_width
+    local network_count visible_network_count hidden_network_count network_index
+    local cpu_columns cpu_cell_width cpu_bar_width cpu_rows max_cpu_columns available_cpu_rows needed_cpu_columns
+    local screen line header_text ip_text rx_text tx_text peak_rx_text peak_tx_text bar cpu_color
+    local cell padding timestamp key="" alias_interfaces=0 monitor_stop=0
+    local saved_int saved_term saved_hup saved_exit lower_key
+    local purple=$'\033[38;5;141m' cyan=$'\033[38;5;45m' green=$'\033[38;5;48m'
+    local yellow=$'\033[38;5;220m' red=$'\033[38;5;203m' dim=$'\033[2m'
+    local bold=$'\033[1m' reset=$'\033[0m'
+    local -a monitor_rows=() refreshed_rows=() core_percent=()
+    local -A previous_rx=() previous_tx=() current_rx=() current_tx=()
+    local -A peak_rx=() peak_tx=() cpu_previous_total=() cpu_previous_idle=()
+
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        fail "Монитор всех IP нужно запускать из интерактивного терминала"
+        return 1
+    fi
+    if ! [[ "$refresh_sec" =~ ^[0-9]+$ ]] || (( refresh_sec < 1 || refresh_sec > 10 )); then
+        refresh_sec=1
+    fi
+
+    mapfile -t monitor_rows < <(list_multi_ip_monitor_interfaces)
+    if (( ${#monitor_rows[@]} == 0 )); then
+        fail "Не найдено IPv4-интерфейсов с рабочим source-route"
+        return 1
+    fi
+
+    for row in "${monitor_rows[@]}"; do
+        IFS=$'\t' read -r interface ip_list kind <<< "$row"
+        rx=0
+        tx=0
+        if [[ -r "/sys/class/net/${interface}/statistics/rx_bytes" ]]; then
+            IFS= read -r rx < "/sys/class/net/${interface}/statistics/rx_bytes" || rx=0
+        fi
+        if [[ -r "/sys/class/net/${interface}/statistics/tx_bytes" ]]; then
+            IFS= read -r tx < "/sys/class/net/${interface}/statistics/tx_bytes" || tx=0
+        fi
+        [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+        [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+        previous_rx["$interface"]="$rx"
+        previous_tx["$interface"]="$tx"
+        peak_rx["$interface"]=0
+        peak_tx["$interface"]=0
+    done
+
+    while IFS=$' \t' read -r label user nice system idle iowait irq softirq steal _; do
+        [[ "$label" == "cpu" || "$label" =~ ^cpu[0-9]+$ ]] || break
+        total=$(( ${user:-0} + ${nice:-0} + ${system:-0} + ${idle:-0} + ${iowait:-0} + ${irq:-0} + ${softirq:-0} + ${steal:-0} ))
+        idle_total=$(( ${idle:-0} + ${iowait:-0} ))
+        cpu_previous_total["$label"]="$total"
+        cpu_previous_idle["$label"]="$idle_total"
+    done < /proc/stat
+
+    previous_ms="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
+    saved_int="$(trap -p INT || true)"
+    saved_term="$(trap -p TERM || true)"
+    saved_hup="$(trap -p HUP || true)"
+    saved_exit="$(trap -p EXIT || true)"
+    trap 'monitor_stop=1' INT TERM HUP
+    trap 'printf "\033[0m\033[?25h\033[?1049l"' EXIT
+
+    printf '\033[?1049h\033[2J\033[H\033[?25l'
+    printf '%bСобираю первую сетевую и CPU-выборку...%b' "$purple" "$reset"
+
+    while (( monitor_stop == 0 )); do
+        key=""
+        if IFS= read -rsn1 -t "$refresh_sec" key; then
+            lower_key="${key,,}"
+            if [[ "$lower_key" == "q" ]]; then
+                break
+            fi
+            if [[ "$lower_key" == "r" ]]; then
+                mapfile -t refreshed_rows < <(list_multi_ip_monitor_interfaces)
+                if (( ${#refreshed_rows[@]} > 0 )); then
+                    monitor_rows=("${refreshed_rows[@]}")
+                    for row in "${monitor_rows[@]}"; do
+                        IFS=$'\t' read -r interface ip_list kind <<< "$row"
+                        if [[ -z "${previous_rx[$interface]+set}" ]]; then
+                            rx=0
+                            tx=0
+                            if [[ -r "/sys/class/net/${interface}/statistics/rx_bytes" ]]; then
+                                IFS= read -r rx < "/sys/class/net/${interface}/statistics/rx_bytes" || rx=0
+                            fi
+                            if [[ -r "/sys/class/net/${interface}/statistics/tx_bytes" ]]; then
+                                IFS= read -r tx < "/sys/class/net/${interface}/statistics/tx_bytes" || tx=0
+                            fi
+                            [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+                            [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+                            previous_rx["$interface"]="$rx"
+                            previous_tx["$interface"]="$tx"
+                            peak_rx["$interface"]=0
+                            peak_tx["$interface"]=0
+                        fi
+                    done
+                fi
+            fi
+        fi
+        (( monitor_stop == 0 )) || break
+
+        now_ms="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")"
+        elapsed_ms=$(( now_ms - previous_ms ))
+        (( elapsed_ms >= 100 )) || elapsed_ms=$(( refresh_sec * 1000 ))
+        previous_ms="$now_ms"
+        current_rx=()
+        current_tx=()
+        total_rx_bps=0
+        total_tx_bps=0
+        max_activity=0
+
+        for row in "${monitor_rows[@]}"; do
+            IFS=$'\t' read -r interface ip_list kind <<< "$row"
+            rx=0
+            tx=0
+            if [[ -r "/sys/class/net/${interface}/statistics/rx_bytes" ]]; then
+                IFS= read -r rx < "/sys/class/net/${interface}/statistics/rx_bytes" || rx=0
+            fi
+            if [[ -r "/sys/class/net/${interface}/statistics/tx_bytes" ]]; then
+                IFS= read -r tx < "/sys/class/net/${interface}/statistics/tx_bytes" || tx=0
+            fi
+            [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+            [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+            previous="${previous_rx[$interface]:-$rx}"
+            delta=$(( rx - previous ))
+            (( delta >= 0 )) || delta=0
+            rx_bps=$(( delta * 8000 / elapsed_ms ))
+            previous="${previous_tx[$interface]:-$tx}"
+            delta=$(( tx - previous ))
+            (( delta >= 0 )) || delta=0
+            tx_bps=$(( delta * 8000 / elapsed_ms ))
+            previous_rx["$interface"]="$rx"
+            previous_tx["$interface"]="$tx"
+            current_rx["$interface"]="$rx_bps"
+            current_tx["$interface"]="$tx_bps"
+            (( rx_bps > ${peak_rx[$interface]:-0} )) && peak_rx["$interface"]="$rx_bps"
+            (( tx_bps > ${peak_tx[$interface]:-0} )) && peak_tx["$interface"]="$tx_bps"
+            total_rx_bps=$(( total_rx_bps + rx_bps ))
+            total_tx_bps=$(( total_tx_bps + tx_bps ))
+            activity=$(( rx_bps + tx_bps ))
+            (( activity > max_activity )) && max_activity="$activity"
+        done
+
+        core_percent=()
+        cpu_average=0
+        core_count=0
+        while IFS=$' \t' read -r label user nice system idle iowait irq softirq steal _; do
+            [[ "$label" == "cpu" || "$label" =~ ^cpu[0-9]+$ ]] || break
+            total=$(( ${user:-0} + ${nice:-0} + ${system:-0} + ${idle:-0} + ${iowait:-0} + ${irq:-0} + ${softirq:-0} + ${steal:-0} ))
+            idle_total=$(( ${idle:-0} + ${iowait:-0} ))
+            previous_total="${cpu_previous_total[$label]:-$total}"
+            previous_idle="${cpu_previous_idle[$label]:-$idle_total}"
+            total_delta=$(( total - previous_total ))
+            idle_delta=$(( idle_total - previous_idle ))
+            if (( total_delta > 0 )); then
+                busy_delta=$(( total_delta - idle_delta ))
+                (( busy_delta >= 0 )) || busy_delta=0
+                percent=$(( (busy_delta * 100 + total_delta / 2) / total_delta ))
+            else
+                percent=0
+            fi
+            (( percent > 100 )) && percent=100
+            cpu_previous_total["$label"]="$total"
+            cpu_previous_idle["$label"]="$idle_total"
+            if [[ "$label" == "cpu" ]]; then
+                cpu_average="$percent"
+            else
+                core="${label#cpu}"
+                core_percent[$(( 10#$core ))]="$percent"
+                core_count=$(( core_count + 1 ))
+            fi
+        done < /proc/stat
+        if [[ -r /proc/loadavg ]]; then
+            IFS=$' \t' read -r load1 load5 load15 _ < /proc/loadavg || true
+        fi
+
+        cols="$(tput cols 2>/dev/null || printf '120')"
+        lines="$(tput lines 2>/dev/null || printf '40')"
+        [[ "$cols" =~ ^[0-9]+$ ]] || cols=120
+        [[ "$lines" =~ ^[0-9]+$ ]] || lines=40
+        (( cols >= 60 )) || cols=60
+        (( lines >= 12 )) || lines=12
+        network_count="${#monitor_rows[@]}"
+
+        cpu_columns=$(( cols / 23 ))
+        (( cpu_columns >= 1 )) || cpu_columns=1
+        (( cpu_columns <= 8 )) || cpu_columns=8
+        available_cpu_rows=$(( lines - network_count - 11 ))
+        if (( available_cpu_rows > 0 )); then
+            needed_cpu_columns=$(( (core_count + available_cpu_rows - 1) / available_cpu_rows ))
+            max_cpu_columns=$(( cols / 16 ))
+            (( max_cpu_columns >= 1 )) || max_cpu_columns=1
+            (( max_cpu_columns <= 12 )) || max_cpu_columns=12
+            if (( needed_cpu_columns > cpu_columns && needed_cpu_columns <= max_cpu_columns )); then
+                cpu_columns="$needed_cpu_columns"
+            fi
+        fi
+        (( cpu_columns > core_count && core_count > 0 )) && cpu_columns="$core_count"
+        (( cpu_columns >= 1 )) || cpu_columns=1
+        cpu_rows=$(( (core_count + cpu_columns - 1) / cpu_columns ))
+        visible_network_count="$network_count"
+        if (( network_count + cpu_rows + 10 > lines )); then
+            visible_network_count=$(( lines - cpu_rows - 10 ))
+            (( visible_network_count >= 1 )) || visible_network_count=1
+            (( visible_network_count <= network_count )) || visible_network_count="$network_count"
+        fi
+        hidden_network_count=$(( network_count - visible_network_count ))
+
+        ip_width=22
+        interface_width=9
+        rate_width=11
+        show_peaks=0
+        show_activity=0
+        activity_width=12
+        if (( cols >= 100 )); then
+            ip_width=27
+            interface_width=10
+            show_peaks=1
+        fi
+        if (( cols >= 132 )); then
+            ip_width=30
+            rate_width=12
+            show_activity=1
+            activity_width=$(( cols - ip_width - interface_width - rate_width * 4 - 10 ))
+            (( activity_width >= 8 )) || activity_width=8
+            (( activity_width <= 24 )) || activity_width=24
+        fi
+
+        printf -v timestamp '%(%H:%M:%S)T' -1
+        screen="${bold}${purple}kto LIVE${reset}  ${bold}Все IP + CPU${reset}  ${dim}${timestamp} · обновление ${refresh_sec}с${reset}"$'\n'
+        screen+="${dim}Скорость считается по интерфейсам; пики — с момента запуска этого экрана.${reset}"$'\n\n'
+        screen+="${bold}${cyan}СЕТЬ${reset}  ${dim}${network_count} интерфейс(ов)${reset}"$'\n'
+        if (( show_peaks == 1 )); then
+            printf -v header_text "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s %${rate_width}s %${rate_width}s" \
+                "IP" "ИНТЕРФЕЙС" "DOWN" "UP" "ПИК DOWN" "ПИК UP"
+        else
+            printf -v header_text "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s" \
+                "IP" "ИНТЕРФЕЙС" "DOWN" "UP"
+        fi
+        if (( show_activity == 1 )); then
+            printf -v line " %-${activity_width}s" "АКТИВНОСТЬ"
+            header_text+="$line"
+        fi
+        screen+="${dim}${header_text}${reset}"$'\n'
+
+        alias_interfaces=0
+        for row in "${monitor_rows[@]}"; do
+            IFS=$'\t' read -r interface ip_list kind <<< "$row"
+            [[ "$ip_list" == *,* ]] && alias_interfaces=$(( alias_interfaces + 1 ))
+        done
+        network_index=0
+        for row in "${monitor_rows[@]}"; do
+            (( network_index < visible_network_count )) || break
+            IFS=$'\t' read -r interface ip_list kind <<< "$row"
+            multi_ip_monitor_fit_text ip_text "$ip_list" "$ip_width"
+            multi_ip_monitor_format_rate rx_text "${current_rx[$interface]:-0}"
+            multi_ip_monitor_format_rate tx_text "${current_tx[$interface]:-0}"
+            if (( show_peaks == 1 )); then
+                multi_ip_monitor_format_rate peak_rx_text "${peak_rx[$interface]:-0}"
+                multi_ip_monitor_format_rate peak_tx_text "${peak_tx[$interface]:-0}"
+                printf -v line "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s %${rate_width}s %${rate_width}s" \
+                    "$ip_text" "$interface" "$rx_text" "$tx_text" "$peak_rx_text" "$peak_tx_text"
+            else
+                printf -v line "%-${ip_width}s %-${interface_width}s %${rate_width}s %${rate_width}s" \
+                    "$ip_text" "$interface" "$rx_text" "$tx_text"
+            fi
+            if (( show_activity == 1 )); then
+                activity=$(( ${current_rx[$interface]:-0} + ${current_tx[$interface]:-0} ))
+                if (( max_activity > 0 )); then
+                    percent=$(( activity * 100 / max_activity ))
+                else
+                    percent=0
+                fi
+                multi_ip_monitor_make_bar bar "$percent" "$activity_width"
+                line+=" ${green}${bar}${reset}"
+            fi
+            screen+="${line}"$'\n'
+            network_index=$(( network_index + 1 ))
+        done
+        if (( hidden_network_count > 0 )); then
+            screen+="${yellow}Ещё ${hidden_network_count} интерфейс(ов) скрыто: увеличьте высоту терминала.${reset}"$'\n'
+        fi
+        multi_ip_monitor_format_rate rx_text "$total_rx_bps"
+        multi_ip_monitor_format_rate tx_text "$total_tx_bps"
+        screen+="${bold}ИТОГО: ↓ ${rx_text}  ↑ ${tx_text}${reset}"$'\n'
+        if (( alias_interfaces > 0 )); then
+            screen+="${yellow}На ${alias_interfaces} интерфейс(ах) несколько IP — для них показан общий трафик интерфейса.${reset}"$'\n'
+        fi
+
+        screen+=$'\n'
+        screen+="${bold}${purple}CPU ПО ЯДРАМ${reset}  среднее ${bold}${cpu_average}%${reset}  ${dim}load ${load1} ${load5} ${load15}${reset}"$'\n'
+        cpu_cell_width=$(( cols / cpu_columns ))
+        cpu_bar_width=$(( cpu_cell_width - 12 ))
+        (( cpu_bar_width >= 4 )) || cpu_bar_width=4
+        (( cpu_bar_width <= 18 )) || cpu_bar_width=18
+        for (( network_index = 0; network_index < cpu_rows; network_index++ )); do
+            line=""
+            for (( activity = 0; activity < cpu_columns; activity++ )); do
+                core=$(( network_index * cpu_columns + activity ))
+                (( core < core_count )) || continue
+                percent="${core_percent[$core]:-0}"
+                multi_ip_monitor_make_bar bar "$percent" "$cpu_bar_width"
+                if (( percent >= 85 )); then
+                    cpu_color="$red"
+                elif (( percent >= 60 )); then
+                    cpu_color="$yellow"
+                else
+                    cpu_color="$green"
+                fi
+                printf -v cell 'C%02d [%b%s%b] %3d%%' "$core" "$cpu_color" "$bar" "$reset" "$percent"
+                padding=$(( cpu_cell_width - cpu_bar_width - 11 ))
+                (( padding >= 1 )) || padding=1
+                printf -v header_text '%*s' "$padding" ''
+                line+="${cell}${header_text}"
+            done
+            screen+="${line}"$'\n'
+        done
+        screen+="${dim}q — выход · r — заново найти IP и интерфейсы${reset}"
+
+        printf '\033[H%s\033[J' "$screen"
+    done
+
+    printf '\033[0m\033[?25h\033[?1049l'
+    if [[ -n "$saved_int" ]]; then eval "$saved_int"; else trap - INT; fi
+    if [[ -n "$saved_term" ]]; then eval "$saved_term"; else trap - TERM; fi
+    if [[ -n "$saved_hup" ]]; then eval "$saved_hup"; else trap - HUP; fi
+    if [[ -n "$saved_exit" ]]; then eval "$saved_exit"; else trap - EXIT; fi
     return 0
 }
 
@@ -4550,7 +4967,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v337"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v338"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -4563,7 +4980,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v337"
+KTO_HAPROXY_FIREWALL_BUILD="v338"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -13706,6 +14123,8 @@ menu() {
     if [[ "$MACHINE_MODE" == "whitelist" ]]; then
         labels+=("btop")
         actions+=("btop")
+        labels+=("Монитор всех IP + CPU")
+        actions+=("multi-ip-monitor")
         labels+=("HAProxy")
         actions+=("haproxy")
         if mobile443_lte_configured; then
@@ -13769,6 +14188,7 @@ menu() {
         ipcheck-place) ipcheck_place ;;
         ipcheck-region) ipcheck_region ;;
         btop) run_btop_for_ip || true ;;
+        multi-ip-monitor) run_multi_ip_cpu_monitor || true ;;
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
         haproxy-update) update_haproxy_existing_config ;;
@@ -13835,6 +14255,7 @@ main() {
         ipcheck-place) ipcheck_place "${2:-}" ;;
         ipcheck-region) ipcheck_region "${2:-}" ;;
         btop|btop-ip|monitor-ip) run_btop_for_ip "${2:-}" ;;
+        btop-all|monitor-all|multi-ip-monitor) run_multi_ip_cpu_monitor ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
         haproxy-update|update-haproxy|haproxy-refresh) update_haproxy_existing_config ;;
