@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v340"
+SCRIPT_BUILD="v341"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -2577,8 +2577,11 @@ apply_whitelist_ssh_rules() {
 ufw_add_rule_first() {
     command_exists ufw || return 1
 
-    # UFW rejects `insert 1` when its IPv4 rule list is empty on some
-    # releases. A normal add becomes rule 1 in that case.
+    # `prepend` works for both empty and populated rule lists. Keep fallbacks
+    # for older UFW releases which do not implement it.
+    if "${SUDO[@]}" ufw prepend "$@" >> "$LOG_FILE" 2>&1; then
+        return 0
+    fi
     if "${SUDO[@]}" ufw insert 1 "$@" >> "$LOG_FILE" 2>&1; then
         return 0
     fi
@@ -2694,7 +2697,7 @@ ensure_global_ssh_ufw_rule() {
 
     mapfile -t numbers < <(ufw_global_allow_rule_numbers_for_port "$port")
     if ! printf '%s\n' "${numbers[@]}" | grep -qx '1'; then
-        fail "UFW: SSH-порт ${port}/tcp открыт не выше блокирующих правил"
+        fail "UFW: SSH-порт ${port}/tcp не удалось поставить выше блокирующих правил"
         return 1
     fi
 }
@@ -2751,12 +2754,13 @@ for number in "\${rules[@]}"; do
     [[ "\$number" =~ ^[0-9]+\$ ]] || continue
     ufw --force delete "\$number" >/dev/null 2>&1 || true
 done
-if ! ufw insert 1 allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1; then
-    ufw allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1 || true
+if ! ufw prepend allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1; then
+    ufw insert 1 allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1 ||
+        ufw allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1 || true
 fi
 mapfile -t rules < <(global_rule_numbers)
 if printf '%s\n' "\${rules[@]}" | grep -qx '1'; then
-    logger -t kto-ssh-firewall-guard "restored global SSH allow at rule 1 for port \${SSH_PORT}"
+    logger -t kto-ssh-firewall-guard "restored global SSH allow for port \${SSH_PORT}"
 else
     logger -t kto-ssh-firewall-guard "failed to restore SSH allow for port \${SSH_PORT}"
     exit 1
@@ -3576,8 +3580,9 @@ prioritize_managed_ssh() {
         [[ "\$number" =~ ^[0-9]+\$ ]] || continue
         ufw --force delete "\$number" >/dev/null 2>&1 || true
     done
-    if ! ufw insert 1 allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1; then
-        ufw allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1 || return 1
+    if ! ufw prepend allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1; then
+        ufw insert 1 allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1 ||
+            ufw allow proto tcp to any port "\$SSH_PORT" comment 'kto-ssh-open' >/dev/null 2>&1 || return 1
     fi
     mapfile -t rules < <(global_ssh_rule_numbers)
     printf '%s\n' "\${rules[@]}" | grep -qx '1'
@@ -3617,7 +3622,8 @@ if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
             for _ in {1..16}; do
                 ufw --force delete allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" >/dev/null 2>&1 || break
             done
-            ufw insert 1 allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 ||
+            ufw prepend allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 ||
+                ufw insert 1 allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 ||
                 ufw allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 || true
         done < "\$TRUSTED_FILE"
     else
@@ -5033,7 +5039,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v340"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v341"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5046,7 +5052,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v340"
+KTO_HAPROXY_FIREWALL_BUILD="v341"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0

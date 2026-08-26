@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v340"', KTO)
-        self.assertIn('PUSH_BUILD="v340"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v340"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v340"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v340"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v340"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v340"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v340"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v341"', KTO)
+        self.assertIn('PUSH_BUILD="v341"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v341"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v341"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v341"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v341"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v341"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v341"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2871,9 +2871,9 @@ ufw() {
     printf 'ufw %s\n' "$*" >> "$events"
     if [[ "${1:-}" == --force && "${2:-}" == delete ]]; then
         rm -f "$state"
-    elif [[ "${1:-}" == insert && ! -e "$state" ]]; then
+    elif [[ "${1:-}" == prepend || "${1:-}" == insert ]]; then
         return 1
-    elif [[ "${1:-}" == insert || "${1:-}" == allow ]]; then
+    elif [[ "${1:-}" == allow ]]; then
         printf '1\n' > "$state"
     fi
 }
@@ -2881,12 +2881,14 @@ ufw() {
 ensure_global_ssh_ufw_rule 23456
 [[ "$(cat "$state")" == 1 ]]
 grep -Fqx 'ufw --force delete 4' "$events"
+grep -Fqx 'ufw prepend allow proto tcp to any port 23456 comment kto-ssh-open' "$events"
 grep -Fqx 'ufw insert 1 allow proto tcp to any port 23456 comment kto-ssh-open' "$events"
 grep -Fqx 'ufw allow proto tcp to any port 23456 comment kto-ssh-open' "$events"
 
 install_ssh_firewall_guard
 bash -n "$KTO_SSH_FIREWALL_GUARD"
 grep -Fq "PORT_FILE='$KTO_SSH_PORT_FILE'" "$KTO_SSH_FIREWALL_GUARD"
+grep -Fq 'ufw prepend allow proto tcp' "$KTO_SSH_FIREWALL_GUARD"
 grep -Fq 'ufw insert 1 allow proto tcp' "$KTO_SSH_FIREWALL_GUARD"
 grep -Fq 'ufw allow proto tcp' "$KTO_SSH_FIREWALL_GUARD"
 grep -Fq 'OnUnitActiveSec=60s' "$KTO_SSH_FIREWALL_GUARD_TIMER_UNIT"
@@ -2963,6 +2965,7 @@ grep -Fq 'flock -u 9' "$ANTISCANNER_SCRIPT"
         push_priority = function_body(PUSH, "ensure_ufw_ssh_open_rule_first")
         self.assertIn("grep -qx '1'", ensure_global)
         self.assertIn('ufw_add_rule_first allow proto tcp', ensure_global)
+        self.assertIn('ufw prepend "$@"', function_body(KTO, "ufw_add_rule_first"))
         self.assertIn('ufw "$@"', function_body(KTO, "ufw_add_rule_first"))
         self.assertIn("OnUnitActiveSec=60s", KTO)
         self.assertIn("kto-ssh-firewall-guard", KTO)
@@ -2980,6 +2983,7 @@ grep -Fq 'flock -u 9' "$ANTISCANNER_SCRIPT"
         self.assertIn("ufw insert 1 allow proto tcp from \"\\$trusted_ip\"", KTO)
         self.assertIn('[[ "$KTO_PUSH_NODE_KIND" == "wl" ]] || return 0', push_apply)
         self.assertIn('ufw_add_rule_first allow proto tcp from "$ip"', push_apply)
+        self.assertIn('ufw prepend "$@"', function_body(PUSH, "ufw_add_rule_first"))
         self.assertIn('ufw "$@"', function_body(PUSH, "ufw_add_rule_first"))
         self.assertIn("fail2ban-client set sshd addignoreip", push_sync)
         self.assertIn("fail2ban-client set sshd unbanip", push_sync)
@@ -3040,7 +3044,7 @@ ufw() {
         return 0
     fi
     printf 'ufw %s\n' "$*" >> "$events"
-    if [[ "${1:-}" == "insert" ]]; then
+    if [[ "${1:-}" == "prepend" || "${1:-}" == "insert" ]]; then
         return 1
     fi
     if [[ "$*" == *"comment kto-ssh-open"* ]]; then
@@ -3053,6 +3057,7 @@ systemctl() { [[ "${1:-}" == "is-active" ]]; }
 fail2ban-client() { printf 'f2b %s\n' "$*" >> "$events"; }
 
 apply_collector_ssh_ips '{}'
+grep -q '^ufw prepend allow proto tcp from 85.192.48.122 to any port 22 comment kto-ssh$' "$events"
 grep -q '^ufw insert 1 allow proto tcp from 85.192.48.122 to any port 22 comment kto-ssh$' "$events"
 grep -q '^ufw allow proto tcp from 85.192.48.122 to any port 22 comment kto-ssh$' "$events"
 grep -q '^f2b set sshd addignoreip 203.0.113.77$' "$events"
@@ -3061,6 +3066,7 @@ grep -q '^ignoreip = 127.0.0.1/8 ::1 203.0.113.77 85.192.48.122$' "$KTO_FAIL2BAN
 
 apply_collector_ssh_firewall_mode '{"ssh_firewall_open":true}'
 [[ -e "$open_state" ]]
+grep -q '^ufw prepend allow proto tcp to any port 22 comment kto-ssh-open$' "$events"
 grep -q '^ufw insert 1 allow proto tcp to any port 22 comment kto-ssh-open$' "$events"
 grep -q '^ufw allow proto tcp to any port 22 comment kto-ssh-open$' "$events"
 apply_collector_ssh_firewall_mode '{"ssh_firewall_open":false}'
@@ -3762,7 +3768,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v340"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v341"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 
