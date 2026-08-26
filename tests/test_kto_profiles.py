@@ -45,14 +45,14 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v341"', KTO)
-        self.assertIn('PUSH_BUILD="v341"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v341"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v341"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v341"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v341"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v341"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v341"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v342"', KTO)
+        self.assertIn('PUSH_BUILD="v342"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v342"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v342"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v342"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v342"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v342"', HAPROXY_BANDWIDTH)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v342"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -2868,6 +2868,10 @@ ufw() {
         printf '[ %s] 23456/tcp ALLOW IN Anywhere # kto-ssh-open\n' "$(cat "$state")"
         return 0
     fi
+    if [[ "${1:-}" == status ]]; then
+        printf 'Status: active\n'
+        return 0
+    fi
     printf 'ufw %s\n' "$*" >> "$events"
     if [[ "${1:-}" == --force && "${2:-}" == delete ]]; then
         rm -f "$state"
@@ -2892,6 +2896,64 @@ grep -Fq 'ufw prepend allow proto tcp' "$KTO_SSH_FIREWALL_GUARD"
 grep -Fq 'ufw insert 1 allow proto tcp' "$KTO_SSH_FIREWALL_GUARD"
 grep -Fq 'ufw allow proto tcp' "$KTO_SSH_FIREWALL_GUARD"
 grep -Fq 'OnUnitActiveSec=60s' "$KTO_SSH_FIREWALL_GUARD_TIMER_UNIT"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_root_ssh_rule_is_staged_safely_while_ufw_is_inactive(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+source <(sed '/^main /d' kto.sh)
+root="$(mktemp -d)"
+trap 'rm -rf "$root"' EXIT
+SUDO=()
+LOG_FILE="$root/kto.log"
+state="$root/rule"
+events="$root/events"
+printf 'old-declaration\n' > "$state"
+
+command_exists() { return 0; }
+ufw() {
+    local IFS=' '
+    if [[ "${1:-}" == status ]]; then
+        printf 'Status: inactive\n'
+        return 0
+    fi
+    if [[ "${1:-}" == show && "${2:-}" == added ]]; then
+        if [[ -e "$state" ]]; then
+            printf "ufw allow proto tcp from any to any port 24567 comment 'kto-ssh-open'\n"
+        fi
+        return 0
+    fi
+    printf 'ufw %s\n' "$*" >> "$events"
+    if [[ "${1:-}" == --force && "${2:-}" == delete ]]; then
+        rm -f "$state"
+        return 0
+    fi
+    if [[ "${1:-}" == prepend ]]; then
+        printf 'prepended\n' > "$state"
+        return 0
+    fi
+    return 1
+}
+
+ensure_global_ssh_ufw_rule 24567
+[[ "$(cat "$state")" == prepended ]]
+grep -Fqx 'ufw --force delete allow proto tcp to any port 24567' "$events"
+grep -Fqx 'ufw prepend allow proto tcp to any port 24567 comment kto-ssh-open' "$events"
+! grep -q '^ufw insert ' "$events"
+grep -Fq 'ufw inactive: staged managed SSH allow 24567/tcp with prepend' "$LOG_FILE"
 '''
         result = subprocess.run(
             [bash, "-lc", harness],
@@ -2965,6 +3027,7 @@ grep -Fq 'flock -u 9' "$ANTISCANNER_SCRIPT"
         push_priority = function_body(PUSH, "ensure_ufw_ssh_open_rule_first")
         self.assertIn("grep -qx '1'", ensure_global)
         self.assertIn('ufw_add_rule_first allow proto tcp', ensure_global)
+        self.assertIn('ufw_global_allow_declared_for_port "$port"', ensure_global)
         self.assertIn('ufw prepend "$@"', function_body(KTO, "ufw_add_rule_first"))
         self.assertIn('ufw "$@"', function_body(KTO, "ufw_add_rule_first"))
         self.assertIn("OnUnitActiveSec=60s", KTO)
@@ -3768,7 +3831,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v341"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v342"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 

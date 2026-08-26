@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v341"
+SCRIPT_BUILD="v342"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -2642,6 +2642,41 @@ ufw_global_allow_exists_for_port() {
     '
 }
 
+ufw_global_allow_declared_for_port() {
+    local port="$1"
+    command_exists ufw || return 1
+    "${SUDO[@]}" ufw show added 2>/dev/null | awk -v port="$port" '
+        $1 == "ufw" {
+            is_allow = is_tcp = is_port = 0
+            is_input = is_global = 1
+            for (i = 2; i <= NF; i++) {
+                if ($i == "allow") is_allow = 1
+                if ($i == "route" || $i == "out") is_input = 0
+                if ($i == "proto" && $(i + 1) == "tcp") is_tcp = 1
+                if ($i == port "/tcp") {
+                    is_tcp = 1
+                    is_port = 1
+                }
+                if ($i == "port" && $(i + 1) == port) is_port = 1
+                if ($i == "from" && $(i + 1) != "any" &&
+                    $(i + 1) != "0.0.0.0/0" && $(i + 1) != "::/0") is_global = 0
+            }
+            if (is_allow && is_tcp && is_port && is_input && is_global) found = 1
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+remove_inactive_ufw_global_allow_rules_for_port() {
+    local port="$1"
+    "${SUDO[@]}" ufw --force delete allow proto tcp to any port "$port" >> "$LOG_FILE" 2>&1 || true
+    "${SUDO[@]}" ufw --force delete allow "${port}/tcp" >> "$LOG_FILE" 2>&1 || true
+    if [[ "$port" == "22" ]]; then
+        "${SUDO[@]}" ufw --force delete allow ssh >> "$LOG_FILE" 2>&1 || true
+        "${SUDO[@]}" ufw --force delete allow OpenSSH >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
 ufw_global_allow_rule_numbers_for_port() {
     local port="$1"
     command_exists ufw || return 0
@@ -2673,25 +2708,46 @@ remove_ufw_allow_rules_for_port() {
         [[ "$number" =~ ^[0-9]+$ ]] || continue
         "${SUDO[@]}" ufw --force delete "$number" >> "$LOG_FILE" 2>&1 || true
     done
+    if ! ufw_active; then
+        remove_inactive_ufw_global_allow_rules_for_port "$port"
+    fi
 }
 
 ensure_global_ssh_ufw_rule() {
-    local port="$1" number
+    local port="$1" number ufw_was_active=0
     local -a numbers=()
     command_exists ufw || return 0
-    mapfile -t numbers < <(ufw_global_allow_rule_numbers_for_port "$port")
-    if printf '%s\n' "${numbers[@]}" | grep -qx '1'; then
-        return 0
-    fi
+    ufw_active && ufw_was_active=1 || true
 
-    # AntiScanner adds deny rules with `insert 1`. Recreate the managed SSH
-    # allow at the very top so a matching blacklist entry cannot lock us out.
-    for number in "${numbers[@]}"; do
-        [[ "$number" =~ ^[0-9]+$ ]] || continue
-        "${SUDO[@]}" ufw --force delete "$number" >> "$LOG_FILE" 2>&1 || true
-    done
+    if (( ufw_was_active == 1 )); then
+        mapfile -t numbers < <(ufw_global_allow_rule_numbers_for_port "$port")
+        if printf '%s\n' "${numbers[@]}" | grep -qx '1'; then
+            return 0
+        fi
+
+        # AntiScanner adds deny rules with `insert 1`. Recreate the managed SSH
+        # allow at the very top so a matching blacklist entry cannot lock us out.
+        for number in "${numbers[@]}"; do
+            [[ "$number" =~ ^[0-9]+$ ]] || continue
+            "${SUDO[@]}" ufw --force delete "$number" >> "$LOG_FILE" 2>&1 || true
+        done
+    else
+        # `ufw status numbered` hides configured rules while UFW is inactive.
+        # Delete an older equivalent declaration so `prepend` cannot skip it as
+        # a duplicate left by an interrupted migration.
+        remove_inactive_ufw_global_allow_rules_for_port "$port"
+    fi
     if ! ufw_add_rule_first allow proto tcp to any port "$port" comment 'kto-ssh-open'; then
         fail "UFW: не удалось открыть SSH-порт ${port}/tcp"
+        return 1
+    fi
+
+    if (( ufw_was_active == 0 )); then
+        if ufw_global_allow_declared_for_port "$port"; then
+            echo "ufw inactive: staged managed SSH allow ${port}/tcp with prepend" >> "$LOG_FILE"
+            return 0
+        fi
+        fail "UFW: правило SSH ${port}/tcp не сохранилось в конфигурации"
         return 1
     fi
 
@@ -2969,7 +3025,11 @@ opt_ssh_root_access() {
     fi
     run_systemctl_bounded 3 is-enabled --quiet ssh.socket 2>/dev/null && socket_was_enabled=1 || true
     run_systemctl_bounded 3 is-active --quiet ssh.socket 2>/dev/null && socket_was_active=1 || true
-    ufw_global_allow_exists_for_port "$new_port" && new_rule_existed=1 || true
+    if ufw_active; then
+        ufw_global_allow_exists_for_port "$new_port" && new_rule_existed=1 || true
+    else
+        ufw_global_allow_declared_for_port "$new_port" && new_rule_existed=1 || true
+    fi
 
     main_tmp="$(mktemp)"
     if (( had_main == 1 )); then
@@ -5039,7 +5099,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v341"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v342"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5052,7 +5112,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v341"
+KTO_HAPROXY_FIREWALL_BUILD="v342"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
