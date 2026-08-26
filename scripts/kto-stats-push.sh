@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v339"
+PUSH_BUILD="v340"
 KTO_SSH_PORT_FILE="${KTO_SSH_PORT_FILE:-/etc/kto-ssh-port}"
 KTO_UFW_LOCK_FILE="${KTO_UFW_LOCK_FILE:-/run/lock/kto-ufw.lock}"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
@@ -402,6 +402,13 @@ ufw_active() {
     command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"
 }
 
+ufw_add_rule_first() {
+    if ufw insert 1 "$@" >/dev/null 2>&1; then
+        return 0
+    fi
+    ufw "$@" >/dev/null 2>&1
+}
+
 ufw_ssh_rule_exists() {
     local rule="$1"
     local ip="$2"
@@ -472,7 +479,10 @@ ensure_ufw_ssh_open_rule_first() {
         [[ "$number" =~ ^[0-9]+$ ]] || continue
         ufw --force delete "$number" >/dev/null 2>&1 || true
     done
-    if ufw insert 1 allow proto tcp to any port "$ssh_port" comment 'kto-ssh-open' >/dev/null 2>&1; then
+    if ufw_add_rule_first allow proto tcp to any port "$ssh_port" comment 'kto-ssh-open'; then
+        mapfile -t numbers < <(ufw_ssh_open_rule_numbers "$ssh_port")
+    fi
+    if printf '%s\n' "${numbers[@]}" | grep -qx '1'; then
         UFW_SSH_OPEN_REPAIRED=1
         [[ -z "$lock_fd" ]] || exec {lock_fd}>&-
         return 0
@@ -554,7 +564,7 @@ apply_collector_ssh_ips() {
         while read -r ip; do
             [[ -n "$ip" ]] || continue
             if ! ufw_ssh_rule_exists "$rule" "$ip"; then
-                if ufw insert 1 allow proto tcp from "$ip" to any port "$ssh_port" comment 'kto-ssh' >/dev/null 2>&1; then
+                if ufw_add_rule_first allow proto tcp from "$ip" to any port "$ssh_port" comment 'kto-ssh'; then
                     applied=$(( applied + 1 ))
                 fi
             fi
