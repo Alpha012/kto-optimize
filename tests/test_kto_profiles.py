@@ -16,6 +16,8 @@ MOBILE443 = (ROOT / "scripts" / "kto-mobile443.sh").read_text(encoding="utf-8")
 ADDITIONAL_IPS = (ROOT / "scripts" / "kto-additional-ips.sh").read_text(encoding="utf-8")
 REMNA_EGRESS = (ROOT / "scripts" / "kto-remnawave-egress.sh").read_text(encoding="utf-8")
 HAPROXY_BANDWIDTH = (ROOT / "scripts" / "kto-haproxy-bandwidth.sh").read_text(encoding="utf-8")
+HAPROXY_GUARD_PATH = ROOT / "scripts" / "kto-haproxy-guard.sh"
+HAPROXY_GUARD = HAPROXY_GUARD_PATH.read_text(encoding="utf-8")
 DPI_PREFLIGHT_PATH = ROOT / "scripts" / "kto-dpi-preflight.py"
 DPI_PREFLIGHT = DPI_PREFLIGHT_PATH.read_text(encoding="utf-8")
 
@@ -45,14 +47,15 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v342"', KTO)
-        self.assertIn('PUSH_BUILD="v342"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v342"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v342"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v342"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v342"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v342"', HAPROXY_BANDWIDTH)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v342"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v343"', KTO)
+        self.assertIn('PUSH_BUILD="v343"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v343"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v343"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v343"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v343"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v343"', HAPROXY_BANDWIDTH)
+        self.assertIn('HAPROXY_GUARD_BUILD="v343"', HAPROXY_GUARD)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v343"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -3217,6 +3220,241 @@ after="$(wc -l < "$events")"
         self.assertIn('haproxy-limit-clear|haproxy-bandwidth-clear', KTO)
         self.assertIn('haproxy-stabilize|haproxy-recover', KTO)
 
+    def test_haproxy_guard_uses_safe_recovery_and_never_deletes_routes(self):
+        installer = function_body(KTO, "install_haproxy_guard")
+        repair = function_body(HAPROXY_GUARD, "repair_health")
+
+        self.assertIn("net.ipv4.ip_nonlocal_bind = 1", installer)
+        self.assertIn("OnUnitActiveSec=30s", installer)
+        self.assertIn("RandomizedDelaySec=3s", installer)
+        self.assertIn("TimeoutStartSec=75", installer)
+        self.assertIn('restore_latest_valid_backup', repair)
+        self.assertIn('trigger_additional_route_repair', repair)
+        self.assertIn('cooldown_ready', repair)
+        self.assertIn('start_or_restart_service reload', repair)
+        self.assertIn('config invalid, but loaded service is active', repair)
+        self.assertNotIn("sed -i", HAPROXY_GUARD)
+        self.assertNotIn("ip address del", HAPROXY_GUARD)
+        self.assertNotIn("ufw delete", HAPROXY_GUARD)
+        self.assertIn('haproxy-guard-install|haproxy-heal-enable', KTO)
+        self.assertIn('13) Автолечение HAProxy', KTO)
+
+    def test_haproxy_guard_starts_valid_config_with_temporarily_missing_ip(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+source <(sed '/^main "$@"/d' scripts/kto-haproxy-guard.sh)
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+mkdir -p "$root/bin" "$root/state" "$root/lock"
+CONFIG="$root/haproxy.cfg"
+STATE_DIR="$root/state"
+LOCK_FILE="$root/lock/guard.lock"
+SERVICE=haproxy.service
+TIMER=kto-haproxy-guard.timer
+FIREWALL_MANAGER="$root/not-installed"
+BACKUP_DIR="$root/backups"
+ADDITIONAL_ROUTE_SERVICE=kto-additional-ip-routes.service
+CONFIG_GRACE_SEC=5
+REPAIR_COOLDOWN_SEC=30
+FIREWALL_INTERVAL_SEC=300
+INVALID_THRESHOLD=2
+LISTENER_THRESHOLD=2
+export FAKE_ROOT="$root"
+
+cat > "$CONFIG" <<'EOF'
+global
+frontend vless_in
+    bind 198.51.100.23:443
+    default_backend vless_pool
+backend vless_pool
+    server xray1 203.0.113.8:443 source 198.51.100.23 check
+EOF
+touch -d '5 minutes ago' "$CONFIG"
+
+cat > "$root/bin/haproxy" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$root/bin/ip" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == '-4 -o address show scope global' ]]; then
+    echo '2: eth0 inet 192.0.2.10/24 scope global eth0'
+fi
+EOF
+cat > "$root/bin/ss" <<'EOF'
+#!/usr/bin/env bash
+if [[ -f "$FAKE_ROOT/active" ]]; then
+    echo 'LISTEN 0 128 198.51.100.23:443 0.0.0.0:* users:(("haproxy",pid=42,fd=7))'
+fi
+EOF
+cat > "$root/bin/sysctl" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    -n)
+        [[ -f "$FAKE_ROOT/nonlocal" ]] && echo 1 || echo 0
+        ;;
+    -w)
+        touch "$FAKE_ROOT/nonlocal"
+        echo 'net.ipv4.ip_nonlocal_bind = 1'
+        ;;
+esac
+EOF
+cat > "$root/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_ROOT/systemctl.log"
+case "$*" in
+    'is-active --quiet haproxy.service') [[ -f "$FAKE_ROOT/active" ]] ;;
+    'is-active kto-haproxy-guard.timer') echo active ;;
+    'cat kto-additional-ip-routes.service') exit 1 ;;
+    'start haproxy.service') touch "$FAKE_ROOT/active" ;;
+    'reset-failed haproxy.service') exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+cat > "$root/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+shift
+exec "$@"
+EOF
+chmod +x "$root/bin/"*
+PATH="$root/bin:$PATH"
+
+prepare_runtime() {
+    mkdir -p "$STATE_DIR" "$(dirname "$LOCK_FILE")"
+}
+
+main repair
+grep -Fqx 'start haproxy.service' "$root/systemctl.log"
+[[ -f "$root/nonlocal" ]]
+[[ -f "$root/active" ]]
+main status > "$root/status"
+grep -Fqx 'Config: valid' "$root/status"
+grep -Fqx 'Service: active' "$root/status"
+grep -Fqx 'Missing route IPs: 198.51.100.23' "$root/status"
+grep -Fqx 'Missing listeners: 0' "$root/status"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_guard_preserves_active_invalid_config_then_restores_verified_backup(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+source <(sed '/^main "$@"/d' scripts/kto-haproxy-guard.sh)
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+mkdir -p "$root/bin" "$root/state" "$root/lock" "$root/backups"
+CONFIG="$root/haproxy.cfg"
+STATE_DIR="$root/state"
+LOCK_FILE="$root/lock/guard.lock"
+SERVICE=haproxy.service
+TIMER=kto-haproxy-guard.timer
+FIREWALL_MANAGER="$root/not-installed"
+BACKUP_DIR="$root/backups"
+ADDITIONAL_ROUTE_SERVICE=kto-additional-ip-routes.service
+CONFIG_GRACE_SEC=5
+REPAIR_COOLDOWN_SEC=30
+FIREWALL_INTERVAL_SEC=300
+INVALID_THRESHOLD=2
+LISTENER_THRESHOLD=2
+export FAKE_ROOT="$root"
+
+printf '%s\n' 'BROKEN' > "$CONFIG"
+touch -d '5 minutes ago' "$CONFIG"
+backup="$BACKUP_DIR/haproxy-verified.cfg"
+cat > "$backup" <<'EOF'
+global
+frontend vless_in
+    bind *:443
+    default_backend vless_pool
+backend vless_pool
+    server xray1 203.0.113.8:443 check
+EOF
+sha256sum "$backup" | awk '{ print $1 }' > "${backup}.sha256"
+touch "$root/active"
+
+cat > "$root/bin/haproxy" <<'EOF'
+#!/usr/bin/env bash
+config="${@: -1}"
+grep -Fq BROKEN "$config" && exit 1
+exit 0
+EOF
+cat > "$root/bin/ip" <<'EOF'
+#!/usr/bin/env bash
+[[ "$*" == '-4 -o address show scope global' ]] &&
+    echo '2: eth0 inet 192.0.2.10/24 scope global eth0'
+EOF
+cat > "$root/bin/ss" <<'EOF'
+#!/usr/bin/env bash
+[[ -f "$FAKE_ROOT/active" ]] && echo 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:* users:(("haproxy",pid=42,fd=7))'
+EOF
+cat > "$root/bin/sysctl" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    -n) [[ -f "$FAKE_ROOT/nonlocal" ]] && echo 1 || echo 0 ;;
+    -w) touch "$FAKE_ROOT/nonlocal"; echo 'net.ipv4.ip_nonlocal_bind = 1' ;;
+esac
+EOF
+cat > "$root/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_ROOT/systemctl.log"
+case "$*" in
+    'is-active --quiet haproxy.service') [[ -f "$FAKE_ROOT/active" ]] ;;
+    'is-active kto-haproxy-guard.timer') echo active ;;
+    'cat kto-additional-ip-routes.service') exit 1 ;;
+    'start haproxy.service') touch "$FAKE_ROOT/active" ;;
+    'reset-failed haproxy.service') exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+cat > "$root/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+shift
+exec "$@"
+EOF
+chmod +x "$root/bin/"*
+PATH="$root/bin:$PATH"
+
+prepare_runtime() { mkdir -p "$STATE_DIR" "$(dirname "$LOCK_FILE")"; }
+
+# Never replace an invalid file while the already-loaded HAProxy worker is alive.
+main repair
+grep -Fqx BROKEN "$CONFIG"
+! compgen -G "$CONFIG.guard-failed-*" >/dev/null
+
+# Once the service is actually down, the second confirmed failure may restore only a verified backup.
+rm -f "$root/active"
+main repair
+! grep -Fq BROKEN "$CONFIG"
+grep -Fq 'frontend vless_in' "$CONFIG"
+[[ -f "$root/active" ]]
+grep -Fqx 'start haproxy.service' "$root/systemctl.log"
+compgen -G "$CONFIG.guard-failed-*" >/dev/null
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_root_file_writer_reports_only_real_content_changes(self):
         bash = bash_executable()
         if bash is None:
@@ -3831,7 +4069,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v342"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v343"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 

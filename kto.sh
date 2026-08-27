@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v342"
+SCRIPT_BUILD="v343"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -77,6 +77,13 @@ HAPROXY_BANDWIDTH_MANAGER="${KTO_HAPROXY_BANDWIDTH_MANAGER:-/usr/local/sbin/kto-
 HAPROXY_BANDWIDTH_CONFIG="${KTO_HAPROXY_BANDWIDTH_CONFIG:-/etc/kto-haproxy-bandwidth.conf}"
 HAPROXY_BANDWIDTH_UNIT="${KTO_HAPROXY_BANDWIDTH_UNIT:-/etc/systemd/system/kto-haproxy-bandwidth.service}"
 HAPROXY_BANDWIDTH_SERVICE="${KTO_HAPROXY_BANDWIDTH_SERVICE:-kto-haproxy-bandwidth.service}"
+HAPROXY_GUARD_MANAGER="${KTO_HAPROXY_GUARD_MANAGER:-/usr/local/sbin/kto-haproxy-guard}"
+HAPROXY_GUARD_UNIT="${KTO_HAPROXY_GUARD_UNIT:-/etc/systemd/system/kto-haproxy-guard.service}"
+HAPROXY_GUARD_TIMER_UNIT="${KTO_HAPROXY_GUARD_TIMER_UNIT:-/etc/systemd/system/kto-haproxy-guard.timer}"
+HAPROXY_GUARD_SERVICE="${KTO_HAPROXY_GUARD_SERVICE:-kto-haproxy-guard.service}"
+HAPROXY_GUARD_TIMER="${KTO_HAPROXY_GUARD_TIMER:-kto-haproxy-guard.timer}"
+HAPROXY_AVAILABILITY_SYSCTL_CONF="${KTO_HAPROXY_AVAILABILITY_SYSCTL_CONF:-/etc/sysctl.d/99-z-kto-haproxy-availability.conf}"
+HAPROXY_GUARD_DISABLED_FILE="${KTO_HAPROXY_GUARD_DISABLED_FILE:-/etc/kto-haproxy-guard.disabled}"
 HAPROXY_BACKEND_MAXCONN=15000
 HAPROXY_GLOBAL_MIN_MAXCONN_DEFAULT=100000
 HAPROXY_GLOBAL_MAX_MAXCONN_DEFAULT=200000
@@ -5099,7 +5106,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v342"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v343"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5112,7 +5119,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v342"
+KTO_HAPROXY_FIREWALL_BUILD="v343"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -5223,6 +5230,184 @@ EOF
     fi
     "${SUDO[@]}" systemctl is-enabled --quiet "$HAPROXY_FIREWALL_SERVICE" 2>/dev/null ||
         cmd "${SUDO[@]}" systemctl enable "$HAPROXY_FIREWALL_SERVICE"
+}
+
+install_haproxy_guard() {
+    local manager_updated=0 unit_updated=0 timer_updated=0 sysctl_updated=0
+
+    "${SUDO[@]}" rm -f "$HAPROXY_GUARD_DISABLED_FILE"
+    install_asset_file scripts/kto-haproxy-guard.sh "$HAPROXY_GUARD_MANAGER" 0755 || return 1
+    manager_updated=1
+
+    if write_root_file_if_changed "$HAPROXY_AVAILABILITY_SYSCTL_CONF" <<'EOF'
+# Keep unrelated HAProxy routes online while a configured floating/additional IP is temporarily absent.
+net.ipv4.ip_nonlocal_bind = 1
+EOF
+    then
+        sysctl_updated="$ROOT_FILE_UPDATED"
+    else
+        fail "Не удалось записать HAProxy availability sysctl"
+        return 1
+    fi
+
+    if write_root_file_if_changed "$HAPROXY_GUARD_UNIT" <<EOF
+[Unit]
+Description=KTO HAProxy safe self-healing guard
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=${HAPROXY_CONFIG_FILE}
+
+[Service]
+Type=oneshot
+ExecStart=${HAPROXY_GUARD_MANAGER} repair
+TimeoutStartSec=75
+Nice=10
+UMask=0077
+EOF
+    then
+        unit_updated="$ROOT_FILE_UPDATED"
+    else
+        fail "Не удалось записать HAProxy guard service"
+        return 1
+    fi
+
+    if write_root_file_if_changed "$HAPROXY_GUARD_TIMER_UNIT" <<EOF
+[Unit]
+Description=Periodic KTO HAProxy health and recovery check
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+AccuracySec=5s
+RandomizedDelaySec=3s
+Unit=${HAPROXY_GUARD_SERVICE}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    then
+        timer_updated="$ROOT_FILE_UPDATED"
+    else
+        fail "Не удалось записать HAProxy guard timer"
+        return 1
+    fi
+
+    if (( manager_updated == 1 || unit_updated == 1 || timer_updated == 1 )); then
+        if ! run_systemctl_bounded 20 daemon-reload >> "$LOG_FILE" 2>&1; then
+            fail "Не удалось обновить systemd для HAProxy guard"
+            return 1
+        fi
+    fi
+    if (( sysctl_updated == 1 )) ||
+        [[ "$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || true)" != "1" ]]; then
+        if ! "${SUDO[@]}" sysctl -w net.ipv4.ip_nonlocal_bind=1 >> "$LOG_FILE" 2>&1; then
+            fail "Не удалось включить HAProxy non-local bind"
+            return 1
+        fi
+    fi
+    if ! run_systemctl_bounded 20 enable --now "$HAPROXY_GUARD_TIMER" >> "$LOG_FILE" 2>&1; then
+        fail "Не удалось включить HAProxy guard timer"
+        return 1
+    fi
+    run_bounded_command 25 "${SUDO[@]}" "$HAPROXY_GUARD_MANAGER" repair >> "$LOG_FILE" 2>&1 || true
+    ok "HAProxy автолечение включено: проверка каждые 30 секунд"
+}
+
+ensure_haproxy_guard() {
+    local current=1
+    if "${SUDO[@]}" test -e "$HAPROXY_GUARD_DISABLED_FILE" 2>/dev/null; then
+        return 0
+    fi
+    if ! "${SUDO[@]}" test -x "$HAPROXY_GUARD_MANAGER" 2>/dev/null ||
+        ! "${SUDO[@]}" grep -Fqx "HAPROXY_GUARD_BUILD=\"${SCRIPT_BUILD}\"" "$HAPROXY_GUARD_MANAGER" 2>/dev/null; then
+        current=0
+    fi
+    if ! "${SUDO[@]}" test -s "$HAPROXY_GUARD_UNIT" 2>/dev/null ||
+        ! "${SUDO[@]}" grep -Fqx "ExecStart=${HAPROXY_GUARD_MANAGER} repair" "$HAPROXY_GUARD_UNIT" 2>/dev/null; then
+        current=0
+    fi
+    if ! "${SUDO[@]}" test -s "$HAPROXY_GUARD_TIMER_UNIT" 2>/dev/null ||
+        ! "${SUDO[@]}" grep -Fqx 'OnUnitActiveSec=30s' "$HAPROXY_GUARD_TIMER_UNIT" 2>/dev/null; then
+        current=0
+    fi
+    if ! root_file_has_line "$HAPROXY_AVAILABILITY_SYSCTL_CONF" 'net.ipv4.ip_nonlocal_bind = 1'; then
+        current=0
+    fi
+    if (( current == 0 )); then
+        install_haproxy_guard
+        return
+    fi
+
+    if [[ "$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || true)" != "1" ]]; then
+        "${SUDO[@]}" sysctl -w net.ipv4.ip_nonlocal_bind=1 >> "$LOG_FILE" 2>&1 || return 1
+    fi
+    if ! run_systemctl_bounded 5 is-enabled --quiet "$HAPROXY_GUARD_TIMER" >/dev/null 2>&1 ||
+        ! run_systemctl_bounded 5 is-active --quiet "$HAPROXY_GUARD_TIMER" >/dev/null 2>&1; then
+        run_systemctl_bounded 20 enable --now "$HAPROXY_GUARD_TIMER" >> "$LOG_FILE" 2>&1 || return 1
+    fi
+}
+
+show_haproxy_guard_status() {
+    header
+    require_haproxy_mode
+    need_root
+    if ! "${SUDO[@]}" test -x "$HAPROXY_GUARD_MANAGER" 2>/dev/null; then
+        warn "HAProxy автолечение ещё не установлено"
+        return 1
+    fi
+    if "${SUDO[@]}" test -e "$HAPROXY_GUARD_DISABLED_FILE" 2>/dev/null; then
+        warn "Фоновая проверка отключена вручную"
+    fi
+    run_bounded_command 25 "${SUDO[@]}" "$HAPROXY_GUARD_MANAGER" status
+}
+
+repair_haproxy_with_guard() {
+    header
+    require_haproxy_mode
+    need_root
+    ensure_haproxy_guard || return 1
+    run_bounded_command 75 "${SUDO[@]}" "$HAPROXY_GUARD_MANAGER" repair
+    run_bounded_command 25 "${SUDO[@]}" "$HAPROXY_GUARD_MANAGER" status
+}
+
+disable_haproxy_guard() {
+    header
+    require_haproxy_mode
+    need_root
+    run_systemctl_bounded 20 disable --now "$HAPROXY_GUARD_TIMER" >> "$LOG_FILE" 2>&1 || true
+    write_root_file "$HAPROXY_GUARD_DISABLED_FILE" <<'EOF'
+# Background HAProxy self-healing was disabled from the kto menu.
+EOF
+    ok "HAProxy guard timer выключен"
+    warn "net.ipv4.ip_nonlocal_bind оставлен включённым, чтобы отсутствующий IP не уронил остальные маршруты."
+}
+
+haproxy_guard_menu() {
+    local choice
+    header
+    echo -e "${BOLD}${PURPLE}[ АВТОЛЕЧЕНИЕ HAPROXY ]${NC}"
+    if "${SUDO[@]}" test -x "$HAPROXY_GUARD_MANAGER" 2>/dev/null; then
+        run_bounded_command 25 "${SUDO[@]}" "$HAPROXY_GUARD_MANAGER" status || true
+    else
+        echo "Статус: не установлено"
+    fi
+    echo
+    echo "1) Включить или обновить автолечение"
+    echo "2) Проверить и починить сейчас"
+    echo "3) Только проверить состояние"
+    echo "4) Выключить фоновую проверку"
+    echo "0) Назад"
+    echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+    read -r choice
+    case "$choice" in
+        1) install_haproxy_guard ;;
+        2) repair_haproxy_with_guard ;;
+        3) show_haproxy_guard_status ;;
+        4) disable_haproxy_guard ;;
+        0) return 0 ;;
+        *) fail "Неверный выбор" ;;
+    esac
 }
 
 ufw_rule_from_allowed() {
@@ -10653,6 +10838,7 @@ configure_haproxy_backend() {
 
     if apply_haproxy_routes_config "$routes_file"; then
         sync_haproxy_firewall "$routes_file" "$previous_routes_file"
+        ensure_haproxy_guard || warn "HAProxy работает, но автолечение не установилось"
         ok "HAProxy установлен: ${listen_ip}:${base_port}/tcp -> ${backend_target}"
         ok "Входной и исходящий IP: ${listen_ip}"
         ok "Разрешенный SNI: $(haproxy_sni_label "$allowed_sni")"
@@ -10851,7 +11037,7 @@ diagnose_haproxy() {
     local backend_stats health_report summary_line marker pools pools_down servers servers_up servers_down servers_other
     local detail_line status_output status_summary ufw_status missing_firewall=0 result=0
     local process_info process_summary process_count=0 process_cpu="0" process_rss_kb=0 process_rss_mb=0
-    local config_threads conntrack_count conntrack_max conntrack_percent capacity_summary
+    local config_threads conntrack_count conntrack_max conntrack_percent capacity_summary guard_timer_state guard_nonlocal
     local -A seen_inputs=() seen_sources=() seen_ports=()
 
     HAPROXY_DIAG_ERRORS=0
@@ -11012,6 +11198,20 @@ diagnose_haproxy() {
         fi
     else
         haproxy_diagnostic_row skip "firewall" "UFW не установлен"
+    fi
+
+    if "${SUDO[@]}" test -e "$HAPROXY_GUARD_DISABLED_FILE" 2>/dev/null; then
+        haproxy_diagnostic_row skip "автолечение" "отключено вручную"
+    elif "${SUDO[@]}" test -x "$HAPROXY_GUARD_MANAGER" 2>/dev/null; then
+        guard_timer_state="$(run_systemctl_bounded 5 is-active "$HAPROXY_GUARD_TIMER" 2>/dev/null || true)"
+        guard_nonlocal="$(sysctl -n net.ipv4.ip_nonlocal_bind 2>/dev/null || true)"
+        if [[ "$guard_timer_state" == "active" && "$guard_nonlocal" == "1" ]]; then
+            haproxy_diagnostic_row ok "автолечение" "timer active, non-local bind включён"
+        else
+            haproxy_diagnostic_row warn "автолечение" "timer=${guard_timer_state:-inactive}, non-local bind=${guard_nonlocal:-?}"
+        fi
+    else
+        haproxy_diagnostic_row warn "автолечение" "не установлено"
     fi
 
     if "${SUDO[@]}" test -s "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null; then
@@ -12144,6 +12344,7 @@ upgrade_haproxy_routes_transaction() {
 
     if apply_haproxy_routes_config "$candidate_file"; then
         sync_haproxy_firewall "$candidate_file" "$routes_file"
+        ensure_haproxy_guard || warn "HAProxy обновлён, но автолечение не установилось"
         cp "$candidate_file" "$routes_file"
         rm -f "$candidate_file"
         ok "HAProxy обновлён: маршруты сохранены, input=output, backend maxconn=${HAPROXY_BACKEND_MAXCONN}"
@@ -12580,6 +12781,7 @@ restore_haproxy_backup() {
     fi
 
     sync_haproxy_firewall "$restored_routes" "$current_routes"
+    ensure_haproxy_guard || warn "Backup восстановлен, но автолечение не установилось"
     cp "$restored_routes" "$routes_file"
     rm -f "$restored_routes" "$current_copy" "$current_routes"
     ok "HAProxy backup восстановлен"
@@ -12619,6 +12821,7 @@ haproxy_menu() {
         echo -e "10) Проверить бинды"
         echo -e "11) Полная диагностика HAProxy"
         echo -e "12) Аварийно стабилизировать HAProxy"
+        echo -e "13) Автолечение HAProxy"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -12642,6 +12845,7 @@ haproxy_menu() {
             10) check_haproxy_bindings "$routes_file" || true ;;
             11) diagnose_haproxy || true ;;
             12) stabilize_haproxy_interactive || true ;;
+            13) haproxy_guard_menu || true ;;
             0)
                 rm -f "$routes_file"
                 return 0
@@ -14400,6 +14604,10 @@ main() {
         haproxy-limit-apply|haproxy-bandwidth-apply|haproxy-limit-reapply) apply_haproxy_bandwidth_limits_cli ;;
         haproxy-limit-status|haproxy-bandwidth-status) show_haproxy_bandwidth_status_cli ;;
         haproxy-diagnose|haproxy-diagnostic|haproxy-diag|haproxy-status) diagnose_haproxy || true ;;
+        haproxy-guard-install|haproxy-heal-enable|haproxy-watchdog-enable) header; require_haproxy_mode; need_root; install_haproxy_guard ;;
+        haproxy-guard-status|haproxy-heal-status|haproxy-watchdog-status) show_haproxy_guard_status || true ;;
+        haproxy-guard-repair|haproxy-heal|haproxy-watchdog-repair) repair_haproxy_with_guard ;;
+        haproxy-guard-disable|haproxy-heal-disable|haproxy-watchdog-disable) disable_haproxy_guard ;;
         haproxy-firewall-repair|haproxy-ufw-repair|repair-haproxy-firewall) repair_haproxy_firewall_cli ;;
         ssh-firewall-repair|ssh-ufw-repair|repair-ssh-firewall|ssh-guard) repair_ssh_firewall_cli ;;
         haproxy-stabilize|haproxy-recover) stabilize_haproxy ;;
