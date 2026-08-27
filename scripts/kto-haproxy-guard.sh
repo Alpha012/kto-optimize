@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-HAPROXY_GUARD_BUILD="v343"
+HAPROXY_GUARD_BUILD="v344"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 SERVICE="${KTO_HAPROXY_SERVICE:-haproxy.service}"
 TIMER="${KTO_HAPROXY_GUARD_TIMER:-kto-haproxy-guard.timer}"

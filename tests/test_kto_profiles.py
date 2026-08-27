@@ -47,15 +47,15 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v343"', KTO)
-        self.assertIn('PUSH_BUILD="v343"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v343"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v343"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v343"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v343"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v343"', HAPROXY_BANDWIDTH)
-        self.assertIn('HAPROXY_GUARD_BUILD="v343"', HAPROXY_GUARD)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v343"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v344"', KTO)
+        self.assertIn('PUSH_BUILD="v344"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v344"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v344"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v344"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v344"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v344"', HAPROXY_BANDWIDTH)
+        self.assertIn('HAPROXY_GUARD_BUILD="v344"', HAPROXY_GUARD)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v344"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -306,6 +306,9 @@ grep -q 'max_header_size 64KB' "$KTO_SELFSTEAL_CADDYFILE"
         firewall = function_body(KTO, "opt_firewall")
         firewall_check = function_body(KTO, "system_check_firewall")
 
+        self.assertIn('REMNA_NODE_IMAGE="${KTO_REMNA_NODE_IMAGE:-remnawave/node:3.0.0}"', KTO)
+        self.assertEqual(node_install.count('image: ${REMNA_NODE_IMAGE}'), 2)
+        self.assertNotIn('remnawave/node:latest', node_install)
         self.assertIn("if node_profile_includes_hysteria2; then", node_install)
         self.assertIn("- /opt/remnawave:/opt/remnawave:ro", node_install)
         self.assertIn('if [[ "$MACHINE_MODE" == "node" ]]', firewall)
@@ -2803,6 +2806,83 @@ grep -Fq 'оставлены без изменений' <<< "$output"
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_node_optimization_preserves_ssh_and_whitelist_keeps_managed_ssh(self):
+        gate = function_body(KTO, "managed_ssh_changes_enabled")
+        migrate = function_body(KTO, "opt_ssh_root_access")
+        optimize = function_body(KTO, "optimize_system")
+        firewall = function_body(KTO, "opt_firewall")
+        antiscanner = function_body(KTO, "install_antiscanner")
+        ssh_check = function_body(KTO, "system_check_ssh_root_access")
+        fail2ban_check = function_body(KTO, "system_check_fail2ban")
+
+        self.assertIn('[[ "$MACHINE_MODE" != "node" ]]', gate)
+        self.assertLess(
+            migrate.index("if ! managed_ssh_changes_enabled"),
+            migrate.index("command_exists sshd"),
+        )
+        self.assertIn('SSH-порт, ключи и параметры входа оставлены без изменений', migrate)
+        self.assertIn('if managed_ssh_changes_enabled; then', optimize)
+        self.assertIn('SSH сохранён без изменений', optimize)
+        self.assertIn('node mode: UFW reset/defaults and SSH rules preserved', firewall)
+        self.assertIn('if managed_ssh_changes_enabled; then', firewall)
+        self.assertIn('managed_ssh_changes_enabled || manage_ssh=0', antiscanner)
+        self.assertIn('MANAGE_SSH="${manage_ssh}"', antiscanner)
+        self.assertIn('if ! managed_ssh_changes_enabled; then', ssh_check)
+        self.assertIn('if ! managed_ssh_changes_enabled; then', fail2ban_check)
+
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+source <(sed '/^main /d' kto.sh)
+events="$(mktemp)"
+output="$(mktemp)"
+trap 'rm -f "$events" "$output"' EXIT
+
+ok() { printf '%s\n' "$*"; }
+command_exists() { printf 'command_exists %s\n' "$1" >> "$events"; return 1; }
+
+MACHINE_MODE=node
+opt_ssh_root_access > "$output"
+grep -Fq 'SSH-порт, ключи и параметры входа оставлены без изменений' "$output"
+[[ ! -s "$events" ]]
+! managed_ssh_changes_enabled
+
+header() { :; }
+need_root() { :; }
+detect_ssh_port() { printf '2222\n'; }
+progress_start() { printf 'steps=%s\n' "$1" >> "$events"; }
+progress_step() { printf 'step=%s\n' "$1" >> "$events"; }
+format_duration() { printf '0 сек\n'; }
+
+: > "$events"
+optimize_system > "$output"
+grep -Fqx 'steps=9' "$events"
+! grep -Fq 'Настраиваю root SSH' "$events"
+! grep -Fq 'Настраиваю Fail2ban' "$events"
+grep -Fq 'SSH сохранён без изменений (текущий порт: 2222/tcp)' "$output"
+
+MACHINE_MODE=whitelist
+: > "$events"
+optimize_system > "$output"
+grep -Fqx 'steps=11' "$events"
+grep -Fq 'Настраиваю root SSH' "$events"
+grep -Fq 'Настраиваю Fail2ban' "$events"
+grep -Fq 'Подключение: ssh -p 2222 root@IP' "$output"
+managed_ssh_changes_enabled
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_managed_root_ssh_stays_global_during_haproxy_firewall_sync(self):
         bash = bash_executable()
         if bash is None:
@@ -4069,7 +4149,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v343"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v344"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 

@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v343"
+SCRIPT_BUILD="v344"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -40,6 +40,7 @@ ADDITIONAL_IP_MANAGER="/usr/local/sbin/kto-additional-ips"
 REMNA_EGRESS_MANAGER="/usr/local/sbin/kto-remnawave-egress"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
+REMNA_NODE_IMAGE="${KTO_REMNA_NODE_IMAGE:-remnawave/node:3.0.0}"
 CERT_DIR="/opt/remnawave"
 CONFIG_FILE="/etc/kto-cfg.conf"
 MACHINE_MODE="${KTO_MACHINE_MODE:-}"
@@ -686,6 +687,10 @@ EOF
 
 valid_machine_mode() {
     [[ "$1" == "node" || "$1" == "whitelist" || "$1" == "panel" ]]
+}
+
+managed_ssh_changes_enabled() {
+    [[ "$MACHINE_MODE" != "node" ]]
 }
 
 valid_node_profile() {
@@ -2983,6 +2988,11 @@ opt_ssh_root_access() {
     local had_main=0 had_managed=0 had_root_keys=0 had_marker=0 new_rule_existed=0
     local socket_was_enabled=0 socket_was_active=0 attempt
 
+    if ! managed_ssh_changes_enabled; then
+        ok "Режим node: SSH-порт, ключи и параметры входа оставлены без изменений"
+        return 0
+    fi
+
     command_exists sshd || {
         fail "OpenSSH server не установлен"
         return 1
@@ -3570,13 +3580,17 @@ remna_enable_node() {
 
 install_antiscanner() {
     stage "AntiScanner"
-    local existing_rules=0
+    local existing_rules=0 manage_ssh=1
     existing_rules="$(antiscanner_rules_count)"
+
+    managed_ssh_changes_enabled || manage_ssh=0
 
     apt_install_quiet curl ufw cron util-linux || true
     cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y iptables-persistent || true
     cmd "${SUDO[@]}" systemctl enable --now cron || true
-    install_ssh_firewall_guard || true
+    if (( manage_ssh == 1 )); then
+        install_ssh_firewall_guard || true
+    fi
 
     write_root_file "$ANTISCANNER_SCRIPT" <<EOF
 #!/usr/bin/env bash
@@ -3588,6 +3602,7 @@ TRUSTED_FILE="\$(mktemp)"
 LOG="/var/log/antiscanner_update.log"
 LOCK_FILE="${KTO_UFW_LOCK_FILE}"
 SSH_GUARD="${KTO_SSH_FIREWALL_GUARD}"
+MANAGE_SSH="${manage_ssh}"
 UFW_LOCKED=0
 
 cleanup() {
@@ -3610,9 +3625,7 @@ if command -v flock >/dev/null 2>&1; then
     UFW_LOCKED=1
 fi
 
-SSH_PORT="\$(awk 'NR == 1 {print \$1; exit}' '${KTO_SSH_PORT_FILE}' 2>/dev/null || true)"
-[[ "\$SSH_PORT" =~ ^[0-9]+\$ ]] || SSH_PORT="\$(sshd -T 2>/dev/null | awk '/^port / {print \$2; exit}' || true)"
-SSH_PORT="\${SSH_PORT:-22}"
+SSH_PORT=22
 MANAGED_SSH=0
 
 global_ssh_rule_numbers() {
@@ -3655,19 +3668,24 @@ prioritize_managed_ssh() {
     printf '%s\n' "\${rules[@]}" | grep -qx '1'
 }
 
-if prioritize_managed_ssh; then
-    MANAGED_SSH=1
-fi
-ufw status 2>/dev/null | awk '
-    /ALLOW/ && /# kto-ssh/ {
-        for (i = 3; i <= NF; i++) {
-            if (\$i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}\$/) {
-                print \$i
-                break
+if (( MANAGE_SSH == 1 )); then
+    SSH_PORT="\$(awk 'NR == 1 {print \$1; exit}' '${KTO_SSH_PORT_FILE}' 2>/dev/null || true)"
+    [[ "\$SSH_PORT" =~ ^[0-9]+\$ ]] || SSH_PORT="\$(sshd -T 2>/dev/null | awk '/^port / {print \$2; exit}' || true)"
+    SSH_PORT="\${SSH_PORT:-22}"
+    if prioritize_managed_ssh; then
+        MANAGED_SSH=1
+    fi
+    ufw status 2>/dev/null | awk '
+        /ALLOW/ && /# kto-ssh/ {
+            for (i = 3; i <= NF; i++) {
+                if (\$i ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}\$/) {
+                    print \$i
+                    break
+                }
             }
         }
-    }
-' | sort -u > "\$TRUSTED_FILE"
+    ' | sort -u > "\$TRUSTED_FILE"
+fi
 
 if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
     for rules_file in /etc/ufw/user.rules /etc/ufw/user6.rules; do
@@ -3683,18 +3701,20 @@ if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
         fi
     done < "\$TEMP_FILE"
 
-    if (( MANAGED_SSH == 0 )); then
-        while IFS= read -r trusted_ip; do
-            [[ "\$trusted_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]] || continue
-            for _ in {1..16}; do
-                ufw --force delete allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" >/dev/null 2>&1 || break
-            done
-            ufw prepend allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 ||
-                ufw insert 1 allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 ||
-                ufw allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 || true
-        done < "\$TRUSTED_FILE"
-    else
-        prioritize_managed_ssh || true
+    if (( MANAGE_SSH == 1 )); then
+        if (( MANAGED_SSH == 0 )); then
+            while IFS= read -r trusted_ip; do
+                [[ "\$trusted_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]] || continue
+                for _ in {1..16}; do
+                    ufw --force delete allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" >/dev/null 2>&1 || break
+                done
+                ufw prepend allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 ||
+                    ufw insert 1 allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 ||
+                    ufw allow proto tcp from "\$trusted_ip" to any port "\$SSH_PORT" comment 'kto-ssh' >/dev/null 2>&1 || true
+            done < "\$TRUSTED_FILE"
+        else
+            prioritize_managed_ssh || true
+        fi
     fi
 
     ufw reload >/dev/null 2>&1 || true
@@ -3706,7 +3726,7 @@ if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
         flock -u 9 || true
         UFW_LOCKED=0
     fi
-    if [[ -x "\$SSH_GUARD" ]]; then
+    if (( MANAGE_SSH == 1 )) && [[ -x "\$SSH_GUARD" ]]; then
         "\$SSH_GUARD" >> "\$LOG" 2>&1 ||
             echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to restore managed SSH UFW rule" >> "\$LOG"
     fi
@@ -4513,25 +4533,31 @@ EOF
 
 opt_firewall() {
     local ssh_port="$1"
-    local anti_rules routes_file ports_file ufw_status_file port
+    local anti_rules routes_file ports_file ufw_status_file port ufw_was_active=0
     anti_rules="$(antiscanner_rules_count)"
     routes_file="$(mktemp)"
     ports_file="$(mktemp)"
     ufw_status_file="$(mktemp)"
 
-    if [[ "${KTO_UFW_RESET:-0}" == "1" ]]; then
-        cmd "${SUDO[@]}" ufw --force reset
-    elif [[ "$anti_rules" =~ ^[0-9]+$ && "$anti_rules" -gt 0 ]]; then
-        echo "ufw reset skipped: preserving AntiScanner rules ($anti_rules)" >> "$LOG_FILE"
-    else
-        echo "ufw reset skipped: preserving existing rules" >> "$LOG_FILE"
-    fi
-    cmd "${SUDO[@]}" ufw default deny incoming
-    cmd "${SUDO[@]}" ufw default allow outgoing
-    ensure_global_ssh_ufw_rule "$ssh_port"
-    if [[ "$ssh_port" != "22" ]]; then
-        remove_ufw_allow_rules_for_port 22
+    ufw_active && ufw_was_active=1 || true
+
+    if managed_ssh_changes_enabled; then
+        if [[ "${KTO_UFW_RESET:-0}" == "1" ]]; then
+            cmd "${SUDO[@]}" ufw --force reset
+        elif [[ "$anti_rules" =~ ^[0-9]+$ && "$anti_rules" -gt 0 ]]; then
+            echo "ufw reset skipped: preserving AntiScanner rules ($anti_rules)" >> "$LOG_FILE"
+        else
+            echo "ufw reset skipped: preserving existing rules" >> "$LOG_FILE"
+        fi
+        cmd "${SUDO[@]}" ufw default deny incoming
+        cmd "${SUDO[@]}" ufw default allow outgoing
         ensure_global_ssh_ufw_rule "$ssh_port"
+        if [[ "$ssh_port" != "22" ]]; then
+            remove_ufw_allow_rules_for_port 22
+            ensure_global_ssh_ufw_rule "$ssh_port"
+        fi
+    else
+        echo "node mode: UFW reset/defaults and SSH rules preserved" >> "$LOG_FILE"
     fi
     extract_haproxy_routes "$HAPROXY_CONFIG_FILE" > "$routes_file"
     haproxy_listener_ports "$routes_file" > "$ports_file"
@@ -4578,16 +4604,32 @@ opt_firewall() {
             cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
         fi
     fi
-    cmd "${SUDO[@]}" ufw --force enable
-    install_ssh_firewall_guard
-    if ! ensure_haproxy_firewall_guard || ! repair_haproxy_firewall_rules "$routes_file"; then
+    if managed_ssh_changes_enabled; then
+        cmd "${SUDO[@]}" ufw --force enable
+        install_ssh_firewall_guard
+    elif (( ufw_was_active == 1 )); then
+        cmd "${SUDO[@]}" ufw reload || true
+    else
+        warn "Режим node: UFW оставлен выключенным, SSH и firewall defaults не менялись"
+    fi
+    if ! ensure_haproxy_firewall_guard; then
         rm -f "$routes_file" "$ports_file" "$ufw_status_file"
         return 1
+    fi
+    if (( ufw_was_active == 1 )) || managed_ssh_changes_enabled; then
+        if ! repair_haproxy_firewall_rules "$routes_file"; then
+            rm -f "$routes_file" "$ports_file" "$ufw_status_file"
+            return 1
+        fi
     fi
     rm -f "$routes_file" "$ports_file" "$ufw_status_file"
 }
 
 opt_haproxy_firewall_final_check() {
+    if [[ "$MACHINE_MODE" == "node" ]] && ! ufw_active; then
+        echo "node mode: HAProxy UFW final check skipped because UFW is inactive" >> "$LOG_FILE"
+        return 0
+    fi
     ensure_haproxy_firewall_guard
     repair_haproxy_firewall_rules
 }
@@ -4598,6 +4640,12 @@ opt_antiscanner() {
 
 opt_fail2ban() {
     local ssh_port
+
+    if ! managed_ssh_changes_enabled; then
+        ok "Режим node: настройки Fail2ban для SSH оставлены без изменений"
+        return 0
+    fi
+
     ssh_port="$(detect_ssh_port)"
     apt_install_quiet fail2ban || true
     write_root_file /etc/fail2ban/jail.d/99-kto-sshd.conf <<EOF
@@ -5106,7 +5154,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v343"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v344"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5119,7 +5167,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v343"
+KTO_HAPROXY_FIREWALL_BUILD="v344"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -5520,6 +5568,12 @@ system_check_kernel() {
 
 system_check_ssh_root_access() {
     local port
+
+    if ! managed_ssh_changes_enabled; then
+        system_check_row skip "ssh" "режим node: порт, ключи и параметры входа сохраняются"
+        return 0
+    fi
+
     port="$(detect_ssh_port)"
     if ssh_root_access_configured; then
         system_check_row ok "ssh root" "key-only, ${port}/tcp открыт для всех"
@@ -5786,21 +5840,27 @@ system_check_firewall() {
 
     if ufw_active; then
         system_check_row ok "ufw" "active"
+    elif [[ "$MACHINE_MODE" == "node" ]]; then
+        system_check_row skip "ufw" "inactive; режим node не включает его, чтобы не менять SSH-доступ"
+        rm -f "$routes_file" "$ports_file" "$ufw_status_file"
+        return 0
     else
         SYSTEM_CHECK_NEEDS_FIREWALL=1
         system_check_row miss "ufw" "не active"
     fi
 
-    ufw_global_allow_exists_for_port "$ssh_port" || missing+=("${ssh_port}/tcp global")
-    managed_port="$(managed_ssh_port 2>/dev/null || true)"
-    if [[ -n "$managed_port" && "$managed_port" == "$ssh_port" ]]; then
-        priority_rules="$(ufw_global_allow_rule_numbers_for_port "$ssh_port")"
-        grep -qx '1' <<< "$priority_rules" || missing+=("${ssh_port}/tcp priority")
-        "${SUDO[@]}" systemctl is-enabled --quiet "$KTO_SSH_FIREWALL_GUARD_TIMER" 2>/dev/null ||
-            missing+=("ssh guard")
-    fi
-    if [[ "$ssh_port" != "22" ]] && ufw_rule_allowed "22/tcp"; then
-        extra+=("22/tcp")
+    if managed_ssh_changes_enabled; then
+        ufw_global_allow_exists_for_port "$ssh_port" || missing+=("${ssh_port}/tcp global")
+        managed_port="$(managed_ssh_port 2>/dev/null || true)"
+        if [[ -n "$managed_port" && "$managed_port" == "$ssh_port" ]]; then
+            priority_rules="$(ufw_global_allow_rule_numbers_for_port "$ssh_port")"
+            grep -qx '1' <<< "$priority_rules" || missing+=("${ssh_port}/tcp priority")
+            "${SUDO[@]}" systemctl is-enabled --quiet "$KTO_SSH_FIREWALL_GUARD_TIMER" 2>/dev/null ||
+                missing+=("ssh guard")
+        fi
+        if [[ "$ssh_port" != "22" ]] && ufw_rule_allowed "22/tcp"; then
+            extra+=("22/tcp")
+        fi
     fi
     extract_haproxy_routes "$HAPROXY_CONFIG_FILE" > "$routes_file"
     haproxy_listener_ports "$routes_file" > "$ports_file"
@@ -5858,6 +5918,11 @@ system_check_antiscanner() {
 system_check_fail2ban() {
     local missing=()
 
+    if ! managed_ssh_changes_enabled; then
+        system_check_row skip "fail2ban" "режим node: SSH-защита сохраняется как есть"
+        return 0
+    fi
+
     package_installed fail2ban || missing+=("package")
     [[ "$(service_ok fail2ban)" == "1" ]] || missing+=("service")
     [[ "$(file_ok /etc/fail2ban/jail.d/99-kto-sshd.conf)" == "1" ]] || missing+=("jail")
@@ -5880,11 +5945,13 @@ system_check_apply_missing() {
     (( SYSTEM_CHECK_NEEDS_PREPARE == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_PACKAGES == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_KERNEL == 1 )) && steps=$(( steps + 1 ))
-    (( SYSTEM_CHECK_NEEDS_SSH == 1 )) && steps=$(( steps + 1 ))
+    if managed_ssh_changes_enabled; then
+        (( SYSTEM_CHECK_NEEDS_SSH == 1 )) && steps=$(( steps + 1 ))
+        (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )) && steps=$(( steps + 1 ))
+    fi
     (( SYSTEM_CHECK_NEEDS_NETWORK == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_FIREWALL == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && steps=$(( steps + 1 ))
-    (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_STORAGE == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_MEMORY_GUARD == 1 )) && steps=$(( steps + 1 ))
 
@@ -5901,7 +5968,7 @@ system_check_apply_missing() {
     (( SYSTEM_CHECK_NEEDS_PREPARE == 1 )) && progress_step "Готовлю систему" opt_prepare_system
     (( SYSTEM_CHECK_NEEDS_PACKAGES == 1 )) && progress_step "Ставлю пакеты" opt_install_packages
     (( SYSTEM_CHECK_NEEDS_KERNEL == 1 )) && progress_step "Ставлю XanMod x64v3" opt_xanmod_kernel
-    if (( SYSTEM_CHECK_NEEDS_SSH == 1 )); then
+    if managed_ssh_changes_enabled && (( SYSTEM_CHECK_NEEDS_SSH == 1 )); then
         progress_step "Настраиваю root SSH" opt_ssh_root_access
         ssh_port="$(detect_ssh_port)"
     fi
@@ -5910,7 +5977,9 @@ system_check_apply_missing() {
     (( SYSTEM_CHECK_NEEDS_MEMORY_GUARD == 1 )) && progress_step "Настраиваю память" opt_memory_guard
     (( SYSTEM_CHECK_NEEDS_FIREWALL == 1 )) && progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
     (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && progress_step "Подключаю AntiScanner" opt_antiscanner
-    (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )) && progress_step "Настраиваю Fail2ban" opt_fail2ban
+    if managed_ssh_changes_enabled && (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )); then
+        progress_step "Настраиваю Fail2ban" opt_fail2ban
+    fi
     opt_haproxy_firewall_final_check
 
     echo
@@ -6027,33 +6096,45 @@ system_check() {
 optimize_system() {
     header
     need_root
-    local ssh_port started_at duration
+    local ssh_port started_at duration steps=11
     started_at="$(date +%s)"
     ssh_port="$(detect_ssh_port)"
+
+    if ! managed_ssh_changes_enabled; then
+        steps=$(( steps - 2 ))
+    fi
 
     export NEEDRESTART_MODE=a
     export NEEDRESTART_SUSPEND=1
 
-    progress_start 11
+    progress_start "$steps"
     progress_step "Готовлю систему" opt_prepare_system
     progress_step "Ставлю базовые пакеты" opt_install_fast_packages
     progress_step "Kernel, сеть и память" opt_kernel_network_memory_parallel
     progress_step "Проверяю kernel" opt_kernel_final_check
-    progress_step "Настраиваю root SSH" opt_ssh_root_access
-    ssh_port="$(detect_ssh_port)"
+    if managed_ssh_changes_enabled; then
+        progress_step "Настраиваю root SSH" opt_ssh_root_access
+        ssh_port="$(detect_ssh_port)"
+    fi
     progress_step "Настраиваю хранение" opt_storage_guard
     progress_step "Мигрирую HAProxy" upgrade_haproxy_if_configured
     progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
     progress_step "Подключаю AntiScanner" opt_antiscanner
-    progress_step "Настраиваю Fail2ban" opt_fail2ban
+    if managed_ssh_changes_enabled; then
+        progress_step "Настраиваю Fail2ban" opt_fail2ban
+    fi
     progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check
 
     echo
     duration=$(( $(date +%s) - started_at ))
     ssh_port="$(detect_ssh_port)"
     ok "Оптимизация завершена. Рекомендуется: sudo reboot"
-    ok "SSH-порт: ${ssh_port}/tcp"
-    ok "Подключение: ssh -p ${ssh_port} root@IP"
+    if managed_ssh_changes_enabled; then
+        ok "SSH-порт: ${ssh_port}/tcp"
+        ok "Подключение: ssh -p ${ssh_port} root@IP"
+    else
+        ok "SSH сохранён без изменений (текущий порт: ${ssh_port}/tcp)"
+    fi
     ok "Время: $(format_duration "$duration")"
 }
 
@@ -6076,7 +6157,7 @@ services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: remnawave/node:latest
+    image: ${REMNA_NODE_IMAGE}
     network_mode: host
     restart: always
     cap_add:
@@ -6097,7 +6178,7 @@ services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: remnawave/node:latest
+    image: ${REMNA_NODE_IMAGE}
     network_mode: host
     restart: always
     cap_add:
