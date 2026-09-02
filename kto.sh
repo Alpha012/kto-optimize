@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v344"
+SCRIPT_BUILD="v346"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -85,6 +85,7 @@ HAPROXY_GUARD_SERVICE="${KTO_HAPROXY_GUARD_SERVICE:-kto-haproxy-guard.service}"
 HAPROXY_GUARD_TIMER="${KTO_HAPROXY_GUARD_TIMER:-kto-haproxy-guard.timer}"
 HAPROXY_AVAILABILITY_SYSCTL_CONF="${KTO_HAPROXY_AVAILABILITY_SYSCTL_CONF:-/etc/sysctl.d/99-z-kto-haproxy-availability.conf}"
 HAPROXY_GUARD_DISABLED_FILE="${KTO_HAPROXY_GUARD_DISABLED_FILE:-/etc/kto-haproxy-guard.disabled}"
+HAPROXY_ROUTES_DISABLED_FILE="${KTO_HAPROXY_ROUTES_DISABLED_FILE:-/etc/kto-haproxy-routes.disabled}"
 HAPROXY_BACKEND_MAXCONN=15000
 HAPROXY_GLOBAL_MIN_MAXCONN_DEFAULT=100000
 HAPROXY_GLOBAL_MAX_MAXCONN_DEFAULT=200000
@@ -5154,7 +5155,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v344"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v346"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5167,7 +5168,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v344"
+KTO_HAPROXY_FIREWALL_BUILD="v346"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -6226,15 +6227,41 @@ install_remnawave_node() {
 
 do_install_selfsteal() {
     local domain="$1"
+    local installer_url="${KTO_SELFSTEAL_INSTALL_URL:-https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/selfsteal.sh}"
     if ! validate_domain "$domain"; then
         fail "Некорректный домен для SelfSteal"
         exit 1
     fi
     stage "Устанавливаю SelfSteal"
     must "SelfSteal install" \
-        "${SUDO[@]}" bash -c \
-        'bash <(curl -Ls "https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh") --force --domain "$1" install' \
-        _ "$domain"
+        "${SUDO[@]}" env \
+        GIT_TERMINAL_PROMPT=0 \
+        GCM_INTERACTIVE=Never \
+        GIT_ASKPASS=/bin/false \
+        SSH_ASKPASS=/bin/false \
+        bash -c '
+            set -Eeuo pipefail
+            installer_url="$1"
+            domain="$2"
+            installer="$(mktemp /tmp/kto-selfsteal.XXXXXX)"
+            trap '\''rm -f -- "$installer"'\'' EXIT
+
+            curl -fsSL \
+                --connect-timeout 15 \
+                --max-time 120 \
+                --retry 3 \
+                --retry-delay 2 \
+                --retry-all-errors \
+                -o "$installer" \
+                "$installer_url"
+
+            if ! grep -q "Selfsteal" "$installer" || ! grep -q "SCRIPT_VERSION=" "$installer"; then
+                echo "SelfSteal: GitHub вернул некорректный файл вместо установщика" >&2
+                exit 1
+            fi
+
+            bash "$installer" --force --domain "$domain" install
+        ' _ "$installer_url" "$domain"
     harden_selfsteal_caddy
 
     echo
@@ -9341,6 +9368,7 @@ haproxy_remote_report_json() {
 haproxy_remote_apply_json() {
     local input_file routes_file previous_routes_file canonical_current canonical_wanted
     local port target_pool sni source_ip server_maxconn listen_ip send_proxy_v2 normalized route_count target_count sni_count
+    local already_disabled=0
 
     command_exists jq || {
         fail "jq не найден: удалённое управление HAProxy недоступно"
@@ -9363,7 +9391,7 @@ haproxy_remote_apply_json() {
 
     if ! jq -e '
         type == "array" and
-        length >= 1 and length <= 128 and
+        length <= 128 and
         all(.[];
             type == "object" and
             ((.targets | type) == "array") and (.targets | length >= 1 and length <= 64) and
@@ -9374,6 +9402,29 @@ haproxy_remote_apply_json() {
         rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
         fail "Collector прислал некорректный список HAProxy-маршрутов"
         return 1
+    fi
+
+    route_count="$(jq -r 'length' "$input_file")"
+    if (( route_count == 0 )); then
+        extract_haproxy_routes > "$previous_routes_file"
+        if ! "${SUDO[@]}" test -e "$HAPROXY_CONFIG_FILE" 2>/dev/null &&
+            "${SUDO[@]}" test -e "$HAPROXY_ROUTES_DISABLED_FILE" 2>/dev/null &&
+            ! run_systemctl_bounded 5 is-active --quiet haproxy >/dev/null 2>&1 &&
+            ! run_systemctl_bounded 5 is-enabled --quiet haproxy >/dev/null 2>&1 &&
+            ! "${SUDO[@]}" test -e "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null; then
+            already_disabled=1
+        fi
+        if (( already_disabled == 0 )) && ! deactivate_all_haproxy_routes "$previous_routes_file"; then
+            rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+            return 1
+        fi
+        rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
+        if (( already_disabled == 1 )); then
+            printf '{"ok":true,"changed":false,"routes":0}\n'
+        else
+            printf '{"ok":true,"changed":true,"routes":0}\n'
+        fi
+        return 0
     fi
 
     while IFS=$'\t' read -r port target_pool sni source_ip server_maxconn listen_ip send_proxy_v2; do
@@ -10226,6 +10277,9 @@ EOF
     fi
 
     rm -f "$tmp_config" "$backup" "$backup_routes"
+    if ! "${SUDO[@]}" rm -f "$HAPROXY_ROUTES_DISABLED_FILE" >> "$LOG_FILE" 2>&1; then
+        warn "HAProxy работает, но не удалось убрать marker ${HAPROXY_ROUTES_DISABLED_FILE}"
+    fi
     haproxy_threads="$(haproxy_thread_count)"
     haproxy_maxconn="$(recommended_haproxy_maxconn)"
     route_count="$(haproxy_route_count "$routes_file")"
@@ -10950,7 +11004,13 @@ print_haproxy_routes() {
             "$listen_ip" "$port" "$target_label" "$(haproxy_sni_label "$sni")" "$source_label" \
             "$(haproxy_send_proxy_v2_label "${send_proxy_v2:-0}")"
     done < "$routes_file"
-    (( shown > 0 )) || printf ' Маршрутов пока нет.\n'
+    if (( shown == 0 )); then
+        if "${SUDO[@]}" test -e "$HAPROXY_ROUTES_DISABLED_FILE" 2>/dev/null; then
+            printf ' Маршруты отключены; HAProxy остановлен. Добавление маршрута включит его снова.\n'
+        else
+            printf ' Маршрутов пока нет.\n'
+        fi
+    fi
 }
 
 check_haproxy_bindings() {
@@ -11128,6 +11188,16 @@ diagnose_haproxy() {
 
     echo -e "${BOLD}${PURPLE}[ ДИАГНОСТИКА HAPROXY ]${NC}"
     if [[ ! -s "$HAPROXY_CONFIG_FILE" ]]; then
+        if "${SUDO[@]}" test -e "$HAPROXY_ROUTES_DISABLED_FILE" 2>/dev/null; then
+            haproxy_diagnostic_row skip "config" "маршруты отключены штатно"
+            if run_systemctl_bounded 5 is-active --quiet haproxy >/dev/null 2>&1; then
+                haproxy_diagnostic_row warn "service" "active без config; останови HAProxy или повтори удаление маршрутов"
+            else
+                haproxy_diagnostic_row ok "service" "остановлен"
+            fi
+            rm -f "$routes_file"
+            return 0
+        fi
         haproxy_diagnostic_row fail "config" "${HAPROXY_CONFIG_FILE} не найден"
         rm -f "$routes_file"
         return 1
@@ -12265,6 +12335,174 @@ reconcile_haproxy_bandwidth_after_route_change() {
     rm -f "$previous_limits" "$next_limits"
 }
 
+restore_haproxy_after_deactivation_failure() {
+    local config_copy="$1" marker_copy="$2" had_config="$3" had_marker="$4"
+    local was_enabled="$5" was_active="$6"
+
+    if (( had_config == 1 )); then
+        "${SUDO[@]}" install -m 0644 "$config_copy" "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1 || true
+    else
+        "${SUDO[@]}" rm -f "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1 || true
+    fi
+    if (( had_marker == 1 )); then
+        "${SUDO[@]}" install -m 0600 "$marker_copy" "$HAPROXY_ROUTES_DISABLED_FILE" >> "$LOG_FILE" 2>&1 || true
+    else
+        "${SUDO[@]}" rm -f "$HAPROXY_ROUTES_DISABLED_FILE" >> "$LOG_FILE" 2>&1 || true
+    fi
+    if (( was_enabled == 1 )); then
+        run_systemctl_bounded 20 enable haproxy >> "$LOG_FILE" 2>&1 || true
+    else
+        run_systemctl_bounded 20 disable haproxy >> "$LOG_FILE" 2>&1 || true
+    fi
+    if (( was_active == 1 )); then
+        run_systemctl_bounded 10 reset-failed haproxy >> "$LOG_FILE" 2>&1 || true
+        run_systemctl_bounded 20 start haproxy >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
+deactivate_all_haproxy_routes() {
+    local previous_routes_file="$1"
+    local config_copy marker_copy route_count backup_path="-" attempt
+    local had_config=0 had_marker=0 was_enabled=0 was_active=0
+    local cleanup_warnings=0
+
+    HAPROXY_LAST_BACKUP=""
+    config_copy="$(mktemp)"
+    marker_copy="$(mktemp)"
+    route_count="$(haproxy_route_count "$previous_routes_file")"
+    if "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null; then
+        had_config=1
+        if ! "${SUDO[@]}" cat "$HAPROXY_CONFIG_FILE" > "$config_copy" || [[ ! -s "$config_copy" ]]; then
+            rm -f "$config_copy" "$marker_copy"
+            fail "Не удалось прочитать текущий HAProxy config; удаление отменено"
+            return 1
+        fi
+        if ! create_haproxy_persistent_backup "before-disable-all" "$HAPROXY_CONFIG_FILE"; then
+            rm -f "$config_copy" "$marker_copy"
+            return 1
+        fi
+        backup_path="$HAPROXY_LAST_BACKUP"
+    fi
+    if "${SUDO[@]}" test -e "$HAPROXY_ROUTES_DISABLED_FILE" 2>/dev/null; then
+        had_marker=1
+        "${SUDO[@]}" cat "$HAPROXY_ROUTES_DISABLED_FILE" > "$marker_copy" 2>/dev/null || true
+    fi
+    run_systemctl_bounded 5 is-enabled --quiet haproxy >/dev/null 2>&1 && was_enabled=1
+    run_systemctl_bounded 5 is-active --quiet haproxy >/dev/null 2>&1 && was_active=1
+
+    stage "Останавливаю HAProxy перед удалением всех маршрутов"
+    run_systemctl_bounded 10 --no-block stop haproxy >> "$LOG_FILE" 2>&1 || true
+    for (( attempt = 0; attempt < 40; attempt++ )); do
+        haproxy_service_is_stopped && break
+        sleep 0.25
+    done
+    if ! haproxy_service_is_stopped; then
+        warn "HAProxy не остановился штатно, завершаю оставшиеся worker-процессы."
+        run_systemctl_bounded 10 kill --kill-who=all --signal=KILL haproxy.service >> "$LOG_FILE" 2>&1 || true
+        sleep 1
+    fi
+    if ! haproxy_service_is_stopped; then
+        restore_haproxy_after_deactivation_failure "$config_copy" "$marker_copy" \
+            "$had_config" "$had_marker" "$was_enabled" "$was_active"
+        rm -f "$config_copy" "$marker_copy"
+        fail "HAProxy не остановился; config и маршруты оставлены без изменений"
+        return 1
+    fi
+
+    run_systemctl_bounded 20 disable haproxy >> "$LOG_FILE" 2>&1 || true
+    if run_systemctl_bounded 5 is-enabled --quiet haproxy >/dev/null 2>&1; then
+        restore_haproxy_after_deactivation_failure "$config_copy" "$marker_copy" \
+            "$had_config" "$had_marker" "$was_enabled" "$was_active"
+        rm -f "$config_copy" "$marker_copy"
+        fail "Не удалось отключить автозапуск HAProxy; удаление отменено"
+        return 1
+    fi
+
+    if ! write_root_file_mode 0600 "$HAPROXY_ROUTES_DISABLED_FILE" <<EOF
+state=disabled
+disabled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+routes=${route_count}
+backup=${backup_path}
+EOF
+    then
+        restore_haproxy_after_deactivation_failure "$config_copy" "$marker_copy" \
+            "$had_config" "$had_marker" "$was_enabled" "$was_active"
+        rm -f "$config_copy" "$marker_copy"
+        fail "Не удалось сохранить состояние отключённых маршрутов; удаление отменено"
+        return 1
+    fi
+    if ! "${SUDO[@]}" rm -f "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1 ||
+        "${SUDO[@]}" test -e "$HAPROXY_CONFIG_FILE" 2>/dev/null; then
+        restore_haproxy_after_deactivation_failure "$config_copy" "$marker_copy" \
+            "$had_config" "$had_marker" "$was_enabled" "$was_active"
+        rm -f "$config_copy" "$marker_copy"
+        fail "Не удалось убрать активный HAProxy config; предыдущее состояние возвращено"
+        return 1
+    fi
+
+    sync_haproxy_firewall /dev/null "$previous_routes_file" || {
+        cleanup_warnings=$(( cleanup_warnings + 1 ))
+        warn "Маршруты удалены, но не все UFW-правила удалось синхронизировать."
+    }
+    if "${SUDO[@]}" test -x "$HAPROXY_BANDWIDTH_MANAGER" 2>/dev/null ||
+        "${SUDO[@]}" test -e "$HAPROXY_BANDWIDTH_CONFIG" 2>/dev/null; then
+        clear_all_haproxy_bandwidth_limits || {
+            cleanup_warnings=$(( cleanup_warnings + 1 ))
+            warn "Маршруты удалены, но kernel-лимиты скорости требуют ручной проверки."
+        }
+    fi
+    run_systemctl_bounded 10 reset-failed haproxy >> "$LOG_FILE" 2>&1 || true
+    : > "$previous_routes_file"
+    rm -f "$config_copy" "$marker_copy"
+
+    ok "Все HAProxy-маршруты удалены; сервис остановлен и выключен из автозапуска"
+    [[ "$backup_path" == "-" ]] || ok "Восстановление доступно из backup: ${backup_path}"
+    (( cleanup_warnings == 0 )) || warn "Основное отключение завершено, предупреждений очистки: ${cleanup_warnings}"
+}
+
+delete_all_haproxy_routes() {
+    local routes_file="$1" answer route_count ports
+
+    route_count="$(haproxy_route_count "$routes_file")"
+    if (( route_count == 0 )); then
+        warn "HAProxy-маршрутов уже нет"
+        return 0
+    fi
+    ports="$(haproxy_route_ports "$routes_file" | paste -sd, -)"
+    echo
+    warn "Будут удалены ВСЕ HAProxy-маршруты: ${route_count} (порты: ${ports:-нет})."
+    warn "Текущие соединения оборвутся, HAProxy остановится и будет отключён из автозапуска."
+    warn "Перед изменением будет создан проверенный backup; UFW-правила и лимиты скорости будут очищены."
+    echo -ne "${YELLOW}Для подтверждения введи DELETE:${NC} "
+    read -r answer
+    if [[ "$answer" != "DELETE" ]]; then
+        warn "Удаление всех маршрутов отменено"
+        return 0
+    fi
+    deactivate_all_haproxy_routes "$routes_file"
+}
+
+clear_haproxy_routes_cli() {
+    local routes_file rc=0
+    header
+    require_haproxy_mode
+    need_root
+    routes_file="$(mktemp)"
+    extract_haproxy_routes > "$routes_file"
+    if "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null && [[ ! -s "$routes_file" ]]; then
+        rm -f "$routes_file"
+        fail "Текущий HAProxy config не распознан; массовое удаление заблокировано"
+        return 1
+    fi
+    if delete_all_haproxy_routes "$routes_file"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "$routes_file"
+    return "$rc"
+}
+
 delete_haproxy_route() {
     local routes_file="$1" selection port listen_ip next_file answer before_count after_count
     local current_line target_pool sni source_ip server_maxconn _current_listen target_label pool_count
@@ -12773,8 +13011,10 @@ pin_haproxy_wildcards_to_source_ips() {
 
 restore_haproxy_backup() {
     local routes_file="$1" choice answer selected index status current_copy current_routes restored_routes
+    local had_current=0 was_disabled=0
     local -a backups=()
 
+    HAPROXY_LAST_BACKUP=""
     mapfile -t backups < <(list_haproxy_backups | head -n 10)
     if (( ${#backups[@]} == 0 )); then
         fail "Сохранённых HAProxy backup нет: ${HAPROXY_BACKUP_DIR}"
@@ -12825,7 +13065,7 @@ restore_haproxy_backup() {
 
     echo
     warn "Будет восстановлен точный config: ${selected}"
-    echo -ne "${YELLOW}Создать backup текущего config и продолжить? [y/N]:${NC} "
+    echo -ne "${YELLOW}Восстановить этот config и запустить HAProxy? [y/N]:${NC} "
     read -r answer
     if [[ "${answer,,}" != "y" && "${answer,,}" != "yes" && "${answer,,}" != "д" && "${answer,,}" != "да" ]]; then
         rm -f "$restored_routes" "$current_copy" "$current_routes"
@@ -12833,41 +13073,60 @@ restore_haproxy_backup() {
         return 0
     fi
 
-    if ! "${SUDO[@]}" cat "$HAPROXY_CONFIG_FILE" > "$current_copy" || [[ ! -s "$current_copy" ]]; then
-        rm -f "$restored_routes" "$current_copy" "$current_routes"
-        fail "Не удалось сохранить текущий config перед восстановлением"
-        return 1
+    if "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null; then
+        had_current=1
+        if ! "${SUDO[@]}" cat "$HAPROXY_CONFIG_FILE" > "$current_copy" || [[ ! -s "$current_copy" ]]; then
+            rm -f "$restored_routes" "$current_copy" "$current_routes"
+            fail "Не удалось сохранить текущий config перед восстановлением"
+            return 1
+        fi
+        extract_haproxy_routes "$current_copy" > "$current_routes"
+        if ! create_haproxy_persistent_backup "before-restore" "$HAPROXY_CONFIG_FILE"; then
+            rm -f "$restored_routes" "$current_copy" "$current_routes"
+            return 1
+        fi
     fi
-    extract_haproxy_routes "$current_copy" > "$current_routes"
-    if ! create_haproxy_persistent_backup "before-restore" "$HAPROXY_CONFIG_FILE" ||
-        ! reserve_haproxy_route_ports "$restored_routes"; then
+    "${SUDO[@]}" test -e "$HAPROXY_ROUTES_DISABLED_FILE" 2>/dev/null && was_disabled=1
+    if ! reserve_haproxy_route_ports "$restored_routes"; then
         rm -f "$restored_routes" "$current_copy" "$current_routes"
         return 1
     fi
 
     stage "Восстанавливаю HAProxy backup"
     if ! "${SUDO[@]}" install -m 0644 "$selected" "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1 ||
+        ! run_systemctl_bounded 20 enable haproxy >> "$LOG_FILE" 2>&1 ||
         ! reload_haproxy_gracefully "$restored_routes"; then
         "${SUDO[@]}" cp -a "$HAPROXY_CONFIG_FILE" "${HAPROXY_CONFIG_FILE}.kto.failed-restore" >> "$LOG_FILE" 2>&1 || true
-        warn "Backup не запустился, возвращаю config, который был до восстановления."
-        "${SUDO[@]}" install -m 0644 "$current_copy" "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1 || true
-        if [[ -s "$current_routes" ]]; then
-            start_haproxy_cleanly "$current_routes" || true
+        if (( had_current == 1 )); then
+            warn "Backup не запустился, возвращаю config, который был до восстановления."
+            "${SUDO[@]}" install -m 0644 "$current_copy" "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1 || true
+            if [[ -s "$current_routes" ]]; then
+                start_haproxy_cleanly "$current_routes" || true
+            else
+                run_systemctl_bounded 15 restart haproxy >> "$LOG_FILE" 2>&1 || true
+            fi
         else
-            run_systemctl_bounded 15 restart haproxy >> "$LOG_FILE" 2>&1 || true
+            warn "Backup не запустился, возвращаю состояние без маршрутов."
+            "${SUDO[@]}" rm -f "$HAPROXY_CONFIG_FILE" >> "$LOG_FILE" 2>&1 || true
+            run_systemctl_bounded 10 --no-block stop haproxy >> "$LOG_FILE" 2>&1 || true
+            run_systemctl_bounded 20 disable haproxy >> "$LOG_FILE" 2>&1 || true
+            if (( was_disabled == 0 )); then
+                "${SUDO[@]}" rm -f "$HAPROXY_ROUTES_DISABLED_FILE" >> "$LOG_FILE" 2>&1 || true
+            fi
         fi
         rm -f "$restored_routes" "$current_copy" "$current_routes"
         fail "Восстановление не применено; предыдущий config возвращён"
         return 1
     fi
 
+    "${SUDO[@]}" rm -f "$HAPROXY_ROUTES_DISABLED_FILE" >> "$LOG_FILE" 2>&1 || true
     sync_haproxy_firewall "$restored_routes" "$current_routes"
     ensure_haproxy_guard || warn "Backup восстановлен, но автолечение не установилось"
     cp "$restored_routes" "$routes_file"
     rm -f "$restored_routes" "$current_copy" "$current_routes"
     ok "HAProxy backup восстановлен"
     ok "Config: ${selected}"
-    ok "Backup предыдущего config: ${HAPROXY_LAST_BACKUP}"
+    [[ -z "$HAPROXY_LAST_BACKUP" ]] || ok "Backup предыдущего config: ${HAPROXY_LAST_BACKUP}"
 }
 
 haproxy_menu() {
@@ -12893,16 +13152,17 @@ haproxy_menu() {
         echo -e "1) Изменить маршрут, backend, SNI или IP"
         echo -e "2) Добавить маршрут (входной IP = выходному IP)"
         echo -e "3) Удалить маршрут"
-        echo -e "4) Заменить SNI у всех маршрутов"
-        echo -e "5) Обновить HAProxy, сохранив маршруты"
-        echo -e "6) Добавить или заменить backend-пул"
-        echo -e "7) Массово добавить backend по следующим портам"
-        echo -e "8) Ограничить скорость по входному IP"
-        echo -e "9) Восстановить HAProxy backup"
-        echo -e "10) Проверить бинды"
-        echo -e "11) Полная диагностика HAProxy"
-        echo -e "12) Аварийно стабилизировать HAProxy"
-        echo -e "13) Автолечение HAProxy"
+        echo -e "4) Удалить ВСЕ маршруты и остановить HAProxy"
+        echo -e "5) Заменить SNI у всех маршрутов"
+        echo -e "6) Обновить HAProxy, сохранив маршруты"
+        echo -e "7) Добавить или заменить backend-пул"
+        echo -e "8) Массово добавить backend по следующим портам"
+        echo -e "9) Ограничить скорость по входному IP"
+        echo -e "10) Восстановить HAProxy backup"
+        echo -e "11) Проверить бинды"
+        echo -e "12) Полная диагностика HAProxy"
+        echo -e "13) Аварийно стабилизировать HAProxy"
+        echo -e "14) Автолечение HAProxy"
         echo -e "0) Назад"
         echo -e "${PURPLE}==========================================${NC}"
         echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
@@ -12911,22 +13171,23 @@ haproxy_menu() {
             1) edit_haproxy_route "$routes_file" || true ;;
             2) add_haproxy_route "$routes_file" || true ;;
             3) delete_haproxy_route "$routes_file" || true ;;
-            4) replace_all_haproxy_sni "$routes_file" || true ;;
-            5)
+            4) delete_all_haproxy_routes "$routes_file" || true ;;
+            5) replace_all_haproxy_sni "$routes_file" || true ;;
+            6)
                 if [[ -s "$routes_file" ]]; then
                     upgrade_haproxy_routes_transaction "$routes_file" || true
                 else
                     warn "Сначала добавь хотя бы один маршрут"
                 fi
                 ;;
-            6) add_haproxy_pool_route "$routes_file" || true ;;
-            7) add_haproxy_sequential_routes "$routes_file" || true ;;
-            8) haproxy_bandwidth_menu || true ;;
-            9) restore_haproxy_backup "$routes_file" || true ;;
-            10) check_haproxy_bindings "$routes_file" || true ;;
-            11) diagnose_haproxy || true ;;
-            12) stabilize_haproxy_interactive || true ;;
-            13) haproxy_guard_menu || true ;;
+            7) add_haproxy_pool_route "$routes_file" || true ;;
+            8) add_haproxy_sequential_routes "$routes_file" || true ;;
+            9) haproxy_bandwidth_menu || true ;;
+            10) restore_haproxy_backup "$routes_file" || true ;;
+            11) check_haproxy_bindings "$routes_file" || true ;;
+            12) diagnose_haproxy || true ;;
+            13) stabilize_haproxy_interactive || true ;;
+            14) haproxy_guard_menu || true ;;
             0)
                 rm -f "$routes_file"
                 return 0
@@ -14411,7 +14672,12 @@ show_status() {
     print_row "ufw" "firewall" "$(service_ok ufw)"
     print_row "antiscanner" "$(antiscanner_rules_count) rules" "$(file_ok "$ANTISCANNER_SCRIPT")"
     if command_exists haproxy; then
-        print_row "haproxy" "proxy" "$(service_ok haproxy)"
+        if [[ ! -s "$HAPROXY_CONFIG_FILE" ]] &&
+            "${SUDO[@]}" test -e "$HAPROXY_ROUTES_DISABLED_FILE" 2>/dev/null; then
+            print_row "haproxy" "disabled, no routes" 1
+        else
+            print_row "haproxy" "proxy" "$(service_ok haproxy)"
+        fi
     fi
     print_row "fail2ban" "ssh guard" "$(service_ok fail2ban)"
     if [[ "$MACHINE_MODE" == "panel" ]]; then
@@ -14679,6 +14945,7 @@ main() {
         haproxy-pool-set|haproxy-set-pool) shift; set_haproxy_pool_route_cli "$@" ;;
         haproxy-pool-collapse|haproxy-collapse-pool) shift; collapse_haproxy_pool_cli "$@" ;;
         haproxy-routes-set|haproxy-set-routes) shift; set_haproxy_sequential_routes_cli "$@" ;;
+        haproxy-routes-clear|haproxy-clear-routes|haproxy-clear) clear_haproxy_routes_cli ;;
         haproxy-limit|haproxy-bandwidth-limit) shift; set_haproxy_input_bandwidth_limit_cli "$@" ;;
         haproxy-limit-off|haproxy-bandwidth-off) shift; remove_haproxy_input_bandwidth_limit_cli "$@" ;;
         haproxy-limit-clear|haproxy-bandwidth-clear) clear_all_haproxy_bandwidth_limits_cli ;;

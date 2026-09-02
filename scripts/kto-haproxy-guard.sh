@@ -4,8 +4,9 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-HAPROXY_GUARD_BUILD="v344"
+HAPROXY_GUARD_BUILD="v346"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
+ROUTES_DISABLED_FILE="${KTO_HAPROXY_ROUTES_DISABLED_FILE:-/etc/kto-haproxy-routes.disabled}"
 SERVICE="${KTO_HAPROXY_SERVICE:-haproxy.service}"
 TIMER="${KTO_HAPROXY_GUARD_TIMER:-kto-haproxy-guard.timer}"
 FIREWALL_MANAGER="${KTO_HAPROXY_FIREWALL_MANAGER:-/usr/local/sbin/kto-haproxy-firewall}"
@@ -328,7 +329,9 @@ repair_firewall_if_due() {
 
 report_status() {
     local config_status service_status missing_ips missing_ips_label missing missing_count timer_status nonlocal last_action last_error
-    if [[ ! -s "$CONFIG" ]]; then
+    if [[ ! -s "$CONFIG" && -e "$ROUTES_DISABLED_FILE" ]]; then
+        config_status="disabled (no routes)"
+    elif [[ ! -s "$CONFIG" ]]; then
         config_status="missing"
     elif config_valid; then
         config_status="valid"
@@ -362,6 +365,11 @@ report_status() {
 
 check_health() {
     local failed=0
+    if [[ ! -s "$CONFIG" && -e "$ROUTES_DISABLED_FILE" ]]; then
+        report_status
+        service_active && return 1
+        return 0
+    fi
     [[ -s "$CONFIG" ]] || return 1
     config_valid || failed=1
     service_active || failed=1
@@ -373,6 +381,7 @@ check_health() {
 repair_health() {
     local invalid_count listener_count missing_ips missing previous_missing
 
+    [[ ! -s "$CONFIG" && -e "$ROUTES_DISABLED_FILE" ]] && return 0
     [[ -s "$CONFIG" ]] || return 0
     config_is_recent && return 0
 

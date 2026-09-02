@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v344"
+COLLECTOR_BUILD = "v346"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -1067,10 +1067,16 @@ def load_haproxy_state():
             if not isinstance(item, dict):
                 continue
             node_key = str(key or "").strip()[:200]
-            routes = normalize_haproxy_routes(item.get("routes"))
+            has_routes = isinstance(item.get("routes"), list)
+            routes = []
+            if has_routes:
+                try:
+                    routes = normalize_haproxy_routes(item.get("routes"), strict=True)
+                except Exception:
+                    has_routes = False
             route_base_hashes = clean_haproxy_base_hashes(item.get("routes_base_hashes"))
-            if routes and not route_base_hashes:
-                routes = []
+            if has_routes and not route_base_hashes:
+                has_routes = False
                 discarded_legacy_commands += 1
             has_bandwidth_limits = isinstance(item.get("bandwidth_limits"), list)
             bandwidth_limits = []
@@ -1083,13 +1089,13 @@ def load_haproxy_state():
             if has_bandwidth_limits and not bandwidth_base_hashes:
                 has_bandwidth_limits = False
                 discarded_legacy_commands += 1
-            if not node_key or (not routes and not has_bandwidth_limits):
+            if not node_key or (not has_routes and not has_bandwidth_limits):
                 continue
             clean_item = {
                 "name": clean_display_text(item.get("name") or node_key)[:120],
                 "updated_at": int(item.get("updated_at") or 0),
             }
-            if routes:
+            if has_routes:
                 clean_item["routes"] = routes
                 clean_item["routes_command_id"] = (
                     clean_haproxy_command_id(item.get("routes_command_id")) or new_haproxy_command_id()
@@ -5309,6 +5315,22 @@ def haproxy_target_override_for_node(node):
     return None
 
 
+def clear_legacy_haproxy_override_for_node(node):
+    aliases = sni_node_aliases(node)
+    if not aliases:
+        return False
+    removed = False
+    with LOCK:
+        nodes = SNI_STATE.setdefault("nodes", {})
+        for key in list(nodes):
+            if canonical_node_key(key) in aliases:
+                del nodes[key]
+                removed = True
+        if removed:
+            save_sni_state()
+    return removed
+
+
 def reported_sni_for_node(node):
     if not isinstance(node, dict):
         return []
@@ -5488,10 +5510,9 @@ def reported_haproxy_routes_for_node(node):
 
 def desired_haproxy_routes_for_node(node):
     item = haproxy_state_item_for_node(node)
-    if not isinstance(item, dict):
+    if not isinstance(item, dict) or "routes" not in item:
         return None
-    routes = normalize_haproxy_routes(item.get("routes"))
-    return routes or None
+    return normalize_haproxy_routes(item.get("routes"))
 
 
 def effective_haproxy_routes_for_node(node):
@@ -5503,8 +5524,6 @@ def effective_haproxy_routes_for_node(node):
 
 def set_haproxy_routes_for_node(node, routes):
     routes = normalize_haproxy_routes(routes, strict=True)
-    if not routes:
-        raise ValueError("empty haproxy routes")
     key = haproxy_state_key(node)
     if not key:
         raise ValueError("empty node key")
@@ -5533,6 +5552,7 @@ def set_haproxy_routes_for_node(node, routes):
         })
         nodes[key] = preserved
         save_haproxy_state()
+    clear_legacy_haproxy_override_for_node(node)
     return routes
 
 
@@ -5637,7 +5657,7 @@ def acknowledge_haproxy_desired_state(node):
                 and not haproxy_routes_equal(desired_routes, reported_routes)
                 and not failed
             )
-            if desired_routes and (applied or haproxy_routes_equal(desired_routes, reported_routes) or local_change):
+            if applied or haproxy_routes_equal(desired_routes, reported_routes) or local_change:
                 item.pop("routes", None)
                 item.pop("updated_at", None)
                 item.pop("routes_command_id", None)
@@ -6087,6 +6107,8 @@ def haproxy_ip_selector_payload(node, token):
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
     if wildcard_count:
         rows.append([{"text": "FULL → точечные бинды", "callback_data": f"hpx:p:{token}"}])
+    if routes:
+        rows.append([{"text": "Удалить все маршруты", "callback_data": f"hpx:E:{token}"}])
     if routes_error:
         rows.append([{"text": "Повторить применение маршрутов", "callback_data": f"hpx:R:{token}"}])
     if bandwidth_error:
@@ -6915,6 +6937,44 @@ def handle_haproxy_callback(callback):
             answer_callback(callback_id, "повторю при ближайшем push")
         else:
             answer_callback(callback_id, "нет команды для повтора")
+        show_haproxy_ip_selector(token)
+        return True
+    if action == "E":
+        if not routes:
+            answer_callback(callback_id, "маршрутов уже нет")
+            show_haproxy_ip_selector(token)
+            return True
+        limits, _ = effective_haproxy_bandwidth_limits_for_node(node)
+        endpoints = len({(route.get("listen_ip"), int(route.get("port") or 0)) for route in routes})
+        answer_callback(callback_id)
+        body = (
+            "<b>Удалить все HAProxy-маршруты?</b>\n"
+            f"{ALERT_SEPARATOR}\n"
+            f"{detail_line('Машина', node_display_name(node))}\n"
+            f"{detail_line('Маршрутов', len(routes))}\n"
+            f"{detail_line('Listener-ов', endpoints)}\n"
+            f"{detail_line('Лимитов скорости', len(limits))}\n\n"
+            "Текущие соединения оборвутся. Машина создаст проверенный backup, удалит маршруты и связанные "
+            "лимиты, остановит HAProxy и отключит его автозапуск. Первый новый маршрут снова включит сервис."
+        )
+        markup = {"inline_keyboard": [[
+            {"text": "Удалить всё", "callback_data": f"hpx:F:{token}"},
+            {"text": "Отмена", "callback_data": f"hpx:r:{token}"},
+        ]]}
+        edit_haproxy_session_message(token, body, markup)
+        return True
+    if action == "F":
+        try:
+            set_haproxy_routes_for_node(node, [])
+            if bool(node.get("haproxy_bandwidth_supported")):
+                set_haproxy_bandwidth_limits_for_node(node, [])
+        except Exception as exc:
+            log(f"haproxy clear all failed node={haproxy_state_key(node)}: {exc}")
+            answer_callback(callback_id, "не удалось сохранить")
+            return True
+        pop_pending_haproxy(chat_id, from_id)
+        update_haproxy_session(token, selected_ip="")
+        answer_callback(callback_id, "удаление ждёт ближайший push")
         show_haproxy_ip_selector(token)
         return True
     if action == "C":

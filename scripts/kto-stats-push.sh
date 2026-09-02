@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v344"
+PUSH_BUILD="v346"
 KTO_SSH_PORT_FILE="${KTO_SSH_PORT_FILE:-/etc/kto-ssh-port}"
 KTO_UFW_LOCK_FILE="${KTO_UFW_LOCK_FILE:-/run/lock/kto-ufw.lock}"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
@@ -1054,7 +1054,7 @@ apply_collector_haproxy_routes() {
           })
         | sort_by(.listen_ip, .port)
     ' 2>/dev/null || true)"
-    if [[ -z "$desired" ]] || ! printf '%s' "$desired" | jq -e 'type == "array" and length >= 1 and length <= 128' >/dev/null 2>&1; then
+    if [[ -z "$desired" ]] || ! printf '%s' "$desired" | jq -e 'type == "array" and length <= 128' >/dev/null 2>&1; then
         write_haproxy_apply_result "error" "collector sent invalid route list" 0 "$command_id"
         echo "push ${PUSH_BUILD}: invalid HAProxy routes from collector" >&2
         return 0

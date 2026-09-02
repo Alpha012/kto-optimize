@@ -47,15 +47,15 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v344"', KTO)
-        self.assertIn('PUSH_BUILD="v344"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v344"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v344"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v344"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v344"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v344"', HAPROXY_BANDWIDTH)
-        self.assertIn('HAPROXY_GUARD_BUILD="v344"', HAPROXY_GUARD)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v344"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v346"', KTO)
+        self.assertIn('PUSH_BUILD="v346"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v346"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v346"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v346"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v346"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v346"', HAPROXY_BANDWIDTH)
+        self.assertIn('HAPROXY_GUARD_BUILD="v346"', HAPROXY_GUARD)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v346"', DPI_PREFLIGHT)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -231,6 +231,12 @@ jq -e '.[0].rate_source == "haproxy"
         harden = function_body(KTO, "harden_selfsteal_caddy")
 
         self.assertIn("harden_selfsteal_caddy", install_selfsteal)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", install_selfsteal)
+        self.assertIn("GCM_INTERACTIVE=Never", install_selfsteal)
+        self.assertIn("GIT_ASKPASS=/bin/false", install_selfsteal)
+        self.assertIn("raw.githubusercontent.com/DigneZzZ", install_selfsteal)
+        self.assertIn("mktemp /tmp/kto-selfsteal.", install_selfsteal)
+        self.assertIn("curl -fsSL", install_selfsteal)
         self.assertIn("# kto-selfsteal-timeouts-v1", harden)
         self.assertIn('read_header 5s', harden)
         self.assertIn('idle 15s', harden)
@@ -1786,7 +1792,9 @@ install_count=0
 install_source_route_manager() { install_count=$((install_count + 1)); }
 sleep() { :; }
 print_result_table() { :; }
-setup_additional_ips
+run_setup() { setup_additional_ips; }
+run_setup
+[[ -z "$(trap -p RETURN)" ]]
 [[ "$apply_count" == 2 ]]
 [[ "$install_count" == 1 ]]
 grep -q '^    wan2:$' "$first"
@@ -1893,19 +1901,21 @@ grep -q 'Основной IP не прошёл HTTPS-проверку' <<< "$out
         self.assertIn('backend_name="vless_pool_${port}"', render)
         self.assertIn('2) Добавить маршрут (входной IP = выходному IP)', haproxy_menu)
         self.assertIn('3) Удалить маршрут', haproxy_menu)
-        self.assertIn('4) Заменить SNI у всех маршрутов', haproxy_menu)
-        self.assertIn('5) Обновить HAProxy, сохранив маршруты', haproxy_menu)
-        self.assertIn('6) Добавить или заменить backend-пул', haproxy_menu)
-        self.assertIn('7) Массово добавить backend по следующим портам', haproxy_menu)
-        self.assertIn('8) Ограничить скорость по входному IP', haproxy_menu)
-        self.assertIn('9) Восстановить HAProxy backup', haproxy_menu)
-        self.assertIn('10) Проверить бинды', haproxy_menu)
-        self.assertIn('11) Полная диагностика HAProxy', haproxy_menu)
-        self.assertIn('12) Аварийно стабилизировать HAProxy', haproxy_menu)
+        self.assertIn('4) Удалить ВСЕ маршруты и остановить HAProxy', haproxy_menu)
+        self.assertIn('5) Заменить SNI у всех маршрутов', haproxy_menu)
+        self.assertIn('6) Обновить HAProxy, сохранив маршруты', haproxy_menu)
+        self.assertIn('7) Добавить или заменить backend-пул', haproxy_menu)
+        self.assertIn('8) Массово добавить backend по следующим портам', haproxy_menu)
+        self.assertIn('9) Ограничить скорость по входному IP', haproxy_menu)
+        self.assertIn('10) Восстановить HAProxy backup', haproxy_menu)
+        self.assertIn('11) Проверить бинды', haproxy_menu)
+        self.assertIn('12) Полная диагностика HAProxy', haproxy_menu)
+        self.assertIn('13) Аварийно стабилизировать HAProxy', haproxy_menu)
         self.assertIn('add_haproxy_route "$routes_file"', haproxy_menu)
         self.assertNotIn('Добавить маршрут через основной', haproxy_menu)
         self.assertNotIn('Добавить маршрут через другой', haproxy_menu)
         self.assertIn('replace_all_haproxy_sni "$routes_file"', haproxy_menu)
+        self.assertIn('delete_all_haproxy_routes "$routes_file"', haproxy_menu)
         self.assertIn('haproxy_bandwidth_menu', haproxy_menu)
         self.assertIn('restore_haproxy_backup "$routes_file"', haproxy_menu)
         self.assertIn('check_haproxy_bindings "$routes_file"', haproxy_menu)
@@ -3317,7 +3327,7 @@ after="$(wc -l < "$events")"
         self.assertNotIn("ip address del", HAPROXY_GUARD)
         self.assertNotIn("ufw delete", HAPROXY_GUARD)
         self.assertIn('haproxy-guard-install|haproxy-heal-enable', KTO)
-        self.assertIn('13) Автолечение HAProxy', KTO)
+        self.assertIn('14) Автолечение HAProxy', KTO)
 
     def test_haproxy_guard_starts_valid_config_with_temporarily_missing_ip(self):
         bash = bash_executable()
@@ -4149,7 +4159,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v344"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v346"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 
@@ -4604,6 +4614,112 @@ rm -f "$routes.before"
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_haproxy_delete_all_routes_stops_disables_backs_up_and_cleans(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+LOG_FILE="$root/kto.log"
+HAPROXY_CONFIG_FILE="$root/haproxy.cfg"
+HAPROXY_BACKUP_DIR="$root/backups"
+HAPROXY_ROUTES_DISABLED_FILE="$root/routes.disabled"
+HAPROXY_BANDWIDTH_CONFIG="$root/bandwidth.conf"
+HAPROXY_BANDWIDTH_MANAGER="$root/kto-haproxy-bandwidth"
+routes="$root/routes.tsv"
+snapshot="$root/haproxy.snapshot"
+events="$root/events"
+service_enabled=1
+service_active=1
+
+printf '443\t89.144.8.3:443\ta.example.com\tdefault\n8443\t5.34.179.144:443\tb.example.com\tdefault\n' > "$routes"
+render_haproxy_routes_config "$routes" "$HAPROXY_CONFIG_FILE"
+cp "$HAPROXY_CONFIG_FILE" "$snapshot"
+printf '78.159.250.112\t2000\n' > "$HAPROXY_BANDWIDTH_CONFIG"
+
+run_systemctl_bounded() {
+    local _timeout="$1" action
+    shift
+    while [[ "${1:-}" == --* ]]; do shift; done
+    action="${1:-}"
+    case "$action" in
+        is-enabled) (( service_enabled == 1 )) ;;
+        is-active) (( service_active == 1 )) ;;
+        stop) service_active=0; printf 'stop\n' >> "$events" ;;
+        disable) service_enabled=0; printf 'disable\n' >> "$events" ;;
+        enable) service_enabled=1; printf 'enable\n' >> "$events" ;;
+        start|restart) service_active=1; printf 'start\n' >> "$events" ;;
+        kill) service_active=0; printf 'kill\n' >> "$events" ;;
+        reset-failed) printf 'reset\n' >> "$events" ;;
+        *) return 0 ;;
+    esac
+}
+haproxy_service_is_stopped() { (( service_active == 0 )); }
+sync_haproxy_firewall() {
+    [[ ! -e "$HAPROXY_CONFIG_FILE" ]]
+    [[ "$1" == /dev/null && "$2" == "$routes" ]]
+    printf 'firewall-clear\n' >> "$events"
+}
+clear_all_haproxy_bandwidth_limits() {
+    rm -f "$HAPROXY_BANDWIDTH_CONFIG"
+    printf 'bandwidth-clear\n' >> "$events"
+}
+
+delete_all_haproxy_routes "$routes" <<< 'NO'
+cmp -s "$HAPROXY_CONFIG_FILE" "$snapshot"
+[[ ! -e "$HAPROXY_ROUTES_DISABLED_FILE" ]]
+[[ "$service_enabled" == 1 && "$service_active" == 1 ]]
+
+delete_all_haproxy_routes "$routes" <<< 'DELETE'
+[[ ! -e "$HAPROXY_CONFIG_FILE" ]]
+[[ -s "$HAPROXY_ROUTES_DISABLED_FILE" ]]
+grep -Fqx 'state=disabled' "$HAPROXY_ROUTES_DISABLED_FILE"
+[[ ! -s "$routes" ]]
+[[ ! -e "$HAPROXY_BANDWIDTH_CONFIG" ]]
+[[ "$service_enabled" == 0 && "$service_active" == 0 ]]
+grep -Fqx 'stop' "$events"
+grep -Fqx 'disable' "$events"
+grep -Fqx 'firewall-clear' "$events"
+grep -Fqx 'bandwidth-clear' "$events"
+[[ -n "$HAPROXY_LAST_BACKUP" && -s "$HAPROXY_LAST_BACKUP" ]]
+verify_haproxy_backup "$HAPROXY_LAST_BACKUP"
+cmp -s "$HAPROXY_LAST_BACKUP" "$snapshot"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_empty_routes_are_a_persisted_remote_command(self):
+        remote_apply = function_body(KTO, "haproxy_remote_apply_json")
+        push_apply = function_body(PUSH, "apply_collector_haproxy_routes")
+
+        self.assertIn('length <= 128', remote_apply)
+        self.assertNotIn('length >= 1 and length <= 128', remote_apply)
+        self.assertIn('deactivate_all_haproxy_routes "$previous_routes_file"', remote_apply)
+        self.assertIn('"routes":0', remote_apply)
+        self.assertIn('type == "array" and length <= 128', push_apply)
+        self.assertNotIn('length >= 1', push_apply)
+        self.assertIn('or "routes" not in item', COLLECTOR)
+        self.assertIn('return normalize_haproxy_routes(item.get("routes"))', COLLECTOR)
+        self.assertNotIn('empty haproxy routes', COLLECTOR)
+        self.assertIn('clear_legacy_haproxy_override_for_node(node)', COLLECTOR)
+        self.assertIn('if applied or haproxy_routes_equal', COLLECTOR)
+        self.assertIn('Удалить все маршруты', COLLECTOR)
+        self.assertIn('if action == "E"', COLLECTOR)
+        self.assertIn('if action == "F"', COLLECTOR)
+        self.assertIn('set_haproxy_routes_for_node(node, [])', COLLECTOR)
+        self.assertIn('set_haproxy_bandwidth_limits_for_node(node, [])', COLLECTOR)
+
     def test_haproxy_route_delete_shared_port_skips_tc_rebuild(self):
         bash = bash_executable()
         if bash is None:
@@ -4906,6 +5022,7 @@ cp "$current_routes" "$menu_routes"
 ensure_haproxy_package() { return 0; }
 haproxy() { return 0; }
 reserve_haproxy_route_ports() { return 0; }
+run_systemctl_bounded() { return 0; }
 reload_haproxy_gracefully() { return 1; }
 start_haproxy_cleanly() { return 0; }
 sync_haproxy_firewall() { return 99; }
@@ -4954,6 +5071,7 @@ cp "$current_routes" "$menu_routes"
 ensure_haproxy_package() { return 0; }
 haproxy() { return 0; }
 reserve_haproxy_route_ports() { return 0; }
+run_systemctl_bounded() { return 0; }
 reload_haproxy_gracefully() { return 0; }
 sync_haproxy_firewall() { printf 'sync\n' >> "$root/events"; }
 restore_haproxy_backup "$menu_routes" <<< $'1\ny'
@@ -4963,6 +5081,61 @@ cmp -s "$menu_routes" "$root/expected-restored.routes"
 grep -q '^sync$' "$root/events"
 [[ -n "$HAPROXY_LAST_BACKUP" && -s "$HAPROXY_LAST_BACKUP" ]]
 verify_haproxy_backup "$HAPROXY_LAST_BACKUP"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_haproxy_restore_reenables_service_from_disabled_routes_state(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+source <(sed '/^main /d' kto.sh)
+SUDO=()
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+LOG_FILE="$root/kto.log"
+HAPROXY_CONFIG_FILE="$root/haproxy.cfg"
+HAPROXY_BACKUP_DIR="$root/backups"
+HAPROXY_ROUTES_DISABLED_FILE="$root/routes.disabled"
+backup_routes="$root/backup.routes"
+menu_routes="$root/menu.routes"
+events="$root/events"
+backup="$HAPROXY_BACKUP_DIR/haproxy-20260901-120000-before-disable-all-1.cfg"
+mkdir -p "$HAPROXY_BACKUP_DIR"
+printf '443\t5.34.179.144:443\trestored.example.com\tdefault\n' > "$backup_routes"
+render_haproxy_routes_config "$backup_routes" "$backup"
+hash=$(sha256sum "$backup" | awk '{print $1}')
+printf '%s  %s\n' "$hash" "$(basename "$backup")" > "${backup}.sha256"
+printf 'state=disabled\nbackup=%s\n' "$backup" > "$HAPROXY_ROUTES_DISABLED_FILE"
+: > "$menu_routes"
+ensure_haproxy_package() { return 0; }
+haproxy() { return 0; }
+reserve_haproxy_route_ports() { return 0; }
+run_systemctl_bounded() {
+    [[ "${2:-}" != "enable" ]] || printf 'enable-haproxy\n' >> "$events"
+    return 0
+}
+reload_haproxy_gracefully() { return 0; }
+sync_haproxy_firewall() { printf 'sync\n' >> "$events"; }
+ensure_haproxy_guard() { return 0; }
+
+restore_haproxy_backup "$menu_routes" <<< $'1\ny'
+cmp -s "$HAPROXY_CONFIG_FILE" "$backup"
+[[ ! -e "$HAPROXY_ROUTES_DISABLED_FILE" ]]
+extract_haproxy_routes "$backup" > "$root/expected.routes"
+cmp -s "$menu_routes" "$root/expected.routes"
+grep -Fqx 'enable-haproxy' "$events"
+grep -Fqx 'sync' "$events"
+[[ -z "$HAPROXY_LAST_BACKUP" ]]
 '''
         result = subprocess.run(
             [bash, "-lc", harness],

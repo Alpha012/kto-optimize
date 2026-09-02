@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-ADDITIONAL_IP_BUILD="v344"
+ADDITIONAL_IP_BUILD="v346"
 MANAGED_NETPLAN_FILE="${KTO_ADDITIONAL_IP_NETPLAN_FILE:-/etc/netplan/90-kto-extra-nics.yaml}"
 LEGACY_ALIAS_NETPLAN_FILE="${KTO_ADDITIONAL_IP_LEGACY_NETPLAN_FILE:-/etc/netplan/90-kto-extra-ips.yaml}"
 MANAGED_SYSCTL_FILE="${KTO_ADDITIONAL_IP_SYSCTL_FILE:-/etc/sysctl.d/99-z-kto-multiwan.conf}"
@@ -992,7 +992,7 @@ print_result_table() {
 }
 
 optimize_all_ip_networks() {
-    local primary_interface_name primary_ip primary_mac state_file external rc=0
+    local primary_interface_name primary_ip primary_mac state_file external cleanup_command rc=0
 
     require_root
     require_commands
@@ -1007,7 +1007,8 @@ optimize_all_ip_networks() {
     fi
 
     state_file="$(mktemp)"
-    trap 'rm -f "$state_file"' RETURN
+    printf -v cleanup_command 'rm -f -- %q; trap - RETURN' "$state_file"
+    trap "$cleanup_command" RETURN
     info "Проверяю текущие интерфейсы и source routes"
     if discover_existing_extra_state "$primary_interface_name" "$primary_ip" "$state_file"; then
         ok "Найдено дополнительных IPv4: ${DISCOVERED_EXTRA_COUNT}"
@@ -1056,7 +1057,7 @@ optimize_all_ip_networks() {
 }
 
 setup_additional_ips() {
-    local metadata_file initial_state final_state initial_netplan final_netplan
+    local metadata_file initial_state final_state initial_netplan final_netplan cleanup_command
     local primary_interface_name primary_ip primary_mac mac interface name
     local idx suffix existing_suffix metric metric_base primary_metric table priority ip_cidr gateway network_cidr successful=0
     local legacy_backup=""
@@ -1085,7 +1086,9 @@ setup_additional_ips() {
     final_state="$(mktemp)"
     initial_netplan="$(mktemp)"
     final_netplan="$(mktemp)"
-    trap 'rm -f "$metadata_file" "$initial_state" "$final_state" "$initial_netplan" "$final_netplan"' RETURN
+    printf -v cleanup_command 'rm -f -- %q %q %q %q %q; trap - RETURN' \
+        "$metadata_file" "$initial_state" "$final_state" "$initial_netplan" "$final_netplan"
+    trap "$cleanup_command" RETURN
 
     info "Читаю OpenStack network metadata"
     if ! fetch_openstack_metadata "$metadata_file"; then
