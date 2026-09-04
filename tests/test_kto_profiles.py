@@ -47,15 +47,15 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v347"', KTO)
-        self.assertIn('PUSH_BUILD="v347"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v347"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v347"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v347"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v347"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v347"', HAPROXY_BANDWIDTH)
-        self.assertIn('HAPROXY_GUARD_BUILD="v347"', HAPROXY_GUARD)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v347"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v348"', KTO)
+        self.assertIn('PUSH_BUILD="v348"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v348"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v348"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v348"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v348"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v348"', HAPROXY_BANDWIDTH)
+        self.assertIn('HAPROXY_GUARD_BUILD="v348"', HAPROXY_GUARD)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v348"', DPI_PREFLIGHT)
 
     def test_runtime_temp_and_storage_preflight_protect_root_disk(self):
         runtime = function_body(KTO, "prepare_runtime_tmpdir")
@@ -65,9 +65,12 @@ class CombinedNodeProfileTests(unittest.TestCase):
 
         self.assertIn('KTO_RUNTIME_TMPDIR="${KTO_RUNTIME_TMPDIR:-/run/kto-tmp}"', KTO)
         self.assertIn('export TMPDIR="$candidate"', runtime)
-        self.assertIn('journalctl --vacuum-size=128M --vacuum-time=3d', cleanup)
+        self.assertIn('journalctl --vacuum-size=64M --vacuum-time=1d', cleanup)
         self.assertIn('apt-get clean', cleanup)
         self.assertIn("-name '*-json.log'", cleanup)
+        self.assertIn('docker image prune -af', cleanup)
+        self.assertIn('docker builder prune -af', cleanup)
+        self.assertIn('/var/lib/apt/lists', cleanup)
         self.assertIn('filesystem_available_inodes /', KTO)
         self.assertIn('storage_is_critical', preflight)
         self.assertLess(main.index("prepare_runtime_tmpdir"), main.index("haproxy-remote-report"))
@@ -4320,7 +4323,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v347"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v348"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 

@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-HAPROXY_GUARD_BUILD="v347"
+HAPROXY_GUARD_BUILD="v348"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 ROUTES_DISABLED_FILE="${KTO_HAPROXY_ROUTES_DISABLED_FILE:-/etc/kto-haproxy-routes.disabled}"
 SERVICE="${KTO_HAPROXY_SERVICE:-haproxy.service}"

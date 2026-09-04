@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v347"
+SCRIPT_BUILD="v348"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -235,10 +235,8 @@ truncate_log_if_oversized() {
 }
 
 emergency_storage_cleanup() {
-    local log_path
-
     if command -v journalctl >/dev/null 2>&1; then
-        "${SUDO[@]}" journalctl --vacuum-size=128M --vacuum-time=3d >/dev/null 2>&1 || true
+        "${SUDO[@]}" journalctl --vacuum-size=64M --vacuum-time=1d >/dev/null 2>&1 || true
     fi
     if command -v apt-get >/dev/null 2>&1; then
         "${SUDO[@]}" apt-get clean >/dev/null 2>&1 || true
@@ -248,17 +246,54 @@ emergency_storage_cleanup() {
     fi
 
     "${SUDO[@]}" find /var/log -xdev -type f \
-        \( -name '*.gz' -o -name '*.old' \) -mtime +7 -delete >/dev/null 2>&1 || true
+        \( -name '*.gz' -o -name '*.old' -o -name '*.1' \) -mtime +3 -delete >/dev/null 2>&1 || true
+    "${SUDO[@]}" find /var/crash /var/lib/systemd/coredump -xdev -type f \
+        -delete >/dev/null 2>&1 || true
     truncate_log_if_oversized "$LOG_FILE" 33554432
-    prune_haproxy_backups 20
+    prune_haproxy_backups 10
 
     storage_is_critical || return 0
 
-    for log_path in /var/log/syslog /var/log/kern.log /var/log/ufw.log /var/log/auth.log; do
-        truncate_log_if_oversized "$log_path" 268435456
-    done
+    "${SUDO[@]}" find /var/lib/apt/lists -mindepth 1 -maxdepth 1 \
+        -exec rm -rf -- {} + >/dev/null 2>&1 || true
+    "${SUDO[@]}" find /tmp -xdev -mindepth 1 -mtime +2 \
+        -exec rm -rf -- {} + >/dev/null 2>&1 || true
+    "${SUDO[@]}" find /var/tmp -xdev -mindepth 1 -mtime +7 \
+        -exec rm -rf -- {} + >/dev/null 2>&1 || true
+    "${SUDO[@]}" find /var/log -xdev -type f -size +50M \
+        ! -path '/var/log/journal/*' -exec truncate -s 0 {} + >/dev/null 2>&1 || true
     "${SUDO[@]}" find /var/lib/docker/containers -xdev -type f -name '*-json.log' \
-        -size +100M -exec truncate -s 0 {} + >/dev/null 2>&1 || true
+        -size +20M -exec truncate -s 0 {} + >/dev/null 2>&1 || true
+    if command -v docker >/dev/null 2>&1; then
+        "${SUDO[@]}" docker image prune -af >/dev/null 2>&1 || true
+        "${SUDO[@]}" docker builder prune -af >/dev/null 2>&1 || true
+    fi
+    sync >/dev/null 2>&1 || true
+}
+
+print_emergency_storage_audit() {
+    local path
+
+    echo '=== FILESYSTEM ===' >&2
+    df -h / /tmp 1>&2 2>/dev/null || true
+    df -ih / /tmp 1>&2 2>/dev/null || true
+    for path in / /var /opt; do
+        echo "=== DU ${path} ===" >&2
+        if command -v timeout >/dev/null 2>&1; then
+            "${SUDO[@]}" timeout 20s du -xhd1 "$path" 1>&2 2>/dev/null || true
+        else
+            "${SUDO[@]}" du -xhd1 "$path" 1>&2 2>/dev/null || true
+        fi
+    done
+    if command -v lsof >/dev/null 2>&1; then
+        echo '=== DELETED OPEN FILES >= 10 MiB ===' >&2
+        "${SUDO[@]}" lsof +L1 2>/dev/null |
+            awk 'NR == 1 || ($7 ~ /^[0-9]+$/ && $7 >= 10485760)' 1>&2 || true
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        echo '=== DOCKER DISK ===' >&2
+        "${SUDO[@]}" docker system df 1>&2 2>/dev/null || true
+    fi
 }
 
 startup_storage_preflight() {
@@ -281,8 +316,7 @@ startup_storage_preflight() {
 
     if storage_is_critical; then
         fail "На / всё ещё недостаточно места: ${after_kb} KiB, inode ${after_inodes}. Настройку не начинаю."
-        df -h / /tmp 1>&2 2>/dev/null || true
-        df -ih / /tmp 1>&2 2>/dev/null || true
+        print_emergency_storage_audit
         fail "Запусти: bash kto.sh disk-clean, затем bash kto.sh disk-audit"
         return 1
     fi
@@ -5331,7 +5365,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v347"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v348"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5344,7 +5378,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v347"
+KTO_HAPROXY_FIREWALL_BUILD="v348"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
