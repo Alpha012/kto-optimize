@@ -47,15 +47,176 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v346"', KTO)
-        self.assertIn('PUSH_BUILD="v346"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v346"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v346"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v346"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v346"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v346"', HAPROXY_BANDWIDTH)
-        self.assertIn('HAPROXY_GUARD_BUILD="v346"', HAPROXY_GUARD)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v346"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v347"', KTO)
+        self.assertIn('PUSH_BUILD="v347"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v347"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v347"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v347"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v347"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v347"', HAPROXY_BANDWIDTH)
+        self.assertIn('HAPROXY_GUARD_BUILD="v347"', HAPROXY_GUARD)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v347"', DPI_PREFLIGHT)
+
+    def test_runtime_temp_and_storage_preflight_protect_root_disk(self):
+        runtime = function_body(KTO, "prepare_runtime_tmpdir")
+        cleanup = function_body(KTO, "emergency_storage_cleanup")
+        preflight = function_body(KTO, "startup_storage_preflight")
+        main = function_body(KTO, "main")
+
+        self.assertIn('KTO_RUNTIME_TMPDIR="${KTO_RUNTIME_TMPDIR:-/run/kto-tmp}"', KTO)
+        self.assertIn('export TMPDIR="$candidate"', runtime)
+        self.assertIn('journalctl --vacuum-size=128M --vacuum-time=3d', cleanup)
+        self.assertIn('apt-get clean', cleanup)
+        self.assertIn("-name '*-json.log'", cleanup)
+        self.assertIn('filesystem_available_inodes /', KTO)
+        self.assertIn('storage_is_critical', preflight)
+        self.assertLess(main.index("prepare_runtime_tmpdir"), main.index("haproxy-remote-report"))
+        self.assertLess(main.index("startup_storage_preflight"), main.index("init_log"))
+
+    def test_haproxy_remote_report_does_not_write_a_root_disk_temp_file(self):
+        report = function_body(KTO, "haproxy_remote_report_json")
+
+        self.assertIn('output="$(extract_haproxy_routes | jq -Rn', report)
+        self.assertIn("printf '%s\\n' \"$output\"", report)
+        self.assertNotIn('routes_file="$(mktemp)"', report)
+
+    def test_storage_guards_limit_persistent_logs_and_backups(self):
+        storage = function_body(KTO, "opt_storage_guard")
+        node_install = function_body(KTO, "do_install_remnawave_node")
+        existing_node = function_body(KTO, "ensure_existing_remnanode_log_rotation")
+        backup = function_body(KTO, "create_haproxy_persistent_backup")
+
+        self.assertIn("SystemKeepFree=512M", storage)
+        self.assertIn("RuntimeKeepFree=128M", storage)
+        self.assertEqual(node_install.count('max-size: "20m"'), 2)
+        self.assertEqual(node_install.count('max-file: "3"'), 2)
+        self.assertIn("ensure_existing_remnanode_log_rotation", storage)
+        self.assertIn("docker-compose.override.yml", KTO)
+        self.assertIn("docker compose up -d --no-deps --force-recreate", existing_node)
+        self.assertIn("remnanode_log_rotation_active", existing_node)
+        self.assertIn("prune_haproxy_backups", backup)
+        self.assertIn('HAPROXY_BACKUP_KEEP="${KTO_HAPROXY_BACKUP_KEEP:-30}"', KTO)
+
+    def test_runtime_temp_directory_is_used_by_mktemp(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+source <(sed '/^main /d' kto.sh)
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+KTO_RUNTIME_TMPDIR="$root/runtime"
+unset TMPDIR
+prepare_runtime_tmpdir
+[[ "$TMPDIR" == "$root/runtime" ]]
+[[ -d "$TMPDIR" && -w "$TMPDIR" ]]
+temporary=$(mktemp)
+[[ "$temporary" == "$TMPDIR"/* ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_storage_preflight_cleans_or_stops_before_configuration(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+source <(sed '/^main /d' kto.sh)
+events=$(mktemp)
+trap 'rm -f "$events"' EXIT
+state=critical
+filesystem_available_kb() {
+    [[ "$state" == critical ]] && printf '100\n' || printf '700000\n'
+}
+filesystem_available_inodes() { printf '100000\n'; }
+storage_is_critical() { [[ "$state" == critical ]]; }
+emergency_storage_cleanup() {
+    printf 'cleanup\n' >> "$events"
+    state=healthy
+}
+startup_storage_preflight menu
+grep -Fqx cleanup "$events"
+
+state=critical
+emergency_storage_cleanup() { printf 'stuck\n' >> "$events"; }
+! startup_storage_preflight menu
+grep -Fqx stuck "$events"
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_existing_remnanode_gets_a_bounded_logging_override(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        harness = r'''
+set -Eeuo pipefail
+source <(sed '/^main /d' kto.sh)
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+SUDO=()
+LOG_FILE="$root/kto.log"
+REMNA_DIR="$root/remnawave"
+REMNA_CONTAINER=remnanode
+REMNA_LOGGING_OVERRIDE="$REMNA_DIR/docker-compose.override.yml"
+mkdir -p "$REMNA_DIR"
+cat > "$REMNA_DIR/docker-compose.yml" <<'EOF'
+services:
+  remnanode:
+    image: remnawave/node:3.0.0
+    restart: always
+EOF
+command_exists() { [[ "$1" == docker ]]; }
+write_root_file_if_changed() { cat > "$1"; }
+remnanode_log_rotation_active() { [[ -e "$root/rotation-active" ]]; }
+docker() {
+    if [[ "$1" == compose && "$2" == version ]]; then
+        return 0
+    elif [[ "$1" == compose && "${!#}" == config ]]; then
+        return 0
+    elif [[ "$1" == compose && "$2" == up ]]; then
+        touch "$root/rotation-active"
+        return 0
+    elif [[ "$1" == inspect && "${3:-}" == *"State.Running"* ]]; then
+        printf 'true\n'
+        return 0
+    fi
+    return 1
+}
+ensure_existing_remnanode_log_rotation
+grep -Fqx '# Managed by kto. Limits Remnawave container logs.' "$REMNA_LOGGING_OVERRIDE"
+grep -Fq 'max-size: "20m"' "$REMNA_LOGGING_OVERRIDE"
+grep -Fq 'max-file: "3"' "$REMNA_LOGGING_OVERRIDE"
+[[ -e "$root/rotation-active" ]]
+'''
+        result = subprocess.run(
+            [bash, "-lc", harness],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_remote_haproxy_bandwidth_control_is_transactional(self):
         report = function_body(KTO, "haproxy_bandwidth_remote_report_json")
@@ -4159,7 +4320,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v346"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v347"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 

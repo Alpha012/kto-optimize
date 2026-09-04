@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v346"
+SCRIPT_BUILD="v347"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -40,6 +40,7 @@ ADDITIONAL_IP_MANAGER="/usr/local/sbin/kto-additional-ips"
 REMNA_EGRESS_MANAGER="/usr/local/sbin/kto-remnawave-egress"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
+REMNA_LOGGING_OVERRIDE="${KTO_REMNA_LOGGING_OVERRIDE:-${REMNA_DIR}/docker-compose.override.yml}"
 REMNA_NODE_IMAGE="${KTO_REMNA_NODE_IMAGE:-remnawave/node:3.0.0}"
 CERT_DIR="/opt/remnawave"
 CONFIG_FILE="/etc/kto-cfg.conf"
@@ -62,6 +63,9 @@ ZRAM_PERCENT="${KTO_ZRAM_PERCENT:-50}"
 ZRAM_MAX_MB="${KTO_ZRAM_MAX_MB:-2048}"
 STORAGE_GUARD_JOURNAL_CONF="/etc/systemd/journald.conf.d/99-kto-storage.conf"
 KTO_LOGROTATE_CONF="/etc/logrotate.d/kto"
+KTO_RUNTIME_TMPDIR="${KTO_RUNTIME_TMPDIR:-/run/kto-tmp}"
+KTO_STORAGE_MIN_FREE_KB="${KTO_STORAGE_MIN_FREE_KB:-524288}"
+KTO_STORAGE_MIN_FREE_INODES="${KTO_STORAGE_MIN_FREE_INODES:-2048}"
 KTO_TUNING_SYSCTL_CONF="/etc/sysctl.d/99-kto-tuning.conf"
 KTO_CONNTRACK_SYSCTL_CONF="/etc/sysctl.d/99-z-kto-conntrack.conf"
 KTO_CONNTRACK_MODPROBE_CONF="/etc/modprobe.d/99-kto-nf-conntrack.conf"
@@ -71,6 +75,7 @@ KTO_USER_LIMITS_CONF="/etc/systemd/user.conf.d/99-kto-limits.conf"
 HAPROXY_RESERVED_PORTS_SYSCTL_CONF="/etc/sysctl.d/99-z-kto-haproxy-ports.conf"
 HAPROXY_CONFIG_FILE="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 HAPROXY_BACKUP_DIR="${KTO_HAPROXY_BACKUP_DIR:-/var/backups/kto-haproxy}"
+HAPROXY_BACKUP_KEEP="${KTO_HAPROXY_BACKUP_KEEP:-30}"
 HAPROXY_FIREWALL_MANAGER="${KTO_HAPROXY_FIREWALL_MANAGER:-/usr/local/sbin/kto-haproxy-firewall}"
 HAPROXY_FIREWALL_UNIT="${KTO_HAPROXY_FIREWALL_UNIT:-/etc/systemd/system/kto-haproxy-firewall.service}"
 HAPROXY_FIREWALL_SERVICE="${KTO_HAPROXY_FIREWALL_SERVICE:-kto-haproxy-firewall.service}"
@@ -178,6 +183,112 @@ SUDO=()
 if command -v sudo >/dev/null 2>&1; then
     SUDO=(sudo -n)
 fi
+
+prepare_runtime_tmpdir() {
+    local candidate="${KTO_RUNTIME_TMPDIR:-/run/kto-tmp}"
+    local fallback="${XDG_RUNTIME_DIR:-}"
+    local available_kb
+
+    if ! mkdir -p "$candidate" >/dev/null 2>&1 || ! chmod 0700 "$candidate" >/dev/null 2>&1; then
+        if [[ -z "$fallback" || ! -d "$fallback" || ! -w "$fallback" ]]; then
+            return 0
+        fi
+        candidate="${fallback%/}/kto-tmp"
+        mkdir -p "$candidate" >/dev/null 2>&1 || return 0
+        chmod 0700 "$candidate" >/dev/null 2>&1 || return 0
+    fi
+
+    [[ -d "$candidate" && -w "$candidate" ]] || return 0
+    available_kb="$(df -Pk "$candidate" 2>/dev/null | awk 'NR == 2 {print $4; exit}')"
+    [[ "$available_kb" =~ ^[0-9]+$ && "$available_kb" -ge 16384 ]] || return 0
+    export TMPDIR="$candidate"
+}
+
+filesystem_available_kb() {
+    df -Pk "${1:-/}" 2>/dev/null |
+        awk 'NR == 2 {print $4 + 0; found=1; exit} END {if (!found) print 0}'
+}
+
+filesystem_available_inodes() {
+    df -Pi "${1:-/}" 2>/dev/null |
+        awk 'NR == 2 {print $4 + 0; found=1; exit} END {if (!found) print 0}'
+}
+
+storage_is_critical() {
+    local available_kb available_inodes min_kb min_inodes
+    min_kb="${KTO_STORAGE_MIN_FREE_KB:-524288}"
+    min_inodes="${KTO_STORAGE_MIN_FREE_INODES:-2048}"
+    [[ "$min_kb" =~ ^[0-9]+$ ]] || min_kb=524288
+    [[ "$min_inodes" =~ ^[0-9]+$ ]] || min_inodes=2048
+    available_kb="$(filesystem_available_kb /)"
+    available_inodes="$(filesystem_available_inodes /)"
+    [[ "$available_kb" =~ ^[0-9]+$ && "$available_inodes" =~ ^[0-9]+$ ]] || return 1
+    (( available_kb < min_kb || available_inodes < min_inodes ))
+}
+
+truncate_log_if_oversized() {
+    local path="$1" max_bytes="$2" size
+    [[ -n "$path" && "$max_bytes" =~ ^[0-9]+$ ]] || return 0
+    size="$("${SUDO[@]}" stat -c %s "$path" 2>/dev/null || true)"
+    [[ "$size" =~ ^[0-9]+$ && "$size" -gt "$max_bytes" ]] || return 0
+    "${SUDO[@]}" truncate -s 0 "$path" >/dev/null 2>&1 || true
+}
+
+emergency_storage_cleanup() {
+    local log_path
+
+    if command -v journalctl >/dev/null 2>&1; then
+        "${SUDO[@]}" journalctl --vacuum-size=128M --vacuum-time=3d >/dev/null 2>&1 || true
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        "${SUDO[@]}" apt-get clean >/dev/null 2>&1 || true
+    fi
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+        "${SUDO[@]}" systemd-tmpfiles --clean >/dev/null 2>&1 || true
+    fi
+
+    "${SUDO[@]}" find /var/log -xdev -type f \
+        \( -name '*.gz' -o -name '*.old' \) -mtime +7 -delete >/dev/null 2>&1 || true
+    truncate_log_if_oversized "$LOG_FILE" 33554432
+    prune_haproxy_backups 20
+
+    storage_is_critical || return 0
+
+    for log_path in /var/log/syslog /var/log/kern.log /var/log/ufw.log /var/log/auth.log; do
+        truncate_log_if_oversized "$log_path" 268435456
+    done
+    "${SUDO[@]}" find /var/lib/docker/containers -xdev -type f -name '*-json.log' \
+        -size +100M -exec truncate -s 0 {} + >/dev/null 2>&1 || true
+}
+
+startup_storage_preflight() {
+    local action="${1:-menu}" before_kb after_kb after_inodes min_kb
+
+    case "$action" in
+        disk-clean|storage-clean|clean-disk|disk-audit|disk-usage|storage-audit)
+            return 0
+            ;;
+    esac
+    storage_is_critical || return 0
+
+    min_kb="${KTO_STORAGE_MIN_FREE_KB:-524288}"
+    [[ "$min_kb" =~ ^[0-9]+$ ]] || min_kb=524288
+    before_kb="$(filesystem_available_kb /)"
+    warn "На / осталось меньше $(( min_kb / 1024 )) MiB или заканчиваются inode; запускаю аварийную очистку."
+    emergency_storage_cleanup
+    after_kb="$(filesystem_available_kb /)"
+    after_inodes="$(filesystem_available_inodes /)"
+
+    if storage_is_critical; then
+        fail "На / всё ещё недостаточно места: ${after_kb} KiB, inode ${after_inodes}. Настройку не начинаю."
+        df -h / /tmp 1>&2 2>/dev/null || true
+        df -ih / /tmp 1>&2 2>/dev/null || true
+        fail "Запусти: bash kto.sh disk-clean, затем bash kto.sh disk-audit"
+        return 1
+    fi
+
+    warn "Аварийная очистка освободила $(( (after_kb - before_kb) / 1024 )) MiB; доступно $(( after_kb / 1024 )) MiB."
+}
 
 on_error() {
     local rc=$?
@@ -3944,6 +4055,65 @@ EOF
     cmd "${SUDO[@]}" systemctl reload docker || true
 }
 
+remnanode_log_rotation_active() {
+    local logging
+
+    logging="$("${SUDO[@]}" docker inspect --format \
+        '{{.HostConfig.LogConfig.Type}}|{{index .HostConfig.LogConfig.Config "max-size"}}|{{index .HostConfig.LogConfig.Config "max-file"}}' \
+        "$REMNA_CONTAINER" 2>/dev/null || true)"
+    [[ "$logging" == "json-file|20m|3" ]]
+}
+
+ensure_existing_remnanode_log_rotation() {
+    local compose_file="${REMNA_DIR}/docker-compose.yml" tmp running
+
+    command_exists docker || return 0
+    "${SUDO[@]}" test -f "$compose_file" 2>/dev/null || return 0
+    "${SUDO[@]}" docker compose version >/dev/null 2>&1 || return 0
+    remnanode_log_rotation_active && return 0
+
+    if ! "${SUDO[@]}" grep -Eq '^[[:space:]]+max-size:[[:space:]]+"?20m"?[[:space:]]*$' "$compose_file" 2>/dev/null; then
+        if "${SUDO[@]}" test -e "$REMNA_LOGGING_OVERRIDE" 2>/dev/null &&
+            ! "${SUDO[@]}" grep -Fqx '# Managed by kto. Limits Remnawave container logs.' "$REMNA_LOGGING_OVERRIDE" 2>/dev/null; then
+            warn "Docker logging override уже существует и не управляется kto; remnanode не меняю."
+            return 0
+        fi
+
+        tmp="$(mktemp)"
+        cat > "$tmp" <<'EOF'
+# Managed by kto. Limits Remnawave container logs.
+services:
+  remnanode:
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+EOF
+        if ! (cd "$REMNA_DIR" && "${SUDO[@]}" docker compose \
+            -f "$compose_file" -f "$tmp" config >/dev/null) >> "$LOG_FILE" 2>&1; then
+            rm -f "$tmp"
+            warn "Не удалось проверить Docker logging override для remnanode."
+            return 0
+        fi
+        write_root_file_if_changed "$REMNA_LOGGING_OVERRIDE" < "$tmp"
+        rm -f "$tmp"
+    fi
+
+    running="$("${SUDO[@]}" docker inspect --format '{{.State.Running}}' "$REMNA_CONTAINER" 2>/dev/null || true)"
+    [[ "$running" == "true" ]] || return 0
+    if ! (cd "$REMNA_DIR" && "${SUDO[@]}" docker compose up -d --no-deps --force-recreate \
+        "$REMNA_CONTAINER") >> "$LOG_FILE" 2>&1; then
+        warn "Не удалось пересоздать remnanode с ограничением логов."
+        return 0
+    fi
+    if remnanode_log_rotation_active; then
+        echo "Remnanode Docker logs limited to 20m x 3" >> "$LOG_FILE" 2>/dev/null || true
+    else
+        warn "Remnanode перезапущен, но лимит Docker-логов не подтвердился."
+    fi
+}
+
 truncate_large_var_logs() {
     [[ "${KTO_DESTRUCTIVE_CLEANUP:-0}" == "1" ]] || return 0
     cmd "${SUDO[@]}" find /var/log -xdev -type f -size +256M \
@@ -4001,7 +4171,9 @@ opt_storage_guard() {
     write_root_file "$STORAGE_GUARD_JOURNAL_CONF" <<'EOF'
 [Journal]
 SystemMaxUse=256M
+SystemKeepFree=512M
 RuntimeMaxUse=64M
+RuntimeKeepFree=128M
 MaxRetentionSec=7day
 MaxFileSec=1day
 EOF
@@ -4036,6 +4208,7 @@ EOF
     fi
 
     configure_docker_log_rotation
+    ensure_existing_remnanode_log_rotation
 }
 
 print_disk_usage_top() {
@@ -4076,6 +4249,7 @@ clean_disk_now() {
     local used
 
     stage "Очищаю диск"
+    emergency_storage_cleanup
     KTO_DESTRUCTIVE_CLEANUP=1 opt_storage_guard
 
     used="$(root_disk_used_percent)"
@@ -4987,7 +5161,9 @@ apt_lists_usage_mb() {
 
 journald_storage_guard_configured() {
     root_file_has_line "$STORAGE_GUARD_JOURNAL_CONF" "SystemMaxUse=256M" &&
+        root_file_has_line "$STORAGE_GUARD_JOURNAL_CONF" "SystemKeepFree=512M" &&
         root_file_has_line "$STORAGE_GUARD_JOURNAL_CONF" "RuntimeMaxUse=64M" &&
+        root_file_has_line "$STORAGE_GUARD_JOURNAL_CONF" "RuntimeKeepFree=128M" &&
         root_file_has_line "$STORAGE_GUARD_JOURNAL_CONF" "MaxRetentionSec=7day"
 }
 
@@ -5155,7 +5331,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v346"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v347"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5168,7 +5344,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v346"
+KTO_HAPROXY_FIREWALL_BUILD="v347"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -6161,6 +6337,11 @@ services:
     image: ${REMNA_NODE_IMAGE}
     network_mode: host
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     cap_add:
       - NET_ADMIN
     ulimits:
@@ -6182,6 +6363,11 @@ services:
     image: ${REMNA_NODE_IMAGE}
     network_mode: host
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     cap_add:
       - NET_ADMIN
     ulimits:
@@ -9335,20 +9521,14 @@ extract_haproxy_routes() {
 }
 
 haproxy_remote_report_json() {
-    local routes_file
+    local output
 
     command_exists jq || {
         echo '[]'
         return 1
     }
-    routes_file="$(mktemp)"
-    extract_haproxy_routes > "$routes_file"
-    if [[ ! -s "$routes_file" ]]; then
-        rm -f "$routes_file"
-        echo '[]'
-        return 0
-    fi
-    jq -Rn '
+
+    if ! output="$(extract_haproxy_routes | jq -Rn '
         [inputs
         | select(length > 0)
         | split("\t")
@@ -9361,8 +9541,11 @@ haproxy_remote_report_json() {
             listen_ip: (.[5] // "*"),
             send_proxy_v2: ((.[6] // "0") == "1")
           }]
-    ' < "$routes_file"
-    rm -f "$routes_file"
+    ')"; then
+        echo '[]'
+        return 1
+    fi
+    printf '%s\n' "$output"
 }
 
 haproxy_remote_apply_json() {
@@ -10103,6 +10286,26 @@ EOF
 
 HAPROXY_LAST_BACKUP=""
 
+prune_haproxy_backups() {
+    local keep="${1:-$HAPROXY_BACKUP_KEEP}" backup
+    local -a stale_backups=()
+
+    [[ "$keep" =~ ^[0-9]+$ ]] || keep=30
+    (( keep >= 1 )) || keep=1
+    "${SUDO[@]}" test -d "$HAPROXY_BACKUP_DIR" 2>/dev/null || return 0
+    mapfile -t stale_backups < <(
+        "${SUDO[@]}" find "$HAPROXY_BACKUP_DIR" -maxdepth 1 -type f -name 'haproxy-*.cfg' \
+            -printf '%T@\t%p\n' 2>/dev/null |
+            sort -t $'\t' -k1,1nr |
+            tail -n "+$(( keep + 1 ))" |
+            cut -f2-
+    )
+    for backup in "${stale_backups[@]}"; do
+        [[ -n "$backup" ]] || continue
+        "${SUDO[@]}" rm -f -- "$backup" "${backup}.sha256" >/dev/null 2>&1 || true
+    done
+}
+
 create_haproxy_persistent_backup() {
     local label="${1:-before-apply}" config="${2:-$HAPROXY_CONFIG_FILE}"
     local safe_label timestamp backup checksum_file tmp checksum_tmp expected actual
@@ -10149,6 +10352,7 @@ create_haproxy_persistent_backup() {
 
     HAPROXY_LAST_BACKUP="$backup"
     printf 'HAProxy backup: %s\n' "$backup" >> "$LOG_FILE" 2>/dev/null || true
+    prune_haproxy_backups
 }
 
 verify_haproxy_backup() {
@@ -14884,6 +15088,7 @@ menu() {
 }
 
 main() {
+    prepare_runtime_tmpdir
     if [[ "${1:-}" == "haproxy-remote-report" ]]; then
         haproxy_remote_report_json
         return
@@ -14892,6 +15097,7 @@ main() {
         haproxy_bandwidth_remote_report_json
         return
     fi
+    startup_storage_preflight "${1:-menu}" || return 1
     init_log
     ensure_utf8_locale
     case "${1:-}" in
