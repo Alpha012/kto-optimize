@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PUSH_BUILD="v348"
+PUSH_BUILD="v349"
 KTO_SSH_PORT_FILE="${KTO_SSH_PORT_FILE:-/etc/kto-ssh-port}"
 KTO_UFW_LOCK_FILE="${KTO_UFW_LOCK_FILE:-/run/lock/kto-ufw.lock}"
 CONFIG="${KTO_STATS_PUSH_CONFIG:-/etc/kto-stats-push.conf}"
@@ -359,19 +359,74 @@ validate_ipv4() {
 
 normalize_haproxy_target() {
     local raw="${1:-}" ip port
-    raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    [[ "$raw" != *[[:space:]]* ]] || return 1
     if [[ "$raw" == *:* ]]; then
         ip="${raw%%:*}"
-        port="${raw##*:}"
+        port="${raw#*:}"
     else
         ip="$raw"
         port="443"
     fi
-    validate_ipv4 "$ip" || return 1
-    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    if ! validate_ipv4 "$ip"; then
+        ip="${ip,,}"
+        ip="${ip%.}"
+        (( ${#ip} <= 253 )) || return 1
+        [[ "$ip" != *[!a-z0-9.-]* && "$ip" == *[a-z]* ]] || return 1
+        [[ "$ip" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] || return 1
+    fi
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
     port=$((10#$port))
     (( port >= 1 && port <= 65535 )) || return 1
     printf '%s:%d\n' "$ip" "$port"
+}
+
+render_haproxy_dns_resolvers() {
+    cat <<'EOF'
+
+# Managed DNS for hostname backends; keep the hostname in server lines.
+resolvers kto_dns
+    parse-resolv-conf
+    resolve_retries 3
+    timeout resolve 1s
+    timeout retry 1s
+    hold valid 10s
+    hold nx 10s
+    hold timeout 10s
+    hold refused 10s
+    hold other 10s
+    hold obsolete 10s
+EOF
+}
+
+rewrite_haproxy_backend_target() {
+    local config="$1" server_name="$2" target="$3" output="$4" dns_clause=""
+    target="$(normalize_haproxy_target "$target")" || return 1
+    if ! validate_ipv4 "${target%:*}"; then
+        dns_clause=" resolvers kto_dns resolve-prefer ipv4 resolve-opts allow-dup-ip init-addr last,none"
+    fi
+    awk -v target="$target" -v server_name="$server_name" -v dns_clause="$dns_clause" '
+        $1 == "server" && $2 == server_name && replaced == 0 {
+            line = "    server " server_name " " target
+            for (i = 4; i <= NF; i++) {
+                if ($i ~ /^#/) break
+                if (dns_clause != "" && ($i == "resolvers" || $i == "resolve-prefer" || $i == "resolve-opts" || $i == "init-addr")) {
+                    i++
+                    continue
+                }
+                line = line " " $i
+            }
+            print line dns_clause
+            replaced = 1
+            next
+        }
+        { print }
+        END { if (replaced == 0) exit 2 }
+    ' "$config" > "$output" || return 1
+    if [[ -n "$dns_clause" ]] && ! grep -Eq '^[[:space:]]*resolvers[[:space:]]+kto_dns([[:space:]]|$)' "$output"; then
+        render_haproxy_dns_resolvers >> "$output"
+    fi
 }
 
 detect_ssh_port() {
@@ -1443,17 +1498,7 @@ apply_collector_haproxy_config() {
             ' "$tmp_cfg" 2>/dev/null || true)"
             current_target="$(normalize_haproxy_target "$current_target_raw" 2>/dev/null || true)"
             if [[ -n "$current_target_raw" && "$current_target" != "$desired_target" ]]; then
-                if awk -v target="$desired_target" -v server_name="$base_server" '
-                    $1 == "server" && $2 == server_name && replaced == 0 {
-                        line = "    server " server_name " " target
-                        for (i = 4; i <= NF; i++) line = line " " $i
-                        print line
-                        replaced = 1
-                        next
-                    }
-                    { print }
-                    END { if (replaced == 0) exit 2 }
-                ' "$tmp_cfg" > "$next_cfg"; then
+                if rewrite_haproxy_backend_target "$tmp_cfg" "$base_server" "$desired_target" "$next_cfg"; then
                     mv "$next_cfg" "$tmp_cfg"
                     changed=1
                     has_target=1

@@ -47,15 +47,15 @@ def function_body(source, name):
 
 class CombinedNodeProfileTests(unittest.TestCase):
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v348"', KTO)
-        self.assertIn('PUSH_BUILD="v348"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v348"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v348"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v348"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v348"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v348"', HAPROXY_BANDWIDTH)
-        self.assertIn('HAPROXY_GUARD_BUILD="v348"', HAPROXY_GUARD)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v348"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v349"', KTO)
+        self.assertIn('PUSH_BUILD="v349"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v349"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v349"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v349"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v349"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v349"', HAPROXY_BANDWIDTH)
+        self.assertIn('HAPROXY_GUARD_BUILD="v349"', HAPROXY_GUARD)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v349"', DPI_PREFLIGHT)
 
     def test_runtime_temp_and_storage_preflight_protect_root_disk(self):
         runtime = function_body(KTO, "prepare_runtime_tmpdir")
@@ -2792,7 +2792,9 @@ haproxy_input_ip_available() { return 1; }
         self.assertIn('/^xray_[0-9]+$/', server)
         self.assertIn('base_frontend="$(haproxy_base_frontend_name)"', read_sni)
         self.assertIn('base_server="$(haproxy_base_server_name)"', read_target)
-        self.assertIn('server_name="$base_server"', apply_config)
+        self.assertIn('rewrite_haproxy_backend_target "$tmp_cfg" "$base_server" "$desired_target" "$next_cfg"', apply_config)
+        rewrite = function_body(PUSH, "rewrite_haproxy_backend_target")
+        self.assertIn('$1 == "server" && $2 == server_name && replaced == 0', rewrite)
         self.assertIn('frontend_name="$base_frontend"', apply_config)
 
         bash = bash_executable()
@@ -2865,7 +2867,7 @@ NODE_PROFILE=hysteria2
         self.assertIn('value = "*" value', read_sni)
         self.assertIn('current_sni_block', apply_haproxy)
         self.assertIn('if (replaced == 0)', apply_haproxy)
-        self.assertIn('line = line " " $i', apply_haproxy)
+        self.assertIn('line = line " " $i', function_body(PUSH, "rewrite_haproxy_backend_target"))
         self.assertIn(
             'WHITELIST_SSH_ALLOWED_IPS_DEFAULT="85.192.48.122 46.28.64.183 146.19.248.67 '
             '85.93.9.35 185.31.243.221 94.247.129.92 83.228.242.53 167.254.243.181 '
@@ -4323,7 +4325,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v348"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v349"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 

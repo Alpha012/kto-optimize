@@ -24,7 +24,7 @@ fi
 PYTHONDONTWRITEBYTECODE=1 "${PYTHON_CMD[@]}" - <<'PY'
 from pathlib import Path
 
-for name in ("scripts/kto-stats-collector.py", "scripts/kto-dpi-preflight.py"):
+for name in ("scripts/kto-stats-collector.py", "scripts/kto-dpi-preflight.py", "scripts/kto-nginx.py"):
     path = Path(name)
     compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY

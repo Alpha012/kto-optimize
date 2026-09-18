@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-COLLECTOR_BUILD = "v348"
+COLLECTOR_BUILD = "v349"
 CONFIG = os.environ.get("KTO_STATS_COLLECTOR_CONFIG", "/etc/kto-stats-collector.conf")
 
 
@@ -567,8 +567,8 @@ def normalize_ip(value):
 
 
 def normalize_haproxy_target(value):
-    value = re.sub(r"\s+", "", str(value or ""))
-    if not value:
+    value = str(value or "").strip()
+    if not value or re.search(r"\s", value):
         raise ValueError("bad haproxy target")
     if ":" in value:
         parts = value.rsplit(":", 1)
@@ -577,8 +577,17 @@ def normalize_haproxy_target(value):
         ip, port_text = parts
     else:
         ip, port_text = value, "443"
-    ip = normalize_ip(ip)
-    if not port_text.isdigit():
+    if re.fullmatch(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}", ip) and valid_ipv4(ip):
+        ip = normalize_ip(ip)
+    else:
+        ip = ip.lower()
+        if ip.endswith("."):
+            ip = ip[:-1]
+        if (len(ip) > 253 or not re.search(r"[a-z]", ip) or not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", ip
+        )):
+            raise ValueError("bad haproxy hostname")
+    if not re.fullmatch(r"[0-9]{1,5}", port_text):
         raise ValueError("bad haproxy port")
     port = int(port_text)
     if port < 1 or port > 65535:
@@ -6472,7 +6481,7 @@ def handle_pending_sni(chat_id, from_id, text):
         try:
             target = normalize_haproxy_target(raw_target)
         except Exception:
-            send_message("<b>Не понял backend.</b>\n\nПример: <code>1.2.3.4</code> или <code>1.2.3.4:8443</code>")
+            send_message("<b>Не понял backend.</b>\n\nПример: <code>1.2.3.4:8443</code> или <code>backend.example.com:443</code>, без https://")
             return True
         current, _ = effective_sni_for_node(node)
         set_pending_sni(chat_id, from_id, "haproxy_sni", node, {"target": target})
@@ -6574,7 +6583,7 @@ def haproxy_targets_prompt(node, token, route=None, adding=False):
         ]
     lines += [
         "",
-        "Ответь одним или несколькими backend: <code>IP:порт</code>.",
+        "Ответь одним или несколькими backend: <code>IP/домен:порт</code> (без https://).",
         "Для пула перечисли их через пробел, запятую или с новой строки.",
     ]
     if route:

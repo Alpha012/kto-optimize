@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v348"
+SCRIPT_BUILD="v349"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -38,6 +38,7 @@ MOBILE443_CONFIG="${MOBILE443_DIR}/config.conf"
 MOBILE443_MANAGER="/usr/local/sbin/kto-mobile443"
 ADDITIONAL_IP_MANAGER="/usr/local/sbin/kto-additional-ips"
 REMNA_EGRESS_MANAGER="/usr/local/sbin/kto-remnawave-egress"
+NGINX_MANAGER="/usr/local/sbin/kto-nginx"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 REMNA_LOGGING_OVERRIDE="${KTO_REMNA_LOGGING_OVERRIDE:-${REMNA_DIR}/docker-compose.override.yml}"
@@ -717,6 +718,10 @@ install_asset_file() {
     local local_path="${SCRIPT_DIR}/${relative_path}"
     local raw_url="${KTO_RAW_BASE%/}/${relative_path}"
     local tmp
+    local -a download_options=()
+    if [[ "${4:-}" == "bounded" ]]; then
+        download_options=(-q -4 --connect-timeout 5 --max-time 30 --retry 2 --retry-max-time 60)
+    fi
 
     if [[ ! "$raw_url" =~ ^https:// ]] && [[ "${KTO_ALLOW_INSECURE_UPDATE_URL:-0}" != "1" ]]; then
         fail "Небезопасный URL asset: ${raw_url}"
@@ -736,7 +741,7 @@ install_asset_file() {
     fi
 
     tmp="$(mktemp)"
-    if ! curl -fsSL "$raw_url" -o "$tmp" >> "$LOG_FILE" 2>&1; then
+    if ! curl "${download_options[@]}" -fsSL "$raw_url" -o "$tmp" >> "$LOG_FILE" 2>&1; then
         rm -f "$tmp"
         fail "Не смог скачать asset: ${relative_path}"
         return 1
@@ -1670,19 +1675,45 @@ validate_ipv4() {
 
 normalize_haproxy_target() {
     local raw="${1:-}" ip port
-    raw="${raw//[[:space:]]/}"
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    [[ "$raw" != *[[:space:]]* ]] || return 1
     if [[ "$raw" == *:* ]]; then
         ip="${raw%%:*}"
-        port="${raw##*:}"
+        port="${raw#*:}"
     else
         ip="$raw"
         port="443"
     fi
-    validate_ipv4 "$ip" || return 1
-    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    if ! validate_ipv4 "$ip"; then
+        ip="${ip,,}"
+        ip="${ip%.}"
+        (( ${#ip} <= 253 )) || return 1
+        [[ "$ip" != *[!a-z0-9.-]* && "$ip" == *[a-z]* ]] || return 1
+        validate_domain "$ip" || return 1
+    fi
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
     port=$((10#$port))
     (( port >= 1 && port <= 65535 )) || return 1
     printf '%s:%d\n' "$ip" "$port"
+}
+
+render_haproxy_dns_resolvers() {
+    cat <<'EOF'
+
+# Managed DNS for hostname backends; keep the hostname in server lines.
+resolvers kto_dns
+    parse-resolv-conf
+    resolve_retries 3
+    timeout resolve 1s
+    timeout retry 1s
+    hold valid 10s
+    hold nx 10s
+    hold timeout 10s
+    hold refused 10s
+    hold other 10s
+    hold obsolete 10s
+EOF
 }
 
 normalize_haproxy_target_pool() {
@@ -3332,7 +3363,7 @@ ask_ipv4() {
 }
 
 ask_haproxy_target() {
-    local prompt="${1:-Введите выходной IP или IP:порт}"
+    local prompt="${1:-Введите backend IP/домен[:порт]}"
     local value target
     while true; do
         printf '%s: ' "$prompt" >&2
@@ -3341,7 +3372,7 @@ ask_haproxy_target() {
             echo "$target"
             return 0
         fi
-        fail "Некорректный target. Пример: 1.2.3.4 или 1.2.3.4:8443"
+        fail "Некорректный backend. Пример: 1.2.3.4:8443 или backend.example.com:443 (без https://)."
     done
 }
 
@@ -3353,7 +3384,7 @@ ask_haproxy_target_default() {
             echo "$target"
             return 0
         fi
-        fail "Некорректный target. Пример: 1.2.3.4 или 1.2.3.4:8443"
+        fail "Некорректный backend. Пример: 1.2.3.4:8443 или backend.example.com:443 (без https://)."
     done
 }
 
@@ -3365,7 +3396,7 @@ ask_haproxy_target_pool_default() {
             echo "$targets"
             return 0
         fi
-        fail "Некорректный список. Укажи IP[:порт] через пробел или запятую."
+        fail "Некорректный список. Укажи IP/домен[:порт] через пробел или запятую, без https://."
     done
 }
 
@@ -5365,7 +5396,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v348"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v349"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5378,7 +5409,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v348"
+KTO_HAPROXY_FIREWALL_BUILD="v349"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -9423,7 +9454,7 @@ extract_haproxy_routes() {
             name = $2
             next
         }
-        $1 == "global" || $1 == "defaults" || $1 == "listen" {
+        $1 == "global" || $1 == "defaults" || $1 == "listen" || $1 == "resolvers" {
             section = $1
             name = $2
             next
@@ -10126,7 +10157,7 @@ render_haproxy_routes_config() {
     local routes_file="$1" output_file="$2"
     local port backend_target_pool allowed_sni source_ip server_maxconn listen_ip send_proxy_v2
     local normalized_target_pool normalized_sni normalized_source_ip normalized_server_maxconn normalized_listen_ip normalized_send_proxy_v2
-    local frontend_name backend_name server_name source_clause proxy_protocol_clause target index
+    local frontend_name backend_name server_name source_clause proxy_protocol_clause target index dns_clause uses_dns=0
     local endpoint_key bind_address route_index name_suffix
     local haproxy_threads haproxy_maxconn wrong_sni_gpc_limit source_conn_rate_limit effective_server_maxconn route_count=0
     local -a backend_targets=()
@@ -10152,6 +10183,12 @@ render_haproxy_routes_config() {
             fail "Некорректный HAProxy маршрут на порту $port"
             return 1
         }
+        IFS=',' read -r -a backend_targets <<< "$normalized_target_pool"
+        for target in "${backend_targets[@]}"; do
+            if ! validate_ipv4 "${target%:*}"; then
+                uses_dns=1
+            fi
+        done
         if [[ "$normalized_listen_ip" != "*" ]]; then
             normalized_source_ip="$normalized_listen_ip"
         elif [[ "$normalized_source_ip" != "default" ]]; then
@@ -10218,6 +10255,10 @@ defaults
 backend wrong_sni_names
     stick-table type string len 160 size 100k expire 30m store gpc0
 EOF
+
+    if (( uses_dns == 1 )); then
+        render_haproxy_dns_resolvers >> "$output_file"
+    fi
 
     while IFS=$'\t' read -r port backend_target_pool allowed_sni source_ip server_maxconn listen_ip send_proxy_v2; do
         port=$((10#$port))
@@ -10303,6 +10344,10 @@ EOF
         }
         for index in "${!backend_targets[@]}"; do
             target="${backend_targets[$index]}"
+            dns_clause=""
+            if ! validate_ipv4 "${target%:*}"; then
+                dns_clause=" resolvers kto_dns resolve-prefer ipv4 resolve-opts allow-dup-ip init-addr last,none"
+            fi
             if (( ${#backend_targets[@]} == 1 )); then
                 if (( port == 443 )); then
                     server_name="xray1"
@@ -10312,8 +10357,8 @@ EOF
             else
                 server_name="xray$(( index + 1 ))"
             fi
-            printf '    server %s %s check weight 10%s%s maxconn %s\n' \
-                "$server_name" "$target" "$source_clause" "$proxy_protocol_clause" "$effective_server_maxconn" >> "$output_file"
+            printf '    server %s %s check weight 10%s%s maxconn %s%s\n' \
+                "$server_name" "$target" "$source_clause" "$proxy_protocol_clause" "$effective_server_maxconn" "$dns_clause" >> "$output_file"
         done
     done < "$routes_file"
 }
@@ -11199,7 +11244,7 @@ configure_haproxy_backend() {
         fi
         return 1
     fi
-    backend_target="$(ask_haproxy_target "Введите Backend IP или IP:порт")"
+    backend_target="$(ask_haproxy_target "Введите backend IP/домен[:порт]")"
     allowed_sni="$(ask_haproxy_sni_list "Введите разрешенный SNI")"
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 0)"
 
@@ -11877,7 +11922,7 @@ add_haproxy_route_with_source() {
         break
     done
 
-    backend_target="$(ask_haproxy_target_default "Backend IP или IP:порт")"
+    backend_target="$(ask_haproxy_target_default "Backend IP/домен[:порт]")"
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 0)"
     next_file="$(mktemp)"
@@ -12051,7 +12096,7 @@ add_haproxy_pool_route() {
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 0)"
     server_maxconn="$HAPROXY_BACKEND_MAXCONN"
-    raw_targets="$(ask_text "Backend IP[:порт] через пробел или запятую")"
+    raw_targets="$(ask_text "Backend IP/домен[:порт] через пробел или запятую")"
     target_pool="$(normalize_haproxy_target_pool "$raw_targets" 2>/dev/null || true)"
     [[ -n "$target_pool" ]] || {
         fail "Не удалось прочитать список backend"
@@ -12368,7 +12413,7 @@ add_haproxy_sequential_routes() {
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI")"
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 0)"
     server_maxconn="$HAPROXY_BACKEND_MAXCONN"
-    raw_targets="$(ask_text "Backend IP[:порт] по порядку через пробел или запятую")"
+    raw_targets="$(ask_text "Backend IP/домен[:порт] по порядку через пробел или запятую")"
     target_pool="$(normalize_haproxy_target_pool "$raw_targets" 2>/dev/null || true)"
     [[ -n "$target_pool" ]] || {
         fail "Не удалось прочитать список backend"
@@ -12451,7 +12496,7 @@ edit_haproxy_route() {
     fi
     rm -f "$filtered_file"
 
-    backend_target_pool="$(ask_haproxy_target_pool_default "Backend IP[:порт] или список через запятую" "$current_target_pool")"
+    backend_target_pool="$(ask_haproxy_target_pool_default "Backend IP/домен[:порт] или список через запятую" "$current_target_pool")"
     allowed_sni="$(ask_haproxy_sni_list "Разрешенный SNI" "$current_sni")"
     send_proxy_v2="$(ask_haproxy_send_proxy_v2 "$current_send_proxy_v2")"
     next_file="$(mktemp)"
@@ -13440,6 +13485,21 @@ haproxy_menu() {
 
 install_haproxy() {
     haproxy_menu
+}
+
+nginx_menu() {
+    need_root
+    stage "Готовлю мастер Nginx: WS + TLS"
+    apt_install_with_update_if_missing python3 || return 1
+    if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+        fail "Мастеру Nginx нужен Python 3.10+ (например, Ubuntu 22.04/24.04 или Debian 12+)"
+        return 1
+    fi
+    if ! install_asset_file scripts/kto-nginx.py "$NGINX_MANAGER" 0755 bounded; then
+        "${SUDO[@]}" test -s "$NGINX_MANAGER" || return 1
+        warn "Не удалось обновить мастер; использую ранее установленный локальный Nginx manager"
+    fi
+    "${SUDO[@]}" python3 "$NGINX_MANAGER" "${1:-menu}"
 }
 
 mobile443_lte_ports_from_routes() {
@@ -15048,6 +15108,8 @@ menu() {
         actions+=("multi-ip-monitor")
         labels+=("HAProxy")
         actions+=("haproxy")
+        labels+=("Nginx (WS + TLS)")
+        actions+=("nginx")
         if mobile443_lte_configured; then
             labels+=("Режим \"Только LTE\" (включён)")
         else
@@ -15061,6 +15123,8 @@ menu() {
     elif [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_reality; then
         labels+=("HAProxy (мост, 8443/tcp)")
         actions+=("haproxy")
+        labels+=("Nginx (WS + TLS)")
+        actions+=("nginx")
     fi
 
     labels+=("Настройки")
@@ -15112,6 +15176,7 @@ menu() {
         multi-ip-monitor) run_multi_ip_cpu_monitor || true ;;
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
+        nginx) nginx_menu || true ;;
         haproxy-update) update_haproxy_existing_config ;;
         mobile443-lte) mobile443_lte_menu ;;
         mobile443-lte-status) show_mobile443_lte_status ;;
@@ -15181,6 +15246,8 @@ main() {
         btop-all|monitor-all|multi-ip-monitor) run_multi_ip_cpu_monitor ;;
         ssl) issue_ssl_certificate ;;
         haproxy|install-haproxy) install_haproxy ;;
+        nginx|nginx-ws|install-nginx) nginx_menu ;;
+        nginx-status|nginx-diagnose) nginx_menu diagnose ;;
         haproxy-update|update-haproxy|haproxy-refresh) update_haproxy_existing_config ;;
         haproxy-pool-set|haproxy-set-pool) shift; set_haproxy_pool_route_cli "$@" ;;
         haproxy-pool-collapse|haproxy-collapse-pool) shift; collapse_haproxy_pool_cli "$@" ;;
