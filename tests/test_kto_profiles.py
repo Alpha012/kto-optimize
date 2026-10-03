@@ -2999,7 +2999,7 @@ grep -Fq 'оставлены без изменений' <<< "$output"
         self.assertIn('SSH-порт, ключи и параметры входа оставлены без изменений', migrate)
         self.assertIn('if managed_ssh_changes_enabled; then', optimize)
         self.assertIn('SSH сохранён без изменений', optimize)
-        self.assertIn('node mode: UFW reset/defaults and SSH rules preserved', firewall)
+        self.assertIn('node/GCloud: UFW reset/defaults and SSH rules preserved', firewall)
         self.assertIn('if managed_ssh_changes_enabled; then', firewall)
         self.assertIn('managed_ssh_changes_enabled || manage_ssh=0', antiscanner)
         self.assertIn('MANAGE_SSH="${manage_ssh}"', antiscanner)

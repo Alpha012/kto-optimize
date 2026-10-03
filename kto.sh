@@ -841,7 +841,7 @@ valid_machine_mode() {
 }
 
 managed_ssh_changes_enabled() {
-    [[ "$MACHINE_MODE" != "node" ]]
+    [[ "$MACHINE_MODE" != "node" ]] && ! google_cloud_detected
 }
 
 valid_node_profile() {
@@ -1345,6 +1345,40 @@ apt_install_with_update_if_missing() {
         warn "apt update не прошёл, пробую ставить пакеты по текущему кешу apt."
     fi
     apt_install_quiet "${missing[@]}"
+}
+
+google_cloud_detected() {
+    local markers
+    case "$(uname -r)" in
+        *-gcp|*-gcp-*|*-gke|*-gke-*) return 0 ;;
+    esac
+    # DMI/cloud-init still identify GCE after a custom kernel has been installed.
+    # Do not query the metadata service: detection must also work without networking.
+    markers="$(cat /sys/class/dmi/id/product_name /sys/class/dmi/id/sys_vendor \
+        /var/lib/cloud/instance/datasource 2>/dev/null || true)"
+    grep -qiE 'Google Compute Engine|^Google$|DataSourceGCE' <<< "$markers"
+}
+
+xanmod_boot_changes_present() {
+    local path
+    [[ "$(uname -r)" == *xanmod* ]] && return 0
+    for path in "$XANMOD_GRUB_DEFAULT_FILE" /boot/vmlinuz-*xanmod* /lib/modules/*xanmod*; do
+        [[ ! -e "$path" ]] || return 0
+    done
+    # Include unfinished installations before dpkg --configure -a can resume them.
+    dpkg-query -W -f='${Status}\n' 'linux-*xanmod*' 2>/dev/null |
+        grep -Eq ' (installed|unpacked|half-installed|half-configured|triggers-awaited|triggers-pending)$'
+}
+
+opt_cloud_boot_preflight() {
+    google_cloud_detected || return 0
+    if xanmod_boot_changes_present; then
+        fail "GCloud: найдены XanMod или его настройки GRUB от прошлого запуска."
+        warn "STOP: сначала проверь загрузку штатного linux-gcp через Serial console; не делай reboot вслепую."
+        warn "Ядра и GRUB автоматически не удаляю. Инструкция: docs/gcloud-optimization.md"
+        return 1
+    fi
+    ok "GCloud: сохраняю штатное ядро, GRUB, SSH, DNS и IPv6."
 }
 
 xanmod_kernel_versions() {
@@ -3166,7 +3200,7 @@ opt_ssh_root_access() {
     local socket_was_enabled=0 socket_was_active=0 attempt
 
     if ! managed_ssh_changes_enabled; then
-        ok "Режим node: SSH-порт, ключи и параметры входа оставлены без изменений"
+        ok "node/GCloud: SSH-порт, ключи и параметры входа оставлены без изменений"
         return 0
     fi
 
@@ -3942,6 +3976,7 @@ EOF
 }
 
 opt_prepare_system() {
+    opt_cloud_boot_preflight || return 1
     cmd "${SUDO[@]}" systemctl stop unattended-upgrades || true
     cmd "${SUDO[@]}" dpkg --configure -a || true
     cmd "${SUDO[@]}" apt-get clean || true
@@ -4013,6 +4048,10 @@ EOF
 }
 
 opt_dns_guard() {
+    if google_cloud_detected; then
+        echo "GCloud: provider DNS preserved (metadata/internal DNS)" >> "$LOG_FILE"
+        return 0
+    fi
     ensure_hostname_hosts_entry
 
     if dns_resolution_ok && [[ "${KTO_FORCE_DNS_GUARD:-0}" != "1" ]]; then
@@ -4059,6 +4098,10 @@ EOF
 }
 
 opt_ipv6_mode_guard() {
+    if google_cloud_detected; then
+        echo "GCloud: provider IPv6 configuration preserved" >> "$LOG_FILE"
+        return 0
+    fi
     if [[ "$MACHINE_MODE" == "whitelist" ]]; then
         write_root_file "$IPV6_WHITELIST_SYSCTL_CONF" <<'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
@@ -4353,6 +4396,11 @@ EOF
 configure_xanmod_repository() {
     local key_tmp keyring_tmp codename fingerprint
 
+    if google_cloud_detected; then
+        fail "GCloud: подключение XanMod отключено; используй штатное ядро linux-gcp."
+        return 1
+    fi
+
     codename="$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/"/, "", $2); print $2; exit }' /etc/os-release 2>/dev/null || true)"
     [[ -n "$codename" ]] || {
         fail "XanMod: не удалось определить Ubuntu codename"
@@ -4420,6 +4468,10 @@ xanmod_release_available() {
 }
 
 prepare_xanmod_grub_state() {
+    if google_cloud_detected; then
+        fail "GCloud: изменение GRUB для XanMod заблокировано."
+        return 1
+    fi
     command_exists update-grub || {
         fail "XanMod: update-grub не найден"
         return 1
@@ -4452,6 +4504,10 @@ prepare_xanmod_grub_state() {
 
 select_xanmod_grub_entry() {
     local version submenu_id entry_id saved_entry
+    if google_cloud_detected; then
+        fail "GCloud: выбор XanMod в GRUB заблокирован."
+        return 1
+    fi
     version="$(xanmod_latest_version)"
     [[ -n "$version" ]] || return 1
 
@@ -4506,6 +4562,11 @@ EOF
 opt_xanmod_kernel() {
     local attempt installed=0 free_mb root_free_mb version codename
 
+    if google_cloud_detected; then
+        opt_cloud_boot_preflight || return 1
+        echo "XanMod skipped: Google Cloud; keeping provider kernel and bootloader" >> "$LOG_FILE"
+        return 0
+    fi
     if [[ "$(uname -m)" != "x86_64" ]] || ! grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
         echo "XanMod skipped: non-Ubuntu or non-amd64" >> "$LOG_FILE"
         return 0
@@ -4515,7 +4576,7 @@ opt_xanmod_kernel() {
         return 1
     fi
     if secure_boot_enabled; then
-        fail "XanMod: Secure Boot включён. Отключи его у провайдера перед установкой неподписанного kernel."
+        fail "XanMod: Secure Boot включён. Сохраняю подписанное штатное ядро; установку пропускаю."
         return 1
     fi
     free_mb="$(xanmod_boot_free_mb)"
@@ -4583,6 +4644,11 @@ opt_xanmod_kernel() {
 }
 
 opt_kernel_final_check() {
+    if google_cloud_detected; then
+        opt_cloud_boot_preflight || return 1
+        echo "Kernel final check: GCloud provider kernel preserved" >> "$LOG_FILE"
+        return 0
+    fi
     if [[ "$(uname -m)" != "x86_64" ]] || ! grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
         return 0
     fi
@@ -4797,7 +4863,7 @@ opt_firewall() {
             ensure_global_ssh_ufw_rule "$ssh_port"
         fi
     else
-        echo "node mode: UFW reset/defaults and SSH rules preserved" >> "$LOG_FILE"
+        echo "node/GCloud: UFW reset/defaults and SSH rules preserved" >> "$LOG_FILE"
     fi
     extract_haproxy_routes "$HAPROXY_CONFIG_FILE" > "$routes_file"
     haproxy_listener_ports "$routes_file" > "$ports_file"
@@ -4866,8 +4932,8 @@ opt_firewall() {
 }
 
 opt_haproxy_firewall_final_check() {
-    if [[ "$MACHINE_MODE" == "node" ]] && ! ufw_active; then
-        echo "node mode: HAProxy UFW final check skipped because UFW is inactive" >> "$LOG_FILE"
+    if ! managed_ssh_changes_enabled && ! ufw_active; then
+        echo "node/GCloud: HAProxy UFW final check skipped because UFW is inactive" >> "$LOG_FILE"
         return 0
     fi
     ensure_haproxy_firewall_guard
@@ -4882,7 +4948,7 @@ opt_fail2ban() {
     local ssh_port
 
     if ! managed_ssh_changes_enabled; then
-        ok "Режим node: настройки Fail2ban для SSH оставлены без изменений"
+        ok "node/GCloud: настройки Fail2ban для SSH оставлены без изменений"
         return 0
     fi
 
@@ -5778,6 +5844,15 @@ system_check_kernel() {
     local kernel
     kernel="$(uname -r)"
 
+    if google_cloud_detected; then
+        SYSTEM_CHECK_NEEDS_KERNEL=0
+        if xanmod_boot_changes_present; then
+            system_check_row warn "GCloud kernel" "найден XanMod/GRUB override; нужна ручная проверка до reboot"
+        else
+            system_check_row ok "GCloud kernel" "$kernel; автоматическая замена ядра отключена"
+        fi
+        return 0
+    fi
     if [[ "$(uname -m)" != "x86_64" ]] || ! grep -qi '^ID=ubuntu' /etc/os-release 2>/dev/null; then
         system_check_row skip "xanmod x64v3" "не Ubuntu amd64"
         return 0
@@ -5812,7 +5887,7 @@ system_check_ssh_root_access() {
     local port
 
     if ! managed_ssh_changes_enabled; then
-        system_check_row skip "ssh" "режим node: порт, ключи и параметры входа сохраняются"
+        system_check_row skip "ssh" "node/GCloud: порт, ключи и параметры входа сохраняются"
         return 0
     fi
 
@@ -5937,14 +6012,18 @@ system_check_network_limits() {
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")"
     qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")"
 
-    if hostname_hosts_configured; then
+    if google_cloud_detected; then
+        system_check_row skip "hostname" "GCloud: cloud-init / guest agent управляет hostname"
+    elif hostname_hosts_configured; then
         system_check_row ok "hostname" "$(hostname 2>/dev/null || echo "-")"
     else
         SYSTEM_CHECK_NEEDS_NETWORK=1
         system_check_row miss "hostname" "нет записи в /etc/hosts"
     fi
 
-    if dns_guard_configured; then
+    if google_cloud_detected; then
+        system_check_row skip "dns guard" "GCloud: DNS провайдера не заменяется публичным"
+    elif dns_guard_configured; then
         if systemd_resolved_available && resolved_dns_guard_configured && resolv_conf_uses_resolved; then
             system_check_row ok "dns guard" "forced через systemd-resolved"
         elif static_resolv_conf_configured; then
@@ -5961,12 +6040,16 @@ system_check_network_limits() {
 
     if dns_resolution_ok; then
         system_check_row ok "dns resolve" "api.telegram.org/raw.githubusercontent.com"
+    elif google_cloud_detected; then
+        system_check_row warn "dns resolve" "проверь DNS/DHCP/VPC; автоматическая подмена DNS отключена"
     else
         SYSTEM_CHECK_NEEDS_NETWORK=1
         system_check_row miss "dns resolve" "внешние домены не резолвятся"
     fi
 
-    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+    if google_cloud_detected; then
+        system_check_row skip "ipv6" "GCloud: сохраняю сетевые настройки провайдера"
+    elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
         if whitelist_ipv6_disabled; then
             system_check_row ok "ipv6" "disabled для whitelist"
         else
@@ -6082,8 +6165,8 @@ system_check_firewall() {
 
     if ufw_active; then
         system_check_row ok "ufw" "active"
-    elif [[ "$MACHINE_MODE" == "node" ]]; then
-        system_check_row skip "ufw" "inactive; режим node не включает его, чтобы не менять SSH-доступ"
+    elif ! managed_ssh_changes_enabled; then
+        system_check_row skip "ufw" "inactive; node/GCloud не включает его, чтобы не менять SSH-доступ"
         rm -f "$routes_file" "$ports_file" "$ufw_status_file"
         return 0
     else
@@ -6161,7 +6244,7 @@ system_check_fail2ban() {
     local missing=()
 
     if ! managed_ssh_changes_enabled; then
-        system_check_row skip "fail2ban" "режим node: SSH-защита сохраняется как есть"
+        system_check_row skip "fail2ban" "node/GCloud: SSH-защита сохраняется как есть"
         return 0
     fi
 
@@ -6184,6 +6267,7 @@ system_check_apply_missing() {
     local ssh_port="$1"
     local steps=0 started_at duration
 
+    opt_cloud_boot_preflight || return 1
     (( SYSTEM_CHECK_NEEDS_PREPARE == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_PACKAGES == 1 )) && steps=$(( steps + 1 ))
     (( SYSTEM_CHECK_NEEDS_KERNEL == 1 )) && steps=$(( steps + 1 ))
@@ -6338,6 +6422,7 @@ system_check() {
 optimize_system() {
     header
     need_root
+    opt_cloud_boot_preflight || return 1
     local ssh_port started_at duration steps=11
     started_at="$(date +%s)"
     ssh_port="$(detect_ssh_port)"
@@ -6370,7 +6455,11 @@ optimize_system() {
     echo
     duration=$(( $(date +%s) - started_at ))
     ssh_port="$(detect_ssh_port)"
-    ok "Оптимизация завершена. Рекомендуется: sudo reboot"
+    if google_cloud_detected; then
+        ok "Оптимизация завершена без замены ядра на XanMod. Reboot нужен только по требованиям обновлений ОС."
+    else
+        ok "Оптимизация завершена. Рекомендуется: sudo reboot"
+    fi
     if managed_ssh_changes_enabled; then
         ok "SSH-порт: ${ssh_port}/tcp"
         ok "Подключение: ssh -p ${ssh_port} root@IP"
@@ -14927,7 +15016,9 @@ print_kernel_status() {
     local kernel="$1"
     echo
     echo -e "${BOLD}${PURPLE}[ ЯДРО ]${NC}"
-    if [[ "$kernel" == *xanmod* ]]; then
+    if google_cloud_detected && [[ "$kernel" != *xanmod* ]]; then
+        print_row "kernel" "$kernel (GCloud: сохраняется)" 1
+    elif [[ "$kernel" == *xanmod* ]]; then
         print_row "kernel" "$kernel" 1
     else
         print_row "kernel" "$kernel" 0
