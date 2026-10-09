@@ -40,6 +40,8 @@ ADDITIONAL_IP_MANAGER="/usr/local/sbin/kto-additional-ips"
 REMNA_EGRESS_MANAGER="/usr/local/sbin/kto-remnawave-egress"
 NGINX_MANAGER="/usr/local/sbin/kto-nginx"
 CLEANUP_MANAGER="/usr/local/sbin/kto-server-cleanup"
+SSH_PASSWORD_MANAGER="/usr/local/sbin/kto-ssh-password"
+KTO_SSH_PASSWORD_MODE_FILE="/etc/kto-ssh-password.enabled"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 REMNA_LOGGING_OVERRIDE="${KTO_REMNA_LOGGING_OVERRIDE:-${REMNA_DIR}/docker-compose.override.yml}"
@@ -3204,6 +3206,10 @@ opt_ssh_root_access() {
         ok "node/GCloud: SSH-порт, ключи и параметры входа оставлены без изменений"
         return 0
     fi
+    if "${SUDO[@]}" test -f "${KTO_SSH_PASSWORD_MODE_FILE:-/etc/kto-ssh-password.enabled}"; then
+        ok "SSH: выбран вход root по паролю и ключу; оптимизация его не переопределяет"
+        return 0
+    fi
 
     command_exists sshd || {
         fail "OpenSSH server не установлен"
@@ -5885,7 +5891,7 @@ system_check_kernel() {
 }
 
 system_check_ssh_root_access() {
-    local port
+    local port effective service
 
     if ! managed_ssh_changes_enabled; then
         system_check_row skip "ssh" "node/GCloud: порт, ключи и параметры входа сохраняются"
@@ -5893,6 +5899,20 @@ system_check_ssh_root_access() {
     fi
 
     port="$(detect_ssh_port)"
+    if "${SUDO[@]}" test -f "${KTO_SSH_PASSWORD_MODE_FILE:-/etc/kto-ssh-password.enabled}"; then
+        effective="$("${SUDO[@]}" sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null || true)"
+        service="$(ssh_service_name 2>/dev/null || true)"
+        if [[ -n "$service" ]] && run_systemctl_bounded 3 is-active --quiet "$service" &&
+            ssh_port_is_listening "$port" && grep -Fqx 'permitrootlogin yes' <<< "$effective" &&
+            grep -Fqx 'passwordauthentication yes' <<< "$effective" &&
+            grep -Fqx 'pubkeyauthentication yes' <<< "$effective" &&
+            grep -Fqx 'authenticationmethods any' <<< "$effective"; then
+            system_check_row ok "ssh root" "пароль + ключ, ${port}/tcp; настройки сохраняются"
+        else
+            system_check_row warn "ssh root" "выбран пароль + ключ, но настройки отличаются; запусти ssh-password"
+        fi
+        return 0
+    fi
     if ssh_root_access_configured; then
         system_check_row ok "ssh root" "key-only, ${port}/tcp открыт для всех"
     elif ! root_public_key_available; then
@@ -13613,6 +13633,26 @@ server_cleanup_menu() {
     "${SUDO[@]}" python3 "$CLEANUP_MANAGER" "${1:-menu}"
 }
 
+enable_ssh_password() {
+    need_root
+    if ! command_exists python3 || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+        fail "Для режима SSH-пароля нужен Python 3.10+. Автоматической установки пакетов нет."
+        return 1
+    fi
+    if [[ ! -f "${SCRIPT_DIR}/scripts/kto-ssh-password.py" ]] && ! command_exists curl; then
+        if ! "${SUDO[@]}" test -s "$SSH_PASSWORD_MANAGER"; then
+            fail "Нет curl и локального мастера SSH-пароля. Запусти из полного репозитория."
+            return 1
+        fi
+        warn "Использую локальный мастер SSH-пароля"
+    elif ! install_asset_file scripts/kto-ssh-password.py "$SSH_PASSWORD_MANAGER" 0755 bounded; then
+        "${SUDO[@]}" test -s "$SSH_PASSWORD_MANAGER" || return 1
+        warn "Обновление не удалось; использую локальный мастер SSH-пароля"
+    fi
+    "${SUDO[@]}" python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$SSH_PASSWORD_MANAGER" || return 1
+    "${SUDO[@]}" python3 "$SSH_PASSWORD_MANAGER" --connection "${SSH_CONNECTION:-}"
+}
+
 mobile443_lte_ports_from_routes() {
     local routes_file="$1"
     awk -F '\t' '$1 ~ /^[0-9]+$/ && $1 >= 1 && $1 <= 65535 { print $1 }' "$routes_file" 2>/dev/null |
@@ -15242,6 +15282,8 @@ menu() {
 
     labels+=("Удалить HAProxy / Nginx / Docker")
     actions+=("server-cleanup")
+    labels+=("SSH: включить пароль root (ключи сохранить)")
+    actions+=("ssh-password")
 
     labels+=("Настройки")
     actions+=("settings")
@@ -15298,14 +15340,21 @@ menu() {
         mobile443-lte-status) show_mobile443_lte_status ;;
         stats-push-menu) stats_push_menu ;;
         server-cleanup) server_cleanup_menu || true ;;
+        ssh-password) enable_ssh_password || true ;;
         settings) settings_menu ;;
         *) fail "Неверный выбор" ;;
     esac
 }
 
 main() {
-    # Cleanup must not run storage repair, SSH/network migration or mode setup first.
+    # Explicit access/cleanup actions must not run storage repair or mode migrations first.
     case "${1:-}" in
+        ssh-password|root-password)
+            init_log
+            ensure_utf8_locale
+            enable_ssh_password
+            return
+            ;;
         cleanup|server-cleanup|uninstall-proxies)
             init_log
             ensure_utf8_locale
