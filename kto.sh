@@ -39,6 +39,7 @@ MOBILE443_MANAGER="/usr/local/sbin/kto-mobile443"
 ADDITIONAL_IP_MANAGER="/usr/local/sbin/kto-additional-ips"
 REMNA_EGRESS_MANAGER="/usr/local/sbin/kto-remnawave-egress"
 NGINX_MANAGER="/usr/local/sbin/kto-nginx"
+CLEANUP_MANAGER="/usr/local/sbin/kto-server-cleanup"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
 REMNA_LOGGING_OVERRIDE="${KTO_REMNA_LOGGING_OVERRIDE:-${REMNA_DIR}/docker-compose.override.yml}"
@@ -13591,6 +13592,27 @@ nginx_menu() {
     "${SUDO[@]}" python3 "$NGINX_MANAGER" "${1:-menu}"
 }
 
+server_cleanup_menu() {
+    need_root
+    if ! command_exists python3 || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+        fail "Для безопасной очистки нужен Python 3.10+. Пакеты автоматически не устанавливаю."
+        return 1
+    fi
+    if [[ ! -f "${SCRIPT_DIR}/scripts/kto-server-cleanup.py" ]] && ! command_exists curl; then
+        if "${SUDO[@]}" test -s "$CLEANUP_MANAGER"; then
+            warn "curl не установлен; использую локальный мастер очистки"
+        else
+            fail "Нет curl и локального мастера очистки. Запусти из полного репозитория."
+            return 1
+        fi
+    elif ! install_asset_file scripts/kto-server-cleanup.py "$CLEANUP_MANAGER" 0755 bounded; then
+        "${SUDO[@]}" test -s "$CLEANUP_MANAGER" || return 1
+        warn "Обновление не удалось; использую локальный мастер очистки"
+    fi
+    "${SUDO[@]}" python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$CLEANUP_MANAGER" || return 1
+    "${SUDO[@]}" python3 "$CLEANUP_MANAGER" "${1:-menu}"
+}
+
 mobile443_lte_ports_from_routes() {
     local routes_file="$1"
     awk -F '\t' '$1 ~ /^[0-9]+$/ && $1 >= 1 && $1 <= 65535 { print $1 }' "$routes_file" 2>/dev/null |
@@ -15218,6 +15240,9 @@ menu() {
         actions+=("nginx")
     fi
 
+    labels+=("Удалить HAProxy / Nginx / Docker")
+    actions+=("server-cleanup")
+
     labels+=("Настройки")
     actions+=("settings")
 
@@ -15272,12 +15297,28 @@ menu() {
         mobile443-lte) mobile443_lte_menu ;;
         mobile443-lte-status) show_mobile443_lte_status ;;
         stats-push-menu) stats_push_menu ;;
+        server-cleanup) server_cleanup_menu || true ;;
         settings) settings_menu ;;
         *) fail "Неверный выбор" ;;
     esac
 }
 
 main() {
+    # Cleanup must not run storage repair, SSH/network migration or mode setup first.
+    case "${1:-}" in
+        cleanup|server-cleanup|uninstall-proxies)
+            init_log
+            ensure_utf8_locale
+            server_cleanup_menu
+            return
+            ;;
+        cleanup-audit|server-cleanup-audit)
+            init_log
+            ensure_utf8_locale
+            server_cleanup_menu audit
+            return
+            ;;
+    esac
     prepare_runtime_tmpdir
     if [[ "${1:-}" == "haproxy-remote-report" ]]; then
         haproxy_remote_report_json

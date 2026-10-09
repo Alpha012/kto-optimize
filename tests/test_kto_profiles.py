@@ -74,7 +74,9 @@ class CombinedNodeProfileTests(unittest.TestCase):
         self.assertIn('filesystem_available_inodes /', KTO)
         self.assertIn('storage_is_critical', preflight)
         self.assertLess(main.index("prepare_runtime_tmpdir"), main.index("haproxy-remote-report"))
-        self.assertLess(main.index("startup_storage_preflight"), main.index("init_log"))
+        # Explicit cleanup has a separate, non-repairing entrypoint before normal startup.
+        ordinary_main = main[main.index("\n    prepare_runtime_tmpdir\n"):]
+        self.assertLess(ordinary_main.index("startup_storage_preflight"), ordinary_main.index("init_log"))
 
     def test_haproxy_remote_report_does_not_write_a_root_disk_temp_file(self):
         report = function_body(KTO, "haproxy_remote_report_json")
