@@ -506,7 +506,9 @@ grep -q 'max_header_size 64KB' "$KTO_SELFSTEAL_CADDYFILE"
         self.assertIn("setsid --wait", install)
         self.assertIn("/etc/wireguard/warp.conf", install)
         self.assertIn("/usr/local/bin/vps-warp", install)
-        self.assertIn("systemctl is-active --quiet wg-quick@warp", install)
+        self.assertIn("is-active --quiet wg-quick@warp", install)
+        self.assertIn("is-active --quiet warp-watchdog.timer", install)
+        self.assertIn("--interface warp", install)
 
     def test_speedtest_installer_uses_verified_non_snap_fallbacks(self):
         fetch = function_body(KTO, "speedtest_fetch_url")

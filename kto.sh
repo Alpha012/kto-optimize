@@ -1312,6 +1312,7 @@ wait_for_apt_locks() {
 
 apt_install_quiet() {
     local missing=() pkg
+    local restart_env=()
     for pkg in "$@"; do
         if ! package_installed "$pkg"; then
             missing+=("$pkg")
@@ -1324,7 +1325,12 @@ apt_install_quiet() {
     fi
 
     wait_for_apt_locks || true
+    # sudo may strip this setting unless it is passed to env explicitly.
+    if [[ -n "${NEEDRESTART_MODE:-}" ]]; then
+        restart_env+=("NEEDRESTART_MODE=$NEEDRESTART_MODE")
+    fi
     "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive \
+        "${restart_env[@]}" \
         apt-get -o DPkg::Lock::Timeout=600 install -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" \
@@ -6706,51 +6712,92 @@ install_selfsteal() {
 }
 
 do_install_warp_native() {
-    stage "Устанавливаю VPS-WARP"
-    local script
-    script="$(mktemp)"
-    must "Скачивание VPS-WARP" curl -fsSL "$WARP_INSTALL_URL" -o "$script"
+    local script install_rc trace tool
+    stage "VPS-WARP: автоматическая установка tagashi666/vps-warp"
+    if ! command_exists systemctl || ! run_systemctl_bounded 10 show-environment >> "$LOG_FILE" 2>&1; then
+        fail "VPS-WARP требует работающий systemd. Устанавливай на хосте, не внутри Docker."
+        return 1
+    fi
 
-    if ! bash -n "$script" >> "$LOG_FILE" 2>&1; then
+    stage "Готовлю зависимости без вопросов и замены ядра"
+    if ! NEEDRESTART_MODE=l apt_install_with_update_if_missing \
+        ca-certificates curl wget wireguard-tools iproute2 iptables iputils-ping util-linux coreutils </dev/null; then
+        fail "Не удалось установить зависимости VPS-WARP; подробности: $LOG_FILE"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        return 1
+    fi
+    for tool in setsid timeout wg-quick ip iptables ping curl wget; do
+        if ! command_exists "$tool"; then
+            fail "Не найдена команда $tool после установки зависимостей VPS-WARP"
+            return 1
+        fi
+    done
+
+    stage "Скачиваю и проверяю установщик VPS-WARP"
+    script="$(mktemp)" || return 1
+    if ! must "Скачивание VPS-WARP" curl -q -fSL --connect-timeout 10 --max-time 90 \
+        --retry 2 --retry-max-time 120 --proto '=https' --proto-redir '=https' \
+        "$WARP_INSTALL_URL" -o "$script"; then
+        rm -f "$script"
+        return 1
+    fi
+
+    if [[ ! -s "$script" ]] || ! bash -n "$script" >> "$LOG_FILE" 2>&1; then
         rm -f "$script"
         fail "Скачанный установщик VPS-WARP повреждён"
         tail -n 25 "$LOG_FILE" >&2 || true
-        exit 1
+        return 1
     fi
 
-    if ! command_exists setsid; then
-        apt_update_quiet
-        apt_install_quiet util-linux
-    fi
-    if ! command_exists setsid; then
-        rm -f "$script"
-        fail "Не найден setsid для автоматической установки VPS-WARP"
-        exit 1
-    fi
-
-    # Upstream intentionally reads /dev/tty. A detached session makes the
-    # supplied language choice and empty WARP+ key fully non-interactive.
-    if ! printf '2\n\n' | "${SUDO[@]}" env \
-        HOME=/root TERM="${TERM:-xterm}" DEBIAN_FRONTEND=noninteractive \
-        setsid --wait bash "$script" >> "$LOG_FILE" 2>&1; then
-        rm -f "$script"
-        fail "VPS-WARP не установился"
-        tail -n 25 "$LOG_FILE" >&2 || true
-        exit 1
+    stage "Устанавливаю: русский язык, WARP+ пропускаю. Лог: $LOG_FILE"
+    # Detach /dev/tty, isolate stdin from the menu, and run timeout INSIDE
+    # the new session so it can terminate the installer's children as well.
+    if printf '2\n\n' | "${SUDO[@]}" env \
+        HOME=/root TERM="${TERM:-xterm}" DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+        setsid --wait timeout --signal=TERM --kill-after=15s 900s bash "$script" 2>&1 | tee -a "$LOG_FILE"; then
+        install_rc=0
+    else
+        install_rc="${PIPESTATUS[1]}"
+        [[ "$install_rc" -ne 0 ]] || install_rc=1
     fi
     rm -f "$script"
-
-    if ! "${SUDO[@]}" test -s /etc/wireguard/warp.conf \
-        || ! "${SUDO[@]}" test -x /usr/local/bin/vps-warp \
-        || ! "${SUDO[@]}" systemctl is-active --quiet wg-quick@warp; then
-        "${SUDO[@]}" systemctl status wg-quick@warp --no-pager >> "$LOG_FILE" 2>&1 || true
-        fail "VPS-WARP завершил установку, но туннель не поднялся"
+    if [[ "$install_rc" -ne 0 ]]; then
+        if [[ "$install_rc" -eq 124 ]]; then
+            fail "Установка VPS-WARP превысила 15 минут и остановлена; подробности: $LOG_FILE"
+        elif [[ "$install_rc" -eq 137 ]]; then
+            fail "Установщик VPS-WARP получил SIGKILL: возможен таймаут или нехватка памяти; лог: $LOG_FILE"
+        else
+            fail "VPS-WARP не установился (код $install_rc); подробности: $LOG_FILE"
+        fi
         tail -n 25 "$LOG_FILE" >&2 || true
-        exit 1
+        return 1
     fi
 
-    echo
-    ok "VPS-WARP установлен и активен"
+    stage "Проверяю туннель и автоматическое восстановление WARP"
+    if ! "${SUDO[@]}" test -s /etc/wireguard/warp.conf \
+        || ! "${SUDO[@]}" test -x /usr/local/bin/vps-warp \
+        || ! run_systemctl_bounded 10 is-active --quiet wg-quick@warp \
+        || ! run_systemctl_bounded 10 is-active --quiet warp-watchdog.timer; then
+        run_systemctl_bounded 10 status wg-quick@warp warp-watchdog.timer --no-pager >> "$LOG_FILE" 2>&1 || true
+        fail "VPS-WARP завершил установку, но туннель или watchdog не активен"
+        tail -n 25 "$LOG_FILE" >&2 || true
+        return 1
+    fi
+
+    stage "Проверяю интернет именно через WARP"
+    if trace="$("${SUDO[@]}" curl -q -4 -fsS --noproxy '*' --interface warp \
+        --connect-timeout 5 --max-time 20 https://www.cloudflare.com/cdn-cgi/trace 2>> "$LOG_FILE")" \
+        && grep -qE '^warp=(on|plus)$' <<< "${trace//$'\r'/}"; then
+        ok "VPS-WARP установлен: туннель работает, watchdog активен"
+    else
+        warn "VPS-WARP установлен, но выход через Cloudflare не подтверждён."
+        warn "Проверь UDP у провайдера и выполни: vps-warp rotate; vps-warp"
+        warn "Лог: $LOG_FILE"
+        return 1
+    fi
+
+    ok "Для Xray: outbound WARP с sockopt.mark=255 и domainStrategy=ForceIPv4."
+    echo "Профиль Remnawave не меняю. Управление: vps-warp"
 }
 
 install_warp_native() {
