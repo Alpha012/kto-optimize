@@ -21,6 +21,7 @@ SYSTEMD_RC=0
 APT_RC=0
 DOWNLOAD_RC=0
 INSTALL_RC=0
+GENERATE_MODE=0
 MISSING_TOOL=''
 INVALID_SCRIPT=0
 EMPTY_SCRIPT=0
@@ -64,9 +65,10 @@ root_cmd() {
             done
             [[ "$1" == setsid && "$2" == --wait && "$3" == timeout ]] || return 94
             [[ "$4" == --signal=TERM && "$5" == --kill-after=15s && "$6" == 900s ]] || return 95
-            [[ "$7" == bash && -s "$8" ]] || return 96
-            printf 'installer:%s\n' "$8" >> "$events"
-            command env "${environment[@]}" FAKE_INSTALL_RC="$INSTALL_RC" bash "$8"
+            [[ "$7" == bash && -s "$8" && -s "$9" ]] || return 96
+            printf 'launcher:%s\ninstaller:%s\n' "$8" "$9" >> "$events"
+            command env "${environment[@]}" FAKE_INSTALL_RC="$INSTALL_RC" \
+                FAKE_GENERATE="$GENERATE_MODE" bash "$8" "$9"
             ;;
         test)
             case "$3" in
@@ -100,6 +102,7 @@ curl() {
                 'if read -r unexpected; then exit 99; fi' \
                 '[[ "$HOME" == /root && "$DEBIAN_FRONTEND" == noninteractive && "$NEEDRESTART_MODE" == l ]]' \
                 'echo upstream-progress' \
+                'if [[ "$FAKE_GENERATE" == 1 ]]; then wgcf generate &>/dev/null || exit 1; fi' \
                 'exit "$FAKE_INSTALL_RC"' > "$target"
         fi
         return "$DOWNLOAD_RC"
@@ -118,7 +121,7 @@ expect_failure() {
 assert_temporary_script_removed() {
     local kind path
     while IFS=: read -r kind path; do
-        [[ "$kind" != download ]] || [[ ! -e "$path" ]]
+        [[ "$kind" != download && "$kind" != launcher ]] || [[ ! -e "$path" ]]
     done < "$events"
 }
 '''
@@ -129,7 +132,9 @@ class WarpInstallTests(unittest.TestCase):
         bash = os.environ.get("KTO_TEST_BASH") or bash_executable()
         if not bash:
             self.skipTest("bash is unavailable")
-        source = HARNESS + "\n" + function_body(KTO, "do_install_warp_native")
+        source = HARNESS + "\n" + "\n".join(function_body(KTO, name) for name in (
+            "warp_wgcf_generate", "warp_write_installer_launcher", "do_install_warp_native",
+        ))
         source += "\n" + scenario + "\nassert_temporary_script_removed\n"
         result = subprocess.run(
             [bash, "-s"], input=source, cwd=ROOT,
@@ -244,6 +249,108 @@ NEEDRESTART_MODE=l apt_install_quiet wireguard-tools
 expected_mode=default
 unset NEEDRESTART_MODE
 apt_install_quiet wireguard-tools
+''')
+
+    def wgcf_scenario(self, error, failures):
+        return r'''
+GENERATE_MODE=1
+export FAKE_WGCF_COUNTER="$tmp/wgcf-count"
+export FAKE_WGCF_SLEEPS="$tmp/wgcf-sleeps"
+printf '0\n' > "$FAKE_WGCF_COUNTER"
+: > "$FAKE_WGCF_SLEEPS"
+printf 'private-key-not-for-logs\n' > "$tmp/account.toml"
+cp "$tmp/account.toml" "$tmp/account-before.toml"
+timeout() {
+    [[ "$1" == --signal=TERM && "$2" == --kill-after=3s && "$3" == 40s ]] || return 91
+    [[ "$4" == /usr/local/bin/wgcf && "$5" == generate ]] || return 92
+    local count
+    count=$(cat "$FAKE_WGCF_COUNTER")
+    count=$(( count + 1 ))
+    printf '%s\n' "$count" > "$FAKE_WGCF_COUNTER"
+    if [[ "$count" -le "$FAKE_WGCF_FAILURES" ]]; then
+        printf '%s\n' "$FAKE_WGCF_ERROR" >&2
+        return "$FAKE_WGCF_RC"
+    fi
+    echo 'profile-generated'
+}
+sleep() { printf '%s\n' "$1" >> "$FAKE_WGCF_SLEEPS"; }
+export -f timeout sleep
+export FAKE_WGCF_RC=1
+''' + f"export FAKE_WGCF_ERROR='{error}'\nexport FAKE_WGCF_FAILURES={failures}\n"
+
+    def test_generate_network_retry_preserves_diagnostics_under_dev_null(self):
+        output = self.run_bash(self.wgcf_scenario(
+            "WARP TLS handshake: context deadline exceeded", 1,
+        ) + r'''
+do_install_warp_native
+[[ "$(cat "$FAKE_WGCF_COUNTER")" == 2 ]]
+[[ "$(cat "$FAKE_WGCF_SLEEPS")" == 2 ]]
+grep -q 'context deadline exceeded' "$LOG_FILE"
+grep -q 'profile-generated' "$LOG_FILE"
+cmp "$tmp/account-before.toml" "$tmp/account.toml"
+! grep -q private-key-not-for-logs "$LOG_FILE"
+''')
+        self.assertIn("context deadline exceeded", output)
+        self.assertIn("profile-generated", output)
+
+    def test_generate_persistent_tls_failure_stops_after_three_attempts(self):
+        output = self.run_bash(self.wgcf_scenario(
+            "WARP TLS handshake: context deadline exceeded", 99,
+        ) + r'''
+expect_failure
+[[ "$(cat "$FAKE_WGCF_COUNTER")" == 3 ]]
+[[ "$(wc -l < "$FAKE_WGCF_SLEEPS")" -eq 2 ]]
+! grep -q '^trace$' "$events"
+cmp "$tmp/account-before.toml" "$tmp/account.toml"
+''')
+        self.assertIn("Аккаунт сохранён", output)
+        self.assertIn("api.cloudflareclient.com:443", output)
+        self.assertNotIn("OK:", output)
+
+    def test_generate_permanent_error_is_not_retried_or_reregistered(self):
+        output = self.run_bash(self.wgcf_scenario(
+            "no account detected, register one first", 99,
+        ) + r'''
+expect_failure
+[[ "$(cat "$FAKE_WGCF_COUNTER")" == 1 ]]
+[[ ! -s "$FAKE_WGCF_SLEEPS" ]]
+cmp "$tmp/account-before.toml" "$tmp/account.toml"
+''')
+        self.assertIn("Аккаунт не сбрасываю", output)
+
+    def test_generate_external_timeout_is_bounded_and_retried(self):
+        self.run_bash(self.wgcf_scenario("", 99) + r'''
+export FAKE_WGCF_RC=124
+expect_failure
+[[ "$(cat "$FAKE_WGCF_COUNTER")" == 3 ]]
+''')
+
+    def test_generate_signal_kill_is_not_retried(self):
+        self.run_bash(self.wgcf_scenario("killed", 99) + r'''
+export FAKE_WGCF_RC=137
+expect_failure
+[[ "$(cat "$FAKE_WGCF_COUNTER")" == 1 ]]
+''')
+
+    def test_launcher_is_syntax_checked_and_keeps_original_installer(self):
+        install = function_body(KTO, "do_install_warp_native")
+        launcher = function_body(KTO, "warp_write_installer_launcher")
+        self.assertIn('bash -n "$launcher"', install)
+        self.assertIn('bash "$launcher" "$script"', install)
+        self.assertIn('exec 3>&1', launcher)
+        self.assertIn('source "$1"', launcher)
+        self.assertNotIn('sed -i', launcher)
+
+    def test_failed_or_invalid_launcher_is_cleaned_without_execution(self):
+        for action in ("return 1", "printf 'if then\\n' > \"$1\""):
+            with self.subTest(action=action):
+                self.run_bash(r'''
+warp_write_installer_launcher() {
+    printf 'launcher:%s\n' "$1" >> "$events"
+''' + action + r'''
+}
+expect_failure
+! grep -q '^installer:' "$events"
 ''')
 
 

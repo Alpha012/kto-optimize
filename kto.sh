@@ -6711,8 +6711,55 @@ install_selfsteal() {
     do_install_selfsteal "$domain"
 }
 
+warp_wgcf_generate() {
+    local attempt output rc
+    for attempt in 1 2 3; do
+        printf '[WARP] Генерация профиля через API Cloudflare: %s/3\n' "$attempt" >&3
+        if output="$(timeout --signal=TERM --kill-after=3s 40s /usr/local/bin/wgcf "$@" 2>&1)"; then
+            printf '%s\n' "$output" >&3
+            return 0
+        else
+            rc=$?
+        fi
+        printf '%s\n' "$output" >&3
+        if [[ "$rc" -ne 124 ]] && ! grep -qiE \
+            'TLS handshake|context deadline|i/o timeout|connection (reset|refused)|unexpected EOF|temporary failure|no such host|network is unreachable|HTTP[^[:digit:]]*(429|502|503|504)' <<< "$output"; then
+            printf '[WARP] Ошибка не похожа на временную сетевую. Аккаунт не сбрасываю.\n' >&3
+            return "$rc"
+        fi
+        if [[ "$attempt" -lt 3 ]]; then
+            printf '[WARP] Временная ошибка API; повторяю без перерегистрации аккаунта.\n' >&3
+            sleep "$(( attempt * 2 ))"
+        fi
+    done
+    printf '[WARP] API Cloudflare недоступен после 3 попыток. Аккаунт сохранён.\n' >&3
+    printf '[WARP] Нужен рабочий выход к api.cloudflareclient.com:443 или генерация профиля на другой машине.\n' >&3
+    printf '[WARP] Это ещё не проверка UDP-туннеля. Смена WireGuard endpoint здесь не поможет.\n' >&3
+    return "$rc"
+}
+
+warp_write_installer_launcher() {
+    local target="$1"
+    # Upstream redirects wgcf output to /dev/null. FD 3 survives those
+    # redirects and feeds the outer tee without modifying upstream code.
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'exec 3>&1'
+        declare -f warp_wgcf_generate
+        printf '%s\n' \
+            'wgcf() {' \
+            '    if [[ "${1:-}" == generate ]]; then' \
+            '        warp_wgcf_generate "$@"' \
+            '    else' \
+            '        /usr/local/bin/wgcf "$@"' \
+            '    fi' \
+            '}' \
+            'export -f wgcf warp_wgcf_generate' \
+            'source "$1"'
+    } > "$target"
+}
+
 do_install_warp_native() {
-    local script install_rc trace tool
+    local script launcher install_rc trace tool
     stage "VPS-WARP: автоматическая установка tagashi666/vps-warp"
     if ! command_exists systemctl || ! run_systemctl_bounded 10 show-environment >> "$LOG_FILE" 2>&1; then
         fail "VPS-WARP требует работающий systemd. Устанавливай на хосте, не внутри Docker."
@@ -6749,18 +6796,26 @@ do_install_warp_native() {
         return 1
     fi
 
+    launcher="$(mktemp)" || { rm -f "$script"; return 1; }
+    if ! warp_write_installer_launcher "$launcher" \
+        || ! bash -n "$launcher" >> "$LOG_FILE" 2>&1; then
+        rm -f "$script" "$launcher"
+        fail "Не удалось подготовить автоматический запуск VPS-WARP"
+        return 1
+    fi
+
     stage "Устанавливаю: русский язык, WARP+ пропускаю. Лог: $LOG_FILE"
     # Detach /dev/tty, isolate stdin from the menu, and run timeout INSIDE
     # the new session so it can terminate the installer's children as well.
     if printf '2\n\n' | "${SUDO[@]}" env \
         HOME=/root TERM="${TERM:-xterm}" DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
-        setsid --wait timeout --signal=TERM --kill-after=15s 900s bash "$script" 2>&1 | tee -a "$LOG_FILE"; then
+        setsid --wait timeout --signal=TERM --kill-after=15s 900s bash "$launcher" "$script" 2>&1 | tee -a "$LOG_FILE"; then
         install_rc=0
     else
         install_rc="${PIPESTATUS[1]}"
         [[ "$install_rc" -ne 0 ]] || install_rc=1
     fi
-    rm -f "$script"
+    rm -f "$script" "$launcher"
     if [[ "$install_rc" -ne 0 ]]; then
         if [[ "$install_rc" -eq 124 ]]; then
             fail "Установка VPS-WARP превысила 15 минут и остановлена; подробности: $LOG_FILE"
