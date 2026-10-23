@@ -208,6 +208,7 @@ docker() {
     return 1
 }
 ensure_existing_remnanode_log_rotation
+grep -Fqx '    image: remnawave/node:3.0.0' "$REMNA_DIR/docker-compose.yml"
 grep -Fqx '# Managed by kto. Limits Remnawave container logs.' "$REMNA_LOGGING_OVERRIDE"
 grep -Fq 'max-size: "20m"' "$REMNA_LOGGING_OVERRIDE"
 grep -Fq 'max-file: "3"' "$REMNA_LOGGING_OVERRIDE"
@@ -478,7 +479,7 @@ grep -q 'max_header_size 64KB' "$KTO_SELFSTEAL_CADDYFILE"
         firewall = function_body(KTO, "opt_firewall")
         firewall_check = function_body(KTO, "system_check_firewall")
 
-        self.assertIn('REMNA_NODE_IMAGE="${KTO_REMNA_NODE_IMAGE:-remnawave/node:3.0.0}"', KTO)
+        self.assertIn('REMNA_NODE_IMAGE="${KTO_REMNA_NODE_IMAGE:-remnawave/node:2.8.0}"', KTO)
         self.assertEqual(node_install.count('image: ${REMNA_NODE_IMAGE}'), 2)
         self.assertNotIn('remnawave/node:latest', node_install)
         self.assertIn("if node_profile_includes_hysteria2; then", node_install)
