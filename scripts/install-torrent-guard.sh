@@ -14,13 +14,29 @@ INTERFACES=()
 PROTECTED_UDP=()
 BUILD=
 INSTALLED=0
+CURRENT_STEP=preflight
 
 die() { printf '[STOP] %s\n' "$*" >&2; exit 1; }
-step() { printf '\n[..] %s\n' "$*"; }
+step() { CURRENT_STEP=$*; printf '\n[..] %s\n' "$*"; }
+
+probe_ndpid_version() {
+    local binary=$1 output rc=0
+    # Upstream returns 1 for a successful -v; verify the banner as well as status.
+    output=$("$binary" -v 2>&1) || rc=$?
+    printf '%s\n' "$output"
+    if (( rc != 0 && rc != 1 )); then
+        die "nDPId version probe failed (exit=$rc)."
+    fi
+    [[ "$output" == *'nDPId version '* && "$output" == *'nDPI version...: '* ]] ||
+        die 'nDPId version probe did not return a valid version banner.'
+}
 
 on_exit() {
     local rc=$?
     trap - EXIT
+    if (( rc != 0 )); then
+        printf '[ERROR] Setup stopped (exit=%s). Step: %s\n' "$rc" "$CURRENT_STEP" >&2
+    fi
     if (( rc != 0 && INSTALLED == 1 )); then
         printf '[ERROR] Setup failed; stopping only torrent-guard services.\n' >&2
         for interface in "${INTERFACES[@]}"; do
@@ -111,7 +127,7 @@ cmake -S "$BUILD/source" -B "$BUILD/build" \
     -DCMAKE_BUILD_TYPE=Release -DBUILD_NDPI=ON -DBUILD_EXAMPLES=OFF \
     -DENABLE_ZLIB=OFF -DENABLE_CRYPTO=OFF -DENABLE_SYSTEMD=OFF
 timeout 1800 env MAKEFLAGS=j2 cmake --build "$BUILD/build" --target nDPId --parallel 2
-"$BUILD/build/nDPId" -v
+probe_ndpid_version "$BUILD/build/nDPId"
 
 step 'Installing isolated services; existing proxy services stay running'
 getent group kto-torrent >/dev/null || groupadd --system kto-torrent

@@ -3,6 +3,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -240,6 +242,49 @@ class TorrentGuardTests(unittest.TestCase):
         self.assertNotIn("modprobe", content)
         self.assertIn("max-packets-per-flow-to-send = 0", content)
         self.assertIn("MemoryMax=1G", content)
+
+    def run_version_probe(self, output, status):
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("bash is not available")
+        source = INSTALLER.read_text(encoding="utf-8")
+        function = re.search(r"(?ms)^probe_ndpid_version\(\) \{\n.*?^\}", source)
+        self.assertIsNotNone(function)
+        # A shell function models upstream's exit status without running a Linux binary.
+        script = ("set -e\n"
+                  "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n" +
+                  function.group() + "\n" +
+                  "fake_ndpid() { printf '%s\\n' \"$PROBE_OUTPUT\"; return \"$PROBE_STATUS\"; }\n"
+                  "probe_ndpid_version fake_ndpid\n"
+                  "printf 'NEXT_INSTALL_STAGE\\n'\n")
+        import os
+        env = {**os.environ, "PROBE_OUTPUT": output, "PROBE_STATUS": str(status)}
+        return subprocess.run([bash, "-c", script], env=env, capture_output=True,
+                              text=True, timeout=10)
+
+    def test_upstream_version_exit_one_does_not_abort_install(self):
+        banner = "nDPId version 1.7.0-release\nnDPI version...: 6.1.0-1-c8443f9"
+        for status in (0, 1):
+            with self.subTest(status=status):
+                result = self.run_version_probe(banner, status)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("NEXT_INSTALL_STAGE", result.stdout)
+
+    def test_broken_binary_or_invalid_banner_still_aborts_install(self):
+        banner = "nDPId version 1.7.0-release\nnDPI version...: 6.1.0-1-c8443f9"
+        for output, status in (("", 1), ("missing shared library", 1),
+                               ("wrong program", 0), (banner, 2), (banner, 132)):
+            with self.subTest(output=output, status=status):
+                result = self.run_version_probe(output, status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("NEXT_INSTALL_STAGE", result.stdout)
+
+    def test_installer_uses_checked_version_probe_and_reports_early_failures(self):
+        content = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn('probe_ndpid_version "$BUILD/build/nDPId"', content)
+        self.assertNotIn('\n"$BUILD/build/nDPId" -v\n', content)
+        self.assertIn('Step: %s\\n', content)
+        self.assertIn('"$rc" "$CURRENT_STEP"', content)
 
 
 if __name__ == "__main__":

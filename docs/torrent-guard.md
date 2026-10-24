@@ -16,6 +16,9 @@ Keep the current SSH session open and have provider console access available.
 The installation compiles pinned nDPId and its pinned nDPI submodule in userspace,
 with two build jobs. It does not install kernel modules or change the kernel.
 Allow at least 1.5 GB of disk space for the temporary build.
+Upstream `nDPId -v` returns exit status 1 even when it successfully prints its
+version. The installer accepts that status only with a valid nDPId/nDPI banner;
+a version display alone is not confirmation that the services were installed.
 
 ```bash
 curl -q -4 -fSL --connect-timeout 10 --max-time 90 \
