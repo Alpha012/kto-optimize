@@ -8,6 +8,7 @@ bash -n tune.sh
 bash -n kto.sh
 bash -n scripts/kto-stats-push.sh
 bash -n scripts/kto-mobile443.sh
+bash -n scripts/install-torrent-guard.sh
 
 PYTHON_CMD=()
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then
@@ -24,7 +25,7 @@ fi
 PYTHONDONTWRITEBYTECODE=1 "${PYTHON_CMD[@]}" - <<'PY'
 from pathlib import Path
 
-for name in ("scripts/kto-stats-collector.py", "scripts/kto-dpi-preflight.py", "scripts/kto-nginx.py"):
+for name in ("scripts/kto-stats-collector.py", "scripts/kto-dpi-preflight.py", "scripts/kto-nginx.py", "scripts/kto-torrent-guard.py"):
     path = Path(name)
     compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
