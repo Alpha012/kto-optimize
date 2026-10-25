@@ -46,6 +46,56 @@ not from the server itself. Look for `OBSERVE BitTorrent peer=...`. Keep a norma
 HTTPS connection and an SSH session working during the test. A running process
 with zero torrent detections is not evidence that torrent blocking works.
 
+## Flow Capacity and Existing Installations
+
+`CAPTURE_ERROR Max flows to track reached` means the capture process cannot track
+some new flows. It is not the host's conntrack limit. Older installations used
+16,384 flows per reader thread. New installations use two reader threads with
+32,768 flows each, or 65,536 each on hosts with at least 16 GiB RAM. The memory
+limits per interface are respectively `MemoryHigh=768M` / `MemoryMax=1G` and
+`MemoryHigh=1536M` / `MemoryMax=2G`. These are limits, not reserved memory, and
+do not guarantee enough capacity at every packet/connection rate.
+
+Tracking garbage collection runs every five seconds. TCP/UDP flows idle for
+60/30 seconds can be forgotten; TCP flows with FIN/RST are retained for ten
+seconds. These are detector retention settings, not socket timeouts: they do
+not close Xray connections. Forgetting an idle flow can reduce recognition of
+later packets, so this remains a capacity/coverage tradeoff.
+
+For an existing installation, update without rebuilding nDPId:
+
+```bash
+(
+set -e
+F=$(mktemp /tmp/kto-torrent-tune.XXXXXX.py)
+trap 'rm -f "$F"' EXIT
+curl -q -4 -fSL --noproxy '*' --connect-timeout 10 --max-time 60 \
+  https://raw.githubusercontent.com/Alpha012/kto-optimize/main/scripts/tune-torrent-capture.py \
+  -o "$F"
+sudo python3 "$F"
+)
+```
+
+The updater requires `observe` mode and at least 2 GiB available RAM. It backs
+up files under `/opt/kto-torrent-guard/capture-backup-*`, downloads a checksum-
+pinned observer, and restarts only the observer and its captures. If startup
+verification fails, it restores the old files and attempts service recovery.
+It does not change Xray, SSH, firewall settings, or the configured mode.
+Inspect fresh logs and memory/CPU usage after the node has been under load:
+
+```bash
+sudo kto-torrent status
+sudo journalctl -u kto-torrent-guard --since '2 minutes ago' --no-pager -n 60
+sudo systemctl status 'kto-torrent-capture@*' --no-pager
+```
+
+Detection logs include the capture alias, nDPI confidence, and `hash_present`.
+The torrent hash itself is not logged. A `DPI` confidence label is not proof
+that a classifier cannot be wrong. A missing hash does not disprove BitTorrent
+(for example DHT or encrypted traffic); a present hash is not a security
+guarantee either. Keep observation enabled while investigating suspicious
+game/service detections, and test those applications before enforcement.
+
 ## Enable, Verify, Undo
 
 ```bash

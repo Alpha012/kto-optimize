@@ -203,6 +203,30 @@ class TorrentGuardTests(unittest.TestCase):
         self.assertEqual(obj.errors, 1)
         self.assertEqual(obj.pending, set())
 
+    def test_detection_log_has_diagnostics_without_logging_torrent_hash(self):
+        obj = self.make_guard("observe")
+        data = event()
+        data["ndpi"]["bittorrent"] = {"hash": "private-infohash-value"}
+        with patch("builtins.print") as output:
+            obj.handle(data)
+        line = output.call_args.args[0]
+        self.assertIn('capture="kto-eth0"', line)
+        self.assertIn('confidence={"6":"DPI"}', line)
+        self.assertIn("hash_present=True", line)
+        self.assertNotIn("private-infohash-value", line)
+
+    def test_capture_error_logs_numeric_limits_but_not_untrusted_details(self):
+        obj = self.make_guard("observe")
+        with patch("builtins.print") as output:
+            obj.handle({"error_event_name": "Max flows to track reached",
+                        "current_active": 16384, "max_active": 16384,
+                        "current_idle": 20, "max_idle": "unsafe\nvalue"})
+        line = output.call_args.args[0]
+        self.assertIn("current_active=16384 max_active=16384 current_idle=20", line)
+        self.assertNotIn("unsafe", line)
+        self.assertNotIn("max_idle=", line)
+        self.assertEqual(obj.pending, set())
+
     def test_enforce_to_observe_removes_only_owned_table(self):
         obj = self.make_guard("enforce")
         obj.pending.add(self.peer(event()))
@@ -241,7 +265,13 @@ class TorrentGuardTests(unittest.TestCase):
         self.assertNotIn("linux-headers", content)
         self.assertNotIn("modprobe", content)
         self.assertIn("max-packets-per-flow-to-send = 0", content)
-        self.assertIn("MemoryMax=1G", content)
+        self.assertIn("CAPTURE_MEMORY_MAX=1G", content)
+        self.assertIn("CAPTURE_MEMORY_MAX=2G", content)
+        self.assertIn("MemoryMax=$CAPTURE_MEMORY_MAX", content)
+        self.assertIn("FLOW_LIMIT=32768", content)
+        self.assertIn("FLOW_LIMIT=65536", content)
+        self.assertIn("flow-scan-interval = 5000000", content)
+        self.assertIn("tcp-max-post-end-flow-time = 10000000", content)
 
     def run_version_probe(self, output, status):
         bash = shutil.which("bash")

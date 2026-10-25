@@ -7,7 +7,7 @@ PREFIX=/opt/kto-torrent-guard
 CONFIG=/etc/kto-torrent-guard.json
 NDPID_REF=b1ef7a62e57b6902098053809bbeb69eb6017c99
 NDPI_REF=c8443f9747efa204fe8673f1fae99f462267d1f5
-GUARD_SHA256=965f78cf725d537f0d66dbb2b30c30f54426ad9803264247ea14b29efbc4e03e
+GUARD_SHA256=858c5b7b86f10b951fd681f775738df8d96c9bc97cdac63dea43a3ecdeee576b
 SOURCE=https://raw.githubusercontent.com/Alpha012/kto-optimize/main/scripts
 MODE=observe
 INTERFACES=()
@@ -130,6 +130,14 @@ timeout 1800 env MAKEFLAGS=j2 cmake --build "$BUILD/build" --target nDPId --para
 probe_ndpid_version "$BUILD/build/nDPId"
 
 step 'Installing isolated services; existing proxy services stay running'
+FLOW_LIMIT=32768
+CAPTURE_MEMORY_HIGH=768M
+CAPTURE_MEMORY_MAX=1G
+if (( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) >= 16777216 )); then
+    FLOW_LIMIT=65536
+    CAPTURE_MEMORY_HIGH=1536M
+    CAPTURE_MEMORY_MAX=2G
+fi
 getent group kto-torrent >/dev/null || groupadd --system kto-torrent
 id kto-torrent >/dev/null 2>&1 || useradd --system --gid kto-torrent \
     --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin kto-torrent
@@ -165,13 +173,15 @@ pidfile = /tmp/kto-torrent-capture-$interface.pid
 bpf = (tcp or udp) and not net 127.0.0.0/8 and not host ::1
 [tuning]
 max-reader-threads = 2
-max-flows-per-thread = 16384
-max-idle-flows-per-thread = 256
+max-flows-per-thread = $FLOW_LIMIT
+max-idle-flows-per-thread = 1024
 max-packets-per-flow-to-send = 0
 max-packets-per-flow-to-process = 32
 daemon-status-interval = 60000000
-tcp-max-idle-time = 180000000
-udp-max-idle-time = 120000000
+flow-scan-interval = 5000000
+tcp-max-idle-time = 60000000
+udp-max-idle-time = 30000000
+tcp-max-post-end-flow-time = 10000000
 [ndpi]
 fpc = disable
 dpi.guess_on_giveup = 0
@@ -212,7 +222,7 @@ LogRateLimitBurst=100
 [Install]
 WantedBy=multi-user.target
 EOF
-cat > /etc/systemd/system/kto-torrent-capture@.service <<'EOF'
+cat > /etc/systemd/system/kto-torrent-capture@.service <<EOF
 [Unit]
 Description=KTO nDPId capture on %i
 After=network-online.target kto-torrent-guard.service
@@ -233,8 +243,8 @@ PrivateTmp=true
 ReadWritePaths=/run/kto-torrent-guard
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID
 RestrictAddressFamilies=AF_UNIX AF_PACKET AF_NETLINK AF_INET AF_INET6
-MemoryHigh=768M
-MemoryMax=1G
+MemoryHigh=$CAPTURE_MEMORY_HIGH
+MemoryMax=$CAPTURE_MEMORY_MAX
 Nice=5
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=60

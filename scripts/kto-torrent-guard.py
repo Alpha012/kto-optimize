@@ -296,7 +296,10 @@ class Guard:
         if isinstance(event.get("error_event_name"), str):
             self.errors += 1
             name = event["error_event_name"].replace("\n", " ").replace("\r", " ")[:80]
-            print(f"CAPTURE_ERROR {name}", flush=True)
+            details = " ".join(f"{key}={event[key]}" for key in
+                               ("current_active", "max_active", "current_idle", "max_idle")
+                               if type(event.get(key)) is int)
+            print(f"CAPTURE_ERROR {name} {details}".rstrip(), flush=True)
         if time.monotonic() - self.local_updated > 60:
             return
         peer = torrent_peer(event, self.addresses, self.protected,
@@ -311,8 +314,14 @@ class Guard:
         while len(self.seen) > MAX_PEERS:
             self.seen.popitem(last=False)
         if first:
+            ndpi = event["ndpi"]
+            confidence = json.dumps(ndpi["confidence"], ensure_ascii=True, separators=(",", ":"))[:160]
+            capture = json.dumps(event.get("alias", "unknown"), ensure_ascii=True)[:80]
+            metadata = ndpi.get("bittorrent", {})
+            has_hash = isinstance(metadata, dict) and bool(metadata.get("hash"))
             print(f"{self.active_mode.upper()} BitTorrent peer={peer[1]}:{peer[2]} "
-                  f"protocol={peer[3]}", flush=True)
+                  f"protocol={peer[3]} capture={capture} confidence={confidence} "
+                  f"hash_present={has_hash}", flush=True)
         if self.blocked.get(peer, now + 1) <= now:
             del self.blocked[peer]
         if self.active_mode == "enforce" and peer not in self.blocked and len(self.pending) < MAX_PEERS:
