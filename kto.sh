@@ -6,7 +6,7 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
-SCRIPT_VERSION="1.4.8.8"
+SCRIPT_VERSION="1.4.8.9"
 SCRIPT_BUILD="v349"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
@@ -61,6 +61,8 @@ else
 fi
 ANTISCANNER_SCRIPT="/usr/local/bin/update-antiscanner.sh"
 ANTISCANNER_URL="https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"
+ANTISCANNER_CACHE_FILE="${KTO_ANTISCANNER_CACHE_FILE:-/var/lib/kto/antiscanner.list}"
+ANTISCANNER_LOG_FILE="${KTO_ANTISCANNER_LOG_FILE:-/var/log/antiscanner_update.log}"
 ZRAM_SETUP_SCRIPT="/usr/local/sbin/kto-zram-setup"
 ZRAM_SERVICE="kto-zram.service"
 ZRAM_PERCENT="${KTO_ZRAM_PERCENT:-50}"
@@ -184,7 +186,7 @@ DIM='\033[2m'
 NC='\033[0m'
 
 SUDO=()
-if command -v sudo >/dev/null 2>&1; then
+if [[ ${EUID:-$(id -u)} -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
     SUDO=(sudo -n)
 fi
 
@@ -555,12 +557,14 @@ progress_step() {
     local title="$1"
     shift
 
-    local from to shown pid rc frame_idx frame
+    local from to shown pid rc frame_idx frame started_at elapsed last_elapsed=-1 display_title
     local frames=('|' '/' '-' '\')
     from=$(( PROGRESS_CURRENT * 100 / PROGRESS_TOTAL ))
     to=$(( (PROGRESS_CURRENT + 1) * 100 / PROGRESS_TOTAL ))
     shown="$from"
     frame_idx=0
+    started_at=$SECONDS
+    display_title="$title"
 
     if [[ ! -t 1 ]]; then
         printf '[..] %3d%% [%s] %s\n' "$to" "$(progress_bar "$to")" "$title"
@@ -578,8 +582,13 @@ progress_step() {
     pid=$!
 
     while jobs -pr | grep -qx "$pid"; do
+        elapsed=$(( SECONDS - started_at ))
+        if (( elapsed != last_elapsed )); then
+            display_title="${title} ($(format_duration "$elapsed"))"
+            last_elapsed="$elapsed"
+        fi
         frame="${frames[$frame_idx]}"
-        progress_line "$shown" "$title" "$frame"
+        progress_line "$shown" "$display_title" "$frame"
         sleep 0.12
         frame_idx=$(( (frame_idx + 1) % 4 ))
         if (( shown < to - 1 )); then
@@ -3804,15 +3813,25 @@ remna_enable_node() {
 
 install_antiscanner() {
     stage "AntiScanner"
-    local existing_rules=0 manage_ssh=1
+    local existing_rules=0 manage_ssh=1 update_mode="${1:-sync}" update_state
+    if [[ "$update_mode" == "background" ]] && "${SUDO[@]}" test -x "$ANTISCANNER_SCRIPT"; then
+        update_state="$(run_systemctl_bounded 5 show antiscanner-update.service -p ActiveState --value 2>/dev/null || true)"
+        if [[ "$update_state" == "activating" ]]; then
+            ok "AntiScanner: обновление уже выполняется; лог ${ANTISCANNER_LOG_FILE}"
+            return 0
+        fi
+    fi
     existing_rules="$(antiscanner_rules_count)"
 
     managed_ssh_changes_enabled || manage_ssh=0
 
-    apt_install_quiet curl ufw cron util-linux || true
-    cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y iptables-persistent || true
+    apt_install_quiet curl ufw cron util-linux python3 || true
+    if package_installed iptables-persistent; then
+        cmd "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y iptables-persistent || true
+    fi
     cmd "${SUDO[@]}" systemctl enable --now cron || true
-    if (( manage_ssh == 1 )); then
+    if (( manage_ssh == 1 )) &&
+        { [[ "$update_mode" != "background" ]] || ! "${SUDO[@]}" test -x "$KTO_SSH_FIREWALL_GUARD"; }; then
         install_ssh_firewall_guard || true
     fi
 
@@ -3823,10 +3842,12 @@ set -Eeuo pipefail
 URL="${ANTISCANNER_URL}"
 TEMP_FILE="\$(mktemp)"
 TRUSTED_FILE="\$(mktemp)"
-LOG="/var/log/antiscanner_update.log"
+LOG="${ANTISCANNER_LOG_FILE}"
 LOCK_FILE="${KTO_UFW_LOCK_FILE}"
 SSH_GUARD="${KTO_SSH_FIREWALL_GUARD}"
 MANAGE_SSH="${manage_ssh}"
+CACHE_FILE="${ANTISCANNER_CACHE_FILE}"
+UFW_RULES_DIR="\${KTO_ANTISCANNER_UFW_DIR:-/etc/ufw}"
 UFW_LOCKED=0
 
 cleanup() {
@@ -3839,9 +3860,46 @@ if ! command -v ufw >/dev/null 2>&1; then
     exit 1
 fi
 
+# Download before taking the shared firewall lock.
+echo "\$(date '+%Y-%m-%d %H:%M:%S') [START] downloading blacklist (timeout 30s)" >> "\$LOG"
+if ! curl -q -fsSL --noproxy '*' --connect-timeout 5 --max-time 30 "\$URL" -o "\$TEMP_FILE" || [[ ! -s "\$TEMP_FILE" ]]; then
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to download blacklist; existing rules preserved" >> "\$LOG"
+    exit 1
+fi
+if ! python3 - "\$TEMP_FILE" >> "\$LOG" 2>&1 <<'PY'
+import ipaddress
+import sys
+
+networks = {4: [], 6: []}
+with open(sys.argv[1], encoding="utf-8-sig") as source:
+    for line in source:
+        value = line.split("#", 1)[0].strip()
+        if not value:
+            continue
+        network = ipaddress.ip_network(value, strict=False)
+        if network.prefixlen == 0:
+            raise ValueError("Refusing to block an entire address family")
+        networks[network.version].append(network)
+collapsed = [network for version in (4, 6)
+             for network in ipaddress.collapse_addresses(networks[version])]
+if any(network.prefixlen == 0 for network in collapsed):
+    raise ValueError("Refusing to block an entire address family")
+normalized = [str(network) for network in collapsed]
+if not normalized:
+    raise ValueError("Blacklist is empty")
+with open(sys.argv[1], "w", encoding="utf-8", newline="\n") as output:
+    output.write("\n".join(normalized) + "\n")
+PY
+then
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] invalid blacklist; existing rules preserved" >> "\$LOG"
+    exit 1
+fi
+TOTAL="\$(wc -l < "\$TEMP_FILE")"
+
 mkdir -p "\$(dirname "\$LOCK_FILE")"
 if command -v flock >/dev/null 2>&1; then
     exec 9>"\$LOCK_FILE"
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [WAIT] acquiring UFW lock (timeout 120s)" >> "\$LOG"
     if ! flock -w 120 9; then
         echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] timed out waiting for UFW lock" >> "\$LOG"
         exit 1
@@ -3911,17 +3969,31 @@ if (( MANAGE_SSH == 1 )); then
     ' | sort -u > "\$TRUSTED_FILE"
 fi
 
-if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
-    for rules_file in /etc/ufw/user.rules /etc/ufw/user6.rules; do
+if [[ -s "\$CACHE_FILE" ]] && cmp -s "\$TEMP_FILE" "\$CACHE_FILE"; then
+    CURRENT="\$(ufw status 2>/dev/null | awk '/AntiScanner-Block/ {count++} END {print count+0}')"
+    if [[ "\$CURRENT" == "\$TOTAL" ]]; then
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') [SKIP] blacklist unchanged (\$TOTAL rules)" >> "\$LOG"
+        exit 0
+    fi
+fi
+
+if [[ -s "\$TEMP_FILE" ]]; then
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [APPLY] applying \$TOTAL rules" >> "\$LOG"
+    for rules_file in "\$UFW_RULES_DIR/user.rules" "\$UFW_RULES_DIR/user6.rules"; do
         [[ -f "\$rules_file" ]] && sed -i '/AntiScanner-Block/d' "\$rules_file"
     done
 
+    PROCESSED=0
+    FAILED=0
     while IFS= read -r subnet; do
-        subnet="\$(echo "\$subnet" | xargs)"
         [[ -z "\$subnet" || "\$subnet" == "#"* ]] && continue
 
         if [[ "\$subnet" =~ \. || "\$subnet" =~ : ]]; then
-            ufw insert "\$((MANAGED_SSH + 1))" deny from "\$subnet" comment 'AntiScanner-Block' >/dev/null 2>&1 || true
+            ufw insert "\$((MANAGED_SSH + 1))" deny from "\$subnet" comment 'AntiScanner-Block' >/dev/null 2>&1 || FAILED=\$((FAILED + 1))
+        fi
+        PROCESSED=\$((PROCESSED + 1))
+        if (( PROCESSED % 25 == 0 || PROCESSED == TOTAL )); then
+            echo "\$(date '+%Y-%m-%d %H:%M:%S') [PROGRESS] \$PROCESSED/\$TOTAL rules; failed=\$FAILED" >> "\$LOG"
         fi
     done < "\$TEMP_FILE"
 
@@ -3954,7 +4026,13 @@ if curl -fsSL "\$URL" -o "\$TEMP_FILE" && [[ -s "\$TEMP_FILE" ]]; then
         "\$SSH_GUARD" >> "\$LOG" 2>&1 ||
             echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to restore managed SSH UFW rule" >> "\$LOG"
     fi
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] AntiScanner updated via ufw" >> "\$LOG"
+    if (( FAILED > 0 )); then
+        echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to apply \$FAILED/\$TOTAL rules" >> "\$LOG"
+        exit 1
+    fi
+    mkdir -p "\$(dirname "\$CACHE_FILE")"
+    install -m 0600 "\$TEMP_FILE" "\$CACHE_FILE"
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] AntiScanner updated via ufw (\$TOTAL rules)" >> "\$LOG"
 else
     echo "\$(date '+%Y-%m-%d %H:%M:%S') [ERROR] failed to download blacklist" >> "\$LOG"
     exit 1
@@ -3974,6 +4052,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${ANTISCANNER_SCRIPT}
 RemainAfterExit=yes
+Nice=10
 
 [Install]
 WantedBy=multi-user.target
@@ -3983,6 +4062,16 @@ EOF
     cmd "${SUDO[@]}" systemctl enable antiscanner-update.service
     if [[ "$existing_rules" =~ ^[0-9]+$ && "$existing_rules" -gt 0 ]]; then
         echo "AntiScanner update skipped: rules already present ($existing_rules)" >> "$LOG_FILE"
+    elif [[ "$update_mode" == "background" ]]; then
+        update_state="$(run_systemctl_bounded 5 show antiscanner-update.service -p ActiveState --value 2>/dev/null || true)"
+        if [[ "$update_state" == "activating" ]]; then
+            ok "AntiScanner: обновление уже выполняется; лог /var/log/antiscanner_update.log"
+        elif run_systemctl_bounded 10 --no-block restart antiscanner-update.service >> "$LOG_FILE" 2>&1; then
+            ok "AntiScanner: обновление запланировано в фоне; лог /var/log/antiscanner_update.log"
+        else
+            fail "Не удалось запланировать AntiScanner; проверь systemctl status antiscanner-update.service"
+            return 1
+        fi
     else
         cmd "${SUDO[@]}" "$ANTISCANNER_SCRIPT" || true
     fi
@@ -4032,7 +4121,7 @@ opt_install_packages() {
 optimization_fast_packages() {
     {
         optimization_packages
-        printf '%s\n' cron fail2ban util-linux kmod
+        printf '%s\n' cron fail2ban util-linux kmod python3
     } | awk 'NF && !seen[$0]++'
 }
 
@@ -4954,7 +5043,7 @@ opt_haproxy_firewall_final_check() {
 }
 
 opt_antiscanner() {
-    install_antiscanner
+    install_antiscanner background
 }
 
 opt_fail2ban() {
@@ -6329,11 +6418,11 @@ system_check_apply_missing() {
     (( SYSTEM_CHECK_NEEDS_STORAGE == 1 )) && progress_step "Настраиваю хранение" opt_storage_guard
     (( SYSTEM_CHECK_NEEDS_MEMORY_GUARD == 1 )) && progress_step "Настраиваю память" opt_memory_guard
     (( SYSTEM_CHECK_NEEDS_FIREWALL == 1 )) && progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
-    (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && progress_step "Подключаю AntiScanner" opt_antiscanner
     if managed_ssh_changes_enabled && (( SYSTEM_CHECK_NEEDS_FAIL2BAN == 1 )); then
         progress_step "Настраиваю Fail2ban" opt_fail2ban
     fi
     opt_haproxy_firewall_final_check
+    (( SYSTEM_CHECK_NEEDS_ANTISCANNER == 1 )) && progress_step "Подключаю AntiScanner" opt_antiscanner
 
     echo
     duration=$(( $(date +%s) - started_at ))
@@ -6473,11 +6562,11 @@ optimize_system() {
     progress_step "Настраиваю хранение" opt_storage_guard
     progress_step "Мигрирую HAProxy" upgrade_haproxy_if_configured
     progress_step "Настраиваю firewall" opt_firewall "$ssh_port"
-    progress_step "Подключаю AntiScanner" opt_antiscanner
     if managed_ssh_changes_enabled; then
         progress_step "Настраиваю Fail2ban" opt_fail2ban
     fi
     progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check
+    progress_step "Подключаю AntiScanner" opt_antiscanner
 
     echo
     duration=$(( $(date +%s) - started_at ))
@@ -6487,6 +6576,7 @@ optimize_system() {
     else
         ok "Оптимизация завершена. Рекомендуется: sudo reboot"
     fi
+    ok "AntiScanner: обновление списка выполняется отдельно; статус — systemctl status antiscanner-update.service"
     if managed_ssh_changes_enabled; then
         ok "SSH-порт: ${ssh_port}/tcp"
         ok "Подключение: ssh -p ${ssh_port} root@IP"

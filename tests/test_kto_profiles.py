@@ -46,6 +46,48 @@ def function_body(source, name):
 
 
 class CombinedNodeProfileTests(unittest.TestCase):
+    def test_root_skips_sudo_and_unprivileged_users_keep_it_when_available(self):
+        bash = bash_executable()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+
+        match = re.search(r"(?ms)^SUDO=\(\)\n.*?^fi$", KTO)
+        self.assertIsNotNone(match)
+        initialization = match.group(0)
+        self.assertIn('${EUID:-$(id -u)} -ne 0', initialization)
+        # EUID is readonly in Bash; exercise the real initializer with a test variable.
+        initialization = initialization.replace("EUID", "TEST_EUID")
+
+        for uid, available, expected in (
+            (0, True, ["0", "", "0"]),
+            (0, False, ["0", "", "0"]),
+            (1000, True, ["2", "sudo -n", "1"]),
+            (1000, False, ["0", "", "1"]),
+        ):
+            with self.subTest(uid=uid, sudo_available=available):
+                harness = f'''
+set -Eeuo pipefail
+TEST_EUID={uid}
+lookups=0
+command() {{
+    [[ "$#" -eq 2 && "$1" == -v && "$2" == sudo ]]
+    lookups=$((lookups + 1))
+    return {0 if available else 1}
+}}
+{initialization}
+printf '%s\\n' "${{#SUDO[@]}}" "${{SUDO[*]}}" "$lookups"
+'''
+                result = subprocess.run(
+                    [bash, "-lc", harness],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.splitlines(), expected)
+
     def test_build_markers_stay_in_sync(self):
         self.assertIn('SCRIPT_BUILD="v349"', KTO)
         self.assertIn('PUSH_BUILD="v349"', PUSH)
@@ -4323,12 +4365,12 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_optimize_rechecks_haproxy_firewall_after_antiscanner(self):
+    def test_optimize_checks_haproxy_firewall_before_background_antiscanner(self):
         optimize = function_body(KTO, "optimize_system")
 
         self.assertLess(
-            optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
+            optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
         )
         self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v349"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
