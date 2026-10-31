@@ -6574,7 +6574,7 @@ optimize_system() {
     if google_cloud_detected; then
         ok "Оптимизация завершена без замены ядра на XanMod. Reboot нужен только по требованиям обновлений ОС."
     else
-        ok "Оптимизация завершена. Рекомендуется: sudo reboot"
+        ok "Оптимизация завершена. Перед sudo reboot дождись завершения AntiScanner."
     fi
     ok "AntiScanner: обновление списка выполняется отдельно; статус — systemctl status antiscanner-update.service"
     if managed_ssh_changes_enabled; then
