@@ -6,7 +6,7 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
-SCRIPT_VERSION="1.4.8.9"
+SCRIPT_VERSION="1.4.8.10"
 SCRIPT_BUILD="v349"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
@@ -3172,6 +3172,39 @@ restore_optional_ssh_file() {
     fi
 }
 
+ensure_ssh_runtime_directory() {
+    local service="${1%.service}" drop_in
+    drop_in="/etc/systemd/system/${service}.service.d/99-kto-runtime.conf"
+    cmd "${SUDO[@]}" mkdir -p "$(dirname "$drop_in")" || return 1
+    if ! write_root_file_if_changed "$drop_in" <<'EOF'
+[Service]
+RuntimeDirectoryPreserve=yes
+EOF
+    then
+        return 1
+    fi
+    if (( ROOT_FILE_UPDATED == 1 )); then
+        run_systemctl_bounded 15 daemon-reload >> "$LOG_FILE" 2>&1 || return 1
+    fi
+    cmd "${SUDO[@]}" install -d -o root -g root -m 0755 /run/sshd
+}
+
+print_ssh_failure_details() {
+    local service="$1" details
+    details="$({
+        echo '=== SSH configuration check ==='
+        run_bounded_command 5 "${SUDO[@]}" sshd -t 2>&1 || true
+        echo '=== SSH service ==='
+        run_systemctl_bounded 5 status "$service" ssh.socket --no-pager -l 2>&1 || true
+        echo '=== SSH journal ==='
+        run_bounded_command 5 "${SUDO[@]}" journalctl -u "$service" -u ssh.socket -n 40 --no-pager -o cat 2>&1 || true
+        echo '=== SSH listeners ==='
+        { run_bounded_command 5 "${SUDO[@]}" ss -Hlnpt 2>&1 || true; } |
+            awk '/"sshd"|"systemd"/'
+    })"
+    printf '%s\n' "$details" | tee -a "$LOG_FILE" >&2
+}
+
 rollback_ssh_migration() {
     local backup_dir="$1" had_main="$2" had_managed="$3" had_root_keys="$4" had_marker="$5"
     local service="$6" socket_was_enabled="$7" socket_was_active="$8" new_port="$9" new_rule_existed="${10}"
@@ -3180,6 +3213,7 @@ rollback_ssh_migration() {
     restore_optional_ssh_file "${backup_dir}/managed.conf" "$KTO_SSH_MANAGED_CONFIG" "$had_managed"
     restore_optional_ssh_file "${backup_dir}/authorized_keys" /root/.ssh/authorized_keys "$had_root_keys"
     restore_optional_ssh_file "${backup_dir}/port" "$KTO_SSH_PORT_FILE" "$had_marker"
+    ensure_ssh_runtime_directory "$service" || true
     run_systemctl_bounded 15 daemon-reload >> "$LOG_FILE" 2>&1 || true
     if [[ "$socket_was_enabled" == "1" ]]; then
         run_systemctl_bounded 15 enable ssh.socket >> "$LOG_FILE" 2>&1 || true
@@ -3187,7 +3221,11 @@ rollback_ssh_migration() {
     if [[ "$socket_was_active" == "1" ]]; then
         run_systemctl_bounded 15 start ssh.socket >> "$LOG_FILE" 2>&1 || true
     fi
-    run_systemctl_bounded 15 restart "$service" >> "$LOG_FILE" 2>&1 || true
+    if ! run_systemctl_bounded 15 restart "$service" >> "$LOG_FILE" 2>&1; then
+        warn "SSH config возвращён, но служба не запустилась. Текущую сессию оставь открытой; проверь журнал SSH."
+    fi
+    # A failed service start must not leave surviving SSH listeners without privsep.
+    cmd "${SUDO[@]}" install -d -o root -g root -m 0755 /run/sshd || true
     if [[ "$new_rule_existed" == "0" ]]; then
         remove_ufw_allow_rules_for_port "$new_port"
     fi
@@ -3213,7 +3251,7 @@ ssh_root_access_configured() {
 }
 
 opt_ssh_root_access() {
-    local old_port new_port service timestamp backup_dir main_tmp keys_tmp effective
+    local old_port new_port service timestamp backup_dir main_tmp keys_tmp effective service_state
     local had_main=0 had_managed=0 had_root_keys=0 had_marker=0 new_rule_existed=0
     local socket_was_enabled=0 socket_was_active=0 attempt
 
@@ -3236,13 +3274,25 @@ opt_ssh_root_access() {
         fail "SSH systemd service не найден"
         return 1
     }
-
     keys_tmp="$(mktemp)"
     if ! merge_root_authorized_keys "$keys_tmp"; then
         rm -f "$keys_tmp" "${keys_tmp}.dedup"
         warn "SSH: public key не найден; текущие порт, UFW и параметры входа оставлены без изменений."
         warn "Чтобы включить root key-only, сначала добавь свой ключ в ~/.ssh/authorized_keys и повтори оптимизацию."
         return 0
+    fi
+
+    if ! ensure_ssh_runtime_directory "$service"; then
+        rm -f "$keys_tmp"
+        fail "Не удалось подготовить /run/sshd; SSH-параметры не изменены"
+        return 1
+    fi
+    service_state="$(run_systemctl_bounded 3 show "$service" -p ActiveState --value 2>/dev/null || true)"
+    if [[ "$service_state" == "failed" ]]; then
+        rm -f "$keys_tmp"
+        fail "SSH-служба уже в состоянии failed; сначала восстанови её. Порт и ключи не изменены."
+        print_ssh_failure_details "$service"
+        return 1
     fi
 
     old_port="$(detect_ssh_port)"
@@ -3344,6 +3394,7 @@ EOF
     run_systemctl_bounded 15 disable --now ssh.socket >> "$LOG_FILE" 2>&1 || true
     if ! run_systemctl_bounded 15 enable "$service" >> "$LOG_FILE" 2>&1 ||
         ! run_systemctl_bounded 15 restart "$service" >> "$LOG_FILE" 2>&1; then
+        print_ssh_failure_details "$service"
         rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
             "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
         fail "SSH не перезапустился на новом порту; выполнен откат"
@@ -3354,6 +3405,7 @@ EOF
         sleep 0.25
     done
     if ! run_systemctl_bounded 3 is-active --quiet "$service" 2>/dev/null || ! ssh_port_is_listening "$new_port"; then
+        print_ssh_failure_details "$service"
         rollback_ssh_migration "$backup_dir" "$had_main" "$had_managed" "$had_root_keys" "$had_marker" \
             "$service" "$socket_was_enabled" "$socket_was_active" "$new_port" "$new_rule_existed"
         fail "SSH listener ${new_port}/tcp не поднялся; выполнен откат"
