@@ -496,7 +496,7 @@ class Guard:
                                ("current_active", "max_active", "current_idle", "max_idle")
                                if type(event.get(key)) is int)
             print(f"CAPTURE_ERROR {name} {details}".rstrip(), flush=True)
-        if time.monotonic() - self.local_updated > 60:
+        if self.local_updated <= 0 or time.monotonic() - self.local_updated > 60:
             return
         exempt = set(self.settings["exempt_ips"])
         if event.get("flow_event_name") in ("new", "end", "idle"):

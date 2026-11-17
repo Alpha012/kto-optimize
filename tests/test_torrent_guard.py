@@ -269,8 +269,15 @@ class TorrentGuardTests(unittest.TestCase):
 
     def test_stale_local_snapshot_never_adds_bans(self):
         obj = self.make_guard("enforce")
-        obj.local_updated = 0
+        obj.local_updated = guard.time.monotonic() - 61
         obj.handle(event())
+        self.assertEqual(obj.pending, set())
+
+    def test_uninitialized_snapshot_is_unsafe_even_on_a_freshly_booted_vps(self):
+        obj = self.make_guard("enforce")
+        obj.local_updated = 0
+        with patch.object(guard.time, "monotonic", return_value=5):
+            obj.handle(event())
         self.assertEqual(obj.pending, set())
 
     def test_capture_errors_are_counted_without_becoming_bans(self):
