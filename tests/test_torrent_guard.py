@@ -143,6 +143,19 @@ class TorrentGuardTests(unittest.TestCase):
                 guard.check_nft()
             run.assert_not_called()
 
+    def test_firewall_errors_include_stderr(self):
+        result = subprocess.CompletedProcess([], 1, "", "unsupported nft syntax")
+        with patch.object(guard.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "unsupported nft syntax"):
+                guard.command(["nft", "-f", "-"], input="fixture")
+            self.assertEqual(guard.command(["nft"], check=False), result)
+
+    def test_expired_set_element_deletion_is_compatible_with_ubuntu_24(self):
+        rules = guard.nft_remove(self.peer(event()))
+        self.assertTrue(rules.startswith("add element"))
+        self.assertIn("\ndelete element", rules)
+        self.assertNotIn("destroy element", rules)
+
     def test_table_ownership(self):
         result = subprocess.CompletedProcess([], 0, json.dumps({"nftables": [
             {"table": {"name": guard.TABLE, "comment": guard.OWNER}}]}), "")
@@ -213,7 +226,7 @@ class TorrentGuardTests(unittest.TestCase):
                     run.assert_not_called()
                     obj.handle(event(flow_event_name=name))
                     obj.flush()
-                    self.assertIn("destroy element", run.call_args.kwargs["input"])
+                    self.assertIn("delete element", run.call_args.kwargs["input"])
                     self.assertEqual(obj.blocked, {})
 
     def test_reused_tuple_is_removed_before_new_detection_is_added(self):
@@ -225,7 +238,7 @@ class TorrentGuardTests(unittest.TestCase):
             obj.handle(event(flow_id=2, flow_first_seen=2000))
             obj.flush()
         rules = run.call_args.kwargs["input"]
-        self.assertLess(rules.index("destroy element"), rules.index("add element"))
+        self.assertLess(rules.index("delete element"), rules.rindex("add element"))
         self.assertEqual(len(obj.blocked), 1)
 
     def test_ended_detection_is_not_added_from_pending_batch(self):

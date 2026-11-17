@@ -28,8 +28,11 @@ VERSION = 2
 
 
 def command(args, *, input=None, check=True):
-    return subprocess.run(args, input=input, text=True, capture_output=True,
-                          check=check, timeout=5)
+    result = subprocess.run(args, input=input, text=True, capture_output=True, timeout=5)
+    if check and result.returncode:
+        detail = (result.stderr or result.stdout).strip()[:3000]
+        raise RuntimeError(f"{args[0]} failed (exit={result.returncode}): {detail}")
+    return result
 
 
 def config(path=CONFIG):
@@ -185,6 +188,13 @@ def nft_element(flow):
     return f'{json.dumps(interface)} . {local} . {local_port} . {remote} . {remote_port} . {protocol}'
 
 
+def nft_remove(flow):
+    # Ubuntu 24.04 nft lacks `destroy element`. Add-if-missing then delete in
+    # one transaction, so expiry cannot race deletion and no temporary ban leaks.
+    element = f"inet {TABLE} flows{flow[0]} {{ {nft_element(flow)} }}"
+    return f"add element {element}\ndelete element {element}\n"
+
+
 def nft_table(protected, ttl):
     lines = [f"table inet {TABLE} {{", f'comment "{OWNER}"']
     for version in (4, 6):
@@ -252,7 +262,10 @@ def check_nft():
         command(["nft", "-f", "-"], input=(
             f'add element inet {TABLE} flows4 {{ "eth0" . 5.34.179.103 . 55432 . 93.184.216.34 . 49999 . tcp timeout 600s }}\n'
             f'add element inet {TABLE} flows6 {{ "warp" . 2606:4700:110:8765::2 . 55432 . 2001:4860:4860::8888 . 49999 . udp timeout 600s }}\n'
-            f'destroy element inet {TABLE} flows4 {{ "eth0" . 5.34.179.103 . 55433 . 93.184.216.34 . 49999 . tcp }}\n'))
+            + nft_remove((4, "eth0", "5.34.179.103", 55433, "93.184.216.34", 49999, "tcp"))))
+        reused = 4, "eth0", "5.34.179.103", 55432, "93.184.216.34", 49999, "tcp"
+        command(["nft", "-f", "-"], input=(nft_remove(reused) +
+                f"add element inet {TABLE} flows4 {{ {nft_element(reused)} timeout 600s }}\n"))
         if not owns_table():
             raise RuntimeError("nftables self-test failed")
         check_isolation()
@@ -386,7 +399,7 @@ ip saddr 192.0.2.1 udp sport 40000 snat to 198.51.100.1:45000
             other.sendall(b"other")
             if other.recv(1024) != b"other":
                 raise RuntimeError("another TCP connection was blocked")
-            command(["nft", "-f", "-"], input=f"destroy element {element}\n")
+            command(["nft", "-f", "-"], input=nft_remove(flow))
             blocked.settimeout(1)
             echo(blocked, target)
     finally:
@@ -541,8 +554,7 @@ class Guard:
         removals = sorted(self.removals)[:256]
         # Remove an old generation before reusing its 5-tuple for a new flow.
         flows = sorted(self.pending - (self.removals - set(removals)))[:256]
-        lines = [f"destroy element inet {TABLE} flows{flow[0]} {{ {nft_element(flow)} }}"
-                 for flow in removals]
+        lines = [nft_remove(flow).rstrip() for flow in removals]
         lines.extend(f"add element inet {TABLE} flows{flow[0]} "
                      f"{{ {nft_element(flow)} timeout {self.settings['ttl']}s }}" for flow in flows)
         if not lines:
