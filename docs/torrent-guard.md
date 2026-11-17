@@ -1,8 +1,9 @@
 # Connection-Scoped Torrent Guard
 
-This is a standalone, experimental userspace nDPI integration for Ubuntu 24.04
-x86_64 exit nodes with host-networked Xray. It is not installed by kto.sh, does
+This is an optional, experimental userspace nDPI integration for Ubuntu 24.04
+x86_64 exit nodes with host-networked Xray. It is available from kto.sh, does
 not change the Xray profile, and is not the Remnawave Torrent Blocker plugin.
+Opening the main script or running full optimization does not install it.
 
 It is a reactive filter, not a guarantee against BitTorrent or copyright abuse.
 The first packets pass before classification. Encrypted, obfuscated, unobserved,
@@ -18,6 +19,35 @@ partial, cached, aggressive, and IP/port guesses are ignored. This reduces
 coverage and does not eliminate false positives such as game traffic.
 
 ## Install
+
+### Main Script Menu
+
+Run the main script normally and select **Торрент-блокер (nDPI, выходная нода)**,
+or open that menu directly with one command:
+
+```bash
+(F=$(mktemp) && trap 'rm -f "$F"' EXIT && curl -q -4 -fSL --noproxy '*' --connect-timeout 10 --max-time 90 https://raw.githubusercontent.com/Alpha012/kto-optimize/main/kto.sh -o "$F" && bash -n "$F" && bash "$F" torrent-guard)
+```
+
+Choose **1** to install/update in observation mode, or **2** to install/update
+and then enable blocking after explicit confirmation and successful checks.
+The wizard accepts optional egress interface names and protected inbound UDP
+ports (for example a UDP-only Hysteria2 listener). Empty interfaces select
+default-route devices plus `warp`. Updating preserves the existing interfaces,
+protected ports, and other settings and does not rebuild nDPId. It temporarily
+switches to observation; a failed update never automatically enables blocking.
+Stopped installations are started in observation, not their previous blocking
+mode. An old peer-wide installation must be updated before this menu enables it.
+
+The menu also provides status, recent logs, observation, stop, and removal.
+It is visible in node and whitelist modes, but encrypted whitelist relays cannot
+inspect the traffic inside a tunnel: use it on the final exit instead.
+The direct entrypoint `bash kto.sh torrent-guard [install|update|setup|enforce|observe|status|logs|stop|uninstall]`
+bypasses unrelated optimization, storage repair, and machine-mode migrations.
+`setup` means install/update and enforce, not an unattended silent install.
+Removing this guard does not remove Xray, SSH, WARP, or other firewall tables.
+
+### Standalone Installer
 
 Keep the current SSH session open and have provider console access available.
 The installation compiles pinned nDPId and its pinned nDPI submodule in userspace,

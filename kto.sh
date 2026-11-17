@@ -39,6 +39,10 @@ MOBILE443_MANAGER="/usr/local/sbin/kto-mobile443"
 ADDITIONAL_IP_MANAGER="/usr/local/sbin/kto-additional-ips"
 REMNA_EGRESS_MANAGER="/usr/local/sbin/kto-remnawave-egress"
 NGINX_MANAGER="/usr/local/sbin/kto-nginx"
+TORRENT_GUARD_PREFIX="/opt/kto-torrent-guard"
+TORRENT_GUARD_CONFIG="/etc/kto-torrent-guard.json"
+TORRENT_GUARD_CLI="/usr/local/bin/kto-torrent"
+TORRENT_GUARD_STATUS="/run/kto-torrent-guard/status.json"
 CLEANUP_MANAGER="/usr/local/sbin/kto-server-cleanup"
 SSH_PASSWORD_MANAGER="/usr/local/sbin/kto-ssh-password"
 KTO_SSH_PASSWORD_MODE_FILE="/etc/kto-ssh-password.enabled"
@@ -13856,6 +13860,222 @@ nginx_menu() {
     "${SUDO[@]}" python3 "$NGINX_MANAGER" "${1:-menu}"
 }
 
+torrent_guard_installed() {
+    "${SUDO[@]}" test -x "$TORRENT_GUARD_CLI" &&
+        "${SUDO[@]}" test -s "$TORRENT_GUARD_PREFIX/guard.py" &&
+        "${SUDO[@]}" test -s "$TORRENT_GUARD_CONFIG" &&
+        "${SUDO[@]}" grep -Fxq kto-torrent-guard-v1 "$TORRENT_GUARD_PREFIX/.owner" 2>/dev/null
+}
+
+torrent_guard_require_installed() {
+    if ! torrent_guard_installed; then
+        fail "Нет полной установки KTO Torrent Guard. Выбери установку; чужие файлы не удаляю."
+        return 1
+    fi
+}
+
+torrent_guard_confirm_enforce() {
+    local answer
+    warn "Блокируются распознанные BitTorrent-соединения, не весь интернет пользователя."
+    warn "Первые пакеты проходят до детекта; 100% защиты нет, возможны ложные срабатывания."
+    printf 'Включить блокировку с автозапуском после перезагрузки? [y/N]: '
+    read -r answer || return 1
+    [[ "$answer" == y || "$answer" == Y ]] || return 1
+}
+
+torrent_guard_observe() {
+    torrent_guard_require_installed || return 1
+    if run_systemctl_bounded 10 is-active --quiet kto-torrent-guard.service; then
+        run_bounded_command 30 "${SUDO[@]}" "$TORRENT_GUARD_CLI" observe || return 1
+    else
+        # A stopped installation must not briefly enforce its previous mode on restart.
+        "${SUDO[@]}" python3 - "$TORRENT_GUARD_CONFIG" <<'PY' || return 1
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+path = Path(sys.argv[1])
+settings = json.loads(path.read_text(encoding="utf-8"))
+if settings.get("mode") not in ("observe", "enforce"):
+    raise ValueError("invalid torrent guard mode")
+settings["mode"] = "observe"
+fd, temporary = tempfile.mkstemp(prefix=".kto-torrent-", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        json.dump(settings, output)
+        output.write("\n")
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+    fi
+    run_systemctl_bounded 40 enable --now kto-torrent-guard.service || return 1
+    local file name attempt
+    for file in "$TORRENT_GUARD_PREFIX"/capture/*.conf; do
+        [[ -f "$file" ]] || continue
+        name=${file##*/}; name=${name%.conf}
+        [[ "$name" =~ ^[a-zA-Z0-9_.-]{1,15}$ && "$name" != lo ]] || return 1
+        run_systemctl_bounded 40 enable --now "kto-torrent-capture@$name.service" || return 1
+    done
+    for (( attempt=0; attempt<20; attempt++ )); do
+        if run_bounded_command 10 "${SUDO[@]}" "$TORRENT_GUARD_CLI" status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    fail "Наблюдатель не готов. Проверь статус и логи; блокировка не включена."
+    return 1
+}
+
+torrent_guard_enable() {
+    torrent_guard_require_installed || return 1
+    torrent_guard_observe || return 1
+    # Old peer-wide guards must be updated before the menu can enable them.
+    if ! "${SUDO[@]}" python3 - "$TORRENT_GUARD_STATUS" <<'PY'
+import json
+from pathlib import Path
+import sys
+state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if state.get("version") != 2 or state.get("block_scope") != "connection":
+    raise ValueError("update the guard to the connection-scoped version first")
+PY
+    then
+        fail "Нужна установка/обновление фильтра отдельных соединений (пункт 1 или 2)."
+        return 1
+    fi
+    if ! run_bounded_command 30 "${SUDO[@]}" "$TORRENT_GUARD_CLI" enforce; then
+        warn "Включение не подтверждено; возвращаю наблюдение."
+        if ! run_bounded_command 30 "${SUDO[@]}" "$TORRENT_GUARD_CLI" observe; then
+            run_bounded_command 90 "${SUDO[@]}" "$TORRENT_GUARD_CLI" stop || true
+            fail "Не удалось подтвердить наблюдение; проверь статус остановки и логи."
+        fi
+        return 1
+    fi
+    ok "Блокировка включена; режим сохранён после перезагрузки."
+}
+
+torrent_guard_setup() (
+    local target="${1:-observe}" asset file directory interfaces ports value
+    local -a options=(--mode observe) values=()
+    [[ "$target" == observe || "$target" == enforce ]] || return 1
+    if [[ "$target" == enforce ]]; then
+        torrent_guard_confirm_enforce || return 0
+    fi
+    warn "Ставь на конечную выходную ноду: внутри зашифрованного прокида торрент не виден."
+    if torrent_guard_installed; then
+        asset=scripts/tune-torrent-capture.py
+        stage "Обновлю KTO Torrent Guard без пересборки nDPI; результат сначала в observe"
+    else
+        asset=scripts/install-torrent-guard.sh
+        echo 'Ubuntu 24.04 x86_64; сборка в 2 потока, нужно 1.5 GB на диске.'
+        printf 'Интерфейсы выхода через пробел/запятую [Enter = default routes + warp]: '
+        read -r interfaces || return 0
+        IFS=$', \t' read -r -a values <<< "$interfaces"
+        for value in "${values[@]}"; do
+            if [[ ! "$value" =~ ^[a-zA-Z0-9_.-]{1,15}$ || "$value" == lo ]]; then
+                fail "Некорректный интерфейс: $value"
+                return 1
+            fi
+            options+=(--interface "$value")
+        done
+        printf 'Входные UDP-порты, которые нельзя блокировать (Hysteria2 и др.) [Enter = нет]: '
+        read -r ports || return 0
+        IFS=$', \t' read -r -a values <<< "$ports"
+        for value in "${values[@]}"; do
+            if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || (( 10#$value < 1 || 10#$value > 65535 )); then
+                fail "Некорректный UDP-порт: $value"
+                return 1
+            fi
+            options+=(--protect-udp "$value")
+        done
+    fi
+    umask 077
+    directory="$(mktemp -d)" || return 1
+    file="$directory/setup"
+    trap 'rm -f -- "$file"; rmdir -- "$directory"' EXIT
+    stage "Загружаю $asset (с ограничением времени)"
+    install_asset_file "$asset" "$file" 0644 bounded || return 1
+    if [[ "$asset" == *.py ]]; then
+        "${SUDO[@]}" python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$file" || return 1
+        stage "Отключаю блокировку на время обновления; Xray и SSH не перезапускаются"
+        torrent_guard_observe || return 1
+        if ! "${SUDO[@]}" python3 "$file"; then
+            fail "Обновление не завершено. Автоматически блокировку не включаю; проверь статус и логи."
+            return 1
+        fi
+    else
+        "${SUDO[@]}" bash -n "$file" || return 1
+        stage "Устанавливаю зависимости, проверяю изоляцию и собираю nDPI"
+        "${SUDO[@]}" env "SSH_CONNECTION=${SSH_CONNECTION:-}" bash "$file" "${options[@]}" || return 1
+    fi
+    if [[ "$target" == enforce ]]; then
+        torrent_guard_enable || return 1
+    else
+        ok "Наблюдение включено. Блокировки нет; для неё выбери пункт 3."
+    fi
+    "${SUDO[@]}" "$TORRENT_GUARD_CLI" status
+)
+
+torrent_guard_menu() {
+    need_root
+    local action="${1:-menu}" choice answer
+    if [[ "$action" != menu ]]; then
+        case "$action" in
+            install|update) torrent_guard_setup observe ;;
+            setup) torrent_guard_setup enforce ;;
+            enforce) torrent_guard_confirm_enforce && torrent_guard_enable ;;
+            observe) torrent_guard_observe ;;
+            status) torrent_guard_require_installed && run_bounded_command 15 "${SUDO[@]}" "$TORRENT_GUARD_CLI" status ;;
+            logs) torrent_guard_require_installed && run_bounded_command 15 "${SUDO[@]}" journalctl -u kto-torrent-guard -u 'kto-torrent-capture@*' -n 80 --no-pager ;;
+            stop) torrent_guard_require_installed && run_bounded_command 90 "${SUDO[@]}" "$TORRENT_GUARD_CLI" stop ;;
+            uninstall)
+                torrent_guard_require_installed || return 1
+                printf 'Удалить только KTO Torrent Guard, его правила и службы? [y/N]: '
+                read -r answer || return 0
+                [[ "$answer" == y || "$answer" == Y ]] || return 0
+                run_bounded_command 90 "${SUDO[@]}" "$TORRENT_GUARD_CLI" uninstall
+                ;;
+            *) fail "Команды: torrent-guard [install|update|setup|enforce|observe|status|logs|stop|uninstall]"; return 1 ;;
+        esac
+        return $?
+    fi
+    while true; do
+        echo
+        echo '=== Торрент-блокер: nDPI / отдельные соединения ==='
+        echo 'На конечной выходной ноде; не блокирует весь IP пользователя.'
+        if torrent_guard_installed; then
+            echo '[Установлен] Текущий режим и здоровье: пункт 5'
+        else
+            echo '[Не установлен или установка неполная]'
+        fi
+        echo '1) Установить / обновить (только наблюдение)'
+        echo '2) Установить / обновить и включить блокировку'
+        echo '3) Включить блокировку (с автозапуском)'
+        echo '4) Отключить блокировку, оставить наблюдение'
+        echo '5) Статус и состояние захвата'
+        echo '6) Последние логи'
+        echo '7) Остановить и отключить автозапуск'
+        echo '8) Удалить только торрент-блокер'
+        echo '0) Назад'
+        printf '> '
+        read -r choice || return 0
+        case "$choice" in
+            1) torrent_guard_menu install || true ;;
+            2) torrent_guard_menu setup || true ;;
+            3) torrent_guard_menu enforce || true ;;
+            4) torrent_guard_menu observe || true ;;
+            5) torrent_guard_menu status || true ;;
+            6) torrent_guard_menu logs || true ;;
+            7) torrent_guard_menu stop || true ;;
+            8) torrent_guard_menu uninstall || true ;;
+            0) return 0 ;;
+            *) warn "Неверный выбор" ;;
+        esac
+    done
+}
+
 server_cleanup_menu() {
     need_root
     if ! command_exists python3 || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
@@ -15524,6 +15744,11 @@ menu() {
         actions+=("nginx")
     fi
 
+    if [[ "$MACHINE_MODE" != "panel" ]]; then
+        labels+=("Торрент-блокер (nDPI, выходная нода)")
+        actions+=("torrent-guard")
+    fi
+
     labels+=("Удалить HAProxy / Nginx / Docker")
     actions+=("server-cleanup")
     labels+=("SSH: включить пароль root (ключи сохранить)")
@@ -15579,6 +15804,7 @@ menu() {
         ssl) issue_ssl_certificate ;;
         haproxy) install_haproxy ;;
         nginx) nginx_menu || true ;;
+        torrent-guard) torrent_guard_menu || true ;;
         haproxy-update) update_haproxy_existing_config ;;
         mobile443-lte) mobile443_lte_menu ;;
         mobile443-lte-status) show_mobile443_lte_status ;;
@@ -15593,6 +15819,12 @@ menu() {
 main() {
     # Explicit access/cleanup actions must not run storage repair or mode migrations first.
     case "${1:-}" in
+        torrent-guard|torrent-blocker)
+            init_log
+            ensure_utf8_locale
+            torrent_guard_menu "${2:-menu}"
+            return
+            ;;
         ssh-password|root-password)
             init_log
             ensure_utf8_locale

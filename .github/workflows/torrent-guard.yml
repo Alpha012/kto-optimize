@@ -3,11 +3,13 @@ name: Torrent Guard
 on:
   push:
     paths:
+      - 'kto.sh'
       - 'scripts/*torrent*'
       - 'tests/*torrent*'
       - '.github/workflows/torrent-guard.yml'
   pull_request:
     paths:
+      - 'kto.sh'
       - 'scripts/*torrent*'
       - 'tests/*torrent*'
       - '.github/workflows/torrent-guard.yml'
@@ -28,6 +30,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends nftables iproute2 util-linux
       - name: Syntax and focused unit tests
         run: |
+          bash -n kto.sh
           bash -n scripts/install-torrent-guard.sh
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_torrent*.py' -v
       - name: Real TCP/UDP and NAT isolation, outside the runner host network
