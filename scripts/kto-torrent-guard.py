@@ -184,25 +184,36 @@ def torrent_flow(event, addresses, protected, exempt, interfaces):
 
 
 def nft_element(flow):
-    _version, interface, local, local_port, remote, remote_port, protocol = flow
-    return f'{json.dumps(interface)} . {local} . {local_port} . {remote} . {remote_port} . {protocol}'
+    _version, _interface, local, local_port, remote, remote_port, protocol = flow
+    return f'{local} . {local_port} . {remote} . {remote_port} . {protocol}'
+
+
+def nft_set(flow):
+    return json.dumps(f"flows{flow[0]}_{flow[1]}")
+
+
+def nft_add(flow, ttl):
+    return f"add element inet {TABLE} {nft_set(flow)} {{ {nft_element(flow)} timeout {ttl}s }}\n"
 
 
 def nft_remove(flow):
     # Ubuntu 24.04 nft lacks `destroy element`. Add-if-missing then delete in
     # one transaction, so expiry cannot race deletion and no temporary ban leaks.
-    element = f"inet {TABLE} flows{flow[0]} {{ {nft_element(flow)} }}"
+    element = f"inet {TABLE} {nft_set(flow)} {{ {nft_element(flow)} }}"
     return f"add element {element}\ndelete element {element}\n"
 
 
-def nft_table(protected, ttl):
+def nft_table(protected, ttl, interfaces):
     lines = [f"table inet {TABLE} {{", f'comment "{OWNER}"']
-    for version in (4, 6):
-        lines.extend([
-            f"set flows{version} {{",
-            f"type ifname . ipv{version}_addr . inet_service . ipv{version}_addr . inet_service . inet_proto",
-            f"flags timeout; timeout {ttl}s; size {MAX_FLOWS}", "}",
-        ])
+    # Five concatenated types fit Ubuntu 24.04's datatype encoding. Keep the
+    # interface in the set name/rule, not as a sixth concatenated datatype.
+    for name in interfaces:
+        for version in (4, 6):
+            lines.extend([
+                f'set {json.dumps(f"flows{version}_{name}")} {{',
+                f"type ipv{version}_addr . inet_service . ipv{version}_addr . inet_service . inet_proto",
+                f"flags timeout; timeout {ttl}s; size {MAX_FLOWS}", "}",
+            ])
     for protocol in ("tcp", "udp"):
         lines.extend([f"set protect_{protocol} {{", "type inet_service"])
         if protected[protocol]:
@@ -223,11 +234,14 @@ def nft_table(protected, ttl):
             f"tcp {local_port} @protect_tcp return",
             f"udp {local_port} @protect_udp return",
         ])
-        for version, family in ((4, "ip"), (6, "ip6")):
-            lines.append(
-                f"meta l4proto {{ tcp, udp }} {interface} . {family} {local_ip} . th {local_port} . "
-                f"{family} {peer_ip} . th {peer_port} . meta l4proto @flows{version} counter drop"
-            )
+        for name in interfaces:
+            for version, family in ((4, "ip"), (6, "ip6")):
+                set_name = json.dumps(f"flows{version}_{name}")
+                lines.append(
+                    f"{interface} {json.dumps(name)} meta l4proto {{ tcp, udp }} "
+                    f"{family} {local_ip} . th {local_port} . {family} {peer_ip} . th {peer_port} . "
+                    f"meta l4proto @{set_name} counter drop"
+                )
         lines.append("}")
     lines.append("}")
     return "\n".join(lines) + "\n"
@@ -255,17 +269,16 @@ def check_nft():
     """Installer runs this in a disposable network namespace, not on the host."""
     if os.stat("/proc/self/ns/net").st_ino == os.stat("/proc/1/ns/net").st_ino:
         raise RuntimeError("self-test requires unshare --net; refusing to touch the host firewall")
-    rules = nft_table({"tcp": {22, 443}, "udp": {2408}}, 600)
+    rules = nft_table({"tcp": {22, 443}, "udp": {2408}}, 600, ["eth0", "warp", "ktg-test0"])
     command(["nft", "--check", "-f", "-"], input=rules)
     command(["nft", "-f", "-"], input=rules)
     try:
         command(["nft", "-f", "-"], input=(
-            f'add element inet {TABLE} flows4 {{ "eth0" . 5.34.179.103 . 55432 . 93.184.216.34 . 49999 . tcp timeout 600s }}\n'
-            f'add element inet {TABLE} flows6 {{ "warp" . 2606:4700:110:8765::2 . 55432 . 2001:4860:4860::8888 . 49999 . udp timeout 600s }}\n'
-            + nft_remove((4, "eth0", "5.34.179.103", 55433, "93.184.216.34", 49999, "tcp"))))
+            nft_add((4, "eth0", "5.34.179.103", 55432, "93.184.216.34", 49999, "tcp"), 600) +
+            nft_add((6, "warp", "2606:4700:110:8765::2", 55432, "2001:4860:4860::8888", 49999, "udp"), 600) +
+            nft_remove((4, "eth0", "5.34.179.103", 55433, "93.184.216.34", 49999, "tcp"))))
         reused = 4, "eth0", "5.34.179.103", 55432, "93.184.216.34", 49999, "tcp"
-        command(["nft", "-f", "-"], input=(nft_remove(reused) +
-                f"add element inet {TABLE} flows4 {{ {nft_element(reused)} timeout 600s }}\n"))
+        command(["nft", "-f", "-"], input=nft_remove(reused) + nft_add(reused, 600))
         if not owns_table():
             raise RuntimeError("nftables self-test failed")
         check_isolation()
@@ -373,8 +386,7 @@ ip saddr 192.0.2.1 udp sport 40000 snat to 198.51.100.1:45000
             echo(blocked, target)
             echo(normal, target)
             flow = version, "ktg-test0", captured, captured_port, remote, 49999, "udp"
-            element = f"inet {TABLE} flows{version} {{ {nft_element(flow)} }}"
-            command(["nft", "-f", "-"], input=f"add element {element}\n")
+            command(["nft", "-f", "-"], input=nft_add(flow, 600))
             blocked.sendto(b"blocked", target)
             dropped(blocked)
             echo(normal, target)
@@ -390,8 +402,7 @@ ip saddr 192.0.2.1 udp sport 40000 snat to 198.51.100.1:45000
             if tcp.recv(1024) != b"tcp-ok":
                 raise RuntimeError("TCP was affected by the UDP ban")
             tcp_flow = version, "ktg-test0", local, 40010, remote, 49999, "tcp"
-            command(["nft", "-f", "-"], input=(
-                f"add element inet {TABLE} flows{version} {{ {nft_element(tcp_flow)} }}\n"))
+            command(["nft", "-f", "-"], input=nft_add(tcp_flow, 600))
             tcp.sendall(b"blocked")
             dropped(tcp)
             other = socket_for(family, socket.SOCK_STREAM, local, 40011)
@@ -466,7 +477,7 @@ class Guard:
             return
         if mode == "enforce":
             present = owns_table()
-            rules = nft_table(self.protected, self.settings["ttl"])
+            rules = nft_table(self.protected, self.settings["ttl"], self.settings["interfaces"])
             if present:
                 rules = f"delete table inet {TABLE}\n" + rules
             command(["nft", "--check", "-f", "-"], input=rules)
@@ -555,8 +566,7 @@ class Guard:
         # Remove an old generation before reusing its 5-tuple for a new flow.
         flows = sorted(self.pending - (self.removals - set(removals)))[:256]
         lines = [nft_remove(flow).rstrip() for flow in removals]
-        lines.extend(f"add element inet {TABLE} flows{flow[0]} "
-                     f"{{ {nft_element(flow)} timeout {self.settings['ttl']}s }}" for flow in flows)
+        lines.extend(nft_add(flow, self.settings["ttl"]).rstrip() for flow in flows)
         if not lines:
             return
         command(["nft", "-f", "-"], input="\n".join(lines) + "\n")
