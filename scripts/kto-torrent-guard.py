@@ -351,7 +351,7 @@ while True:
         sock.settimeout(0.4)
         try:
             sock.recv(1024)
-        except socket.timeout:
+        except (socket.timeout, PermissionError):
             return
         raise RuntimeError("a banned connection still received traffic")
 
@@ -389,7 +389,10 @@ ip saddr 192.0.2.1 udp sport 40000 snat to 198.51.100.1:45000
             echo(normal, target)
             flow = version, "ktg-test0", captured, captured_port, remote, 49999, "udp"
             command(["nft", "-f", "-"], input=nft_add(flow, 600))
-            blocked.sendto(b"blocked", target)
+            try:
+                blocked.sendto(b"blocked", target)
+            except PermissionError:
+                pass  # A local POSTROUTING drop can synchronously return EPERM.
             dropped(blocked)
             echo(normal, target)
             request = f"push {captured} {captured_port}".encode()
@@ -405,7 +408,10 @@ ip saddr 192.0.2.1 udp sport 40000 snat to 198.51.100.1:45000
                 raise RuntimeError("TCP was affected by the UDP ban")
             tcp_flow = version, "ktg-test0", local, 40010, remote, 49999, "tcp"
             command(["nft", "-f", "-"], input=nft_add(tcp_flow, 600))
-            tcp.sendall(b"blocked")
+            try:
+                tcp.sendall(b"blocked")
+            except PermissionError:
+                pass
             dropped(tcp)
             other = socket_for(family, socket.SOCK_STREAM, local, 40011)
             other.connect(target)
@@ -415,6 +421,15 @@ ip saddr 192.0.2.1 udp sport 40000 snat to 198.51.100.1:45000
             command(["nft", "-f", "-"], input=nft_remove(flow))
             blocked.settimeout(1)
             echo(blocked, target)
+        report = json.loads(command(["nft", "-j", "list", "table", "inet", TABLE]).stdout)
+        drops = {"prerouting": 0, "postrouting": 0}
+        for entry in report["nftables"]:
+            rule = entry.get("rule", {})
+            if rule.get("chain") in drops:
+                drops[rule["chain"]] += sum(expr.get("counter", {}).get("packets", 0)
+                                            for expr in rule.get("expr", []))
+        if not all(drops.values()):
+            raise RuntimeError("socket test did not confirm both ingress and egress drop counters")
     finally:
         for sock in sockets:
             sock.close()

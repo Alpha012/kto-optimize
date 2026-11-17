@@ -21,7 +21,7 @@ CONFIG = Path("/etc/kto-torrent-guard.json")
 UNIT = Path("/etc/systemd/system/kto-torrent-capture@.service")
 STATUS = Path("/run/kto-torrent-guard/status.json")
 HELPER_URL = "https://raw.githubusercontent.com/Alpha012/kto-optimize/main/scripts/kto-torrent-guard.py"
-HELPER_SHA256 = "329eb88937e5e8c4a30860543f800ce76e029af07859311f4a1ba8e67144625e"
+HELPER_SHA256 = "3ce6f225c24663d55d5ae12167a0578b30cd41ff2a0c7a36c932a50d60a44862"
 
 
 def profile(total_kib):
