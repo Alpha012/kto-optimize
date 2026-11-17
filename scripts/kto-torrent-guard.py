@@ -372,7 +372,8 @@ while True:
         command(["nft", "-f", "-"], input='''table ip ktg_test_nat {
 chain post { type nat hook postrouting priority 100; policy accept;
 ip saddr 192.0.2.1 udp sport 40000 snat to 198.51.100.1:45000
-} }
+}
+}
 ''')
         peer.stdin.write("start\n")
         peer.stdin.flush()
