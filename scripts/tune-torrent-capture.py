@@ -21,7 +21,7 @@ CONFIG = Path("/etc/kto-torrent-guard.json")
 UNIT = Path("/etc/systemd/system/kto-torrent-capture@.service")
 STATUS = Path("/run/kto-torrent-guard/status.json")
 HELPER_URL = "https://raw.githubusercontent.com/Alpha012/kto-optimize/main/scripts/kto-torrent-guard.py"
-HELPER_SHA256 = "858c5b7b86f10b951fd681f775738df8d96c9bc97cdac63dea43a3ecdeee576b"
+HELPER_SHA256 = "a196384e06d818ebbbe8a03c9aab32a70b64e90f4127f2e15a73d44ba0f4163f"
 
 
 def profile(total_kib):
@@ -105,6 +105,14 @@ def restart_observer():
     subprocess.run(["systemctl", "restart", "kto-torrent-guard.service"], check=True, timeout=90)
 
 
+def check_helper(helper):
+    with tempfile.TemporaryDirectory(prefix="kto-torrent-preflight-") as directory:
+        path = Path(directory) / "guard.py"
+        path.write_bytes(helper)
+        subprocess.run(["unshare", "--net", sys.executable, str(path), "check-nft"],
+                       check=True, timeout=60)
+
+
 def main():
     if os.geteuid() != 0:
         raise ValueError("Run with sudo python3.")
@@ -128,12 +136,14 @@ def main():
         plan.append((path, capture_config(path.read_text(), limit).encode()))
     plan.append((UNIT, capture_unit(UNIT.read_text(), high, maximum).encode()))
 
-    print("[..] Downloading hash-pinned observer with classification diagnostics", flush=True)
+    print("[..] Downloading hash-pinned connection filter", flush=True)
     with urllib.request.urlopen(HELPER_URL, timeout=30) as response:
         helper = response.read(512001)
     if hashlib.sha256(helper).hexdigest() != HELPER_SHA256:
         raise ValueError("observer checksum mismatch; no files were changed")
     compile(helper, "guard.py", "exec")
+    print("[..] Testing selective TCP/UDP blocking in disposable network namespaces", flush=True)
+    check_helper(helper)
     plan.append((PREFIX / "guard.py", helper))
     if json.loads(CONFIG.read_text()) != settings:
         raise ValueError("settings changed during preparation; retry after reviewing them")
@@ -155,7 +165,8 @@ def main():
             try:
                 status = json.loads(STATUS.read_text())
                 expected = {f"kto-{name}" for name in interfaces}
-                if (status["mode"] == "observe" and status["started"] >= restarted_at
+                if (status["mode"] == "observe" and status.get("version") == 2
+                        and status.get("block_scope") == "connection" and status["started"] >= restarted_at
                         and 0 <= time.time() - status["updated"] < 10
                         and set(status["captures"]) == expected):
                     return
@@ -165,7 +176,7 @@ def main():
         raise RuntimeError("captures did not become healthy; restoring previous files")
 
     apply_files(plan, backup, activate, verify)
-    print("[OK] Updated without rebuilding nDPId. Mode remains observe.")
+    print("[OK] Connection-only filter updated without rebuilding nDPId. Mode remains observe.")
     print("Check fresh logs: journalctl -u kto-torrent-guard --since '2 minutes ago' --no-pager")
     print("Watch observer CPU/RAM: systemctl status 'kto-torrent-capture@*' --no-pager")
     print("Do not enable enforcement until suspected false positives have been checked.")

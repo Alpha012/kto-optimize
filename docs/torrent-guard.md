@@ -1,4 +1,4 @@
-# Optional Torrent Guard
+# Connection-Scoped Torrent Guard
 
 This is a standalone, experimental userspace nDPI integration for Ubuntu 24.04
 x86_64 exit nodes with host-networked Xray. It is not installed by kto.sh, does
@@ -10,12 +10,23 @@ or misclassified flows can pass. Legitimate applications that use BitTorrent
 (including some game updaters) can be blocked. An encrypted outbound to another
 proxy cannot be inspected here; install filtering on the actual final exit.
 
+Version 2 drops a classified connection, not a whole client, account, or remote
+peer endpoint. The key is `(interface, local address, local port, remote address,
+remote port, transport)`. A second connection to the same remote service with
+a different local port is not banned. Only nDPI's direct `DPI` verdict is used;
+partial, cached, aggressive, and IP/port guesses are ignored. This reduces
+coverage and does not eliminate false positives such as game traffic.
+
 ## Install
 
 Keep the current SSH session open and have provider console access available.
 The installation compiles pinned nDPId and its pinned nDPI submodule in userspace,
 with two build jobs. It does not install kernel modules or change the kernel.
 Allow at least 1.5 GB of disk space for the temporary build.
+Without `--interface`, the installer selects the IPv4 default-route interfaces
+from the main table and includes `warp` when present. Explicit interfaces are
+recommended for unusual policy-routing setups. Add each plaintext egress device;
+capturing only the encrypted WireGuard outer interface is not sufficient.
 Upstream `nDPId -v` returns exit status 1 even when it successfully prints its
 version. The installer accepts that status only with a valid nDPId/nDPI banner;
 a version display alone is not confirmation that the services were installed.
@@ -31,9 +42,11 @@ sudo bash /tmp/install-torrent-guard.sh --interface eth0 --interface warp
 Download and syntax checks must succeed before running the installer. It starts
 in `observe` mode: **no blocking**. The same Ubuntu image and XanMod kernel as
 the target node were not available for local end-to-end verification. The
-installer checks nftables rules and set insertions in a temporary network
-namespace before enabling services. This does not verify detection quality or
-throughput on your traffic.
+installer tests real TCP/UDP sockets between temporary network namespaces
+before enabling services. It verifies IPv4, IPv6, ingress/egress drops, source
+NAT address/port rewriting, and an unrelated connection to the same remote
+service continuing to work. The host routes and test peers on the Internet are
+not used. This verifies the firewall, not detection quality or throughput.
 
 ```bash
 sudo kto-torrent status
@@ -42,7 +55,7 @@ sudo kto-torrent logs
 
 Both `kto-eth0` and `kto-warp` must appear under `captures`, and `events` must
 increase. Test with a legally distributed Ubuntu ISO torrent through this node,
-not from the server itself. Look for `OBSERVE BitTorrent peer=...`. Keep a normal
+not from the server itself. Look for `OBSERVE BitTorrent local=... peer=...`. Keep a normal
 HTTPS connection and an SSH session working during the test. A running process
 with zero torrent detections is not evidence that torrent blocking works.
 
@@ -76,9 +89,12 @@ sudo python3 "$F"
 )
 ```
 
-The updater requires `observe` mode and at least 2 GiB available RAM. It backs
+First use `sudo kto-torrent observe` if the old filter is enforcing. The updater
+requires `observe` mode and at least 2 GiB available RAM. It backs
 up files under `/opt/kto-torrent-guard/capture-backup-*`, downloads a checksum-
-pinned observer, and restarts only the observer and its captures. If startup
+pinned observer, verifies selective blocking in isolated namespaces, and restarts
+only the observer and its captures. It replaces the old peer-wide implementation
+with the connection-scoped implementation. If startup
 verification fails, it restores the old files and attempts service recovery.
 It does not change Xray, SSH, firewall settings, or the configured mode.
 Inspect fresh logs and memory/CPU usage after the node has been under load:
@@ -103,11 +119,20 @@ sudo kto-torrent enforce
 sudo nft list table inet kto_torrent_guard
 ```
 
-This persists across reboot. New DPI-confirmed BitTorrent peer endpoints are
-added as `(address, port, transport)` for ten minutes. A subsequent verdict can
-block them again after expiration. They are blocked node-wide, not per account:
-other clients cannot use the same endpoint either. IP/port-only guesses and
-generic FileSharing categories are ignored. No client IP bans are performed.
+This persists across reboot. Classified connections are inserted into IPv4/IPv6
+sets with a timeout (60 seconds for new installs; existing configured timeouts
+are preserved on update). A subsequent verdict can block a connection again
+after expiration. Flow `end`/`idle` events remove its ban early; a new flow
+generation clears a stale ban for the reused tuple. No client, account, entire
+peer, tracker-IP, port-range, or UDP-wide ban is performed. Other connections
+keep their existing firewall policy. Partial/cache/IP/port-only guesses and
+generic FileSharing categories are ignored.
+
+This is not per-request isolation inside a single multiplexed connection: if
+several application requests share exactly one transport flow, that whole flow
+is the smallest blocking unit. A false positive can still break that flow.
+The classifier needs packets before it can decide, so detection cannot promise
+zero leaked packets or prevent every possible copyright complaint.
 
 Retest the legal torrent after enabling enforcement. Logs must show `BLOCKED`,
 and the nftables drop counters must increase. Those checks establish that the
@@ -139,18 +164,35 @@ service (for example Hysteria2 on UDP 8443), pass `--protect-udp 8443` at instal
 Unconnected UDP egress sockets are not blindly treated as server listeners.
 The SSH client's address is also exempt if `SSH_CONNECTION` reaches the installer.
 
-The table uses INPUT/OUTPUT hooks because Xray uses the host network. It is not a
-FORWARD filter for bridge-networked containers or a general WireGuard gateway.
+The table uses PREROUTING at priority -101 (before standard reverse NAT) and
+POSTROUTING at priority 101 (after standard source NAT at priority 100). This
+matches the capture-visible tuple even when WARP masquerade changes the source
+address or port. Nonstandard NAT/mangling priorities, forwarding offload, bridge
+containers, or a general VPN gateway require separate validation; the supported
+deployment remains a host-networked proxy exit.
 Monitoring `warp` is necessary to inspect its inner traffic before encryption.
-Matching only the remote endpoint avoids depending on source NAT rewriting the
-local source address/port. A systemd restart or observer failure removes this
+A systemd restart or observer failure removes this
 guard's rules; the design fails open to preserve connectivity. Check status and
 logs rather than assuming protection continues after a failure.
 
 No performance or full-detection claim is made. Automatic account suspension
 and integration into Remnawave are separate features and are not implemented.
 
+## Developer Checks
+
+The GitHub Actions workflow `Torrent Guard` runs focused unit tests and the same
+real-socket firewall test on Ubuntu 24.04. Run the latter locally only in a
+disposable network namespace:
+
+```bash
+sudo timeout 60 unshare --net python3 scripts/kto-torrent-guard.py check-nft
+```
+
+The helper refuses to run this test in PID 1's network namespace. It never
+contacts real torrent peers or changes the host's firewall for testing.
+
 Upstream sources:
 
 - https://github.com/utoni/nDPId
 - https://github.com/ntop/nDPI
+- https://wiki.nftables.org/wiki-nftables/index.php/Netfilter_hooks

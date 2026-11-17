@@ -87,6 +87,14 @@ class TorrentCaptureTuningTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(), tuning.HELPER_SHA256)
         self.assertTrue(tuning.HELPER_URL.startswith("https://raw.githubusercontent.com/Alpha012/"))
 
+    def test_preflight_uses_a_disposable_namespace_and_does_not_restart_services(self):
+        with patch.object(tuning.subprocess, "run") as run:
+            tuning.check_helper(b"# fixture, never executed by this unit test\n")
+        args = run.call_args.args[0]
+        self.assertEqual(args[:2], ["unshare", "--net"])
+        self.assertEqual(args[-1], "check-nft")
+        self.assertEqual(run.call_args.kwargs, {"check": True, "timeout": 60})
+
     def test_success_backups_and_activation_order(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

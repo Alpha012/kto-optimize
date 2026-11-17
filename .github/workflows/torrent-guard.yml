@@ -1,0 +1,34 @@
+name: Torrent Guard
+
+on:
+  push:
+    paths:
+      - 'scripts/*torrent*'
+      - 'tests/*torrent*'
+      - '.github/workflows/torrent-guard.yml'
+  pull_request:
+    paths:
+      - 'scripts/*torrent*'
+      - 'tests/*torrent*'
+      - '.github/workflows/torrent-guard.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  connection-isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install firewall test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nftables iproute2 util-linux
+      - name: Syntax and focused unit tests
+        run: |
+          bash -n scripts/install-torrent-guard.sh
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_torrent*.py' -v
+      - name: Real TCP/UDP and NAT isolation, outside the runner host network
+        run: sudo timeout 60 unshare --net python3 scripts/kto-torrent-guard.py check-nft

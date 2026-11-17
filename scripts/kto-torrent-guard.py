@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optional, reactive BitTorrent peer filter for host-networked proxy nodes."""
+"""Reactive, connection-scoped BitTorrent filter for host-networked exit nodes."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import selectors
 import signal
 import socket
 import subprocess
+import re
+import sys
 import time
 
 
@@ -20,8 +22,9 @@ TABLE = "kto_torrent_guard"
 OWNER = "kto-torrent-guard-v1"
 CONFIG = Path("/etc/kto-torrent-guard.json")
 RUNTIME = Path("/run/kto-torrent-guard")
-MAX_PEERS = 32768
+MAX_FLOWS = 32768
 MAX_FRAME = 33792
+VERSION = 2
 
 
 def command(args, *, input=None, check=True):
@@ -33,14 +36,17 @@ def config(path=CONFIG):
     raw = json.loads(path.read_text(encoding="utf-8"))
     if raw.get("mode") not in ("observe", "enforce"):
         raise ValueError("mode must be observe or enforce")
-    ttl = raw.get("ttl", 600)
+    ttl = raw.get("ttl", 60)
     if type(ttl) is not int or not 60 <= ttl <= 3600:
         raise ValueError("ttl must be 60..3600 seconds")
     raw["ttl"] = ttl
     raw["exempt_ips"] = [str(ipaddress.ip_address(ip)) for ip in raw.get("exempt_ips", [])]
     interfaces = raw.get("interfaces", [])
-    if not interfaces or not all(isinstance(item, str) and item for item in interfaces):
-        raise ValueError("interfaces must be a nonempty list")
+    if (not isinstance(interfaces, list) or not interfaces or len(interfaces) > 16 or
+            not all(isinstance(item, str) and item != "lo" and
+                    re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", item) for item in interfaces) or
+            len(set(interfaces)) != len(interfaces)):
+        raise ValueError("interfaces must contain 1..16 unique non-loopback interface names")
     raw["protected_udp"] = raw.get("protected_udp", [])
     if any(type(port) is not int or not 0 < port < 65536 for port in raw["protected_udp"]):
         raise ValueError("protected_udp must contain valid port numbers")
@@ -122,22 +128,17 @@ def protected_ports(text, extra_udp, wireguard_text=""):
     return ports
 
 
-def torrent_peer(event, addresses, protected, exempt):
-    if event.get("flow_event_name") not in ("detected", "detection-update", "update"):
-        return None
-    ndpi = event.get("ndpi")
-    if not isinstance(ndpi, dict):
-        return None
-    # Port/IP guesses and a generic FileSharing category are not a torrent verdict.
-    if "bittorrent" not in str(ndpi.get("proto", "")).casefold().split("."):
-        return None
-    confidence = ndpi.get("confidence", {})
-    if not isinstance(confidence, dict) or not any(
-        confidence.get(key) == label for key, label in (
-            ("3", "DPI (partial)"), ("4", "DPI (partial cache)"),
-            ("5", "DPI (cache)"), ("6", "DPI"),
-        )
-    ):
+def flow_identity(event):
+    values = tuple(event.get(key) for key in ("thread_id", "flow_id", "flow_first_seen"))
+    if (all(type(value) is int for value in values) and 0 <= values[0] < 32
+            and 0 < values[1] < 2**64 and 0 <= values[2] < 2**64):
+        return values
+    return None
+
+
+def connection_tuple(event, addresses, protected, exempt, interfaces):
+    interface = next((name for name in interfaces if event.get("alias") == f"kto-{name}"), None)
+    if interface is None or flow_identity(event) is None:
         return None
     protocol = event.get("l4_proto")
     if protocol not in ("tcp", "udp"):
@@ -151,9 +152,9 @@ def torrent_peer(event, addresses, protected, exempt):
         if src.version != dst.version:
             return None
         if str(src) in addresses and str(dst) not in addresses:
-            peer, port, local_port = dst, dport, sport
+            local, local_port, peer, port = src, sport, dst, dport
         elif str(dst) in addresses and str(src) not in addresses:
-            peer, port, local_port = src, sport, dport
+            local, local_port, peer, port = dst, dport, src, sport
         else:
             return None
         if (not peer.is_global or str(peer) in exempt or
@@ -161,16 +162,36 @@ def torrent_peer(event, addresses, protected, exempt):
             return None
     except (KeyError, ValueError, TypeError):
         return None
-    return peer.version, str(peer), port, protocol
+    return peer.version, interface, str(local), local_port, str(peer), port, protocol
+
+
+def torrent_flow(event, addresses, protected, exempt, interfaces):
+    if event.get("flow_event_name") not in ("detected", "detection-update", "update"):
+        return None
+    ndpi = event.get("ndpi")
+    if not isinstance(ndpi, dict):
+        return None
+    if "bittorrent" not in str(ndpi.get("proto", "")).casefold().split("."):
+        return None
+    # Cached/partial/IP/port classifications cannot ban a new connection.
+    confidence = ndpi.get("confidence", {})
+    if not isinstance(confidence, dict) or confidence.get("6") != "DPI":
+        return None
+    return connection_tuple(event, addresses, protected, exempt, interfaces)
+
+
+def nft_element(flow):
+    _version, interface, local, local_port, remote, remote_port, protocol = flow
+    return f'{json.dumps(interface)} . {local} . {local_port} . {remote} . {remote_port} . {protocol}'
 
 
 def nft_table(protected, ttl):
     lines = [f"table inet {TABLE} {{", f'comment "{OWNER}"']
     for version in (4, 6):
         lines.extend([
-            f"set peers{version} {{",
-            f"type ipv{version}_addr . inet_service . inet_proto",
-            f"flags timeout; timeout {ttl}s; size {MAX_PEERS}", "}",
+            f"set flows{version} {{",
+            f"type ifname . ipv{version}_addr . inet_service . ipv{version}_addr . inet_service . inet_proto",
+            f"flags timeout; timeout {ttl}s; size {MAX_FLOWS}", "}",
         ])
     for protocol in ("tcp", "udp"):
         lines.extend([f"set protect_{protocol} {{", "type inet_service"])
@@ -178,21 +199,24 @@ def nft_table(protected, ttl):
             elements = ", ".join(map(str, sorted(protected[protocol])))
             lines.append(f"elements = {{ {elements} }}")
         lines.append("}")
-    for direction in ("input", "output"):
-        local_port = "dport" if direction == "input" else "sport"
-        peer_ip = "saddr" if direction == "input" else "daddr"
-        peer_port = "sport" if direction == "input" else "dport"
+    # Match the capture-side tuple: before standard reverse NAT on ingress,
+    # after standard SNAT/masquerade on egress (including WARP source rewriting).
+    for direction, priority in (("prerouting", -101), ("postrouting", 101)):
+        inbound = direction == "prerouting"
+        local_ip, peer_ip = ("daddr", "saddr") if inbound else ("saddr", "daddr")
+        local_port, peer_port = ("dport", "sport") if inbound else ("sport", "dport")
+        interface = "iifname" if inbound else "oifname"
         lines.extend([
             f"chain {direction} {{",
-            f"type filter hook {direction} priority -20; policy accept;",
-            'iifname "lo" return' if direction == "input" else 'oifname "lo" return',
+            f"type filter hook {direction} priority {priority}; policy accept;",
+            f'{interface} "lo" return',
             f"tcp {local_port} @protect_tcp return",
             f"udp {local_port} @protect_udp return",
         ])
         for version, family in ((4, "ip"), (6, "ip6")):
             lines.append(
-                f"meta l4proto {{ tcp, udp }} {family} {peer_ip} . th {peer_port} . "
-                f"meta l4proto @peers{version} counter drop"
+                f"meta l4proto {{ tcp, udp }} {interface} . {family} {local_ip} . th {local_port} . "
+                f"{family} {peer_ip} . th {peer_port} . meta l4proto @flows{version} counter drop"
             )
         lines.append("}")
     lines.append("}")
@@ -219,18 +243,165 @@ def cleanup():
 
 def check_nft():
     """Installer runs this in a disposable network namespace, not on the host."""
+    if os.stat("/proc/self/ns/net").st_ino == os.stat("/proc/1/ns/net").st_ino:
+        raise RuntimeError("self-test requires unshare --net; refusing to touch the host firewall")
     rules = nft_table({"tcp": {22, 443}, "udp": {2408}}, 600)
     command(["nft", "--check", "-f", "-"], input=rules)
     command(["nft", "-f", "-"], input=rules)
     try:
         command(["nft", "-f", "-"], input=(
-            f"add element inet {TABLE} peers4 {{ 93.184.216.34 . 49999 . tcp timeout 600s }}\n"
-            f"add element inet {TABLE} peers6 {{ 2001:4860:4860::8888 . 49999 . udp timeout 600s }}\n"))
+            f'add element inet {TABLE} flows4 {{ "eth0" . 5.34.179.103 . 55432 . 93.184.216.34 . 49999 . tcp timeout 600s }}\n'
+            f'add element inet {TABLE} flows6 {{ "warp" . 2606:4700:110:8765::2 . 55432 . 2001:4860:4860::8888 . 49999 . udp timeout 600s }}\n'
+            f'destroy element inet {TABLE} flows4 {{ "eth0" . 5.34.179.103 . 55433 . 93.184.216.34 . 49999 . tcp }}\n'))
         if not owns_table():
             raise RuntimeError("nftables self-test failed")
+        check_isolation()
     finally:
         cleanup()
-    print("NFT SELF-TEST OK (isolated namespace, IPv4+IPv6, timed peer sets)")
+    print("NFT SELF-TEST OK (TCP/UDP, IPv4/IPv6, SNAT, unrelated connections stay usable)")
+
+
+def check_isolation():
+    """Exercise real sockets between disposable namespaces, never public peers."""
+    program = r'''
+import selectors, socket, sys
+print("NETNS", flush=True)
+sys.stdin.readline()
+sel = selectors.DefaultSelector()
+for family, address in ((socket.AF_INET, "192.0.2.2"), (socket.AF_INET6, "fd42:6b74:6f::2")):
+    for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
+        sock = socket.socket(family, kind)
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind((address, 49999))
+        if kind == socket.SOCK_STREAM:
+            sock.listen(8)
+        sel.register(sock, selectors.EVENT_READ, "udp" if kind == socket.SOCK_DGRAM else "listen")
+print("READY", flush=True)
+while True:
+    for key, _ in sel.select():
+        sock = key.fileobj
+        if key.data == "listen":
+            client, _ = sock.accept()
+            sel.register(client, selectors.EVENT_READ, "tcp")
+        elif key.data == "udp":
+            data, address = sock.recvfrom(1024)
+            if data.startswith(b"push "):
+                _, ip, port = data.decode().split()
+                sock.sendto(b"probe", (ip, int(port)))
+            sock.sendto(data, address)
+        else:
+            data = sock.recv(1024)
+            if data:
+                sock.sendall(data)
+            else:
+                sel.unregister(sock)
+                sock.close()
+'''
+    peer = subprocess.Popen(["unshare", "--net", sys.executable, "-u", "-c", program],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    sockets = []
+
+    def ready(expected):
+        with selectors.DefaultSelector() as waiter:
+            waiter.register(peer.stdout, selectors.EVENT_READ)
+            if not waiter.select(8) or peer.stdout.readline().strip() != expected:
+                raise RuntimeError("isolated socket test peer did not become ready")
+
+    def socket_for(family, kind, address, port):
+        sock = socket.socket(family, kind)
+        sockets.append(sock)
+        sock.settimeout(1)
+        sock.bind((address, port))
+        return sock
+
+    def echo(sock, remote):
+        sock.sendto(b"echo", remote)
+        if sock.recv(1024) != b"echo":
+            raise RuntimeError("unrelated UDP connection stopped working")
+
+    def dropped(sock):
+        sock.settimeout(0.4)
+        try:
+            sock.recv(1024)
+        except socket.timeout:
+            return
+        raise RuntimeError("a banned connection still received traffic")
+
+    try:
+        ready("NETNS")
+        command(["ip", "link", "add", "ktg-test0", "type", "veth", "peer", "name", "ktg-test1"])
+        command(["ip", "link", "set", "ktg-test1", "netns", str(peer.pid)])
+        command(["ip", "address", "add", "192.0.2.1/30", "dev", "ktg-test0"])
+        command(["ip", "-6", "address", "add", "fd42:6b74:6f::1/64", "dev", "ktg-test0", "nodad"])
+        command(["ip", "link", "set", "ktg-test0", "up"])
+        command(["ip", "link", "set", "lo", "up"])
+        command(["ip", "address", "add", "198.51.100.1/32", "dev", "lo"])
+        ns = ["nsenter", "--target", str(peer.pid), "--net", "--"]
+        command(ns + ["ip", "address", "add", "192.0.2.2/30", "dev", "ktg-test1"])
+        command(ns + ["ip", "-6", "address", "add", "fd42:6b74:6f::2/64", "dev", "ktg-test1", "nodad"])
+        command(ns + ["ip", "link", "set", "ktg-test1", "up"])
+        command(ns + ["ip", "route", "add", "198.51.100.1/32", "via", "192.0.2.1"])
+        command(["nft", "-f", "-"], input='''table ip ktg_test_nat {
+chain post { type nat hook postrouting priority 100; policy accept;
+ip saddr 192.0.2.1 udp sport 40000 snat to 198.51.100.1:45000
+} }
+''')
+        peer.stdin.write("start\n")
+        peer.stdin.flush()
+        ready("READY")
+        for family, local, remote, captured, captured_port, version in (
+            (socket.AF_INET, "192.0.2.1", "192.0.2.2", "198.51.100.1", 45000, 4),
+            (socket.AF_INET6, "fd42:6b74:6f::1", "fd42:6b74:6f::2", "fd42:6b74:6f::1", 40000, 6),
+        ):
+            blocked = socket_for(family, socket.SOCK_DGRAM, local, 40000)
+            normal = socket_for(family, socket.SOCK_DGRAM, local, 40001)
+            target = (remote, 49999)
+            echo(blocked, target)
+            echo(normal, target)
+            flow = version, "ktg-test0", captured, captured_port, remote, 49999, "udp"
+            element = f"inet {TABLE} flows{version} {{ {nft_element(flow)} }}"
+            command(["nft", "-f", "-"], input=f"add element {element}\n")
+            blocked.sendto(b"blocked", target)
+            dropped(blocked)
+            echo(normal, target)
+            request = f"push {captured} {captured_port}".encode()
+            normal.sendto(request, target)
+            if normal.recv(1024) != request:
+                raise RuntimeError("control UDP connection failed")
+            dropped(blocked)
+            # Same remote port over TCP must still be reachable.
+            tcp = socket_for(family, socket.SOCK_STREAM, local, 40010)
+            tcp.connect(target)
+            tcp.sendall(b"tcp-ok")
+            if tcp.recv(1024) != b"tcp-ok":
+                raise RuntimeError("TCP was affected by the UDP ban")
+            tcp_flow = version, "ktg-test0", local, 40010, remote, 49999, "tcp"
+            command(["nft", "-f", "-"], input=(
+                f"add element inet {TABLE} flows{version} {{ {nft_element(tcp_flow)} }}\n"))
+            tcp.sendall(b"blocked")
+            dropped(tcp)
+            other = socket_for(family, socket.SOCK_STREAM, local, 40011)
+            other.connect(target)
+            other.sendall(b"other")
+            if other.recv(1024) != b"other":
+                raise RuntimeError("another TCP connection was blocked")
+            command(["nft", "-f", "-"], input=f"destroy element {element}\n")
+            blocked.settimeout(1)
+            echo(blocked, target)
+    finally:
+        for sock in sockets:
+            sock.close()
+        peer.terminate()
+        try:
+            peer.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            peer.kill()
+            peer.wait(timeout=3)
+        peer.stdin.close()
+        peer.stdout.close()
+        command(["ip", "link", "delete", "ktg-test0"], check=False)
+        command(["nft", "delete", "table", "ip", "ktg_test_nat"], check=False)
 
 
 class Guard:
@@ -241,11 +412,14 @@ class Guard:
         self.local_updated = 0.0
         self.active_mode = None
         self.seen = OrderedDict()
+        self.identities = {}
         self.pending = set()
+        self.removals = set()
         self.blocked = OrderedDict()
         self.events = self.detections = self.added = self.errors = 0
         self.running = True
         self.started = time.time()
+        self.saturated_at = 0
 
     def refresh_local(self):
         addresses = json.loads(command(["ip", "-j", "address", "show"]).stdout)
@@ -287,9 +461,18 @@ class Guard:
         else:
             cleanup()
         self.pending.clear()
+        self.removals.clear()
         self.blocked.clear()
+        self.identities = {flow: identity for flow, identity in self.identities.items() if flow in self.seen}
         self.active_mode = mode
-        print(f"MODE {mode}; IPv4+IPv6; peer endpoint bans, not client IP bans", flush=True)
+        print(f"MODE {mode}; IPv4+IPv6; connection-only drops, no client/peer IP bans", flush=True)
+
+    def retire(self, flow):
+        self.pending.discard(flow)
+        if flow in self.blocked:
+            self.removals.add(flow)
+        self.seen.pop(flow, None)
+        self.identities.pop(flow, None)
 
     def handle(self, event):
         self.events += 1
@@ -302,53 +485,86 @@ class Guard:
             print(f"CAPTURE_ERROR {name} {details}".rstrip(), flush=True)
         if time.monotonic() - self.local_updated > 60:
             return
-        peer = torrent_peer(event, self.addresses, self.protected,
-                            set(self.settings["exempt_ips"]))
-        if peer is None:
+        exempt = set(self.settings["exempt_ips"])
+        if event.get("flow_event_name") in ("new", "end", "idle"):
+            flow = connection_tuple(event, self.addresses, self.protected, exempt,
+                                    self.settings["interfaces"])
+            if flow is not None:
+                identity = flow_identity(event)
+                if ((event["flow_event_name"] == "new" and self.identities.get(flow) != identity) or
+                        (event["flow_event_name"] != "new" and self.identities.get(flow) == identity)):
+                    self.retire(flow)
+            return
+        flow = torrent_flow(event, self.addresses, self.protected, exempt, self.settings["interfaces"])
+        if flow is None:
             return
         self.detections += 1
         now = time.monotonic()
-        first = peer not in self.seen or now - self.seen[peer] > self.settings["ttl"]
-        self.seen[peer] = now
-        self.seen.move_to_end(peer)
-        while len(self.seen) > MAX_PEERS:
-            self.seen.popitem(last=False)
+        identity = flow_identity(event)
+        if flow in self.identities and self.identities[flow] != identity:
+            self.retire(flow)
+        first = flow not in self.seen or now - self.seen[flow] > self.settings["ttl"]
+        self.seen[flow] = now
+        self.identities[flow] = identity
+        self.seen.move_to_end(flow)
+        while len(self.seen) > MAX_FLOWS:
+            old, _ = self.seen.popitem(last=False)
+            if old not in self.blocked and old not in self.pending:
+                self.identities.pop(old, None)
         if first:
             ndpi = event["ndpi"]
             confidence = json.dumps(ndpi["confidence"], ensure_ascii=True, separators=(",", ":"))[:160]
             capture = json.dumps(event.get("alias", "unknown"), ensure_ascii=True)[:80]
             metadata = ndpi.get("bittorrent", {})
             has_hash = isinstance(metadata, dict) and bool(metadata.get("hash"))
-            print(f"{self.active_mode.upper()} BitTorrent peer={peer[1]}:{peer[2]} "
-                  f"protocol={peer[3]} capture={capture} confidence={confidence} "
+            print(f"{self.active_mode.upper()} BitTorrent local={flow[2]}:{flow[3]} peer={flow[4]}:{flow[5]} "
+                  f"protocol={flow[6]} capture={capture} confidence={confidence} "
                   f"hash_present={has_hash}", flush=True)
-        if self.blocked.get(peer, now + 1) <= now:
-            del self.blocked[peer]
-        if self.active_mode == "enforce" and peer not in self.blocked and len(self.pending) < MAX_PEERS:
-            self.pending.add(peer)
+        if self.blocked.get(flow, now + 1) <= now:
+            del self.blocked[flow]
+        if self.active_mode == "enforce" and (flow not in self.blocked or flow in self.removals):
+            if len(self.blocked) + len(self.pending) < MAX_FLOWS:
+                self.pending.add(flow)
+            elif now - self.saturated_at > 10:
+                self.errors += 1
+                self.saturated_at = now
+                print("CAPACITY_ERROR connection ban set full; new detections are not blocked", flush=True)
 
     def flush(self):
         now = time.monotonic()
         while self.blocked and next(iter(self.blocked.values())) <= now:
-            self.blocked.popitem(last=False)
-        if not self.pending or self.active_mode != "enforce":
+            expired, _ = self.blocked.popitem(last=False)
+            if expired not in self.seen:
+                self.identities.pop(expired, None)
+        if self.active_mode != "enforce":
             return
-        peers = sorted(self.pending)[:256]
-        lines = [f"add element inet {TABLE} peers{version} "
-                 f"{{ {ip} . {port} . {proto} timeout {self.settings['ttl']}s }}"
-                 for version, ip, port, proto in peers]
+        removals = sorted(self.removals)[:256]
+        # Remove an old generation before reusing its 5-tuple for a new flow.
+        flows = sorted(self.pending - (self.removals - set(removals)))[:256]
+        lines = [f"destroy element inet {TABLE} flows{flow[0]} {{ {nft_element(flow)} }}"
+                 for flow in removals]
+        lines.extend(f"add element inet {TABLE} flows{flow[0]} "
+                     f"{{ {nft_element(flow)} timeout {self.settings['ttl']}s }}" for flow in flows)
+        if not lines:
+            return
         command(["nft", "-f", "-"], input="\n".join(lines) + "\n")
-        for peer in peers:
-            self.pending.discard(peer)
-            self.blocked[peer] = now + self.settings["ttl"] + 2
-        self.added += len(peers)
-        print(f"BLOCKED endpoints={len(peers)} ttl={self.settings['ttl']}s", flush=True)
+        for flow in removals:
+            self.removals.discard(flow)
+            self.blocked.pop(flow, None)
+        for flow in flows:
+            self.pending.discard(flow)
+            self.blocked[flow] = now + self.settings["ttl"] + 2
+            self.blocked.move_to_end(flow)
+        self.added += len(flows)
+        if flows:
+            print(f"BLOCKED connections={len(flows)} ttl={self.settings['ttl']}s", flush=True)
 
     def status(self, connections, captures):
         atomic_json(RUNTIME / "status.json", {
+            "version": VERSION, "block_scope": "connection",
             "mode": self.active_mode, "started": self.started, "updated": time.time(),
             "collector_connections": connections, "events": self.events,
-            "torrent_events": self.detections, "endpoints_added": self.added,
+            "torrent_events": self.detections, "connections_added": self.added,
             "tracked_bans": len(self.blocked), "errors": self.errors,
             "captures": sorted(captures),
             "expected_captures": sorted(f"kto-{name}" for name in self.settings["interfaces"]),
@@ -431,7 +647,8 @@ def main():
         raw = json.loads((RUNTIME / "status.json").read_text(encoding="utf-8"))
         age = time.time() - raw["updated"]
         print(json.dumps(raw, indent=2))
-        if (age > 15 or not raw["collector_connections"] or
+        if (age > 15 or age < 0 or raw.get("version") != VERSION or
+                raw.get("block_scope") != "connection" or not raw["collector_connections"] or
                 set(raw["captures"]) != set(raw["expected_captures"])):
             raise RuntimeError("STALE/NO CAPTURE: inspect systemctl and journal; not protected")
     elif args.action in ("observe", "enforce"):

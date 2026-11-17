@@ -22,6 +22,7 @@ spec.loader.exec_module(guard)
 def event(**values):
     result = {
         "alias": "kto-eth0", "flow_event_name": "detected", "l4_proto": "tcp",
+        "thread_id": 0, "flow_id": 1, "flow_first_seen": 1000,
         "src_ip": "5.34.179.103", "src_port": 55432,
         "dst_ip": "93.184.216.34", "dst_port": 49999,
         "ndpi": {"proto": "BitTorrent", "confidence": {"6": "DPI"}},
@@ -38,7 +39,7 @@ class TorrentGuardTests(unittest.TestCase):
                          "interfaces": ["eth0", "warp"], "protected_udp": []}
 
     def peer(self, data):
-        return guard.torrent_peer(data, self.local, self.ports, set())
+        return guard.torrent_flow(data, self.local, self.ports, set(), self.settings["interfaces"])
 
     def frame(self, data):
         payload = json.dumps(data).encode() + b"\n"
@@ -58,20 +59,20 @@ class TorrentGuardTests(unittest.TestCase):
                 guard.Frames().feed(data)
 
     def test_tcp_peer(self):
-        self.assertEqual(self.peer(event()), (4, "93.184.216.34", 49999, "tcp"))
+        self.assertEqual(self.peer(event()), (4, "eth0", "5.34.179.103", 55432, "93.184.216.34", 49999, "tcp"))
 
     def test_warp_and_udp(self):
-        self.assertEqual(self.peer(event(src_ip="172.16.0.2", l4_proto="udp")),
-                         (4, "93.184.216.34", 49999, "udp"))
+        self.assertEqual(self.peer(event(alias="kto-warp", src_ip="172.16.0.2", l4_proto="udp")),
+                         (4, "warp", "172.16.0.2", 55432, "93.184.216.34", 49999, "udp"))
 
     def test_ipv6_peer(self):
         self.assertEqual(self.peer(event(src_ip="2606:4700:110:8765::2", dst_ip="2001:4860:4860::8888")),
-                         (6, "2001:4860:4860::8888", 49999, "tcp"))
+                         (6, "eth0", "2606:4700:110:8765::2", 55432, "2001:4860:4860::8888", 49999, "tcp"))
 
     def test_reverse_direction(self):
         self.assertEqual(self.peer(event(src_ip="93.184.216.34", dst_ip="5.34.179.103",
                                         src_port=49999, dst_port=55432)),
-                         (4, "93.184.216.34", 49999, "tcp"))
+                         (4, "eth0", "5.34.179.103", 55432, "93.184.216.34", 49999, "tcp"))
 
     def test_listening_ports_protect_fronts_and_ssh(self):
         for port in self.ports["tcp"]:
@@ -90,19 +91,21 @@ class TorrentGuardTests(unittest.TestCase):
                            {"8": "DPI (aggressive)"}, {"6": "Match by port"}):
             self.assertIsNone(self.peer(event(ndpi={"proto": "BitTorrent", "confidence": confidence})))
         for key, value in (("3", "DPI (partial)"), ("4", "DPI (partial cache)"), ("5", "DPI (cache)")):
-            self.assertIsNotNone(self.peer(event(ndpi={"proto": "BitTorrent", "confidence": {key: value}})))
+            self.assertIsNone(self.peer(event(ndpi={"proto": "BitTorrent", "confidence": {key: value}})))
         self.assertIsNone(self.peer(event(flow_event_name="guessed")))
 
     def test_private_local_and_foreign_traffic_ignored(self):
         for ip in ("127.0.0.1", "10.0.0.1", "192.168.1.1", "172.16.0.2", "5.34.179.103"):
             self.assertIsNone(self.peer(event(dst_ip=ip)))
         self.assertIsNone(self.peer(event(src_ip="8.8.8.8")))
-        self.assertIsNone(guard.torrent_peer(event(), self.local, self.ports, {"93.184.216.34"}))
+        self.assertIsNone(guard.torrent_flow(event(), self.local, self.ports, {"93.184.216.34"}, ["eth0"]))
 
     def test_untrusted_values_cannot_become_nft_commands(self):
         for values in ({"src_port": "55432"}, {"dst_port": True}, {"dst_port": 65536},
                        {"dst_ip": "8.8.8.8; flush ruleset"}, {"src_ip": None},
-                       {"l4_proto": "tcp; flush ruleset"}, {"ndpi": []}):
+                       {"l4_proto": "tcp; flush ruleset"}, {"ndpi": []},
+                       {"alias": 'kto-eth0"; flush ruleset'}, {"flow_id": True},
+                       {"flow_first_seen": -1}, {"thread_id": 32}, {"flow_id": "1"}):
             self.assertIsNone(self.peer(event(**values)))
 
     def test_parse_ipv4_ipv6_and_wildcard_listeners(self):
@@ -123,14 +126,22 @@ class TorrentGuardTests(unittest.TestCase):
     def test_nft_scope_and_safety(self):
         rules = guard.nft_table(self.ports, 600)
         self.assertIn('comment "kto-torrent-guard-v1"', rules)
-        self.assertIn("hook output priority -20; policy accept", rules)
-        self.assertIn("hook input priority -20; policy accept", rules)
+        self.assertIn("hook postrouting priority 101; policy accept", rules)
+        self.assertIn("hook prerouting priority -101; policy accept", rules)
         self.assertIn("tcp sport @protect_tcp return", rules)
         self.assertIn("tcp dport @protect_tcp return", rules)
-        self.assertIn("ip daddr . th dport . meta l4proto @peers4 counter drop", rules)
-        self.assertIn("ip6 saddr . th sport . meta l4proto @peers6 counter drop", rules)
+        self.assertIn("oifname . ip saddr . th sport . ip daddr . th dport . meta l4proto @flows4 counter drop", rules)
+        self.assertIn("iifname . ip6 daddr . th dport . ip6 saddr . th sport . meta l4proto @flows6 counter drop", rules)
+        self.assertNotIn("set peers", rules)
         self.assertNotIn("flush ruleset", rules)
         self.assertNotIn("hook forward", rules)
+
+    def test_socket_selftest_refuses_the_host_network(self):
+        with patch.object(guard.os, "stat") as stat, patch.object(guard, "command") as run:
+            stat.return_value.st_ino = 123
+            with self.assertRaisesRegex(RuntimeError, "refusing to touch the host firewall"):
+                guard.check_nft()
+            run.assert_not_called()
 
     def test_table_ownership(self):
         result = subprocess.CompletedProcess([], 0, json.dumps({"nftables": [
@@ -168,19 +179,71 @@ class TorrentGuardTests(unittest.TestCase):
             run.assert_not_called()
         self.assertEqual(obj.detections, 1)
 
-    def test_enforce_batches_and_deduplicates_endpoints(self):
+    def test_enforce_blocks_connections_not_everyone_at_the_peer(self):
         obj = self.make_guard("enforce")
         with patch.object(guard, "command") as run:
+            obj.handle(event())
             obj.handle(event())
             obj.handle(event(src_port=55433))
             obj.flush()
             self.assertEqual(run.call_count, 1)
             rules = run.call_args.kwargs["input"]
-            self.assertEqual(rules.count("add element"), 1)
-            self.assertIn("93.184.216.34 . 49999 . tcp timeout 600s", rules)
+            self.assertEqual(rules.count("add element"), 2)
+            self.assertIn('"eth0" . 5.34.179.103 . 55432 . 93.184.216.34 . 49999 . tcp timeout 600s', rules)
+            self.assertIn('"eth0" . 5.34.179.103 . 55433 . 93.184.216.34 . 49999 . tcp timeout 600s', rules)
             obj.handle(event())
             obj.flush()
             self.assertEqual(run.call_count, 1)
+
+    def test_same_peer_different_local_address_interface_or_protocol_are_separate(self):
+        original = self.peer(event())
+        for data in (event(src_ip="172.16.0.2"), event(alias="kto-warp"), event(l4_proto="udp")):
+            self.assertNotEqual(original, self.peer(data))
+
+    def test_end_and_idle_remove_only_the_correct_flow_generation(self):
+        for name in ("end", "idle"):
+            with self.subTest(name=name):
+                obj = self.make_guard("enforce")
+                with patch.object(guard, "command") as run:
+                    obj.handle(event())
+                    obj.flush()
+                    run.reset_mock()
+                    obj.handle(event(flow_event_name=name, flow_id=2))
+                    obj.flush()
+                    run.assert_not_called()
+                    obj.handle(event(flow_event_name=name))
+                    obj.flush()
+                    self.assertIn("destroy element", run.call_args.kwargs["input"])
+                    self.assertEqual(obj.blocked, {})
+
+    def test_reused_tuple_is_removed_before_new_detection_is_added(self):
+        obj = self.make_guard("enforce")
+        with patch.object(guard, "command") as run:
+            obj.handle(event())
+            obj.flush()
+            obj.handle(event(flow_event_name="new", flow_id=2, flow_first_seen=2000))
+            obj.handle(event(flow_id=2, flow_first_seen=2000))
+            obj.flush()
+        rules = run.call_args.kwargs["input"]
+        self.assertLess(rules.index("destroy element"), rules.index("add element"))
+        self.assertEqual(len(obj.blocked), 1)
+
+    def test_ended_detection_is_not_added_from_pending_batch(self):
+        obj = self.make_guard("enforce")
+        with patch.object(guard, "command") as run:
+            obj.handle(event())
+            obj.handle(event(flow_event_name="end"))
+            obj.flush()
+            run.assert_not_called()
+
+    def test_limits_do_not_allow_nft_set_overflow(self):
+        obj = self.make_guard("enforce")
+        with patch.object(guard, "MAX_FLOWS", 1), patch.object(guard, "command") as run:
+            obj.handle(event())
+            obj.handle(event(src_port=55433, flow_id=2))
+            obj.flush()
+        self.assertEqual(run.call_args.kwargs["input"].count("add element"), 1)
+        self.assertEqual(len(obj.blocked), 1)
 
     def test_expired_lease_can_be_added_again(self):
         obj = self.make_guard("enforce")
@@ -242,7 +305,9 @@ class TorrentGuardTests(unittest.TestCase):
             path.write_text(json.dumps(self.settings), encoding="utf-8")
             self.assertEqual(guard.config(path)["ttl"], 600)
             for values in ({"mode": "drop_all"}, {"ttl": True}, {"ttl": 0},
-                           {"exempt_ips": ["bad"]}, {"interfaces": []}, {"protected_udp": [True]}):
+                           {"exempt_ips": ["bad"]}, {"interfaces": []}, {"interfaces": ["lo"]},
+                           {"interfaces": ["eth0;flush"]}, {"interfaces": ["eth0", "eth0"]},
+                           {"protected_udp": [True]}):
                 path.write_text(json.dumps({**self.settings, **values}), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     guard.config(path)

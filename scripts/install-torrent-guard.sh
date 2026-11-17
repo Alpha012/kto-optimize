@@ -7,7 +7,7 @@ PREFIX=/opt/kto-torrent-guard
 CONFIG=/etc/kto-torrent-guard.json
 NDPID_REF=b1ef7a62e57b6902098053809bbeb69eb6017c99
 NDPI_REF=c8443f9747efa204fe8673f1fae99f462267d1f5
-GUARD_SHA256=858c5b7b86f10b951fd681f775738df8d96c9bc97cdac63dea43a3ecdeee576b
+GUARD_SHA256=a196384e06d818ebbbe8a03c9aab32a70b64e90f4127f2e15a73d44ba0f4163f
 SOURCE=https://raw.githubusercontent.com/Alpha012/kto-optimize/main/scripts
 MODE=observe
 INTERFACES=()
@@ -76,8 +76,19 @@ command -v systemctl >/dev/null || die 'systemd is required.'
 (( $(df -Pk /var/tmp | awk 'NR==2 {print $4}') >= 1500000 )) ||
     die 'At least 1.5 GB free in /var/tmp is required for the source build.'
 if (( ${#INTERFACES[@]} == 0 )); then
-    INTERFACES=(eth0)
-    ip link show warp >/dev/null 2>&1 && INTERFACES+=(warp)
+    mapfile -t INTERFACES < <(ip -j -4 route show table main default | python3 -c '
+import json, sys
+seen = set()
+for route in json.load(sys.stdin):
+    name = route.get("dev", "")
+    if name and name != "lo" and name not in seen:
+        seen.add(name)
+        print(name)
+')
+    (( ${#INTERFACES[@]} > 0 )) || die 'No IPv4 default interface found. Pass --interface NAME explicitly.'
+    if ip link show warp >/dev/null 2>&1 && [[ " ${INTERFACES[*]} " != *' warp '* ]]; then
+        INTERFACES+=(warp)
+    fi
 fi
 declare -A SEEN=()
 for port in "${PROTECTED_UDP[@]}"; do
@@ -108,8 +119,8 @@ p = Path(sys.argv[1])
 compile(p.read_text(encoding="utf-8"), str(p), "exec")
 PY
 python3 "$BUILD/guard.py" cleanup
-step 'Testing nftables syntax and IPv4/IPv6 sets in an isolated network namespace'
-unshare --net python3 "$BUILD/guard.py" check-nft
+step 'Testing connection isolation: TCP/UDP, IPv4/IPv6, NAT, unrelated connections'
+timeout 60 unshare --net python3 "$BUILD/guard.py" check-nft
 
 step 'Fetching pinned nDPId and its pinned nDPI submodule'
 git init -q "$BUILD/source"
@@ -156,7 +167,7 @@ if sys.argv[2].split():
     ips.append(str(ipaddress.ip_address(sys.argv[2].split()[0])))
 fd = os.open('/etc/kto-torrent-guard.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, 'w') as f:
-    json.dump({'mode': sys.argv[1], 'ttl': 600, 'exempt_ips': ips,
+    json.dump({'mode': sys.argv[1], 'ttl': 60, 'exempt_ips': ips,
                'interfaces': sys.argv[4:],
                'protected_udp': [int(p) for p in sys.argv[3].split(',') if p]}, f)
     f.write('\n')
@@ -191,7 +202,7 @@ CAPTURE_UNITS=()
 for interface in "${INTERFACES[@]}"; do CAPTURE_UNITS+=("kto-torrent-capture@$interface.service"); done
 cat > /etc/systemd/system/kto-torrent-guard.service <<EOF
 [Unit]
-Description=KTO BitTorrent peer guard (userspace nDPI events)
+Description=KTO BitTorrent connection guard (userspace nDPI events)
 After=network-online.target
 Wants=network-online.target ${CAPTURE_UNITS[*]}
 [Service]
