@@ -188,18 +188,19 @@ def nft_element(flow):
     return f'{local} . {local_port} . {remote} . {remote_port} . {protocol}'
 
 
-def nft_set(flow):
-    return json.dumps(f"flows{flow[0]}_{flow[1]}")
+def nft_set(version, interface):
+    # Hex keeps names collision-free and valid even for interfaces with dots/dashes.
+    return f"flows{version}_{interface.encode('ascii').hex()}"
 
 
 def nft_add(flow, ttl):
-    return f"add element inet {TABLE} {nft_set(flow)} {{ {nft_element(flow)} timeout {ttl}s }}\n"
+    return f"add element inet {TABLE} {nft_set(flow[0], flow[1])} {{ {nft_element(flow)} timeout {ttl}s }}\n"
 
 
 def nft_remove(flow):
     # Ubuntu 24.04 nft lacks `destroy element`. Add-if-missing then delete in
     # one transaction, so expiry cannot race deletion and no temporary ban leaks.
-    element = f"inet {TABLE} {nft_set(flow)} {{ {nft_element(flow)} }}"
+    element = f"inet {TABLE} {nft_set(flow[0], flow[1])} {{ {nft_element(flow)} }}"
     return f"add element {element}\ndelete element {element}\n"
 
 
@@ -210,7 +211,7 @@ def nft_table(protected, ttl, interfaces):
     for name in interfaces:
         for version in (4, 6):
             lines.extend([
-                f'set {json.dumps(f"flows{version}_{name}")} {{',
+                f"set {nft_set(version, name)} {{",
                 f"type ipv{version}_addr . inet_service . ipv{version}_addr . inet_service . inet_proto",
                 f"flags timeout; timeout {ttl}s; size {MAX_FLOWS}", "}",
             ])
@@ -236,7 +237,7 @@ def nft_table(protected, ttl, interfaces):
         ])
         for name in interfaces:
             for version, family in ((4, "ip"), (6, "ip6")):
-                set_name = json.dumps(f"flows{version}_{name}")
+                set_name = nft_set(version, name)
                 lines.append(
                     f"{interface} {json.dumps(name)} meta l4proto {{ tcp, udp }} "
                     f"{family} {local_ip} . th {local_port} . {family} {peer_ip} . th {peer_port} . "

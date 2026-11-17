@@ -130,8 +130,8 @@ class TorrentGuardTests(unittest.TestCase):
         self.assertIn("hook prerouting priority -101; policy accept", rules)
         self.assertIn("tcp sport @protect_tcp return", rules)
         self.assertIn("tcp dport @protect_tcp return", rules)
-        self.assertIn('oifname "eth0" meta l4proto { tcp, udp } ip saddr . th sport . ip daddr . th dport . meta l4proto @"flows4_eth0" counter drop', rules)
-        self.assertIn('iifname "warp" meta l4proto { tcp, udp } ip6 daddr . th dport . ip6 saddr . th sport . meta l4proto @"flows6_warp" counter drop', rules)
+        self.assertIn('oifname "eth0" meta l4proto { tcp, udp } ip saddr . th sport . ip daddr . th dport . meta l4proto @flows4_65746830 counter drop', rules)
+        self.assertIn('iifname "warp" meta l4proto { tcp, udp } ip6 daddr . th dport . ip6 saddr . th sport . meta l4proto @flows6_77617270 counter drop', rules)
         self.assertNotIn("type ifname .", rules)
         self.assertNotIn("set peers", rules)
         self.assertNotIn("flush ruleset", rules)
@@ -203,11 +203,16 @@ class TorrentGuardTests(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             rules = run.call_args.kwargs["input"]
             self.assertEqual(rules.count("add element"), 2)
-            self.assertIn('"flows4_eth0" { 5.34.179.103 . 55432 . 93.184.216.34 . 49999 . tcp timeout 600s', rules)
-            self.assertIn('"flows4_eth0" { 5.34.179.103 . 55433 . 93.184.216.34 . 49999 . tcp timeout 600s', rules)
+            self.assertIn('flows4_65746830 { 5.34.179.103 . 55432 . 93.184.216.34 . 49999 . tcp timeout 600s', rules)
+            self.assertIn('flows4_65746830 { 5.34.179.103 . 55433 . 93.184.216.34 . 49999 . tcp timeout 600s', rules)
             obj.handle(event())
             obj.flush()
             self.assertEqual(run.call_count, 1)
+
+    def test_interface_set_names_cannot_collide_or_become_nft_syntax(self):
+        names = [guard.nft_set(4, name) for name in ("wan.test-1", "wan_test_1", "eth0", "warp")]
+        self.assertEqual(len(set(names)), 4)
+        self.assertTrue(all(re.fullmatch(r"flows4_[a-f0-9]+", name) for name in names))
 
     def test_same_peer_different_local_address_interface_or_protocol_are_separate(self):
         original = self.peer(event())
