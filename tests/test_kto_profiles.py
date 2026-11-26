@@ -89,15 +89,15 @@ printf '%s\\n' "${{#SUDO[@]}}" "${{SUDO[*]}}" "$lookups"
                 self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v350"', KTO)
-        self.assertIn('PUSH_BUILD="v350"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v350"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v350"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v350"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v350"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v350"', HAPROXY_BANDWIDTH)
-        self.assertIn('HAPROXY_GUARD_BUILD="v350"', HAPROXY_GUARD)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v350"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v351"', KTO)
+        self.assertIn('PUSH_BUILD="v351"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v351"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v351"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v351"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v351"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v351"', HAPROXY_BANDWIDTH)
+        self.assertIn('HAPROXY_GUARD_BUILD="v351"', HAPROXY_GUARD)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v351"', DPI_PREFLIGHT)
 
     def test_runtime_temp_and_storage_preflight_protect_root_disk(self):
         runtime = function_body(KTO, "prepare_runtime_tmpdir")
@@ -531,11 +531,13 @@ grep -q 'max_header_size 64KB' "$KTO_SELFSTEAL_CADDYFILE"
         self.assertIn('ufw_rule_allowed "443/udp"', firewall_check)
 
     def test_menu_and_remote_status_show_combined_features(self):
-        menu = function_body(KTO, "menu")
+        node_stack = function_body(KTO, "node_stack_menu")
+        proxy = function_body(KTO, "proxy_menu")
         status = function_body(PUSH, "status_panel_rows_json")
 
-        self.assertIn("node_profile_includes_reality", menu)
-        self.assertIn("node_profile_includes_hysteria2", menu)
+        self.assertIn("node_profile_includes_reality", node_stack)
+        self.assertIn("node_profile_includes_hysteria2", node_stack)
+        self.assertIn("node_profile_includes_reality", proxy)
         self.assertIn('reality_hysteria2) profile_label="Reality + Hysteria2"', status)
         self.assertIn('section="SSL"', status)
         self.assertIn('cert_dir="/opt/remnawave"', status)
@@ -901,7 +903,7 @@ grep -q 'Conntrack: 262144/2097152 (12%), buckets=524288' <<< "$output"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_tspu_ip_probe_targets_one_ip_through_the_selected_source(self):
-        menu = function_body(KTO, "menu")
+        net_menu = function_body(KTO, "network_diag_menu")
         runner = function_body(KTO, "run_tspu_ip_test")
         tcp_probe = function_body(KTO, "tspu_ip_tcp_probe")
         http_probe = function_body(KTO, "tspu_ip_http_probe")
@@ -909,9 +911,9 @@ grep -q 'Conntrack: 262144/2097152 (12%), buckets=524288' <<< "$output"
         trace = function_body(KTO, "tspu_ip_trace")
         main = function_body(KTO, "main")
 
-        self.assertIn('labels+=("Проверка ТСПУ (IP)")', menu)
-        self.assertIn('actions+=("dpi-ip-test")', menu)
-        self.assertIn('dpi-ip-test) run_tspu_ip_test', menu)
+        self.assertIn('"Проверка ТСПУ (IP)"', net_menu)
+        self.assertIn('"dpi-ip-test"', net_menu)
+        self.assertIn('dpi-ip-test) run_tspu_ip_test', net_menu)
         self.assertIn('select_test_source_ipv4 "$requested_source_ip"', runner)
         self.assertIn('ask_text "Целевой IPv4 или IPv4:порт"', runner)
         self.assertLess(
@@ -1003,15 +1005,15 @@ parse_tspu_ipv4_target '198.51.100.30:65535'
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_batch_tcp_mtr_parses_groups_and_uses_each_target_port(self):
-        menu = function_body(KTO, "menu")
+        net_menu = function_body(KTO, "network_diag_menu")
         parser = function_body(KTO, "parse_mtr_batch_targets")
         runner = function_body(KTO, "run_mtr_batch")
         target_runner = function_body(KTO, "run_mtr_batch_target")
         main = function_body(KTO, "main")
 
-        self.assertIn('labels+=("Пакетный TCP-MTR")', menu)
-        self.assertIn('actions+=("mtr-batch")', menu)
-        self.assertIn('mtr-batch) run_mtr_batch || true', menu)
+        self.assertIn('"Пакетный TCP-MTR"', net_menu)
+        self.assertIn('"mtr-batch"', net_menu)
+        self.assertIn('mtr-batch) run_mtr_batch || true', net_menu)
         self.assertIn('parse_tspu_ipv4_target "$token"', parser)
         self.assertIn('KTO_MTR_BATCH_MAX_TARGETS', parser)
         self.assertIn('KTO_MTR_BATCH_PARALLEL', runner)
@@ -1119,15 +1121,15 @@ grep -Fq 'TCP-MTR завершён для 5 целей' "$work/batch-output"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_whitelist_btop_selects_ip_and_uses_temporary_interface_config(self):
-        menu = function_body(KTO, "menu")
+        ip_menu = function_body(KTO, "additional_ip_menu")
         runner = function_body(KTO, "run_btop_for_ip")
         writer = function_body(KTO, "write_btop_interface_config")
         launcher = function_body(KTO, "run_btop_with_config")
         main = function_body(KTO, "main")
 
-        self.assertIn('labels+=("btop")', menu)
-        self.assertIn('actions+=("btop")', menu)
-        self.assertIn('btop) run_btop_for_ip || true', menu)
+        self.assertIn('labels+=("btop")', ip_menu)
+        self.assertIn('actions+=("btop")', ip_menu)
+        self.assertIn('btop) run_btop_for_ip ||', ip_menu)
         self.assertIn('require_whitelist_mode', runner)
         self.assertIn('select_test_source_ipv4 "$requested_ip"', runner)
         self.assertIn('source_interface="$TEST_SOURCE_INTERFACE"', runner)
@@ -1209,16 +1211,16 @@ grep -Fqx 'arg1=|arg2=|xdg=/tmp/kto-btop-xdg' "$events"
         self.assertNotIn("regexp escape sequence", result.stderr)
 
     def test_whitelist_multi_ip_monitor_combines_interfaces_and_tracks_cpu_cores(self):
-        menu = function_body(KTO, "menu")
+        ip_menu = function_body(KTO, "additional_ip_menu")
         runner = function_body(KTO, "run_multi_ip_cpu_monitor")
         listing = function_body(KTO, "list_multi_ip_monitor_interfaces")
         formatter = function_body(KTO, "multi_ip_monitor_format_rate")
         byte_formatter = function_body(KTO, "multi_ip_monitor_format_bytes")
         main = function_body(KTO, "main")
 
-        self.assertIn('labels+=("Монитор всех IP + CPU")', menu)
-        self.assertIn('actions+=("multi-ip-monitor")', menu)
-        self.assertIn('multi-ip-monitor) run_multi_ip_cpu_monitor || true', menu)
+        self.assertIn('labels+=("Монитор всех IP + CPU")', ip_menu)
+        self.assertIn('actions+=("multi-ip-monitor")', ip_menu)
+        self.assertIn('multi-ip-monitor) run_multi_ip_cpu_monitor ||', ip_menu)
         self.assertIn('btop-all|monitor-all|multi-ip-monitor) run_multi_ip_cpu_monitor', main)
         self.assertIn('require_whitelist_mode', runner)
         self.assertIn('list_multi_ip_monitor_interfaces', runner)
@@ -1278,6 +1280,7 @@ multi_ip_monitor_fit_text value 123456 4
 
     def test_dpi_detector_is_one_shot_hardened_and_source_routed(self):
         menu = function_body(KTO, "menu")
+        net_menu = function_body(KTO, "network_diag_menu")
         runner = function_body(KTO, "run_dpi_detector")
         image_prepare = function_body(KTO, "dpi_detector_prepare_image")
         image_pull = function_body(KTO, "dpi_detector_pull_image")
@@ -1292,9 +1295,10 @@ multi_ip_monitor_fit_text value 123456 4
             'DPI_DETECTOR_IMAGE="${KTO_DPI_DETECTOR_IMAGE:-ghcr.io/runnin4ik/dpi-detector:3.3.0}"',
             KTO,
         )
-        self.assertIn('labels+=("Проверка ТСПУ")', menu)
-        self.assertIn('actions+=("dpi-test")', menu)
-        self.assertIn('[[ "$MACHINE_MODE" != "panel" ]]', menu)
+        self.assertIn('"Проверка ТСПУ"', net_menu)
+        self.assertIn('"dpi-test"', net_menu)
+        self.assertIn('actions+=("network-diag-menu")', menu)
+        self.assertIn('[[ "$MACHINE_MODE" == "panel" ]]', menu)
         self.assertIn('[[ "$MACHINE_MODE" == "panel" ]]', runner)
         self.assertIn('select_test_source_ipv4 "$requested_source_ip"', runner)
         self.assertIn('dpi_detector_prepare_image', runner)
@@ -1556,7 +1560,7 @@ ensure_hostname_hosts_entry
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_additional_ip_menu_uses_openstack_ports_and_source_routing(self):
-        menu = function_body(KTO, "menu")
+        ip_menu = function_body(KTO, "additional_ip_menu")
         wrapper = function_body(KTO, "setup_additional_ips")
         optimizer_wrapper = function_body(KTO, "optimize_additional_ip_networks")
         setup = function_body(ADDITIONAL_IPS, "setup_additional_ips")
@@ -1564,10 +1568,10 @@ ensure_hostname_hosts_entry
         apply_netplan = function_body(ADDITIONAL_IPS, "apply_managed_netplan")
         render = function_body(ADDITIONAL_IPS, "render_netplan")
 
-        self.assertIn('labels+=("Проверить и завести дополнительные IP")', menu)
-        self.assertIn('actions+=("additional-ips")', menu)
-        self.assertIn('labels+=("Оптимизировать сеть всех IP")', menu)
-        self.assertIn('actions+=("additional-ips-optimize")', menu)
+        self.assertIn('"Проверить и завести дополнительные IP"', ip_menu)
+        self.assertIn('"additional-ips"', ip_menu)
+        self.assertIn('"Оптимизировать сеть всех IP"', ip_menu)
+        self.assertIn('"additional-ips-optimize"', ip_menu)
         self.assertIn('ensure_additional_ip_manager', wrapper)
         self.assertIn('ensure_additional_ip_manager', optimizer_wrapper)
         self.assertIn('"$ADDITIONAL_IP_MANAGER" optimize', optimizer_wrapper)
@@ -1588,12 +1592,12 @@ ensure_hostname_hosts_entry
         self.assertIn('table: ${table}', render)
 
     def test_reality_profiles_expose_remnawave_egress_manager(self):
-        menu = function_body(KTO, "menu")
+        node_stack = function_body(KTO, "node_stack_menu")
         wrapper = function_body(KTO, "configure_remnawave_egress")
 
-        self.assertIn('labels+=("Исходящий IP Remnawave")', menu)
-        self.assertIn('actions+=("remnawave-egress")', menu)
-        self.assertIn('node_profile_includes_reality', menu)
+        self.assertIn('labels+=("Исходящий IP Remnawave")', node_stack)
+        self.assertIn('actions+=("remnawave-egress")', node_stack)
+        self.assertIn('node_profile_includes_reality', node_stack)
         self.assertIn('node_profile_includes_reality', wrapper)
         self.assertIn('ensure_remna_api_config', wrapper)
         self.assertIn('ensure_remna_egress_manager', wrapper)
@@ -2102,6 +2106,9 @@ grep -q 'Основной IP не прошёл HTTPS-проверку' <<< "$out
     def test_haproxy_multiport_menu_keeps_legacy_443_names_and_unified_route_flow(self):
         render = function_body(KTO, "render_haproxy_routes_config")
         haproxy_menu = function_body(KTO, "haproxy_menu")
+        bulk_menu = function_body(KTO, "haproxy_routes_bulk_menu")
+        maint_menu = function_body(KTO, "haproxy_maintenance_menu")
+        all_haproxy_menus = haproxy_menu + "\n" + bulk_menu + "\n" + maint_menu
         main_menu = function_body(KTO, "menu")
 
         self.assertIn('if (( port == 443 ))', render)
@@ -2110,27 +2117,27 @@ grep -q 'Основной IP не прошёл HTTPS-проверку' <<< "$out
         self.assertIn('server_name="xray1"', render)
         self.assertIn('frontend_name="vless_in_${port}"', render)
         self.assertIn('backend_name="vless_pool_${port}"', render)
-        self.assertIn('2) Добавить маршрут (входной IP = выходному IP)', haproxy_menu)
-        self.assertIn('3) Удалить маршрут', haproxy_menu)
-        self.assertIn('4) Удалить ВСЕ маршруты и остановить HAProxy', haproxy_menu)
-        self.assertIn('5) Заменить SNI у всех маршрутов', haproxy_menu)
-        self.assertIn('6) Обновить HAProxy, сохранив маршруты', haproxy_menu)
-        self.assertIn('7) Добавить или заменить backend-пул', haproxy_menu)
-        self.assertIn('8) Массово добавить backend по следующим портам', haproxy_menu)
-        self.assertIn('9) Ограничить скорость по входному IP', haproxy_menu)
-        self.assertIn('10) Восстановить HAProxy backup', haproxy_menu)
-        self.assertIn('11) Проверить бинды', haproxy_menu)
-        self.assertIn('12) Полная диагностика HAProxy', haproxy_menu)
-        self.assertIn('13) Аварийно стабилизировать HAProxy', haproxy_menu)
+        self.assertIn('"Добавить маршрут (входной IP = выходному IP)"', haproxy_menu)
+        self.assertIn('"Удалить маршрут"', haproxy_menu)
+        self.assertIn('"Удалить ВСЕ маршруты и остановить HAProxy"', bulk_menu)
+        self.assertIn('"Заменить SNI у всех маршрутов"', bulk_menu)
+        self.assertIn('"Обновить HAProxy, сохранив маршруты"', maint_menu)
+        self.assertIn('"Добавить или заменить backend-пул"', bulk_menu)
+        self.assertIn('"Массово добавить backend по следующим портам"', bulk_menu)
+        self.assertIn('"Ограничить скорость по входному IP ›"', haproxy_menu)
+        self.assertIn('"Восстановить HAProxy backup"', maint_menu)
+        self.assertIn('"Проверить бинды"', maint_menu)
+        self.assertIn('"Полная диагностика HAProxy"', maint_menu)
+        self.assertIn('"Аварийно стабилизировать HAProxy"', maint_menu)
         self.assertIn('add_haproxy_route "$routes_file"', haproxy_menu)
-        self.assertNotIn('Добавить маршрут через основной', haproxy_menu)
-        self.assertNotIn('Добавить маршрут через другой', haproxy_menu)
-        self.assertIn('replace_all_haproxy_sni "$routes_file"', haproxy_menu)
-        self.assertIn('delete_all_haproxy_routes "$routes_file"', haproxy_menu)
+        self.assertNotIn('Добавить маршрут через основной', all_haproxy_menus)
+        self.assertNotIn('Добавить маршрут через другой', all_haproxy_menus)
+        self.assertIn('replace_all_haproxy_sni "$routes_file"', bulk_menu)
+        self.assertIn('delete_all_haproxy_routes "$routes_file"', bulk_menu)
         self.assertIn('haproxy_bandwidth_menu', haproxy_menu)
-        self.assertIn('restore_haproxy_backup "$routes_file"', haproxy_menu)
-        self.assertIn('check_haproxy_bindings "$routes_file"', haproxy_menu)
-        self.assertIn('diagnose_haproxy', haproxy_menu)
+        self.assertIn('restore_haproxy_backup "$routes_file"', maint_menu)
+        self.assertIn('check_haproxy_bindings "$routes_file"', maint_menu)
+        self.assertIn('diagnose_haproxy', maint_menu)
         self.assertIn('haproxy-diagnose|haproxy-diagnostic|haproxy-diag|haproxy-status', KTO)
         self.assertNotIn('labels+=("Обновить HAProxy")', main_menu)
 
@@ -2755,7 +2762,7 @@ remove_haproxy_input_bandwidth_limit 217.19.122.109
         base_port = function_body(KTO, "haproxy_base_port")
         configure = function_body(KTO, "configure_haproxy_backend")
         haproxy_menu = function_body(KTO, "haproxy_menu")
-        settings_menu = function_body(KTO, "settings_menu")
+        proxy_menu = function_body(KTO, "proxy_menu")
         main_menu = function_body(KTO, "menu")
 
         self.assertIn('[[ "$MACHINE_MODE" == "whitelist" ]]', supported)
@@ -2770,8 +2777,8 @@ remove_haproxy_input_bandwidth_limit 217.19.122.109
         self.assertIn('print_haproxy_route "$base_port"', configure)
         self.assertIn('sync_haproxy_firewall "$routes_file" "$previous_routes_file"', configure)
         self.assertIn('require_haproxy_mode', haproxy_menu)
-        self.assertIn('if haproxy_mode_supported; then', settings_menu)
-        self.assertIn('labels+=("HAProxy (мост, 8443/tcp)")', main_menu)
+        self.assertIn('labels+=("HAProxy ›")', main_menu)
+        self.assertIn('labels+=("HAProxy (мост, 8443/tcp)")', proxy_menu)
 
     def test_new_haproxy_routes_default_to_an_exact_input_ip(self):
         default_bind = function_body(KTO, "haproxy_default_listen_ip_for_source")
@@ -3540,7 +3547,8 @@ after="$(wc -l < "$events")"
         self.assertNotIn("ip address del", HAPROXY_GUARD)
         self.assertNotIn("ufw delete", HAPROXY_GUARD)
         self.assertIn('haproxy-guard-install|haproxy-heal-enable', KTO)
-        self.assertIn('14) Автолечение HAProxy', KTO)
+        self.assertIn('"Автолечение HAProxy ›"', function_body(KTO, "haproxy_maintenance_menu"))
+        self.assertIn('haproxy_guard_menu', function_body(KTO, "haproxy_maintenance_menu"))
 
     def test_haproxy_guard_starts_valid_config_with_temporarily_missing_ip(self):
         bash = bash_executable()
@@ -4372,7 +4380,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v350"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v351"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 
@@ -5637,11 +5645,11 @@ actual=$(cat "$routes")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_panel_menu_manages_connection_alert_mutes(self):
-        panel_menu = function_body(KTO, "menu")
+        collector_menu = function_body(KTO, "panel_collector_menu")
         alerts_menu = function_body(KTO, "stats_collector_alerts_menu")
 
-        self.assertIn('labels+=("Не получать push-уведомления")', panel_menu)
-        self.assertIn('stats-collector-alerts) stats_collector_alerts_menu', panel_menu)
+        self.assertIn('"Не получать push-уведомления"', collector_menu)
+        self.assertIn('stats-collector-alerts) stats_collector_alerts_menu', collector_menu)
         self.assertIn('--connection-alerts-list', alerts_menu)
         self.assertIn('--connection-alerts-toggle "$query"', alerts_menu)
         self.assertIn('systemctl stop "$STATS_COLLECTOR_SERVICE"', alerts_menu)
@@ -5681,7 +5689,7 @@ stats_collector_alerts_menu <<< '  0  ' >/dev/null
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_whitelist_mobile443_mode_is_minimal_pinned_and_fail_open(self):
-        main_menu = function_body(KTO, "menu")
+        proxy_menu = function_body(KTO, "proxy_menu")
         lte_menu = function_body(KTO, "mobile443_lte_menu")
         enable = function_body(KTO, "enable_mobile443_lte")
         disable = function_body(KTO, "disable_mobile443_lte")
@@ -5692,10 +5700,10 @@ stats_collector_alerts_menu <<< '  0  ' >/dev/null
         manager_enable = function_body(MOBILE443, "enable_lte")
         manager_status = function_body(MOBILE443, "show_status")
 
-        self.assertIn('labels+=("Включение режима \\"Только LTE\\"")', main_menu)
-        self.assertIn('actions+=("mobile443-lte")', main_menu)
-        self.assertIn('labels+=("Статус режима \\"Только LTE\\"")', main_menu)
-        self.assertIn('actions+=("mobile443-lte-status")', main_menu)
+        self.assertIn('labels+=("Включение режима \\"Только LTE\\"")', proxy_menu)
+        self.assertIn('actions+=("mobile443-lte")', proxy_menu)
+        self.assertIn('labels+=("Статус режима \\"Только LTE\\"")', proxy_menu)
+        self.assertIn('actions+=("mobile443-lte-status")', proxy_menu)
         self.assertIn('enable_mobile443_lte || true', lte_menu)
         self.assertIn('extract_haproxy_routes > "$routes_file"', enable)
         self.assertIn('whitelist_ipv6_disabled', enable)

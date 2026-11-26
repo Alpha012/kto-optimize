@@ -11,7 +11,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 KTO = (ROOT / "kto.sh").read_text(encoding="utf-8")
-FUNCTIONS = KTO[KTO.index("torrent_guard_installed() {"):KTO.index("server_cleanup_menu() {")]
+MENU_ENGINE = KTO[KTO.index("MENU_LABELS=()"):KTO.index("stage() {")]
+FUNCTIONS = MENU_ENGINE + "\n" + KTO[KTO.index("torrent_guard_installed() {"):KTO.index("server_cleanup_menu() {")]
 
 
 class TorrentMenuTests(unittest.TestCase):
@@ -75,6 +76,8 @@ TORRENT_GUARD_CONFIG="$TEST_ROOT/config.json"
 TORRENT_GUARD_CLI="$TEST_ROOT/cli"
 TORRENT_GUARD_STATUS="$TEST_ROOT/status.json"
 SSH_CONNECTION='192.0.2.1 12345 198.51.100.1 22'
+BOLD= DIM= PURPLE= GREEN= NC=
+header() { :; }
 need_root() { :; }
 stage() { printf 'STAGE %s\n' "$*"; }
 warn() { printf 'WARN %s\n' "$*"; }
@@ -139,19 +142,27 @@ node_profile_includes_reality() { return 0; }
 node_profile_includes_hysteria2() { return 0; }
 mobile443_lte_configured() { return 1; }
 torrent_guard_menu() { echo SELECTED-GUARD; }
-BOLD= DIM= PURPLE= NC=
+BOLD= DIM= PURPLE= GREEN= NC=
 MACHINE_MODE=$TEST_MODE
 '''
         for mode in ("node", "whitelist", "panel"):
             with self.subTest(mode=mode):
                 self.env["TEST_MODE"] = mode
                 run = self.run_bash("menu", "0\n", extra=extra)
-                choice = re.search(r"(?m)^(\d+)\) Торрент-блокер", run.stdout)
+                proxy_branch = re.search(r"(?m)^(\d+)\) Прокси и фильтры", run.stdout)
                 if mode == "panel":
-                    self.assertIsNone(choice)
+                    self.assertIsNone(proxy_branch)
+                    self.assertNotIn("Торрент-блокер", run.stdout)
                 else:
-                    self.assertIsNotNone(choice)
-                    selected = self.run_bash("menu", choice.group(1) + "\n", extra=extra)
+                    self.assertIsNotNone(proxy_branch)
+                    branch_run = self.run_bash("menu", f"{proxy_branch.group(1)}\n0\n0\n", extra=extra)
+                    guard_choice = re.search(r"(?m)^(\d+)\) Торрент-блокер", branch_run.stdout)
+                    self.assertIsNotNone(guard_choice)
+                    selected = self.run_bash(
+                        "menu",
+                        f"{proxy_branch.group(1)}\n{guard_choice.group(1)}\n0\n0\n",
+                        extra=extra,
+                    )
                     self.assertIn("SELECTED-GUARD", selected.stdout)
 
     def test_owner_marker_is_required(self):
@@ -292,8 +303,12 @@ torrent_guard_observe() {
 
     def test_numbered_actions_stay_in_sync(self):
         menu = FUNCTIONS[FUNCTIONS.index("torrent_guard_menu() {"):]
-        for number, action in enumerate(("install", "setup", "enforce", "observe", "status", "logs", "stop", "uninstall"), 1):
-            self.assertRegex(menu, rf"{number}\) torrent_guard_menu {re.escape(action)} \|\| true")
+        self.assertIn(
+            'MENU_ACTIONS=("install" "setup" "enforce" "observe" "status" "logs" "stop" "uninstall")',
+            menu,
+        )
+        for action in ("install", "setup", "enforce", "observe", "status", "logs", "stop", "uninstall"):
+            self.assertRegex(menu, rf"{re.escape(action)}\) torrent_guard_menu {re.escape(action)} \|\| true")
 
 
 if __name__ == "__main__":

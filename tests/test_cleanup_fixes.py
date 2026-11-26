@@ -41,12 +41,13 @@ def run_kto_bash(snippet: str, *, timeout: int = 30) -> subprocess.CompletedProc
 
 
 class CleanupFixesTests(unittest.TestCase):
-    def test_version_pinned_and_build_v350_synced(self):
+    def test_version_pinned_and_build_v351_synced(self):
         self.assertIn('SCRIPT_VERSION="1.4.8.8"', KTO)
         self.assertNotIn("1.4.8.10", KTO)
-        self.assertIn('SCRIPT_BUILD="v350"', KTO)
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v350"', KTO)
+        self.assertIn('SCRIPT_BUILD="v351"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v351"', KTO)
         self.assertNotIn("v349", KTO)
+        self.assertNotIn("v350", KTO)
 
     def test_check_sh_covers_all_shell_and_python_scripts(self):
         self.assertIn("for script in scripts/*.sh; do", CHECK_SH)

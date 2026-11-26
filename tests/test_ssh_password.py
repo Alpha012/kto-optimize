@@ -309,7 +309,8 @@ class IntegrationTests(unittest.TestCase):
     def test_direct_entrypoint_and_menu(self):
         main = function_body(KTO, "main")
         self.assertLess(main.index("ssh-password|root-password)"), main.index("startup_storage_preflight"))
-        self.assertIn('actions+=("ssh-password")', function_body(KTO, "menu"))
+        self.assertIn('"ssh-password"', function_body(KTO, "settings_menu"))
+        self.assertIn('actions+=("settings")', function_body(KTO, "menu"))
         wrapper = function_body(KTO, "enable_ssh_password")
         self.assertIn('scripts/kto-ssh-password.py', wrapper)
         self.assertIn('--connection "${SSH_CONNECTION:-}"', wrapper)

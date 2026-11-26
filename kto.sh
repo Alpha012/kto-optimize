@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v350"
+SCRIPT_BUILD="v351"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -375,12 +375,342 @@ header_line() {
 }
 
 header() {
-    printf '\033c'
+    if [[ "${KTO_HEADER_SOFT_CLEAR:-0}" == "1" ]]; then
+        if [[ -t 1 ]]; then
+            printf '\033[H\033[J'
+        fi
+    else
+        printf '\033c'
+    fi
     echo -e "${PURPLE}==========================================${NC}"
     header_line "kto" "${BOLD}${GREEN}"
     header_line "v${SCRIPT_VERSION}" "$DIM"
     header_line "$SCRIPT_BUILD" "$DIM"
     echo -e "${PURPLE}==========================================${NC}"
+}
+
+MENU_LABELS=()
+MENU_ACTIONS=()
+MENU_KEY=""
+MENU_SELECTED_ACTION=""
+MENU_SELECTED_INDEX=0
+MENU_INLINE_CHOICE=""
+MENU_TTY_SAVED_STTY=""
+MENU_TTY_CURSOR_HIDDEN=0
+
+menu_is_interactive() {
+    if [[ "${KTO_MENU_INTERACTIVE:-}" == "1" ]]; then
+        return 0
+    fi
+    if [[ "${KTO_MENU_INTERACTIVE:-}" == "0" ]]; then
+        return 1
+    fi
+    [[ -t 0 && -t 1 ]]
+}
+
+menu_tty_enter() {
+    MENU_TTY_SAVED_STTY=""
+    MENU_TTY_CURSOR_HIDDEN=0
+    if [[ -t 0 ]]; then
+        MENU_TTY_SAVED_STTY="$(stty -g 2>/dev/null || true)"
+        stty -echo 2>/dev/null || true
+    fi
+    if [[ -t 1 ]]; then
+        printf '\033[?25l'
+        MENU_TTY_CURSOR_HIDDEN=1
+    fi
+}
+
+menu_tty_leave() {
+    if [[ "${MENU_TTY_CURSOR_HIDDEN:-0}" == "1" ]]; then
+        printf '\033[?25h'
+        MENU_TTY_CURSOR_HIDDEN=0
+    fi
+    if [[ -n "${MENU_TTY_SAVED_STTY:-}" ]]; then
+        stty "$MENU_TTY_SAVED_STTY" 2>/dev/null || true
+        MENU_TTY_SAVED_STTY=""
+    fi
+}
+
+menu_read_key() {
+    local key="" seq1="" seq2="" extra=""
+    MENU_KEY="other"
+    if ! IFS= read -rsn1 key; then
+        MENU_KEY="eof"
+        return 0
+    fi
+    case "$key" in
+        ""|$'\r'|$'\n'|" ") MENU_KEY="enter" ;;
+        0) MENU_KEY="zero" ;;
+        [1-9]) MENU_KEY="digit:${key}" ;;
+        q|Q|$'\x7f'|$'\x08') MENU_KEY="back" ;;
+        k|K) MENU_KEY="up" ;;
+        j|J) MENU_KEY="down" ;;
+        $'\x1b')
+            if ! IFS= read -rsn1 -t 0.05 seq1; then
+                MENU_KEY="back"
+                return 0
+            fi
+            if [[ "$seq1" == "[" || "$seq1" == "O" ]]; then
+                if IFS= read -rsn1 -t 0.05 seq2; then
+                    case "$seq2" in
+                        A) MENU_KEY="up" ;;
+                        B) MENU_KEY="down" ;;
+                        C) MENU_KEY="enter" ;;
+                        D) MENU_KEY="back" ;;
+                        H) MENU_KEY="home" ;;
+                        F) MENU_KEY="end" ;;
+                        [0-9])
+                            while IFS= read -rsn1 -t 0.02 extra; do
+                                [[ "$extra" =~ ^[a-zA-Z~]$ ]] && break
+                            done
+                            case "$seq2" in
+                                1|7) MENU_KEY="home" ;;
+                                4|8) MENU_KEY="end" ;;
+                                *) MENU_KEY="other" ;;
+                            esac
+                            ;;
+                        *) MENU_KEY="other" ;;
+                    esac
+                fi
+            fi
+            ;;
+        *) MENU_KEY="other" ;;
+    esac
+}
+
+menu_pause() {
+    local prompt="${1:-Нажмите любую клавишу, чтобы вернуться...}"
+    if ! menu_is_interactive; then
+        return 0
+    fi
+    echo
+    echo -ne "${PURPLE}>${NC} ${DIM}${prompt}${NC} "
+    menu_read_key
+    echo
+}
+
+menu_read_inline_choice() {
+    local valid_digits="$1"
+    local d="" prev_int_trap="" prev_term_trap=""
+    MENU_INLINE_CHOICE=""
+    if menu_is_interactive; then
+        prev_int_trap="$(trap -p INT 2>/dev/null || true)"
+        prev_term_trap="$(trap -p TERM 2>/dev/null || true)"
+        trap 'menu_tty_leave; exit 130' INT
+        trap 'menu_tty_leave; exit 143' TERM
+        menu_tty_enter
+        while true; do
+            menu_read_key
+            case "$MENU_KEY" in
+                zero|back|eof)
+                    MENU_INLINE_CHOICE="0"
+                    break
+                    ;;
+                digit:*)
+                    d="${MENU_KEY#digit:}"
+                    if [[ "$valid_digits" == *"$d"* ]]; then
+                        MENU_INLINE_CHOICE="$d"
+                        break
+                    fi
+                    ;;
+            esac
+        done
+        if [[ -n "$prev_int_trap" ]]; then
+            eval "$prev_int_trap"
+        else
+            trap - INT
+        fi
+        if [[ -n "$prev_term_trap" ]]; then
+            eval "$prev_term_trap"
+        else
+            trap - TERM
+        fi
+        menu_tty_leave
+        echo "$MENU_INLINE_CHOICE"
+    else
+        if ! read -r MENU_INLINE_CHOICE; then
+            MENU_INLINE_CHOICE="0"
+        fi
+    fi
+}
+
+menu_render() {
+    local title="$1"
+    local back_label="$2"
+    local header_text="$3"
+    local cursor="$4"
+    local interactive="$5"
+    local soft_clear="${6:-0}"
+    local count="${#MENU_LABELS[@]}"
+    local i range_hint
+
+    if [[ "$soft_clear" == "1" ]]; then
+        KTO_HEADER_SOFT_CLEAR=1 header
+    else
+        header
+    fi
+
+    if [[ -n "$title" ]]; then
+        printf '%b[ %s ]%b\n' "${BOLD}${PURPLE}" "$title" "${NC}"
+    fi
+    if [[ -n "$header_text" ]]; then
+        printf '%s\n' "$header_text"
+    fi
+
+    for i in "${!MENU_LABELS[@]}"; do
+        if [[ "$interactive" == "1" ]]; then
+            if (( i == cursor )); then
+                printf '%b %b%d) %s%b\n' "${BOLD}${PURPLE}>${NC}" "${BOLD}${GREEN}" "$((i + 1))" "${MENU_LABELS[$i]}" "${NC}"
+            else
+                printf '  %d) %s\n' "$((i + 1))" "${MENU_LABELS[$i]}"
+            fi
+        else
+            printf '%d) %s\n' "$((i + 1))" "${MENU_LABELS[$i]}"
+        fi
+    done
+
+    if [[ -n "$back_label" ]]; then
+        if [[ "$interactive" == "1" ]]; then
+            if (( cursor == count )); then
+                printf '%b %b0) %s%b\n' "${BOLD}${PURPLE}>${NC}" "${BOLD}${GREEN}" "$back_label" "${NC}"
+            else
+                printf '  %b0) %s%b\n' "${DIM}" "$back_label" "${NC}"
+            fi
+        else
+            printf '0) %s\n' "$back_label"
+        fi
+    fi
+
+    echo -e "${PURPLE}==========================================${NC}"
+    if [[ "$interactive" == "1" ]]; then
+        if (( count == 1 )); then
+            range_hint="1"
+        else
+            range_hint="1-${count}"
+        fi
+        if [[ -n "$back_label" ]]; then
+            printf '%b↑/↓ выбор · Enter · %s сразу · 0/Esc/q %s%b\n' "${DIM}" "$range_hint" "${back_label,,}" "${NC}"
+        else
+            printf '%b↑/↓ выбор · Enter · %s сразу%b\n' "${DIM}" "$range_hint" "${NC}"
+        fi
+    else
+        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+    fi
+}
+
+menu_select() {
+    local title="${1:-}"
+    local back_label="${2:-}"
+    local header_text="${3:-}"
+    local initial_cursor="${4:-0}"
+    local count="${#MENU_LABELS[@]}"
+    local total="$count"
+    local cursor="$initial_cursor"
+    local choice="" digit=0 prev_int_trap="" prev_term_trap=""
+
+    MENU_SELECTED_ACTION=""
+    MENU_SELECTED_INDEX=0
+    if (( count == 0 )); then
+        MENU_SELECTED_ACTION="__back__"
+        return 0
+    fi
+    if [[ -n "$back_label" ]]; then
+        total=$(( count + 1 ))
+    fi
+    if (( cursor < 0 || cursor >= total )); then
+        cursor=0
+    fi
+
+    if ! menu_is_interactive; then
+        menu_render "$title" "$back_label" "$header_text" 0 0 0
+        if ! read -r choice; then
+            MENU_SELECTED_ACTION="__eof__"
+            return 0
+        fi
+        choice="${choice#"${choice%%[![:space:]]*}"}"
+        choice="${choice%"${choice##*[![:space:]]}"}"
+        if [[ -n "$back_label" && ( "$choice" == "0" || "${choice,,}" == "q" ) ]]; then
+            MENU_SELECTED_ACTION="__back__"
+            return 0
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice >= 1 && 10#$choice <= count )); then
+            MENU_SELECTED_INDEX=$(( 10#$choice - 1 ))
+            MENU_SELECTED_ACTION="${MENU_ACTIONS[$MENU_SELECTED_INDEX]}"
+            return 0
+        fi
+        MENU_SELECTED_ACTION="__invalid__:${choice}"
+        return 0
+    fi
+
+    prev_int_trap="$(trap -p INT 2>/dev/null || true)"
+    prev_term_trap="$(trap -p TERM 2>/dev/null || true)"
+    trap 'menu_tty_leave; exit 130' INT
+    trap 'menu_tty_leave; exit 143' TERM
+
+    menu_tty_enter
+    menu_render "$title" "$back_label" "$header_text" "$cursor" 1 1
+
+    while true; do
+        menu_read_key
+        case "$MENU_KEY" in
+            eof)
+                MENU_SELECTED_ACTION="__eof__"
+                break
+                ;;
+            zero|back)
+                if [[ -n "$back_label" ]]; then
+                    MENU_SELECTED_ACTION="__back__"
+                    break
+                fi
+                ;;
+            digit:*)
+                digit="${MENU_KEY#digit:}"
+                if (( digit >= 1 && digit <= count )); then
+                    MENU_SELECTED_INDEX=$(( digit - 1 ))
+                    MENU_SELECTED_ACTION="${MENU_ACTIONS[$MENU_SELECTED_INDEX]}"
+                    break
+                fi
+                ;;
+            up)
+                cursor=$(( (cursor - 1 + total) % total ))
+                menu_render "$title" "$back_label" "$header_text" "$cursor" 1 1
+                ;;
+            down)
+                cursor=$(( (cursor + 1) % total ))
+                menu_render "$title" "$back_label" "$header_text" "$cursor" 1 1
+                ;;
+            home)
+                cursor=0
+                menu_render "$title" "$back_label" "$header_text" "$cursor" 1 1
+                ;;
+            end)
+                cursor=$(( total - 1 ))
+                menu_render "$title" "$back_label" "$header_text" "$cursor" 1 1
+                ;;
+            enter)
+                if [[ -n "$back_label" && "$cursor" -eq "$count" ]]; then
+                    MENU_SELECTED_ACTION="__back__"
+                else
+                    MENU_SELECTED_INDEX="$cursor"
+                    MENU_SELECTED_ACTION="${MENU_ACTIONS[$cursor]}"
+                fi
+                break
+                ;;
+        esac
+    done
+
+    if [[ -n "$prev_int_trap" ]]; then
+        eval "$prev_int_trap"
+    else
+        trap - INT
+    fi
+    if [[ -n "$prev_term_trap" ]]; then
+        eval "$prev_term_trap"
+    else
+        trap - TERM
+    fi
+    menu_tty_leave
 }
 
 stage() { echo -e "${PURPLE}[..]${NC} $*"; }
@@ -1096,29 +1426,38 @@ cleanup_runtime_state() {
 }
 
 select_node_profile() {
-    local choice
+    local raw_choice=""
 
     while true; do
-        header
-        echo -e "${BOLD}${PURPLE}[ ПРОФИЛЬ НОДЫ ]${NC}"
-        echo -e "1) Reality"
-        echo -e "2) Hysteria2"
-        echo -e "3) Reality + Hysteria2"
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите профиль (1-3):${NC} "
-        read -r choice
-        case "$choice" in
-            1|reality|Reality)
-                NODE_PROFILE="reality"
+        MENU_LABELS=("Reality" "Hysteria2" "Reality + Hysteria2")
+        MENU_ACTIONS=("reality" "hysteria2" "reality_hysteria2")
+        menu_select "ПРОФИЛЬ НОДЫ" ""
+        case "$MENU_SELECTED_ACTION" in
+            reality|hysteria2|reality_hysteria2)
+                NODE_PROFILE="$MENU_SELECTED_ACTION"
                 break
                 ;;
-            2|hysteria2|Hysteria2|hysteria|Hysteria)
-                NODE_PROFILE="hysteria2"
-                break
+            __eof__)
+                return 1
                 ;;
-            3|reality_hysteria2|reality+hysteria2|Reality+Hysteria2|combo|hybrid)
-                NODE_PROFILE="reality_hysteria2"
-                break
+            __invalid__:*)
+                raw_choice="${MENU_SELECTED_ACTION#__invalid__:}"
+                case "$raw_choice" in
+                    reality|Reality)
+                        NODE_PROFILE="reality"
+                        break
+                        ;;
+                    hysteria2|Hysteria2|hysteria|Hysteria)
+                        NODE_PROFILE="hysteria2"
+                        break
+                        ;;
+                    reality_hysteria2|reality+hysteria2|Reality+Hysteria2|combo|hybrid)
+                        NODE_PROFILE="reality_hysteria2"
+                        break
+                        ;;
+                esac
+                fail "Неверный выбор"
+                sleep 1
                 ;;
             *)
                 fail "Неверный выбор"
@@ -1129,31 +1468,50 @@ select_node_profile() {
 }
 
 select_machine_mode() {
-    local choice
+    local raw_choice=""
 
     while true; do
-        header
-        echo -e "${BOLD}${PURPLE}[ РЕЖИМ МАШИНЫ ]${NC}"
-        echo -e "1) node"
-        echo -e "2) whitelist"
-        echo -e "3) panel"
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите режим (1-3):${NC} "
-        read -r choice
-        case "$choice" in
-            1|node)
+        MENU_LABELS=("node" "whitelist" "panel")
+        MENU_ACTIONS=("node" "whitelist" "panel")
+        menu_select "РЕЖИМ МАШИНЫ" ""
+        case "$MENU_SELECTED_ACTION" in
+            node)
                 MACHINE_MODE="node"
                 break
                 ;;
-            2|whitelist)
+            whitelist)
                 MACHINE_MODE="whitelist"
                 NODE_PROFILE=""
                 break
                 ;;
-            3|panel)
+            panel)
                 MACHINE_MODE="panel"
                 NODE_PROFILE=""
                 break
+                ;;
+            __eof__)
+                return 1
+                ;;
+            __invalid__:*)
+                raw_choice="${MENU_SELECTED_ACTION#__invalid__:}"
+                case "$raw_choice" in
+                    node)
+                        MACHINE_MODE="node"
+                        break
+                        ;;
+                    whitelist)
+                        MACHINE_MODE="whitelist"
+                        NODE_PROFILE=""
+                        break
+                        ;;
+                    panel)
+                        MACHINE_MODE="panel"
+                        NODE_PROFILE=""
+                        break
+                        ;;
+                esac
+                fail "Неверный выбор"
+                sleep 1
                 ;;
             *)
                 fail "Неверный выбор"
@@ -1197,46 +1555,58 @@ reconfigure_machine_mode() {
 }
 
 settings_menu() {
-    local choice
+    local labels=() actions=() cursor=0
 
     while true; do
-        header
-        echo -e "${BOLD}${PURPLE}[ НАСТРОЙКИ ]${NC}"
-        echo -e "1) Изменение режима"
-        echo -e "2) Проверка системы"
-        echo -e "3) Очистка диска"
-        if haproxy_mode_supported; then
-            echo -e "4) HAProxy"
+        labels=(
+            "Проверка системы"
+            "Очистка диска"
+            "SSH: включить пароль root (ключи сохранить)"
+        )
+        actions=(
+            "system-check"
+            "disk-clean"
+            "ssh-password"
+        )
+        if [[ "$MACHINE_MODE" == "panel" ]]; then
+            labels+=("Удалить HAProxy / Nginx / Docker")
+            actions+=("server-cleanup")
         fi
-        echo -e "0) Выйти"
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
-        read -r choice
+        labels+=("Изменение режима")
+        actions+=("mode")
 
-        case "$choice" in
-            1)
-                reconfigure_machine_mode
+        MENU_LABELS=("${labels[@]}")
+        MENU_ACTIONS=("${actions[@]}")
+        menu_select "СИСТЕМА И SSH" "Назад" "" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            system-check)
+                system_check || true
                 ;;
-            2)
-                system_check
+            disk-clean)
+                clean_disk_now || true
+                menu_pause
                 ;;
-            3)
-                clean_disk_now
-                system_check_pause
+            ssh-password)
+                enable_ssh_password || true
+                menu_pause
                 ;;
-            4)
-                if haproxy_mode_supported; then
-                    haproxy_menu
-                else
-                    fail "HAProxy доступен для whitelist, Reality и Reality + Hysteria2."
-                    sleep 1
-                fi
+            server-cleanup)
+                server_cleanup_menu || true
                 ;;
-            0)
+            mode)
+                reconfigure_machine_mode || true
+                menu_pause
+                ;;
+            __back__|__eof__)
                 return 0
                 ;;
             *)
                 fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
                 sleep 1
                 ;;
         esac
@@ -5542,7 +5912,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v350"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v351"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5555,7 +5925,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v350"
+KTO_HAPROXY_FIREWALL_BUILD="v351"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -5820,30 +6190,40 @@ EOF
 }
 
 haproxy_guard_menu() {
-    local choice
-    header
-    echo -e "${BOLD}${PURPLE}[ АВТОЛЕЧЕНИЕ HAPROXY ]${NC}"
-    if "${SUDO[@]}" test -x "$HAPROXY_GUARD_MANAGER" 2>/dev/null; then
-        run_bounded_command 25 "${SUDO[@]}" "$HAPROXY_GUARD_MANAGER" status || true
-    else
-        echo "Статус: не установлено"
-    fi
-    echo
-    echo "1) Включить или обновить автолечение"
-    echo "2) Проверить и починить сейчас"
-    echo "3) Только проверить состояние"
-    echo "4) Выключить фоновую проверку"
-    echo "0) Назад"
-    echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
-    read -r choice
-    case "$choice" in
-        1) install_haproxy_guard ;;
-        2) repair_haproxy_with_guard ;;
-        3) show_haproxy_guard_status ;;
-        4) disable_haproxy_guard ;;
-        0) return 0 ;;
-        *) fail "Неверный выбор" ;;
-    esac
+    local header_text="" cursor=0
+
+    while true; do
+        if "${SUDO[@]}" test -x "$HAPROXY_GUARD_MANAGER" 2>/dev/null; then
+            header_text="$(run_bounded_command 25 "${SUDO[@]}" "$HAPROXY_GUARD_MANAGER" status || true)"
+        else
+            header_text="Статус: не установлено"
+        fi
+        header_text+=$'\n'
+
+        MENU_LABELS=(
+            "Включить или обновить автолечение"
+            "Проверить и починить сейчас"
+            "Только проверить состояние"
+            "Выключить фоновую проверку"
+        )
+        MENU_ACTIONS=("install" "repair" "status" "disable")
+        menu_select "АВТОЛЕЧЕНИЕ HAPROXY" "Назад" "$header_text" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            install) install_haproxy_guard || true; menu_pause ;;
+            repair) repair_haproxy_with_guard || true; menu_pause ;;
+            status) show_haproxy_guard_status || true; menu_pause ;;
+            disable) disable_haproxy_guard || true; menu_pause ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                ;;
+        esac
+    done
 }
 
 ufw_rule_from_allowed() {
@@ -6395,9 +6775,7 @@ system_check_apply_missing() {
 }
 
 system_check_pause() {
-    echo
-    echo -ne "${PURPLE}>${NC} ${BOLD}Нажмите Enter, чтобы вернуться:${NC} "
-    read -r
+    menu_pause "Нажмите любую клавишу, чтобы вернуться..."
 }
 
 system_check() {
@@ -6405,7 +6783,7 @@ system_check() {
     need_root
     system_check_reset
 
-    local ssh_port choice
+    local ssh_port choice valid_digits=""
     ssh_port="$(detect_ssh_port)"
 
     echo -e "${BOLD}${PURPLE}[ ПРОВЕРКА СИСТЕМЫ ]${NC}"
@@ -6457,14 +6835,17 @@ system_check() {
     if (( SYSTEM_CHECK_MISSING > 0 )); then
         echo -e "1) Исправить только недостающее"
         echo -e "2) Запустить полную оптимизацию"
+        valid_digits+="12"
     fi
     if (( SYSTEM_CHECK_NEEDS_ZRAM == 1 )); then
         echo -e "3) Включить ZRAM ($(format_mb "$(recommended_zram_mb)"))"
+        valid_digits+="3"
     fi
     echo -e "0) Ничего не делать"
     echo -e "${PURPLE}==========================================${NC}"
     echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
-    read -r choice
+    menu_read_inline_choice "$valid_digits"
+    choice="$MENU_INLINE_CHOICE"
 
     case "$choice" in
         1)
@@ -11334,32 +11715,39 @@ clear_all_haproxy_bandwidth_limits_cli() {
 }
 
 haproxy_bandwidth_menu() {
-    local choice
+    local header_text="" cursor=0
+
     while true; do
-        header
-        print_haproxy_bandwidth_limits || return 1
-        echo
-        echo "1) Добавить или изменить лимит"
-        echo "2) Убрать лимит с IP"
-        echo "3) Переприменить лимиты"
-        echo "4) Подробный статус и счётчики"
-        echo "5) Снять все лимиты скорости"
-        echo "0) Назад"
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
-        read -r choice
-        case "$choice" in
-            1) set_haproxy_input_bandwidth_limit_interactive || true ;;
-            2) remove_haproxy_input_bandwidth_limit_interactive || true ;;
-            3) ensure_haproxy_bandwidth_manager && reapply_haproxy_bandwidth_limits || true ;;
-            4) show_haproxy_bandwidth_status || true ;;
-            5) clear_all_haproxy_bandwidth_limits || true ;;
-            0) return 0 ;;
-            *) fail "Неверный выбор" ;;
+        if ! header_text="$(print_haproxy_bandwidth_limits)"; then
+            return 1
+        fi
+        header_text+=$'\n'
+
+        MENU_LABELS=(
+            "Добавить или изменить лимит"
+            "Убрать лимит с IP"
+            "Переприменить лимиты"
+            "Подробный статус и счётчики"
+            "Снять все лимиты скорости"
+        )
+        MENU_ACTIONS=("set" "remove" "reapply" "status" "clear")
+        menu_select "ОГРАНИЧЕНИЕ СКОРОСТИ HAPROXY" "Назад" "$header_text" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            set) set_haproxy_input_bandwidth_limit_interactive || true; menu_pause ;;
+            remove) remove_haproxy_input_bandwidth_limit_interactive || true; menu_pause ;;
+            reapply) ensure_haproxy_bandwidth_manager && reapply_haproxy_bandwidth_limits || true; menu_pause ;;
+            status) show_haproxy_bandwidth_status || true; menu_pause ;;
+            clear) clear_all_haproxy_bandwidth_limits || true; menu_pause ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                ;;
         esac
-        echo
-        echo -ne "${PURPLE}>${NC} Нажмите Enter, чтобы продолжить..."
-        read -r _
     done
 }
 
@@ -13630,11 +14018,86 @@ restore_haproxy_backup() {
     [[ -z "$HAPROXY_LAST_BACKUP" ]] || ok "Backup предыдущего config: ${HAPROXY_LAST_BACKUP}"
 }
 
+haproxy_routes_bulk_menu() {
+    local routes_file="$1"
+    local header_text="" cursor=0
+
+    while true; do
+        header_text="$(print_haproxy_routes "$routes_file")"$'\n'
+        MENU_LABELS=(
+            "Добавить или заменить backend-пул"
+            "Массово добавить backend по следующим портам"
+            "Заменить SNI у всех маршрутов"
+            "Удалить ВСЕ маршруты и остановить HAProxy"
+        )
+        MENU_ACTIONS=("pool" "sequential" "replace-sni" "delete-all")
+        menu_select "HAPROXY: ПУЛЫ И МАССОВЫЕ ОПЕРАЦИИ" "Назад" "$header_text" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            pool) add_haproxy_pool_route "$routes_file" || true; menu_pause ;;
+            sequential) add_haproxy_sequential_routes "$routes_file" || true; menu_pause ;;
+            replace-sni) replace_all_haproxy_sni "$routes_file" || true; menu_pause ;;
+            delete-all) delete_all_haproxy_routes "$routes_file" || true; menu_pause ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                ;;
+        esac
+    done
+}
+
+haproxy_maintenance_menu() {
+    local routes_file="$1"
+    local header_text="" cursor=0
+
+    while true; do
+        header_text="$(print_haproxy_routes "$routes_file")"$'\n'
+        MENU_LABELS=(
+            "Проверить бинды"
+            "Полная диагностика HAProxy"
+            "Обновить HAProxy, сохранив маршруты"
+            "Восстановить HAProxy backup"
+            "Аварийно стабилизировать HAProxy"
+            "Автолечение HAProxy ›"
+        )
+        MENU_ACTIONS=("bindings" "diagnose" "upgrade" "restore" "stabilize" "guard")
+        menu_select "HAPROXY: ДИАГНОСТИКА И ОБСЛУЖИВАНИЕ" "Назад" "$header_text" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            bindings) check_haproxy_bindings "$routes_file" || true; menu_pause ;;
+            diagnose) diagnose_haproxy || true; menu_pause ;;
+            upgrade)
+                if [[ -s "$routes_file" ]]; then
+                    upgrade_haproxy_routes_transaction "$routes_file" || true
+                else
+                    warn "Сначала добавь хотя бы один маршрут"
+                fi
+                menu_pause
+                ;;
+            restore) restore_haproxy_backup "$routes_file" || true; menu_pause ;;
+            stabilize) stabilize_haproxy_interactive || true; menu_pause ;;
+            guard) haproxy_guard_menu || true ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                ;;
+        esac
+    done
+}
+
 haproxy_menu() {
     header
     require_haproxy_mode
     need_root
-    local routes_file choice
+    local routes_file header_text="" cursor=0
     routes_file="$(mktemp)"
 
     if "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null; then
@@ -13647,57 +14110,38 @@ haproxy_menu() {
     fi
 
     while true; do
-        header
-        print_haproxy_routes "$routes_file"
-        echo
-        echo -e "1) Изменить маршрут, backend, SNI или IP"
-        echo -e "2) Добавить маршрут (входной IP = выходному IP)"
-        echo -e "3) Удалить маршрут"
-        echo -e "4) Удалить ВСЕ маршруты и остановить HAProxy"
-        echo -e "5) Заменить SNI у всех маршрутов"
-        echo -e "6) Обновить HAProxy, сохранив маршруты"
-        echo -e "7) Добавить или заменить backend-пул"
-        echo -e "8) Массово добавить backend по следующим портам"
-        echo -e "9) Ограничить скорость по входному IP"
-        echo -e "10) Восстановить HAProxy backup"
-        echo -e "11) Проверить бинды"
-        echo -e "12) Полная диагностика HAProxy"
-        echo -e "13) Аварийно стабилизировать HAProxy"
-        echo -e "14) Автолечение HAProxy"
-        echo -e "0) Назад"
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
-        read -r choice
-        case "$choice" in
-            1) edit_haproxy_route "$routes_file" || true ;;
-            2) add_haproxy_route "$routes_file" || true ;;
-            3) delete_haproxy_route "$routes_file" || true ;;
-            4) delete_all_haproxy_routes "$routes_file" || true ;;
-            5) replace_all_haproxy_sni "$routes_file" || true ;;
-            6)
-                if [[ -s "$routes_file" ]]; then
-                    upgrade_haproxy_routes_transaction "$routes_file" || true
-                else
-                    warn "Сначала добавь хотя бы один маршрут"
-                fi
-                ;;
-            7) add_haproxy_pool_route "$routes_file" || true ;;
-            8) add_haproxy_sequential_routes "$routes_file" || true ;;
-            9) haproxy_bandwidth_menu || true ;;
-            10) restore_haproxy_backup "$routes_file" || true ;;
-            11) check_haproxy_bindings "$routes_file" || true ;;
-            12) diagnose_haproxy || true ;;
-            13) stabilize_haproxy_interactive || true ;;
-            14) haproxy_guard_menu || true ;;
-            0)
+        header_text="$(print_haproxy_routes "$routes_file")"$'\n'
+        MENU_LABELS=(
+            "Изменить маршрут, backend, SNI или IP"
+            "Добавить маршрут (входной IP = выходному IP)"
+            "Удалить маршрут"
+            "Пулы, SNI и массовые операции ›"
+            "Ограничить скорость по входному IP ›"
+            "Диагностика и обслуживание ›"
+        )
+        MENU_ACTIONS=("edit" "add" "delete" "bulk" "bandwidth" "maintenance")
+        menu_select "HAPROXY" "Назад" "$header_text" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            edit) edit_haproxy_route "$routes_file" || true; menu_pause ;;
+            add) add_haproxy_route "$routes_file" || true; menu_pause ;;
+            delete) delete_haproxy_route "$routes_file" || true; menu_pause ;;
+            bulk) haproxy_routes_bulk_menu "$routes_file" || true ;;
+            bandwidth) haproxy_bandwidth_menu || true ;;
+            maintenance) haproxy_maintenance_menu "$routes_file" || true ;;
+            __back__|__eof__)
                 rm -f "$routes_file"
                 return 0
                 ;;
-            *) fail "Неверный выбор" ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    rm -f "$routes_file"
+                    return 1
+                fi
+                ;;
         esac
-        echo
-        echo -ne "${PURPLE}>${NC} Нажмите Enter, чтобы продолжить..."
-        read -r _
     done
 }
 
@@ -13901,37 +14345,46 @@ torrent_guard_menu() {
         esac
         return $?
     fi
+    local header_text="" cursor=0
     while true; do
-        echo
-        echo '=== Торрент-блокер: nDPI / отдельные соединения ==='
-        echo 'На конечной выходной ноде; не блокирует весь IP пользователя.'
+        header_text="На конечной выходной ноде; не блокирует весь IP пользователя."
         if torrent_guard_installed; then
-            echo '[Установлен] Текущий режим и здоровье: пункт 5'
+            header_text+=$'\n'"[Установлен] Текущий режим и здоровье: пункт 5"
         else
-            echo '[Не установлен или установка неполная]'
+            header_text+=$'\n'"[Не установлен или установка неполная]"
         fi
-        echo '1) Установить / обновить (только наблюдение)'
-        echo '2) Установить / обновить и включить блокировку'
-        echo '3) Включить блокировку (с автозапуском)'
-        echo '4) Отключить блокировку, оставить наблюдение'
-        echo '5) Статус и состояние захвата'
-        echo '6) Последние логи'
-        echo '7) Остановить и отключить автозапуск'
-        echo '8) Удалить только торрент-блокер'
-        echo '0) Назад'
-        printf '> '
-        read -r choice || return 0
-        case "$choice" in
-            1) torrent_guard_menu install || true ;;
-            2) torrent_guard_menu setup || true ;;
-            3) torrent_guard_menu enforce || true ;;
-            4) torrent_guard_menu observe || true ;;
-            5) torrent_guard_menu status || true ;;
-            6) torrent_guard_menu logs || true ;;
-            7) torrent_guard_menu stop || true ;;
-            8) torrent_guard_menu uninstall || true ;;
-            0) return 0 ;;
-            *) warn "Неверный выбор" ;;
+        header_text+=$'\n'
+
+        MENU_LABELS=(
+            "Установить / обновить (только наблюдение)"
+            "Установить / обновить и включить блокировку"
+            "Включить блокировку (с автозапуском)"
+            "Отключить блокировку, оставить наблюдение"
+            "Статус и состояние захвата"
+            "Последние логи"
+            "Остановить и отключить автозапуск"
+            "Удалить только торрент-блокер"
+        )
+        MENU_ACTIONS=("install" "setup" "enforce" "observe" "status" "logs" "stop" "uninstall")
+        menu_select "ТОРРЕНТ-БЛОКЕР: nDPI / ОТДЕЛЬНЫЕ СОЕДИНЕНИЯ" "Назад" "$header_text" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            install) torrent_guard_menu install || true; menu_pause ;;
+            setup) torrent_guard_menu setup || true; menu_pause ;;
+            enforce) torrent_guard_menu enforce || true; menu_pause ;;
+            observe) torrent_guard_menu observe || true; menu_pause ;;
+            status) torrent_guard_menu status || true; menu_pause ;;
+            logs) torrent_guard_menu logs || true; menu_pause ;;
+            stop) torrent_guard_menu stop || true; menu_pause ;;
+            uninstall) torrent_guard_menu uninstall || true; menu_pause ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                warn "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 0
+                fi
+                ;;
         esac
     done
 }
@@ -14066,37 +14519,51 @@ show_mobile443_lte_status() {
 mobile443_lte_menu() {
     require_whitelist_mode
     need_root
-    local choice
+    local answer="" header_text="" cursor=0
     if ! mobile443_lte_configured; then
         enable_mobile443_lte || true
+        menu_pause
         return 0
     fi
 
     while true; do
-        header
-        if ! print_mobile443_lte_status; then
+        if ! header_text="$(print_mobile443_lte_status)"; then
             fail "Не удалось прочитать состояние LTE-фильтра"
+            menu_pause
             return 0
         fi
-        echo
-        echo -e "1) Обновить списки и синхронизировать HAProxy-порты"
-        echo -e "2) Выключить режим \"Только LTE\""
-        echo -e "0) Назад"
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
-        read -r choice
-        case "$choice" in
-            1) enable_mobile443_lte || true; return 0 ;;
-            2)
+        header_text+=$'\n'
+
+        MENU_LABELS=(
+            "Обновить списки и синхронизировать HAProxy-порты"
+            "Выключить режим \"Только LTE\""
+        )
+        MENU_ACTIONS=("sync" "disable")
+        menu_select "РЕЖИМ \"ТОЛЬКО LTE\"" "Назад" "$header_text" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            sync)
+                enable_mobile443_lte || true
+                menu_pause
+                return 0
+                ;;
+            disable)
                 echo -ne "${YELLOW}Отключить LTE-фильтр? [y/N]:${NC} "
-                read -r choice
-                if [[ "${choice,,}" == "y" || "${choice,,}" == "yes" ]]; then
+                read -r answer || answer=""
+                if [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]; then
                     disable_mobile443_lte || true
+                    menu_pause
                     return 0
                 fi
                 ;;
-            0) return 0 ;;
-            *) fail "Неверный выбор" ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                ;;
         esac
     done
 }
@@ -15295,47 +15762,49 @@ run_stats_push_debug() {
 }
 
 stats_push_menu() {
-    local choice
+    local cursor=0
 
     while true; do
-        header
-        echo -e "${BOLD}${PURPLE}[ PUSH СТАТИСТИКИ ]${NC}"
-        echo -e "1) Настроить push на коллектор"
-        echo -e "2) Отправить push сейчас"
-        echo -e "3) Статус push"
-        echo -e "4) Диагностика push"
-        echo -e "5) Полностью удалить push / очистить collector state"
-        echo -e "0) Выйти"
-        echo -e "${PURPLE}==========================================${NC}"
-        echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
-        read -r choice
+        MENU_LABELS=(
+            "Настроить push на коллектор"
+            "Отправить push сейчас"
+            "Статус push"
+            "Диагностика push"
+            "Полностью удалить push / очистить collector state"
+        )
+        MENU_ACTIONS=("install" "send" "status" "debug" "delete")
+        menu_select "PUSH СТАТИСТИКИ" "Назад" "" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
 
-        case "$choice" in
-            1)
-                install_stats_push_client
-                system_check_pause
+        case "$MENU_SELECTED_ACTION" in
+            install)
+                install_stats_push_client || true
+                menu_pause
                 ;;
-            2)
-                send_stats_push_once
-                system_check_pause
+            send)
+                send_stats_push_once || true
+                menu_pause
                 ;;
-            3)
-                stats_push_status
-                system_check_pause
+            status)
+                stats_push_status || true
+                menu_pause
                 ;;
-            4)
-                run_stats_push_debug
-                system_check_pause
+            debug)
+                run_stats_push_debug || true
+                menu_pause
                 ;;
-            5)
-                stats_push_delete_all
-                system_check_pause
+            delete)
+                stats_push_delete_all || true
+                menu_pause
                 ;;
-            0)
+            __back__|__eof__)
                 return 0
                 ;;
             *)
                 fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
                 sleep 1
                 ;;
         esac
@@ -15502,176 +15971,323 @@ show_status() {
 }
 
 menu() {
-    header
-    local labels=() actions=() choice action i
+    local labels=() actions=() header_text="" cursor=0
 
-    echo -e "${DIM}Режим: ${MACHINE_MODE}${NC}"
-    if [[ "$MACHINE_MODE" == "node" ]]; then
-        echo -e "${DIM}Профиль: $(node_profile_label)${NC}"
-    fi
+    while true; do
+        labels=()
+        actions=()
+        header_text="$(printf '%bРежим: %s%b' "${DIM}" "$MACHINE_MODE" "${NC}")"
+        if [[ "$MACHINE_MODE" == "node" ]]; then
+            header_text+=$'\n'"$(printf '%bПрофиль: %s%b' "${DIM}" "$(node_profile_label)" "${NC}")"
+        fi
 
-    if [[ "$MACHINE_MODE" != "panel" ]]; then
-        labels+=("Полная оптимизация")
-        actions+=("optimize")
-    fi
+        if [[ "$MACHINE_MODE" == "panel" ]]; then
+            labels+=("Панель состояния")
+            actions+=("status")
+            labels+=("Коллектор статистики ›")
+            actions+=("panel-collector-menu")
+            labels+=("Тест сети")
+            actions+=("network-test")
+            labels+=("Система и SSH ›")
+            actions+=("settings")
+        elif [[ "$MACHINE_MODE" == "whitelist" ]]; then
+            labels+=("Полная оптимизация")
+            actions+=("optimize")
+            labels+=("Панель состояния")
+            actions+=("status")
+            labels+=("HAProxy ›")
+            actions+=("haproxy")
+            labels+=("Прокси и фильтры ›")
+            actions+=("proxy-menu")
+            labels+=("Сеть и диагностика ›")
+            actions+=("network-diag-menu")
+            labels+=("Доп. IP и монитор ›")
+            actions+=("additional-ip-menu")
+            labels+=("Push статистики ›")
+            actions+=("stats-push-menu")
+            labels+=("Система и SSH ›")
+            actions+=("settings")
+        else
+            labels+=("Полная оптимизация")
+            actions+=("optimize")
+            labels+=("Панель состояния")
+            actions+=("status")
+            labels+=("Стек ноды ›")
+            actions+=("node-stack-menu")
+            labels+=("Прокси и фильтры ›")
+            actions+=("proxy-menu")
+            labels+=("Сеть и диагностика ›")
+            actions+=("network-diag-menu")
+            labels+=("Дополнительные IP ›")
+            actions+=("additional-ip-menu")
+            labels+=("Push статистики ›")
+            actions+=("stats-push-menu")
+            labels+=("Система и SSH ›")
+            actions+=("settings")
+        fi
 
-    if [[ "$MACHINE_MODE" == "node" ]]; then
-        labels+=("Общее поднятие")
-        actions+=("common")
-        labels+=("Установка ноды Remnawave")
-        actions+=("node")
+        MENU_LABELS=("${labels[@]}")
+        MENU_ACTIONS=("${actions[@]}")
+        menu_select "" "Выход" "$header_text" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            optimize) optimize_system || true; menu_pause ;;
+            status) show_status || true; menu_pause ;;
+            network-test) network_test || true; menu_pause ;;
+            node-stack-menu) node_stack_menu || true ;;
+            proxy-menu) proxy_menu || true ;;
+            network-diag-menu) network_diag_menu || true ;;
+            additional-ip-menu) additional_ip_menu || true ;;
+            panel-collector-menu) panel_collector_menu || true ;;
+            haproxy) install_haproxy || true ;;
+            stats-push-menu) stats_push_menu || true ;;
+            settings) settings_menu || true ;;
+            __back__|__eof__)
+                echo -e "${PURPLE}Выход.${NC}"
+                return 0
+                ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+node_stack_menu() {
+    local labels=() actions=() cursor=0
+
+    while true; do
+        labels=(
+            "Общее поднятие"
+            "Установка ноды Remnawave"
+        )
+        actions=(
+            "common"
+            "node"
+        )
         if node_profile_includes_reality; then
             labels+=("Установка SelfSteal")
             actions+=("selfsteal")
         fi
+        if node_profile_includes_hysteria2; then
+            labels+=("Сгенерировать SSL-сертификат")
+            actions+=("ssl")
+        fi
         labels+=("Установка VPS-WARP")
         actions+=("warp")
-        labels+=("Push статистики")
-        actions+=("stats-push-menu")
-    fi
-
-    labels+=("Панель состояния")
-    actions+=("status")
-    labels+=("Тест сети")
-    actions+=("network-test")
-    if [[ "$MACHINE_MODE" != "panel" ]]; then
-        labels+=("Проверка ТСПУ")
-        actions+=("dpi-test")
-        labels+=("Проверка ТСПУ (IP)")
-        actions+=("dpi-ip-test")
-        labels+=("Пакетный TCP-MTR")
-        actions+=("mtr-batch")
-    fi
-    if [[ "$MACHINE_MODE" != "panel" ]]; then
-        labels+=("Проверить и завести дополнительные IP")
-        actions+=("additional-ips")
-        labels+=("Оптимизировать сеть всех IP")
-        actions+=("additional-ips-optimize")
-    fi
-    if [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_reality; then
-        labels+=("Исходящий IP Remnawave")
-        actions+=("remnawave-egress")
-    fi
-    if [[ "$MACHINE_MODE" == "panel" ]]; then
-        labels+=("Коллектор статистики")
-        actions+=("stats-collector")
-        labels+=("Статус коллектора")
-        actions+=("stats-collector-status")
-        labels+=("Не получать push-уведомления")
-        actions+=("stats-collector-alerts")
-        labels+=("Очистить список статистики")
-        actions+=("stats-push-delete")
-    else
-        labels+=("Speedtest")
-        actions+=("speedtest")
-        labels+=("Speedtest (RU)")
-        actions+=("speedtest-ru")
-        labels+=("Проверка IP (IP.Check.Place)")
-        actions+=("ipcheck-place")
-        labels+=("Проверка IP (Region Check)")
-        actions+=("ipcheck-region")
-    fi
-
-    if [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_hysteria2; then
-        labels+=("Сгенерировать SSL-сертификат")
-        actions+=("ssl")
-    fi
-    if [[ "$MACHINE_MODE" == "whitelist" ]]; then
-        labels+=("btop")
-        actions+=("btop")
-        labels+=("Монитор всех IP + CPU")
-        actions+=("multi-ip-monitor")
-        labels+=("HAProxy")
-        actions+=("haproxy")
-        labels+=("Nginx (WS + TLS)")
-        actions+=("nginx")
-        if mobile443_lte_configured; then
-            labels+=("Режим \"Только LTE\" (включён)")
-        else
-            labels+=("Включение режима \"Только LTE\"")
+        if node_profile_includes_reality; then
+            labels+=("Исходящий IP Remnawave")
+            actions+=("remnawave-egress")
         fi
-        actions+=("mobile443-lte")
-        labels+=("Статус режима \"Только LTE\"")
-        actions+=("mobile443-lte-status")
-        labels+=("Push статистики")
-        actions+=("stats-push-menu")
-    elif [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_reality; then
-        labels+=("HAProxy (мост, 8443/tcp)")
-        actions+=("haproxy")
-        labels+=("Nginx (WS + TLS)")
-        actions+=("nginx")
-    fi
 
-    if [[ "$MACHINE_MODE" != "panel" ]]; then
+        MENU_LABELS=("${labels[@]}")
+        MENU_ACTIONS=("${actions[@]}")
+        menu_select "СТЕК НОДЫ" "Назад" "" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            common) install_common_stack || true; menu_pause ;;
+            node) install_remnawave_node || true; menu_pause ;;
+            selfsteal) install_selfsteal || true; menu_pause ;;
+            ssl) issue_ssl_certificate || true; menu_pause ;;
+            warp) install_warp_native || true; menu_pause ;;
+            remnawave-egress) configure_remnawave_egress || menu_pause ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+proxy_menu() {
+    local labels=() actions=() cursor=0
+
+    while true; do
+        labels=()
+        actions=()
+        if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+            labels+=("Nginx (WS + TLS)")
+            actions+=("nginx")
+            if mobile443_lte_configured; then
+                labels+=("Режим \"Только LTE\" (включён)")
+            else
+                labels+=("Включение режима \"Только LTE\"")
+            fi
+            actions+=("mobile443-lte")
+            labels+=("Статус режима \"Только LTE\"")
+            actions+=("mobile443-lte-status")
+        elif [[ "$MACHINE_MODE" == "node" ]] && node_profile_includes_reality; then
+            labels+=("HAProxy (мост, 8443/tcp)")
+            actions+=("haproxy")
+            labels+=("Nginx (WS + TLS)")
+            actions+=("nginx")
+        fi
+
         labels+=("Торрент-блокер (nDPI, выходная нода)")
         actions+=("torrent-guard")
-    fi
+        labels+=("Удалить HAProxy / Nginx / Docker")
+        actions+=("server-cleanup")
 
-    labels+=("Удалить HAProxy / Nginx / Docker")
-    actions+=("server-cleanup")
-    labels+=("SSH: включить пароль root (ключи сохранить)")
-    actions+=("ssh-password")
+        MENU_LABELS=("${labels[@]}")
+        MENU_ACTIONS=("${actions[@]}")
+        menu_select "ПРОКСИ И ФИЛЬТРЫ" "Назад" "" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
 
-    labels+=("Настройки")
-    actions+=("settings")
-
-    for i in "${!labels[@]}"; do
-        echo -e "$((i + 1))) ${labels[$i]}"
+        case "$MENU_SELECTED_ACTION" in
+            haproxy) install_haproxy || true ;;
+            nginx) nginx_menu || true ;;
+            mobile443-lte) mobile443_lte_menu || true ;;
+            mobile443-lte-status) show_mobile443_lte_status || true; menu_pause ;;
+            torrent-guard) torrent_guard_menu || true ;;
+            server-cleanup) server_cleanup_menu || true ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                sleep 1
+                ;;
+        esac
     done
-    echo -e "0) Выход"
-    echo -e "${PURPLE}==========================================${NC}"
-    echo -ne "${PURPLE}>${NC} ${BOLD}Выберите действие:${NC} "
+}
 
-    read -r choice
+network_diag_menu() {
+    local cursor=0
 
-    if [[ "$choice" == "0" ]]; then
-        echo -e "${PURPLE}Выход.${NC}"
-        return 0
-    fi
+    while true; do
+        MENU_LABELS=(
+            "Тест сети"
+            "Проверка ТСПУ"
+            "Проверка ТСПУ (IP)"
+            "Пакетный TCP-MTR"
+            "Speedtest"
+            "Speedtest (RU)"
+            "Проверка IP (IP.Check.Place)"
+            "Проверка IP (Region Check)"
+        )
+        MENU_ACTIONS=(
+            "network-test"
+            "dpi-test"
+            "dpi-ip-test"
+            "mtr-batch"
+            "speedtest"
+            "speedtest-ru"
+            "ipcheck-place"
+            "ipcheck-region"
+        )
+        menu_select "СЕТЬ И ДИАГНОСТИКА" "Назад" "" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
 
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#actions[@]} )); then
-        fail "Неверный выбор"
-        return 1
-    fi
+        case "$MENU_SELECTED_ACTION" in
+            network-test) network_test || true; menu_pause ;;
+            dpi-test) run_dpi_detector || true; menu_pause ;;
+            dpi-ip-test) run_tspu_ip_test || true; menu_pause ;;
+            mtr-batch) run_mtr_batch || true; menu_pause ;;
+            speedtest) install_speedtest || true; menu_pause ;;
+            speedtest-ru) speedtest_ru || true; menu_pause ;;
+            ipcheck-place) ipcheck_place || true; menu_pause ;;
+            ipcheck-region) ipcheck_region || true; menu_pause ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                sleep 1
+                ;;
+        esac
+    done
+}
 
-    action="${actions[$((choice - 1))]}"
-    case "$action" in
-        optimize) optimize_system ;;
-        common) install_common_stack ;;
-        node) install_remnawave_node ;;
-        selfsteal) install_selfsteal ;;
-        warp) install_warp_native ;;
-        status) show_status ;;
-        network-test) network_test ;;
-        dpi-test) run_dpi_detector ;;
-        dpi-ip-test) run_tspu_ip_test ;;
-        mtr-batch) run_mtr_batch || true ;;
-        additional-ips) setup_additional_ips || true ;;
-        additional-ips-optimize) optimize_additional_ip_networks || true ;;
-        remnawave-egress) configure_remnawave_egress || true ;;
-        stats-collector) install_stats_collector ;;
-        stats-collector-status) stats_collector_status ;;
-        stats-collector-alerts) stats_collector_alerts_menu ;;
-        stats-push-delete) stats_push_delete_all ;;
-        speedtest) install_speedtest ;;
-        speedtest-ru) speedtest_ru ;;
-        ipcheck-place) ipcheck_place ;;
-        ipcheck-region) ipcheck_region ;;
-        btop) run_btop_for_ip || true ;;
-        multi-ip-monitor) run_multi_ip_cpu_monitor || true ;;
-        ssl) issue_ssl_certificate ;;
-        haproxy) install_haproxy ;;
-        nginx) nginx_menu || true ;;
-        torrent-guard) torrent_guard_menu || true ;;
-        haproxy-update) update_haproxy_existing_config ;;
-        mobile443-lte) mobile443_lte_menu ;;
-        mobile443-lte-status) show_mobile443_lte_status ;;
-        stats-push-menu) stats_push_menu ;;
-        server-cleanup) server_cleanup_menu || true ;;
-        ssh-password) enable_ssh_password || true ;;
-        settings) settings_menu ;;
-        *) fail "Неверный выбор" ;;
-    esac
+additional_ip_menu() {
+    local labels=() actions=() title="ДОПОЛНИТЕЛЬНЫЕ IP" cursor=0
+
+    while true; do
+        labels=(
+            "Проверить и завести дополнительные IP"
+            "Оптимизировать сеть всех IP"
+        )
+        actions=(
+            "additional-ips"
+            "additional-ips-optimize"
+        )
+        if [[ "$MACHINE_MODE" == "whitelist" ]]; then
+            title="ДОП. IP И МОНИТОР"
+            labels+=("btop")
+            actions+=("btop")
+            labels+=("Монитор всех IP + CPU")
+            actions+=("multi-ip-monitor")
+        else
+            title="ДОПОЛНИТЕЛЬНЫЕ IP"
+        fi
+
+        MENU_LABELS=("${labels[@]}")
+        MENU_ACTIONS=("${actions[@]}")
+        menu_select "$title" "Назад" "" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            additional-ips) setup_additional_ips || true; menu_pause ;;
+            additional-ips-optimize) optimize_additional_ip_networks || true; menu_pause ;;
+            btop) run_btop_for_ip || menu_pause ;;
+            multi-ip-monitor) run_multi_ip_cpu_monitor || menu_pause ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+panel_collector_menu() {
+    local cursor=0
+
+    while true; do
+        MENU_LABELS=(
+            "Коллектор статистики"
+            "Статус коллектора"
+            "Не получать push-уведомления"
+            "Очистить список статистики"
+        )
+        MENU_ACTIONS=(
+            "stats-collector"
+            "stats-collector-status"
+            "stats-collector-alerts"
+            "stats-push-delete"
+        )
+        menu_select "КОЛЛЕКТОР СТАТИСТИКИ" "Назад" "" "$cursor"
+        cursor="$MENU_SELECTED_INDEX"
+
+        case "$MENU_SELECTED_ACTION" in
+            stats-collector) install_stats_collector || true; menu_pause ;;
+            stats-collector-status) stats_collector_status || true; menu_pause ;;
+            stats-collector-alerts) stats_collector_alerts_menu || true ;;
+            stats-push-delete) stats_push_delete_all || true; menu_pause ;;
+            __back__|__eof__) return 0 ;;
+            *)
+                fail "Неверный выбор"
+                if ! menu_is_interactive; then
+                    return 1
+                fi
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 main() {

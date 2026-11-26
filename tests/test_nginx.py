@@ -130,9 +130,11 @@ class NginxPureTests(unittest.TestCase):
 
     def test_main_menu_places_nginx_directly_under_haproxy(self):
         source = (ROOT / "kto.sh").read_text(encoding="utf-8")
-        for label in ("HAProxy", "HAProxy (мост, 8443/tcp)"):
-            self.assertIn(f'labels+=("{label}")\n        actions+=("haproxy")\n'
-                          '        labels+=("Nginx (WS + TLS)")\n        actions+=("nginx")', source)
+        self.assertIn('labels+=("HAProxy (мост, 8443/tcp)")\n            actions+=("haproxy")\n'
+                      '            labels+=("Nginx (WS + TLS)")\n            actions+=("nginx")', source)
+        self.assertIn('labels+=("HAProxy ›")\n            actions+=("haproxy")\n'
+                      '            labels+=("Прокси и фильтры ›")\n            actions+=("proxy-menu")', source)
+        self.assertIn('labels+=("Nginx (WS + TLS)")\n            actions+=("nginx")', source)
         self.assertIn('nginx|nginx-ws|install-nginx) nginx_menu', source)
         self.assertIn('install_asset_file scripts/kto-nginx.py "$NGINX_MANAGER" 0755 bounded', source)
 
