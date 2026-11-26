@@ -6,8 +6,8 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
-SCRIPT_VERSION="1.4.8.10"
-SCRIPT_BUILD="v349"
+SCRIPT_VERSION="1.4.8.8"
+SCRIPT_BUILD="v350"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -352,8 +352,13 @@ init_log() {
     else
         "${SUDO[@]}" mkdir -p "$log_dir" >/dev/null 2>&1 || true
         "${SUDO[@]}" touch "$LOG_FILE" >/dev/null 2>&1 || LOG_FILE="/tmp/kto-tune.log"
-        if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-            "${SUDO[@]}" chmod 0666 "$LOG_FILE" >/dev/null 2>&1 || true
+        if [[ ${EUID:-$(id -u)} -ne 0 && "$LOG_FILE" != /tmp/* ]]; then
+            "${SUDO[@]}" chown "$(id -u):$(id -g)" "$LOG_FILE" >/dev/null 2>&1 || true
+            "${SUDO[@]}" chmod 0640 "$LOG_FILE" >/dev/null 2>&1 || true
+            if [[ ! -w "$LOG_FILE" ]]; then
+                LOG_FILE="/tmp/kto-tune.log"
+                touch "$LOG_FILE" >/dev/null 2>&1 || true
+            fi
         fi
     fi
 
@@ -620,11 +625,13 @@ progress_step() {
 
 parallel_run_tasks() {
     local parent_log="$LOG_FILE"
-    local tmp_dir idx title fn log pid rc failed=0
+    local allow_fail="${KTO_PARALLEL_ALLOW_FAIL:-}"
+    local tmp_dir idx title fn log pid rc critical_failed=0 optional_failed=0 joined
     local -a pids=()
     local -a titles=()
     local -a logs=()
-    local -a failed_titles=()
+    local -a failed_critical=()
+    local -a failed_optional=()
 
     tmp_dir="$(mktemp -d)"
 
@@ -651,8 +658,13 @@ parallel_run_tasks() {
         else
             rc=$?
             echo "[ERR] parallel: ${titles[$idx]} rc=${rc}" >> "$parent_log"
-            failed=1
-            failed_titles+=("${titles[$idx]}")
+            if [[ -n "$allow_fail" && ",${allow_fail}," == *",${titles[$idx]},"* ]]; then
+                optional_failed=1
+                failed_optional+=("${titles[$idx]}")
+            else
+                critical_failed=1
+                failed_critical+=("${titles[$idx]}")
+            fi
         fi
     done
 
@@ -664,18 +676,34 @@ parallel_run_tasks() {
         } >> "$parent_log"
     done
 
-    if (( failed != 0 )); then
+    if (( optional_failed != 0 )); then
+        joined=""
         {
             echo
             echo "[WARN] parallel block finished with non-critical errors:"
-            for title in "${failed_titles[@]}"; do
+            for title in "${failed_optional[@]}"; do
                 echo " - ${title}"
+                joined+="${joined:+, }${title}"
             done
         } >> "$parent_log"
+        warn "Необязательный этап завершился с ошибкой (будет перепроверен): ${joined}"
+    fi
+
+    if (( critical_failed != 0 )); then
+        joined=""
+        {
+            echo
+            echo "[ERROR] parallel block failed in critical tasks:"
+            for title in "${failed_critical[@]}"; do
+                echo " - ${title}"
+                joined+="${joined:+, }${title}"
+            done
+        } >> "$parent_log"
+        fail "Ошибка параллельного этапа: ${joined}"
     fi
 
     rm -rf "$tmp_dir"
-    return 0
+    (( critical_failed == 0 ))
 }
 
 command_exists() {
@@ -734,7 +762,7 @@ install_asset_file() {
     local local_path="${SCRIPT_DIR}/${relative_path}"
     local raw_url="${KTO_RAW_BASE%/}/${relative_path}"
     local tmp
-    local -a download_options=()
+    local -a download_options=(--connect-timeout 10 --max-time 60 --retry 2 --retry-delay 2)
     if [[ "${4:-}" == "bounded" ]]; then
         download_options=(-q -4 --connect-timeout 5 --max-time 30 --retry 2 --retry-max-time 60)
     fi
@@ -1661,21 +1689,6 @@ normalize_time_hm() {
     echo "$value"
 }
 
-ask_time_hm() {
-    local prompt="$1"
-    local default="${2-}"
-    local value
-    while true; do
-        value="$(ask_text "$prompt" "$default")"
-        value="$(normalize_time_hm "$value")"
-        if validate_time_hm "$value"; then
-            echo "$value"
-            return 0
-        fi
-        fail "Некорректное время. Пример: 00:05 или 23;59"
-    done
-}
-
 ask_optional_time_hm() {
     local prompt="$1"
     local default="${2-}"
@@ -1783,7 +1796,7 @@ normalize_haproxy_target_pool() {
         [[ -n "$item" ]] || continue
         target="$(normalize_haproxy_target "$item" 2>/dev/null || true)"
         [[ -n "$target" ]] || return 1
-        for existing in "${targets[@]:-}"; do
+        for existing in ${targets[@]+"${targets[@]}"}; do
             [[ "$existing" == "$target" ]] && continue 2
         done
         targets+=("$target")
@@ -2701,7 +2714,7 @@ normalize_haproxy_sni_list() {
             base="${base#*.}"
         fi
         validate_domain "$base" || return 1
-        for existing in "${normalized[@]:-}"; do
+        for existing in ${normalized[@]+"${normalized[@]}"}; do
             [[ "$existing" == "$token" ]] && continue 2
         done
         normalized+=("$token")
@@ -3460,20 +3473,6 @@ unban_whitelist_ssh_ips() {
     done < <(whitelist_ssh_allowed_ips | sort -u)
 }
 
-ask_ipv4() {
-    local prompt="${1:-Введите IP}"
-    local ip
-    while true; do
-        printf '%s: ' "$prompt" >&2
-        read -r ip
-        if validate_ipv4 "$ip"; then
-            echo "$ip"
-            return 0
-        fi
-        fail "Некорректный IPv4. Пример: 1.2.3.4"
-    done
-}
-
 ask_haproxy_target() {
     local prompt="${1:-Введите backend IP/домен[:порт]}"
     local value target
@@ -3746,8 +3745,19 @@ ensure_docker() {
     if ! command_exists docker; then
         local installer
         installer="$(mktemp)"
-        must "Скачивание Docker" curl -fsSL https://get.docker.com -o "$installer"
-        must "Установка Docker" "${SUDO[@]}" sh "$installer"
+        if ! must "Скачивание Docker" curl -fsSL --connect-timeout 15 --max-time 90 --retry 2 --retry-delay 2 https://get.docker.com -o "$installer"; then
+            rm -f "$installer"
+            return 1
+        fi
+        if [[ ! -s "$installer" ]] || ! sh -n "$installer" >> "$LOG_FILE" 2>&1; then
+            rm -f "$installer"
+            fail "Скачанный установщик Docker повреждён"
+            return 1
+        fi
+        if ! must "Установка Docker" "${SUDO[@]}" sh "$installer"; then
+            rm -f "$installer"
+            return 1
+        fi
         rm -f "$installer"
     fi
 
@@ -3769,102 +3779,6 @@ ensure_remna_api_config() {
         REMNA_API_TOKEN="$(ask_api_token)"
         save_machine_mode
     fi
-}
-
-remna_api() {
-    local method="$1"
-    local path="$2"
-    local payload_file="${3:-}"
-    local tmp code url
-    local curl_tls=()
-    tmp="$(mktemp)"
-    url="${REMNA_API_URL%/}${path}"
-    if [[ "${KTO_REMNA_API_INSECURE:-0}" == "1" ]]; then
-        curl_tls=(-k)
-    fi
-
-    if [[ -n "$payload_file" ]]; then
-        code="$(curl "${curl_tls[@]}" -sS -L -X "$method" \
-            -H "Authorization: Bearer ${REMNA_API_TOKEN}" \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            --data-binary "@${payload_file}" \
-            -o "$tmp" -w '%{http_code}' "$url" 2>> "$LOG_FILE" || true)"
-    else
-        code="$(curl "${curl_tls[@]}" -sS -L -X "$method" \
-            -H "Authorization: Bearer ${REMNA_API_TOKEN}" \
-            -H "Accept: application/json" \
-            -o "$tmp" -w '%{http_code}' "$url" 2>> "$LOG_FILE" || true)"
-    fi
-
-    if [[ "$code" =~ ^2[0-9][0-9]$ ]]; then
-        cat "$tmp"
-        rm -f "$tmp"
-        return 0
-    fi
-
-    fail "Remnawave API ${method} ${path} (${code:-curl})"
-    head -c 700 "$tmp" >&2 || true
-    echo >&2
-    rm -f "$tmp"
-    return 1
-}
-
-external_ipv4() {
-    local ip
-    ip="$(curl -4 -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-    if ! validate_ipv4 "$ip"; then
-        ip="$(curl -4 -fsSL --max-time 8 https://ifconfig.me/ip 2>/dev/null || true)"
-    fi
-    if ! validate_ipv4 "$ip"; then
-        ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    fi
-    if validate_ipv4 "$ip"; then
-        echo "$ip"
-        return 0
-    fi
-    fail "Не смог определить внешний IPv4"
-    return 1
-}
-
-remna_profile_uuid_by_name() {
-    local name="$1"
-    remna_api GET /api/config-profiles \
-        | jq -r --arg name "$name" '.response.configProfiles[]? | select(.name == $name) | .uuid' \
-        | head -n 1
-}
-
-remna_node_uuid_by_name() {
-    local name="$1"
-    remna_api GET /api/nodes \
-        | jq -r --arg name "$name" '.response[]? | select(.name == $name) | .uuid' \
-        | head -n 1
-}
-
-remna_node_uuid_by_address() {
-    local address="$1"
-    remna_api GET /api/nodes \
-        | jq -r --arg address "$address" '.response[]? | select(.address == $address) | .uuid' \
-        | head -n 1
-}
-
-remna_host_uuid_by_remark() {
-    local remark="$1"
-    remna_api GET /api/hosts \
-        | jq -r --arg remark "$remark" '.response[]? | select(.remark == $remark) | .uuid' \
-        | head -n 1
-}
-
-remna_host_uuid_by_address() {
-    local address="$1"
-    remna_api GET /api/hosts \
-        | jq -r --arg address "$address" '.response[]? | select(.address == $address) | .uuid' \
-        | head -n 1
-}
-
-remna_enable_node() {
-    local uuid="$1"
-    remna_api POST "/api/nodes/${uuid}/actions/enable" >/dev/null || true
 }
 
 install_antiscanner() {
@@ -4548,7 +4462,11 @@ vm.dirty_background_ratio = 5
 vm.dirty_ratio = 20
 vm.page-cluster = 0
 EOF
-    cmd "${SUDO[@]}" sysctl --system || true
+    if command_exists flock && "${SUDO[@]}" mkdir -p /run/lock >/dev/null 2>&1; then
+        cmd "${SUDO[@]}" flock -w 30 "${KTO_SYSCTL_LOCK_FILE:-/run/lock/kto-sysctl.lock}" sysctl --system || true
+    else
+        cmd "${SUDO[@]}" sysctl --system || true
+    fi
 }
 
 configure_xanmod_repository() {
@@ -4825,7 +4743,7 @@ opt_kernel_final_check() {
 }
 
 opt_kernel_network_memory_parallel() {
-    parallel_run_tasks \
+    KTO_PARALLEL_ALLOW_FAIL="kernel" parallel_run_tasks \
         "kernel" opt_xanmod_kernel \
         "network limits" opt_network_limits \
         "memory guard" opt_memory_guard
@@ -4965,7 +4883,11 @@ net.ipv4.tcp_wmem = 4096 1048576 33554432
 vm.swappiness = 1
 EOF
     configure_conntrack_capacity || return 1
-    cmd "${SUDO[@]}" sysctl --system || true
+    if command_exists flock && "${SUDO[@]}" mkdir -p /run/lock >/dev/null 2>&1; then
+        cmd "${SUDO[@]}" flock -w 30 "${KTO_SYSCTL_LOCK_FILE:-/run/lock/kto-sysctl.lock}" sysctl --system || true
+    else
+        cmd "${SUDO[@]}" sysctl --system || true
+    fi
 
     write_root_file "$KTO_LIMITS_CONF" <<'EOF'
 * soft nofile 1048576
@@ -5620,7 +5542,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v349"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v350"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5633,7 +5555,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v349"
+KTO_HAPROXY_FIREWALL_BUILD="v350"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -5941,20 +5863,6 @@ ufw_rule_from_allowed() {
             }
             END { exit found ? 0 : 1 }
         '
-}
-
-whitelist_ssh_rules_configured() {
-    local ssh_port="$1"
-    local rule="${ssh_port}/tcp"
-    local ip
-
-    if ufw_rule_open_to_any "$rule"; then
-        return 1
-    fi
-    while read -r ip; do
-        [[ -n "$ip" ]] || continue
-        ufw_rule_from_allowed "$rule" "$ip" || return 1
-    done < <(whitelist_ssh_allowed_ips | sort -u)
 }
 
 system_check_prepare_state() {
@@ -9290,7 +9198,8 @@ container_running() {
 
 do_issue_ssl_certificate() {
     local domain="$1"
-    local email had_80=0 stopped=()
+    local email had_80=0 opened_80=0 issue_rc=0 acme_installer="" c
+    local -a stopped=()
     if ! validate_domain "$domain"; then
         fail "Некорректный домен для SSL"
         exit 1
@@ -9304,7 +9213,22 @@ do_issue_ssl_certificate() {
     cmd "${SUDO[@]}" mkdir -p "$CERT_DIR"
 
     if ! "${SUDO[@]}" test -x /root/.acme.sh/acme.sh; then
-        curl -fsSL https://get.acme.sh | "${SUDO[@]}" env HOME=/root sh -s "email=${email}" --force >> "$LOG_FILE" 2>&1
+        acme_installer="$(mktemp)"
+        if ! curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 --retry-delay 2 \
+            https://get.acme.sh -o "$acme_installer" >> "$LOG_FILE" 2>&1 ||
+            [[ ! -s "$acme_installer" ]] ||
+            ! sh -n "$acme_installer" >> "$LOG_FILE" 2>&1; then
+            rm -f "$acme_installer"
+            fail "Не удалось безопасно скачать установщик acme.sh"
+            return 1
+        fi
+        if ! "${SUDO[@]}" env HOME=/root sh "$acme_installer" "email=${email}" --force >> "$LOG_FILE" 2>&1; then
+            rm -f "$acme_installer"
+            fail "Не удалось установить acme.sh"
+            tail -n 25 "$LOG_FILE" >&2 || true
+            return 1
+        fi
+        rm -f "$acme_installer"
     fi
 
     cmd "${SUDO[@]}" env HOME=/root /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
@@ -9314,13 +9238,14 @@ do_issue_ssl_certificate() {
             had_80=1
         else
             cmd "${SUDO[@]}" ufw allow 80/tcp
+            opened_80=1
         fi
     fi
 
     for c in remnanode caddy-selfsteal nginx-selfsteal; do
         if container_running "$c"; then
             stopped+=("$c")
-            cmd "${SUDO[@]}" docker stop "$c"
+            cmd "${SUDO[@]}" docker stop "$c" || true
         fi
     done
 
@@ -9329,21 +9254,26 @@ do_issue_ssl_certificate() {
         --key-file "${CERT_DIR}/privkey.key" \
         --fullchain-file "${CERT_DIR}/fullchain.pem" \
         --force >> "$LOG_FILE" 2>&1; then
-        ok "Сертификат выпущен"
+        issue_rc=0
     else
+        issue_rc=$?
+    fi
+
+    for c in ${stopped[@]+"${stopped[@]}"}; do
+        cmd "${SUDO[@]}" docker start "$c" || true
+    done
+
+    if (( opened_80 == 1 && had_80 == 0 )) && command_exists ufw && "${SUDO[@]}" ufw status 2>/dev/null | grep -q "Status: active"; then
+        cmd "${SUDO[@]}" ufw --force delete allow 80/tcp || true
+    fi
+
+    if (( issue_rc != 0 )); then
         fail "Не удалось выпустить сертификат. Проверь DNS и порт 80."
         tail -n 25 "$LOG_FILE" >&2 || true
         return 1
     fi
 
-    for c in "${stopped[@]:-}"; do
-        cmd "${SUDO[@]}" docker start "$c" || true
-    done
-
-    if [[ "$had_80" == "0" ]] && command_exists ufw && "${SUDO[@]}" ufw status 2>/dev/null | grep -q "Status: active"; then
-        cmd "${SUDO[@]}" ufw delete allow 80/tcp || true
-    fi
-
+    ok "Сертификат выпущен"
     echo
     echo -e "Ключ:      ${BOLD}${CERT_DIR}/privkey.key${NC}"
     echo -e "Fullchain: ${BOLD}${CERT_DIR}/fullchain.pem${NC}"
@@ -10072,13 +10002,13 @@ haproxy_remote_apply_json() {
         }
         source_ip="$(canonicalize_haproxy_runtime_source_ip "${source_ip:-default}" 2>/dev/null || true)"
         server_maxconn="$(normalize_haproxy_server_maxconn "${server_maxconn:-default}" 2>/dev/null || true)"
-        listen_ip="$(haproxy_route_ip_for_source "$source_ip" 2>/dev/null || true)"
         send_proxy_v2="$(normalize_haproxy_send_proxy_v2 "${send_proxy_v2:-0}" 2>/dev/null || true)"
-        [[ -n "$source_ip" && -n "$server_maxconn" && -n "$listen_ip" && -n "$send_proxy_v2" ]] || {
+        [[ -n "$source_ip" && -n "$server_maxconn" && -n "$send_proxy_v2" ]] || {
             rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
             fail "Некорректные параметры HAProxy-маршрута"
             return 1
         }
+        listen_ip="$(haproxy_route_ip_for_source "$source_ip" 2>/dev/null || true)"
         if [[ -z "$listen_ip" ]]; then
             rm -f "$input_file" "$routes_file" "$previous_routes_file" "$canonical_current" "$canonical_wanted"
             fail "Для выходного IP ${source_ip} нет рабочего локального source-route"
@@ -10228,23 +10158,6 @@ haproxy_bandwidth_remote_apply_json() {
     fi
     rm -f "$input_file" "$previous_file" "$next_file"
     printf '{"ok":true,"changed":true,"limits":%s}\n' "$limit_count"
-}
-
-extract_haproxy_backend_target() {
-    extract_haproxy_routes | awk -F '\t' 'NR == 1 { split($2, targets, ","); print targets[1]; exit }'
-}
-
-extract_haproxy_backend_ip() {
-    extract_haproxy_backend_target | awk -F : 'NR == 1 { print $1; exit }'
-}
-
-extract_haproxy_allowed_sni() {
-    extract_haproxy_routes | awk -F '\t' 'NR == 1 { print $3; exit }'
-}
-
-haproxy_route_file_has_port() {
-    local routes_file="$1" wanted="$2"
-    awk -F '\t' -v wanted="$wanted" '$1 == wanted { found = 1 } END { exit found ? 0 : 1 }' "$routes_file"
 }
 
 haproxy_route_file_has_endpoint() {
@@ -10935,20 +10848,6 @@ EOF
     fi
 }
 
-apply_haproxy_config() {
-    local backend_target="$1" allowed_sni="$2" listen_ip="${3:-}" routes_file base_port
-    base_port="$(haproxy_base_port)"
-    [[ -n "$listen_ip" ]] || listen_ip="$(haproxy_default_listen_ip_for_source default)"
-    routes_file="$(mktemp)"
-    print_haproxy_route "$base_port" "$backend_target" "$allowed_sni" default default "$listen_ip" > "$routes_file"
-    if apply_haproxy_routes_config "$routes_file"; then
-        rm -f "$routes_file"
-        return 0
-    fi
-    rm -f "$routes_file"
-    return 1
-}
-
 ensure_haproxy_package() {
     # Route edits need only HAProxy and ss. socat is an optional diagnostics
     # dependency and must not trigger apt during an otherwise local edit.
@@ -11157,45 +11056,6 @@ select_haproxy_route_source_ip() {
                 IFS=$'\t' read -r source_ip interface kind <<< "${rows[$(( choice - 1 ))]}"
                 canonicalize_haproxy_runtime_source_ip "$source_ip"
                 return
-            fi
-        fi
-        fail "Неверный выбор"
-    done
-}
-
-select_haproxy_route_listen_ip() {
-    local current choice ip interface index marker default_index=1
-    local -a entries=()
-
-    current="$(normalize_haproxy_listen_ip "${1:-*}" 2>/dev/null || printf '*')"
-    entries+=("*"$'\t'"все локальные IP")
-    while IFS= read -r ip; do
-        [[ -n "$ip" ]] && entries+=("$ip")
-    done < <(list_haproxy_input_ips)
-
-    printf 'Выберите входной IP HAProxy:\n' >&2
-    for index in "${!entries[@]}"; do
-        IFS=$'\t' read -r ip interface <<< "${entries[$index]}"
-        [[ "$ip" == "$current" ]] && default_index=$(( index + 1 ))
-        marker=""
-        [[ "$ip" == "$current" ]] && marker=" — текущий"
-        if [[ "$ip" == "*" ]]; then
-            printf ' %d) * (все локальные IP)%s\n' "$(( index + 1 ))" "$marker" >&2
-        else
-            printf ' %d) %s (%s)%s\n' "$(( index + 1 ))" "$ip" "$interface" "$marker" >&2
-        fi
-    done
-
-    while true; do
-        printf '> [%d] ' "$default_index" >&2
-        read -r choice
-        [[ -n "$choice" ]] || choice="$default_index"
-        if [[ "$choice" =~ ^[0-9]+$ ]]; then
-            choice=$((10#$choice))
-            if (( choice >= 1 && choice <= ${#entries[@]} )); then
-                IFS=$'\t' read -r ip interface <<< "${entries[$(( choice - 1 ))]}"
-                printf '%s\n' "$ip"
-                return 0
             fi
         fi
         fail "Неверный выбор"
@@ -14703,8 +14563,9 @@ stats_collector_status() {
     header
     require_panel_mode
     need_root
-    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec stale_sec wl_offline_confirm_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown remna_test_id remna_test_log remna_code remna_probe dashboard_enabled dashboard_token
+    local state listen_host listen_port health_host health_log rc remna_api_url remna_api_token remna_api_insecure remna_node_alert_enabled remna_node_poll_sec remna_offline_guard_enabled remna_offline_state_max_age_sec remna_offline_log_grace_sec stale_sec wl_offline_confirm_sec bl_stale_sec bl_offline_confirm_sec bl_stale_fallback_sec bl_push_interval_sec push_miss_window_sec push_miss_threshold push_miss_alert_cooldown remna_test_id remna_test_log remna_code remna_probe dashboard_enabled dashboard_token
     local ip_limit_enabled ip_limit_source ip_limit_scan_sec ip_limit_alert_threshold ip_limit_alert_top ip_limit_max_events asn_lookup_enabled asn_cache_sec
+    local -a remna_curl_tls=()
     state="$(service_ok "$STATS_COLLECTOR_SERVICE")"
     listen_host="$(config_get KTO_COLLECTOR_LISTEN_HOST "$STATS_COLLECTOR_CONFIG")"
     listen_port="$(config_get KTO_COLLECTOR_LISTEN_PORT "$STATS_COLLECTOR_CONFIG")"
@@ -14712,6 +14573,7 @@ stats_collector_status() {
     dashboard_token="$("${SUDO[@]}" "$STATS_COLLECTOR_SCRIPT" --dashboard-token 2>/dev/null || true)"
     remna_api_url="$(config_get KTO_COLLECTOR_REMNA_API_URL "$STATS_COLLECTOR_CONFIG")"
     remna_api_token="$(config_get KTO_COLLECTOR_REMNA_API_TOKEN "$STATS_COLLECTOR_CONFIG")"
+    remna_api_insecure="$(config_get KTO_COLLECTOR_REMNA_API_INSECURE "$STATS_COLLECTOR_CONFIG")"
     remna_node_alert_enabled="$(config_get KTO_COLLECTOR_REMNA_NODE_ALERT_ENABLED "$STATS_COLLECTOR_CONFIG")"
     remna_node_poll_sec="$(config_get KTO_COLLECTOR_REMNA_NODE_POLL_SEC "$STATS_COLLECTOR_CONFIG")"
     remna_offline_guard_enabled="$(config_get KTO_COLLECTOR_REMNA_OFFLINE_GUARD_ENABLED "$STATS_COLLECTOR_CONFIG")"
@@ -14777,9 +14639,11 @@ stats_collector_status() {
         fi
         rm -f "$health_log"
         if [[ -n "$remna_api_url" && -n "$remna_api_token" ]]; then
-            remna_test_id="$("${SUDO[@]}" python3 - <<PY 2>/dev/null || true
+            remna_test_id="$("${SUDO[@]}" python3 - "${STATS_COLLECTOR_STATE_DIR}/ip_limit.sqlite" <<'PY' 2>/dev/null || true
 import sqlite3
-path = "${STATS_COLLECTOR_STATE_DIR}/ip_limit.sqlite"
+import sys
+
+path = sys.argv[1]
 try:
     conn = sqlite3.connect(path)
     row = conn.execute(
@@ -14793,7 +14657,11 @@ PY
 )"
             if [[ -n "$remna_test_id" ]]; then
                 remna_test_log="$(mktemp)"
-                remna_code="$(curl -4 -k -sS --connect-timeout 3 --max-time 8 \
+                remna_curl_tls=()
+                if [[ "${remna_api_insecure:-0}" == "1" ]]; then
+                    remna_curl_tls=(-k)
+                fi
+                remna_code="$(curl -4 ${remna_curl_tls[@]+"${remna_curl_tls[@]}"} -sS --connect-timeout 3 --max-time 8 \
                     -H "Authorization: Bearer ${remna_api_token}" \
                     -H "Accept: application/json" \
                     -o "$remna_test_log" \
@@ -15485,16 +15353,6 @@ badge() {
 service_ok() {
     local svc="$1"
     "${SUDO[@]}" systemctl is-active --quiet "$svc" 2>/dev/null && echo 1 || echo 0
-}
-
-tcp_listen() {
-    local port="$1"
-    command_exists ss && ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$" && echo 1 || echo 0
-}
-
-udp_listen() {
-    local port="$1"
-    command_exists ss && ss -lnu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$" && echo 1 || echo 0
 }
 
 file_ok() {
