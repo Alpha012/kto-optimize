@@ -41,13 +41,58 @@ def run_kto_bash(snippet: str, *, timeout: int = 30) -> subprocess.CompletedProc
 
 
 class CleanupFixesTests(unittest.TestCase):
-    def test_version_pinned_and_build_v351_synced(self):
+    def test_version_pinned_and_build_v352_synced(self):
         self.assertIn('SCRIPT_VERSION="1.4.8.8"', KTO)
         self.assertNotIn("1.4.8.10", KTO)
-        self.assertIn('SCRIPT_BUILD="v351"', KTO)
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v351"', KTO)
+        self.assertIn('SCRIPT_BUILD="v352"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v352"', KTO)
         self.assertNotIn("v349", KTO)
-        self.assertNotIn("v350", KTO)
+        self.assertNotIn("v351", KTO)
+
+    @unittest.skipUnless(BASH, "bash is unavailable")
+    def test_ipcheck_place_handles_upstream_ipv6_trailing_condition_without_false_warning(self):
+        res = run_kto_bash(
+            r'''
+header() { :; }
+select_test_source_ipv4() { TEST_SOURCE_IP="198.51.100.10"; TEST_SOURCE_INTERFACE="eth0"; }
+download_ip_test_script() {
+    local _url="$1" out="$2"
+    cat > "$out" <<'EOF'
+#!/usr/bin/env bash
+IPV4work=1; IPV4check=1; IPV6work=0; IPV6check=0
+check_IP() { echo "REPORT_OK_$1"; }
+[[ $IPV4work -ne 0 && $IPV4check -ne 0 ]]&&check_IP "$IPV4" 4
+[[ $IPV6work -ne 0 && $IPV6check -ne 0 ]]&&check_IP "$IPV6" 6
+EOF
+}
+ipcheck_place 198.51.100.10
+'''
+        )
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("REPORT_OK_", res.stdout)
+        self.assertNotIn("завершился с кодом", res.stderr)
+
+    @unittest.skipUnless(BASH, "bash is unavailable")
+    def test_ipcheck_place_still_warns_on_real_upstream_error(self):
+        res = run_kto_bash(
+            r'''
+header() { :; }
+select_test_source_ipv4() { TEST_SOURCE_IP="198.51.100.10"; TEST_SOURCE_INTERFACE="eth0"; }
+download_ip_test_script() {
+    local _url="$1" out="$2"
+    cat > "$out" <<'EOF'
+#!/usr/bin/env bash
+echo "ERROR_FROM_UPSTREAM"
+exit 40
+[[ $IPV6work -ne 0 && $IPV6check -ne 0 ]]&&check_IP "$IPV6" 6
+EOF
+}
+ipcheck_place 198.51.100.10
+'''
+        )
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("ERROR_FROM_UPSTREAM", res.stdout)
+        self.assertIn("IP.Check.Place завершился с кодом 40", res.stderr)
 
     def test_check_sh_covers_all_shell_and_python_scripts(self):
         self.assertIn("for script in scripts/*.sh; do", CHECK_SH)

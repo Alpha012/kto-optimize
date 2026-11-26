@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v351"
+SCRIPT_BUILD="v352"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5912,7 +5912,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v351"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v352"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5925,7 +5925,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v351"
+KTO_HAPROXY_FIREWALL_BUILD="v352"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -9530,7 +9530,7 @@ validate_ip_test_script() {
 
 ipcheck_place() {
     header
-    local source_ip="${1:-}" script
+    local source_ip="${1:-}" script rc=0
     select_test_source_ipv4 "$source_ip" || return 1
     source_ip="$TEST_SOURCE_IP"
     stage "Проверяю IP.Check.Place через ${source_ip} (${TEST_SOURCE_INTERFACE})"
@@ -9540,11 +9540,17 @@ ipcheck_place() {
         rm -f "$script"
         return 1
     fi
+    # Upstream IP.Check.Place ends with `[[ $IPV6work -ne 0 && $IPV6check -ne 0 ]]&&check_IP "$IPV6" 6`
+    # without a trailing `exit 0`, so passing `-4` returns exit code 1 even after a complete IPv4 report.
+    if tail -n 1 "$script" | grep -Eq '^\[\[ \$IPV6work -ne 0 && \$IPV6check -ne 0 \]\][[:space:]]*&&[[:space:]]*check_IP '; then
+        printf '\nexit 0\n' >> "$script"
+    fi
     if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
         bash "$script" -4 -i "$source_ip" -l en; then
-        :
+        rc=0
     else
-        warn "IP.Check.Place завершился с нестандартным кодом, вывод выше оставил как есть."
+        rc=$?
+        warn "IP.Check.Place завершился с кодом ${rc}, вывод выше оставил как есть."
     fi
     rm -f "$script"
     return 0
