@@ -41,13 +41,13 @@ def run_kto_bash(snippet: str, *, timeout: int = 30) -> subprocess.CompletedProc
 
 
 class CleanupFixesTests(unittest.TestCase):
-    def test_version_pinned_and_build_v352_synced(self):
+    def test_version_pinned_and_build_v353_synced(self):
         self.assertIn('SCRIPT_VERSION="1.4.8.8"', KTO)
         self.assertNotIn("1.4.8.10", KTO)
-        self.assertIn('SCRIPT_BUILD="v352"', KTO)
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v352"', KTO)
+        self.assertIn('SCRIPT_BUILD="v353"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v353"', KTO)
         self.assertNotIn("v349", KTO)
-        self.assertNotIn("v351", KTO)
+        self.assertNotIn("v352", KTO)
 
     @unittest.skipUnless(BASH, "bash is unavailable")
     def test_ipcheck_place_handles_upstream_ipv6_trailing_condition_without_false_warning(self):

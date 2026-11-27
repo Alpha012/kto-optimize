@@ -17,6 +17,7 @@ CAPTURE = """[general]
 netif = eth0
 alias = kto-eth0
 collector = /run/kto-torrent-guard/collector.sock
+pidfile = /tmp/kto-torrent-capture-eth0.pid
 bpf = (tcp or udp) and not net 127.0.0.0/8 and not host ::1
 [tuning]
 max-reader-threads = 2
@@ -34,26 +35,36 @@ UNIT = """[Unit]
 Description=KTO nDPId capture on %i
 PartOf=kto-torrent-guard.service
 [Service]
-ExecStart=/opt/kto-torrent-guard/nDPId -c /opt/kto-torrent-guard/capture/%i.conf
+ExecStart=/opt/kto-torrent-guard/nDPId -l -f /opt/kto-torrent-guard/capture/%i.conf
 MemoryHigh=768M
 MemoryMax=1G
 Nice=5
 """
 
+GUARD_UNIT = """[Unit]
+Description=KTO BitTorrent connection guard
+[Service]
+ExecStart=/usr/bin/python3 /opt/kto-torrent-guard/guard.py daemon
+CapabilityBoundingSet=CAP_NET_ADMIN
+"""
+
 
 class TorrentCaptureTuningTests(unittest.TestCase):
-    def test_profiles_respect_upstream_flow_limit_and_bound_memory(self):
-        self.assertEqual(tuning.profile(8 * 1024 * 1024), (32768, "768M", "1G"))
+    def test_profiles_adapt_for_small_medium_and_large_hosts(self):
+        self.assertEqual(tuning.profile(1 * 1024 * 1024), (16384, "384M", "512M"))
+        self.assertEqual(tuning.profile(4 * 1024 * 1024 - 1), (16384, "384M", "512M"))
+        self.assertEqual(tuning.profile(4 * 1024 * 1024), (32768, "768M", "1G"))
         self.assertEqual(tuning.profile(16 * 1024 * 1024 - 1), (32768, "768M", "1G"))
         self.assertEqual(tuning.profile(16 * 1024 * 1024), (65536, "1536M", "2G"))
         self.assertEqual(tuning.profile(32 * 1024 * 1024), (65536, "1536M", "2G"))
 
-    def test_capture_config_preserves_scope_and_privacy_settings(self):
+    def test_capture_config_preserves_scope_and_drops_obsolete_pidfile(self):
         old = configparser.ConfigParser(interpolation=None)
         old.read_string(CAPTURE)
         new = configparser.ConfigParser(interpolation=None)
         new.read_string(tuning.capture_config(CAPTURE, 65536))
-        self.assertEqual(dict(old["general"]), dict(new["general"]))
+        self.assertNotIn("pidfile", new["general"])
+        self.assertEqual(new["general"]["netif"], old["general"]["netif"])
         self.assertEqual(dict(old["ndpi"]), dict(new["ndpi"]))
         self.assertEqual(new.getint("tuning", "max-reader-threads"), 2)
         self.assertEqual(new.getint("tuning", "max-packets-per-flow-to-send"), 0)
@@ -74,13 +85,36 @@ class TorrentCaptureTuningTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 tuning.capture_config(text, 65536)
 
-    def test_unit_changes_only_memory_limits(self):
+    def test_unit_changes_only_memory_limits_and_guard_unit_adds_proc_caps(self):
         expected = UNIT.replace("MemoryHigh=768M", "MemoryHigh=1536M").replace("MemoryMax=1G", "MemoryMax=2G")
         self.assertEqual(tuning.capture_unit(UNIT, "1536M", "2G"), expected)
         for text in (UNIT.replace("KTO nDPId", "Another"),
                      UNIT.replace("MemoryMax=1G\n", ""), UNIT + "MemoryMax=4G\n"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 tuning.capture_unit(text, "1536M", "2G")
+        updated_guard = tuning.guard_unit(GUARD_UNIT)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE", updated_guard)
+
+    def test_migrate_config_detects_hybrid_vs_kernel_and_preserves_settings(self):
+        v2 = {"mode": "observe", "ttl": 300, "interfaces": ["eth0"], "protected_udp": [8443]}
+        self.assertEqual(tuning.migrate_config(v2, has_ndpi=True)["engine"], "hybrid")
+        self.assertEqual(tuning.migrate_config(v2, has_ndpi=False)["engine"], "kernel")
+        self.assertEqual(tuning.migrate_config(v2, has_ndpi=True)["ttl"], 300)
+        self.assertTrue(tuning.migrate_config(v2, has_ndpi=True)["block_encrypted_cache"])
+
+    def test_prune_old_backups_keeps_only_latest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for idx in range(5):
+                d = root / f"capture-backup-{idx}"
+                d.mkdir()
+                (d / "x").write_text("ok", encoding="utf-8")
+                ts = 1000 + idx * 10
+                import os
+                os.utime(d, (ts, ts))
+            tuning.prune_old_backups(root, keep=3)
+            remaining = sorted(p.name for p in root.glob("capture-backup-*"))
+            self.assertEqual(remaining, ["capture-backup-2", "capture-backup-3", "capture-backup-4"])
 
     def test_download_is_pinned_to_current_helper(self):
         helper = ROOT / "scripts/kto-torrent-guard.py"
@@ -171,7 +205,8 @@ class TorrentCaptureTuningTests(unittest.TestCase):
             with patch.object(tuning, "PREFIX", root), patch.object(tuning, "CONFIG", config), \
                     patch.object(tuning.os, "geteuid", return_value=0, create=True), \
                     patch.object(tuning.urllib.request, "urlopen") as download, \
-                    patch.object(tuning, "restart_observer") as restart:
+                    patch.object(tuning, "restart_observer") as restart, \
+                    patch.object(tuning.sys, "argv", ["tune-torrent-capture.py"]):
                 with self.assertRaisesRegex(ValueError, "observe before tuning"):
                     tuning.main()
                 download.assert_not_called()

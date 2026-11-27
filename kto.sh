@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v352"
+SCRIPT_BUILD="v353"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -5912,7 +5912,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v352"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v353"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5925,7 +5925,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v352"
+KTO_HAPROXY_FIREWALL_BUILD="v353"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -14186,8 +14186,8 @@ torrent_guard_require_installed() {
 
 torrent_guard_confirm_enforce() {
     local answer
-    warn "Блокируются распознанные BitTorrent-соединения, не весь интернет пользователя."
-    warn "Первые пакеты проходят до детекта; 100% защиты нет, возможны ложные срабатывания."
+    warn "Блокируются BitTorrent handshake, трекеры (HTTP/UDP), DHT и пойманные peer:port (TCP RST + DROP)."
+    warn "SSH, Xray, Hysteria2, WARP и локальные сети защищены; на портах 53/80/443/853 банятся только совпавшие пакеты/потоки."
     printf 'Включить блокировку с автозапуском после перезагрузки? [y/N]: '
     read -r answer || return 1
     [[ "$answer" == y || "$answer" == Y ]] || return 1
@@ -14235,24 +14235,24 @@ PY
         fi
         sleep 1
     done
-    fail "Наблюдатель не готов. Проверь статус и логи; блокировка не включена."
+    fail "Торрент-блокер не готов. Проверь статус и логи; блокировка не включена."
     return 1
 }
 
 torrent_guard_enable() {
     torrent_guard_require_installed || return 1
     torrent_guard_observe || return 1
-    # Old peer-wide guards must be updated before the menu can enable them.
+    # Require v3 engine (kernel nftables + peer:port bans) before enabling via menu.
     if ! "${SUDO[@]}" python3 - "$TORRENT_GUARD_STATUS" <<'PY'
 import json
 from pathlib import Path
 import sys
 state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if state.get("version") != 2 or state.get("block_scope") != "connection":
-    raise ValueError("update the guard to the connection-scoped version first")
+if state.get("version") != 3:
+    raise ValueError("update the guard to v3 first")
 PY
     then
-        fail "Нужна установка/обновление фильтра отдельных соединений (пункт 1 или 2)."
+        fail "Нужно обновить торрент-блокер до v3 (пункт 1)."
         return 1
     fi
     if ! run_bounded_command 30 "${SUDO[@]}" "$TORRENT_GUARD_CLI" enforce; then
@@ -14267,33 +14267,56 @@ PY
 }
 
 torrent_guard_setup() (
-    local target="${1:-observe}" asset file directory interfaces ports value
-    local -a options=(--mode observe) values=()
+    local target="${1:-observe}" engine="${2:-kernel}" asset file directory interfaces ports value
+    local -a options=(--mode observe) values=() extra_py_args=()
     [[ "$target" == observe || "$target" == enforce ]] || return 1
+    [[ "$engine" == kernel || "$engine" == hybrid ]] || return 1
     if [[ "$target" == enforce ]]; then
         torrent_guard_confirm_enforce || return 0
     fi
     warn "Ставь на конечную выходную ноду: внутри зашифрованного прокида торрент не виден."
-    if torrent_guard_installed; then
+    if torrent_guard_installed && [[ "$engine" == kernel ]]; then
         asset=scripts/tune-torrent-capture.py
-        stage "Обновлю KTO Torrent Guard без пересборки nDPI; результат сначала в observe"
-    else
+        stage "Обновлю KTO Torrent Guard до v3 без пересборки; результат сначала в observe"
+    elif torrent_guard_installed && [[ "$engine" == hybrid ]]; then
         asset=scripts/install-torrent-guard.sh
-        echo 'Ubuntu 24.04 x86_64; сборка в 2 потока, нужно 1.5 GB на диске.'
+        options=(--add-ndpi)
+        echo 'Усиленный режим (Kernel + nDPI): Ubuntu/Debian x86_64/arm64; сборка nDPId в 2 потока, нужно 1.5 GB на диске.'
         printf 'Интерфейсы выхода через пробел/запятую [Enter = default routes + warp]: '
         read -r interfaces || return 0
         IFS=$', \t' read -r -a values <<< "$interfaces"
-        for value in "${values[@]}"; do
+        for value in "${values[@]+"${values[@]}"}"; do
+            [[ -n "$value" ]] || continue
             if [[ ! "$value" =~ ^[a-zA-Z0-9_.-]{1,15}$ || "$value" == lo ]]; then
                 fail "Некорректный интерфейс: $value"
                 return 1
             fi
             options+=(--interface "$value")
         done
-        printf 'Входные UDP-порты, которые нельзя блокировать (Hysteria2 и др.) [Enter = нет]: '
+    else
+        asset=scripts/install-torrent-guard.sh
+        options+=(--engine "$engine")
+        if [[ "$engine" == hybrid ]]; then
+            echo 'Усиленный режим (Kernel + nDPI): Ubuntu/Debian x86_64/arm64; сборка nDPId в 2 потока, нужно 1.5 GB на диске.'
+            printf 'Интерфейсы выхода через пробел/запятую [Enter = default routes + warp]: '
+            read -r interfaces || return 0
+            IFS=$', \t' read -r -a values <<< "$interfaces"
+            for value in "${values[@]+"${values[@]}"}"; do
+                [[ -n "$value" ]] || continue
+                if [[ ! "$value" =~ ^[a-zA-Z0-9_.-]{1,15}$ || "$value" == lo ]]; then
+                    fail "Некорректный интерфейс: $value"
+                    return 1
+                fi
+                options+=(--interface "$value")
+            done
+        else
+            echo 'Быстрый Kernel-режим (nftables, 0 RAM, установка за пару секунд; без компиляции).'
+        fi
+        printf 'Доп. входные UDP-порты (если автоопределение их не покроет) [Enter = авто]: '
         read -r ports || return 0
         IFS=$', \t' read -r -a values <<< "$ports"
-        for value in "${values[@]}"; do
+        for value in "${values[@]+"${values[@]}"}"; do
+            [[ -n "$value" ]] || continue
             if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || (( 10#$value < 1 || 10#$value > 65535 )); then
                 fail "Некорректный UDP-порт: $value"
                 return 1
@@ -14307,34 +14330,78 @@ torrent_guard_setup() (
     trap 'rm -f -- "$file"; rmdir -- "$directory"' EXIT
     stage "Загружаю $asset (с ограничением времени)"
     install_asset_file "$asset" "$file" 0644 bounded || return 1
+    if [[ -n "${SCRIPT_DIR:-}" && -f "${SCRIPT_DIR}/scripts/kto-torrent-guard.py" ]]; then
+        extra_py_args+=(--local-guard "${SCRIPT_DIR}/scripts/kto-torrent-guard.py")
+        options+=(--local-guard "${SCRIPT_DIR}/scripts/kto-torrent-guard.py")
+    fi
     if [[ "$asset" == *.py ]]; then
         "${SUDO[@]}" python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$file" || return 1
         stage "Отключаю блокировку на время обновления; Xray и SSH не перезапускаются"
         torrent_guard_observe || return 1
-        if ! "${SUDO[@]}" python3 "$file"; then
-            fail "Обновление не завершено. Автоматически блокировку не включаю; проверь статус и логи."
-            return 1
+        if (( ${#SUDO[@]} > 0 )); then
+            if ! "${SUDO[@]}" env "KTO_RAW_BASE=${KTO_RAW_BASE:-}" python3 "$file" "${extra_py_args[@]+"${extra_py_args[@]}"}"; then
+                fail "Обновление не завершено. Автоматически блокировку не включаю; проверь статус и логи."
+                return 1
+            fi
+        else
+            if ! KTO_RAW_BASE="${KTO_RAW_BASE:-}" python3 "$file" "${extra_py_args[@]+"${extra_py_args[@]}"}"; then
+                fail "Обновление не завершено. Автоматически блокировку не включаю; проверь статус и логи."
+                return 1
+            fi
         fi
     else
         "${SUDO[@]}" bash -n "$file" || return 1
-        stage "Устанавливаю зависимости, проверяю изоляцию и собираю nDPI"
-        "${SUDO[@]}" env "SSH_CONNECTION=${SSH_CONNECTION:-}" bash "$file" "${options[@]}" || return 1
+        if [[ "$engine" == hybrid ]]; then
+            stage "Проверяю изоляцию nftables и собираю nDPId"
+        else
+            stage "Проверяю изоляцию nftables и устанавливаю Kernel-блокер"
+        fi
+        "${SUDO[@]}" env "SSH_CONNECTION=${SSH_CONNECTION:-}" "KTO_RAW_BASE=${KTO_RAW_BASE:-}" bash "$file" "${options[@]}" || return 1
     fi
     if [[ "$target" == enforce ]]; then
         torrent_guard_enable || return 1
     else
-        ok "Наблюдение включено. Блокировки нет; для неё выбери пункт 3."
+        ok "Установлено в режиме наблюдения. Для включения блокировки выбери пункт 2."
     fi
     "${SUDO[@]}" "$TORRENT_GUARD_CLI" status
 )
 
+torrent_guard_summary_line() {
+    if ! torrent_guard_installed; then
+        echo "[Не установлен]"
+        return 0
+    fi
+    "${SUDO[@]}" python3 - "$TORRENT_GUARD_CONFIG" "$TORRENT_GUARD_STATUS" <<'PY' 2>/dev/null || echo "[Установлен]"
+import json
+from pathlib import Path
+import sys
+cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+engine = cfg.get("engine", "legacy")
+mode = cfg.get("mode", "?")
+extra = ""
+status_path = Path(sys.argv[2])
+if status_path.exists():
+    st = json.loads(status_path.read_text(encoding="utf-8"))
+    drops = st.get("kernel_drops", {}).get("total", 0)
+    peers = st.get("active_kernel_peers", 0)
+    extra = f" | v{st.get('version', '?')} | дропов: {drops} | peer-банов: {peers}"
+print(f"[Установлен] движок: {engine} | режим: {mode}{extra}")
+PY
+}
+
 torrent_guard_menu() {
     need_root
-    local action="${1:-menu}" choice answer
+    local action="${1:-menu}" answer
     if [[ "$action" != menu ]]; then
         case "$action" in
-            install|update) torrent_guard_setup observe ;;
-            setup) torrent_guard_setup enforce ;;
+            install|update) torrent_guard_setup observe kernel ;;
+            setup) torrent_guard_setup enforce kernel ;;
+            hybrid|add-ndpi) torrent_guard_setup enforce hybrid ;;
+            hybrid-observe) torrent_guard_setup observe hybrid ;;
+            kernel|remove-ndpi)
+                torrent_guard_require_installed || return 1
+                run_bounded_command 60 "${SUDO[@]}" "$TORRENT_GUARD_CLI" remove-ndpi
+                ;;
             enforce) torrent_guard_confirm_enforce && torrent_guard_enable ;;
             observe) torrent_guard_observe ;;
             status) torrent_guard_require_installed && run_bounded_command 15 "${SUDO[@]}" "$TORRENT_GUARD_CLI" status ;;
@@ -14347,42 +14414,37 @@ torrent_guard_menu() {
                 [[ "$answer" == y || "$answer" == Y ]] || return 0
                 run_bounded_command 90 "${SUDO[@]}" "$TORRENT_GUARD_CLI" uninstall
                 ;;
-            *) fail "Команды: torrent-guard [install|update|setup|enforce|observe|status|logs|stop|uninstall]"; return 1 ;;
+            *) fail "Команды: torrent-guard [install|update|setup|hybrid|kernel|enforce|observe|status|logs|stop|uninstall]"; return 1 ;;
         esac
         return $?
     fi
     local header_text="" cursor=0
     while true; do
-        header_text="На конечной выходной ноде; не блокирует весь IP пользователя."
-        if torrent_guard_installed; then
-            header_text+=$'\n'"[Установлен] Текущий режим и здоровье: пункт 5"
-        else
-            header_text+=$'\n'"[Не установлен или установка неполная]"
-        fi
-        header_text+=$'\n'
+        header_text="На конечной выходной ноде; режет BitTorrent/DHT/трекеры в ядре (TCP RST + DROP)."
+        header_text+=$'\n'"$(torrent_guard_summary_line)"$'\n'
 
         MENU_LABELS=(
-            "Установить / обновить (только наблюдение)"
-            "Установить / обновить и включить блокировку"
+            "Установить / обновить и включить (Kernel, 0 RAM)"
             "Включить блокировку (с автозапуском)"
-            "Отключить блокировку, оставить наблюдение"
-            "Статус и состояние захвата"
+            "Отключить блокировку (режим наблюдения)"
+            "Усиленный режим: подключить nDPI (MSE / uTP)"
+            "Отключить nDPI (оставить только Kernel)"
+            "Статус и счётчики блокировок"
             "Последние логи"
-            "Остановить и отключить автозапуск"
-            "Удалить только торрент-блокер"
+            "Удалить торрент-блокер"
         )
-        MENU_ACTIONS=("install" "setup" "enforce" "observe" "status" "logs" "stop" "uninstall")
-        menu_select "ТОРРЕНТ-БЛОКЕР: nDPI / ОТДЕЛЬНЫЕ СОЕДИНЕНИЯ" "Назад" "$header_text" "$cursor"
+        MENU_ACTIONS=("setup" "enforce" "observe" "hybrid" "kernel" "status" "logs" "uninstall")
+        menu_select "ТОРРЕНТ-БЛОКЕР (KERNEL + nDPI)" "Назад" "$header_text" "$cursor"
         cursor="$MENU_SELECTED_INDEX"
 
         case "$MENU_SELECTED_ACTION" in
-            install) torrent_guard_menu install || true; menu_pause ;;
             setup) torrent_guard_menu setup || true; menu_pause ;;
             enforce) torrent_guard_menu enforce || true; menu_pause ;;
             observe) torrent_guard_menu observe || true; menu_pause ;;
+            hybrid) torrent_guard_menu hybrid || true; menu_pause ;;
+            kernel) torrent_guard_menu kernel || true; menu_pause ;;
             status) torrent_guard_menu status || true; menu_pause ;;
             logs) torrent_guard_menu logs || true; menu_pause ;;
-            stop) torrent_guard_menu stop || true; menu_pause ;;
             uninstall) torrent_guard_menu uninstall || true; menu_pause ;;
             __back__|__eof__) return 0 ;;
             *)
@@ -16139,7 +16201,7 @@ proxy_menu() {
             actions+=("nginx")
         fi
 
-        labels+=("Торрент-блокер (nDPI, выходная нода)")
+        labels+=("Торрент-блокер (Kernel + nDPI, выходная нода)")
         actions+=("torrent-guard")
         labels+=("Удалить HAProxy / Nginx / Docker")
         actions+=("server-cleanup")

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Retune an existing KTO torrent observer without rebuilding nDPId or Xray."""
+"""Update an existing KTO torrent guard installation without rebuilding nDPId or Xray."""
 
+import argparse
 import configparser
 import hashlib
 import io
@@ -8,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -18,14 +20,21 @@ import urllib.request
 
 PREFIX = Path("/opt/kto-torrent-guard")
 CONFIG = Path("/etc/kto-torrent-guard.json")
+GUARD_UNIT = Path("/etc/systemd/system/kto-torrent-guard.service")
 UNIT = Path("/etc/systemd/system/kto-torrent-capture@.service")
 STATUS = Path("/run/kto-torrent-guard/status.json")
-HELPER_URL = "https://raw.githubusercontent.com/Alpha012/kto-optimize/main/scripts/kto-torrent-guard.py"
-HELPER_SHA256 = "3ce6f225c24663d55d5ae12167a0578b30cd41ff2a0c7a36c932a50d60a44862"
+RAW_BASE = os.environ.get("KTO_RAW_BASE", "https://raw.githubusercontent.com/Alpha012/kto-optimize/main").rstrip("/")
+HELPER_URL = f"{RAW_BASE}/scripts/kto-torrent-guard.py"
+HELPER_SHA256 = "27fd15e76dc74423dc632fff1103cefb079194873682f16d975f7a4d594dadf1"
+MAX_BACKUPS = 3
 
 
 def profile(total_kib):
-    return (65536, "1536M", "2G") if total_kib >= 16777216 else (32768, "768M", "1G")
+    if total_kib >= 16777216:
+        return (65536, "1536M", "2G")
+    if total_kib >= 4194304:
+        return (32768, "768M", "1G")
+    return (16384, "384M", "512M")
 
 
 def capture_config(text, flow_limit):
@@ -35,6 +44,7 @@ def capture_config(text, flow_limit):
         raise ValueError("capture config has no general/tuning sections")
     if parser.getint("tuning", "max-reader-threads") not in (1, 2):
         raise ValueError("nonstandard thread count; review memory sizing before tuning")
+    parser.remove_option("general", "pidfile")
     for key, value in {
         "max-flows-per-thread": flow_limit,
         "max-idle-flows-per-thread": 1024,
@@ -59,6 +69,31 @@ def capture_unit(text, high, maximum):
     return text
 
 
+def guard_unit(text):
+    if "ExecStart=/usr/bin/python3 /opt/kto-torrent-guard/guard.py daemon" not in text:
+        raise ValueError("guard service is not the expected KTO unit")
+    text, count = re.subn(
+        r"(?m)^CapabilityBoundingSet=[^\r\n]*",
+        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE",
+        text,
+    )
+    if count != 1:
+        raise ValueError("expected exactly one CapabilityBoundingSet setting")
+    return text
+
+
+def migrate_config(settings, *, has_ndpi):
+    updated = dict(settings)
+    if "engine" not in updated:
+        updated["engine"] = "hybrid" if has_ndpi else "kernel"
+    updated.setdefault("ttl", 600)
+    updated.setdefault("block_encrypted_cache", True)
+    updated.setdefault("protected_udp", [])
+    updated.setdefault("exempt_ips", [])
+    updated.setdefault("interfaces", [])
+    return updated
+
+
 def write_atomic(path, content, mode):
     fd, temporary = tempfile.mkstemp(prefix=".kto-tune-", dir=path.parent)
     try:
@@ -71,6 +106,16 @@ def write_atomic(path, content, mode):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def prune_old_backups(prefix, keep=MAX_BACKUPS):
+    backups = sorted(
+        (p for p in prefix.glob("capture-backup-*") if p.is_dir() and not p.is_symlink()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in backups[keep:]:
+        shutil.rmtree(stale, ignore_errors=True)
 
 
 def apply_files(plan, backup, activate, verify):
@@ -114,72 +159,104 @@ def check_helper(helper):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--local-guard", help="Use a local guard.py file instead of downloading")
+    args = parser.parse_args()
+
     if os.geteuid() != 0:
         raise ValueError("Run with sudo python3.")
-    if (PREFIX / ".owner").read_text().strip() != "kto-torrent-guard-v1":
+    if (PREFIX / ".owner").read_text(encoding="utf-8").strip() != "kto-torrent-guard-v1":
         raise ValueError("existing KTO torrent guard was not found")
-    settings = json.loads(CONFIG.read_text())
+    settings = json.loads(CONFIG.read_text(encoding="utf-8"))
     if settings.get("mode") != "observe":
         raise ValueError("Run sudo kto-torrent observe before tuning. No files were changed.")
-    interfaces = settings.get("interfaces", [])
-    if not interfaces or any(not isinstance(name, str) or
-                             not re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", name) for name in interfaces):
-        raise ValueError("invalid capture interface list")
-    mem = dict((line.split()[0].rstrip(":"), int(line.split()[1]))
-               for line in Path("/proc/meminfo").read_text().splitlines() if len(line.split()) >= 2)
-    if mem["MemAvailable"] < 2097152:
-        raise ValueError("less than 2 GiB available; do not increase observer capacity yet")
-    limit, high, maximum = profile(mem["MemTotal"])
-    plan = []
-    for name in interfaces:
-        path = PREFIX / "capture" / f"{name}.conf"
-        plan.append((path, capture_config(path.read_text(), limit).encode()))
-    plan.append((UNIT, capture_unit(UNIT.read_text(), high, maximum).encode()))
 
-    print("[..] Downloading hash-pinned connection filter", flush=True)
-    with urllib.request.urlopen(HELPER_URL, timeout=30) as response:
-        helper = response.read(512001)
+    has_ndpi = (PREFIX / "nDPId").is_file() and UNIT.is_file() and bool(list((PREFIX / "capture").glob("*.conf")))
+    migrated = migrate_config(settings, has_ndpi=has_ndpi)
+    engine = migrated["engine"]
+    interfaces = migrated.get("interfaces", [])
+    if engine == "hybrid":
+        if not interfaces or any(not isinstance(name, str) or
+                                 not re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", name) for name in interfaces):
+            raise ValueError("invalid capture interface list")
+
+    mem = dict((line.split()[0].rstrip(":"), int(line.split()[1]))
+               for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines() if len(line.split()) >= 2)
+    limit, high, maximum = profile(mem["MemTotal"])
+
+    plan = []
+    if migrated != settings:
+        plan.append((CONFIG, (json.dumps(migrated) + "\n").encode("utf-8")))
+    if GUARD_UNIT.is_file():
+        plan.append((GUARD_UNIT, guard_unit(GUARD_UNIT.read_text(encoding="utf-8")).encode("utf-8")))
+    if engine == "hybrid":
+        for name in interfaces:
+            path = PREFIX / "capture" / f"{name}.conf"
+            plan.append((path, capture_config(path.read_text(encoding="utf-8"), limit).encode("utf-8")))
+        plan.append((UNIT, capture_unit(UNIT.read_text(encoding="utf-8"), high, maximum).encode("utf-8")))
+
+    if args.local_guard:
+        print("[..] Loading hash-verified torrent guard from local path", flush=True)
+        helper = Path(args.local_guard).read_bytes()
+    else:
+        print("[..] Downloading hash-pinned torrent guard v3", flush=True)
+        with urllib.request.urlopen(HELPER_URL, timeout=30) as response:
+            helper = response.read(512001)
     if hashlib.sha256(helper).hexdigest() != HELPER_SHA256:
         raise ValueError("observer checksum mismatch; no files were changed")
     compile(helper, "guard.py", "exec")
-    print("[..] Testing selective TCP/UDP blocking in disposable network namespaces", flush=True)
+    print("[..] Testing kernel signatures and selective TCP/UDP blocking in isolated namespaces", flush=True)
     check_helper(helper)
     plan.append((PREFIX / "guard.py", helper))
-    if json.loads(CONFIG.read_text()) != settings:
+    if json.loads(CONFIG.read_text(encoding="utf-8")) != settings:
         raise ValueError("settings changed during preparation; retry after reviewing them")
 
     backup = Path(tempfile.mkdtemp(prefix="capture-backup-", dir=PREFIX))
     print(f"[..] Backup: {backup}", flush=True)
-    print(f"[..] {limit} flows/thread, MemoryHigh={high}, MemoryMax={maximum} per capture", flush=True)
-    print("[..] Restarting only the KTO observer/captures; Xray and SSH stay running", flush=True)
-    restarted_at = 0
+    if engine == "hybrid":
+        print(f"[..] Hybrid mode: {limit} flows/thread, MemoryHigh={high}, MemoryMax={maximum} per capture", flush=True)
+    else:
+        print("[..] Kernel mode: zero-RAM nftables engine", flush=True)
+    print("[..] Restarting only KTO torrent guard; Xray and SSH stay running", flush=True)
+    restarted_mono = 0.0
+    restarted_wall = 0.0
 
     def activate():
-        nonlocal restarted_at
-        restarted_at = time.time()
+        nonlocal restarted_mono, restarted_wall
+        restarted_mono = time.monotonic()
+        restarted_wall = time.time()
         restart_observer()
 
     def verify():
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
             try:
-                status = json.loads(STATUS.read_text())
-                expected = {f"kto-{name}" for name in interfaces}
-                if (status["mode"] == "observe" and status.get("version") == 2
-                        and status.get("block_scope") == "connection" and status["started"] >= restarted_at
-                        and 0 <= time.time() - status["updated"] < 10
-                        and set(status["captures"]) == expected):
+                status = json.loads(STATUS.read_text(encoding="utf-8"))
+                started_ok = (
+                    (isinstance(status.get("started_mono"), (int, float)) and status["started_mono"] >= restarted_mono - 1) or
+                    (isinstance(status.get("started"), (int, float)) and status["started"] >= restarted_wall - 2)
+                )
+                fresh_ok = (
+                    (isinstance(status.get("updated_mono"), (int, float)) and 0 <= time.monotonic() - status["updated_mono"] < 12) or
+                    (isinstance(status.get("updated"), (int, float)) and -5 <= time.time() - status["updated"] < 12)
+                )
+                captures_ok = (
+                    engine != "hybrid" or set(status.get("captures", [])) == {f"kto-{name}" for name in interfaces}
+                )
+                if (status.get("mode") == "observe" and status.get("version") == 3
+                        and status.get("engine") == engine
+                        and started_ok and fresh_ok and captures_ok):
                     return
             except (OSError, ValueError, KeyError):
                 pass
             time.sleep(1)
-        raise RuntimeError("captures did not become healthy; restoring previous files")
+        raise RuntimeError("torrent guard did not become healthy; restoring previous files")
 
     apply_files(plan, backup, activate, verify)
-    print("[OK] Connection-only filter updated without rebuilding nDPId. Mode remains observe.")
-    print("Check fresh logs: journalctl -u kto-torrent-guard --since '2 minutes ago' --no-pager")
-    print("Watch observer CPU/RAM: systemctl status 'kto-torrent-capture@*' --no-pager")
-    print("Do not enable enforcement until suspected false positives have been checked.")
+    prune_old_backups(PREFIX)
+    print(f"[OK] KTO Torrent Guard v3 updated (engine={engine}). Mode remains observe.")
+    print("Check status: sudo kto-torrent status")
+    print("Enable blocking: sudo kto-torrent enforce")
 
 
 if __name__ == "__main__":

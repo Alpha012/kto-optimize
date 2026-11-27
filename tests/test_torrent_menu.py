@@ -27,8 +27,8 @@ class TorrentMenuTests(unittest.TestCase):
         self.prefix = self.path / "guard"
         self.config = self.path / "config.json"
         self.status = self.path / "status.json"
-        self.settings = {"mode": "enforce", "interfaces": ["eth0"], "ttl": 600,
-                         "protected_udp": [8443], "exempt_ips": ["192.0.2.1"]}
+        self.settings = {"engine": "kernel", "mode": "enforce", "interfaces": ["eth0"], "ttl": 600,
+                         "protected_udp": [8443], "exempt_ips": ["192.0.2.1"], "block_encrypted_cache": True}
         self.cli = self.path / "cli"
         self.cli.write_text("""#!/usr/bin/env bash
 printf 'CLI %s\n' "$1" >> "$TEST_TRACE"
@@ -58,14 +58,19 @@ sys.exit(int(os.environ.get('TEST_UPDATE_RC', '0')))
         self.env = dict(os.environ, TEST_ROOT=self.path.as_posix(), TEST_TRACE=self.trace.as_posix(),
                         TEST_PYTHON=Path(sys.executable).as_posix(), PYTHONUTF8="1")
 
-    def installed(self, mode="enforce", version=2):
+    def installed(self, mode="enforce", version=3, engine="kernel"):
         (self.prefix / "capture").mkdir(parents=True)
         (self.prefix / ".owner").write_text("kto-torrent-guard-v1\n", encoding="utf-8")
         (self.prefix / "guard.py").write_text("# test helper\n", encoding="utf-8")
-        (self.prefix / "capture/eth0.conf").write_text("# capture\n", encoding="utf-8")
+        if engine == "hybrid":
+            (self.prefix / "capture/eth0.conf").write_text("# capture\n", encoding="utf-8")
         self.settings["mode"] = mode
+        self.settings["engine"] = engine
         self.config.write_text(json.dumps(self.settings), encoding="utf-8")
-        self.status.write_text(json.dumps({"version": version, "block_scope": "connection"}), encoding="utf-8")
+        self.status.write_text(json.dumps({
+            "version": version, "engine": engine, "block_scope": "peer_port+kernel",
+            "kernel_drops": {"total": 0}, "active_kernel_peers": 0,
+        }), encoding="utf-8")
 
     def run_bash(self, command, input_text="", expected=0, extra=""):
         harness = r'''
@@ -115,7 +120,7 @@ install_asset_file() {
         return self.trace.read_text(encoding="utf-8").splitlines() if self.trace.exists() else []
 
     def test_main_menu_and_direct_entrypoint(self):
-        self.assertIn('labels+=("Торрент-блокер (nDPI, выходная нода)")', KTO)
+        self.assertIn('labels+=("Торрент-блокер (Kernel + nDPI, выходная нода)")', KTO)
         self.assertIn('torrent-guard) torrent_guard_menu || true', KTO)
         main = KTO[KTO.index("main() {"):]
         self.assertLess(main.index("torrent-guard|torrent-blocker)"), main.index("prepare_runtime_tmpdir"))
@@ -176,23 +181,43 @@ MACHINE_MODE=$TEST_MODE
         self.run_bash("torrent_guard_menu status")
         self.assertEqual(self.trace_lines(), ["CLI status"])
 
-    def test_fresh_install_passes_interfaces_udp_and_ssh_context(self):
-        self.run_bash("torrent_guard_menu install", "eth0,warp\n8443 9443\n")
+    def test_fresh_kernel_install_passes_engine_udp_and_ssh_context(self):
+        self.run_bash("torrent_guard_menu install", "8443 9443\n")
         trace = self.trace_lines()
         self.assertIn("FETCH scripts/install-torrent-guard.sh bounded", trace)
-        self.assertIn("INSTALL --mode observe --interface eth0 --interface warp --protect-udp 8443 --protect-udp 9443", trace)
+        self.assertIn("INSTALL --mode observe --engine kernel --protect-udp 8443 --protect-udp 9443", trace)
         self.assertIn("SSH 192.0.2.1 12345 198.51.100.1 22", trace)
         self.assertNotIn("CLI enforce", trace)
         self.run_bash('[[ ! -e "$(cat "$TEST_ROOT/asset-path")" ]]')
 
+    def test_fresh_hybrid_install_passes_interfaces_and_udp(self):
+        self.run_bash("torrent_guard_menu hybrid-observe", "eth0,warp\n8443\n")
+        trace = self.trace_lines()
+        self.assertIn("INSTALL --mode observe --engine hybrid --interface eth0 --interface warp --protect-udp 8443", trace)
+
+    def test_add_ndpi_and_remove_ndpi_transitions(self):
+        self.installed(engine="kernel")
+        self.run_bash("torrent_guard_menu hybrid", "y\neth0,warp\n")
+        trace = self.trace_lines()
+        self.assertIn("INSTALL --add-ndpi --interface eth0 --interface warp", trace)
+        self.assertIn("CLI enforce", trace)
+
+        self.trace.unlink()
+        self.run_bash("torrent_guard_menu kernel")
+        self.assertEqual(self.trace_lines(), ["CLI remove-ndpi"])
+
     def test_empty_inputs_keep_installer_auto_detection(self):
-        self.run_bash("torrent_guard_menu install", "\n\n")
-        self.assertIn("INSTALL --mode observe", self.trace_lines())
+        self.run_bash("torrent_guard_menu install", "\n")
+        self.assertIn("INSTALL --mode observe --engine kernel", self.trace_lines())
 
     def test_invalid_wizard_inputs_never_download_or_execute(self):
-        for text in ("lo\n\n", "eth0;reboot\n\n", "eth0\n0\n", "eth0\n65536\n", "eth0\n--help\n"):
+        for text in ("0\n", "65536\n", "--help\n"):
             with self.subTest(text=text):
                 self.run_bash("torrent_guard_menu install", text, expected=1)
+                self.assertEqual(self.trace_lines(), [])
+        for text in ("lo\n\n", "eth0;reboot\n\n"):
+            with self.subTest(text=text):
+                self.run_bash("torrent_guard_menu hybrid-observe", text, expected=1)
                 self.assertEqual(self.trace_lines(), [])
 
     def test_cancel_enforcement_before_download_or_changes(self):
@@ -201,15 +226,15 @@ MACHINE_MODE=$TEST_MODE
 
     def test_install_failure_does_not_enable(self):
         self.env["TEST_INSTALL_RC"] = "1"
-        self.run_bash("torrent_guard_menu setup", "y\n\n\n", expected=1)
+        self.run_bash("torrent_guard_menu setup", "y\n\n", expected=1)
         self.assertNotIn("CLI enforce", self.trace_lines())
 
     def test_fresh_setup_enables_only_after_the_installer(self):
-        self.run_bash("torrent_guard_menu setup", "y\n\n\n", extra=r'''
+        self.run_bash("torrent_guard_menu setup", "y\n\n", extra=r'''
 torrent_guard_enable() { printf 'ENABLE\n' >> "$TEST_TRACE"; }
 ''')
         trace = self.trace_lines()
-        self.assertLess(trace.index("INSTALL --mode observe"), trace.index("ENABLE"))
+        self.assertLess(trace.index("INSTALL --mode observe --engine kernel"), trace.index("ENABLE"))
 
     def test_download_failure_does_not_disable_running_guard(self):
         self.installed()
@@ -248,7 +273,7 @@ torrent_guard_enable() { printf 'ENABLE\n' >> "$TEST_TRACE"; }
         self.assertNotIn("CLI enforce", self.trace_lines())
 
     def test_stopped_guard_is_set_to_observe_and_other_config_is_preserved(self):
-        self.installed()
+        self.installed(engine="hybrid")
         self.env["TEST_ACTIVE_RC"] = "3"
         self.run_bash("torrent_guard_menu observe")
         expected = dict(self.settings, mode="observe")
@@ -257,22 +282,22 @@ torrent_guard_enable() { printf 'ENABLE\n' >> "$TEST_TRACE"; }
         self.assertIn("SYSTEMCTL 40 enable --now kto-torrent-capture@eth0.service", self.trace_lines())
 
     def test_failed_capture_start_prevents_enforce(self):
-        self.installed()
+        self.installed(engine="hybrid")
         self.env["TEST_SYSTEMCTL_RC"] = "1"
         self.run_bash("torrent_guard_menu enforce", "y\n", expected=1)
         self.assertNotIn("CLI enforce", self.trace_lines())
 
-    def test_old_peer_guard_cannot_be_enabled_without_update(self):
-        self.installed(version=1)
+    def test_old_guard_version_cannot_be_enabled_without_update(self):
+        self.installed(version=2)
         self.run_bash("torrent_guard_menu enforce", "y\n", expected=1)
         self.assertIn("CLI observe", self.trace_lines())
         self.assertNotIn("CLI enforce", self.trace_lines())
 
-    def test_scope_is_checked_after_resuming_the_observer(self):
+    def test_version_is_checked_after_resuming_the_guard(self):
         self.installed()
         self.run_bash("torrent_guard_menu enforce", "y\n", expected=1, extra=r'''
 torrent_guard_observe() {
-    printf '{"version": 1, "block_scope": "peer"}\n' > "$TORRENT_GUARD_STATUS"
+    printf '{"version": 2, "block_scope": "connection"}\n' > "$TORRENT_GUARD_STATUS"
 }
 ''')
         self.assertNotIn("CLI enforce", self.trace_lines())
@@ -301,13 +326,14 @@ torrent_guard_observe() {
         self.run_bash("torrent_guard_menu", "")
         self.assertEqual(self.trace_lines(), [])
 
-    def test_numbered_actions_stay_in_sync(self):
+    def test_menu_actions_stay_in_sync_and_fit_single_digit_keys(self):
         menu = FUNCTIONS[FUNCTIONS.index("torrent_guard_menu() {"):]
+        actions = ("setup", "enforce", "observe", "hybrid", "kernel", "status", "logs", "uninstall")
         self.assertIn(
-            'MENU_ACTIONS=("install" "setup" "enforce" "observe" "status" "logs" "stop" "uninstall")',
+            'MENU_ACTIONS=("setup" "enforce" "observe" "hybrid" "kernel" "status" "logs" "uninstall")',
             menu,
         )
-        for action in ("install", "setup", "enforce", "observe", "status", "logs", "stop", "uninstall"):
+        for action in actions:
             self.assertRegex(menu, rf"{re.escape(action)}\) torrent_guard_menu {re.escape(action)} \|\| true")
 
 
