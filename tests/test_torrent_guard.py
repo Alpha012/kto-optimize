@@ -144,8 +144,8 @@ class TorrentGuardTests(unittest.TestCase):
         self.assertIn("0x0000041727101980", kernel_rules)  # UDP tracker BEP 15
         self.assertIn("0x64313a6164323a69", kernel_rules)  # DHT BEP 5
         self.assertIn("flags dynamic,timeout; timeout 600s", kernel_rules)
-        self.assertIn("tcp dport != 80 tcp dport != 443 add @bt_peers4_tcp", kernel_rules)
-        self.assertIn("udp dport != 53 udp dport != 443 udp dport != 853 add @bt_peers4_udp", kernel_rules)
+        self.assertIn("th dport != 80 th dport != 443 add @bt_peers4_tcp", kernel_rules)
+        self.assertIn("th dport != 53 th dport != 443 th dport != 853 add @bt_peers4_udp", kernel_rules)
         self.assertIn("set private_v4", kernel_rules)
         self.assertIn("set private_v6", kernel_rules)
         self.assertNotIn("flows4_", kernel_rules)
@@ -154,8 +154,8 @@ class TorrentGuardTests(unittest.TestCase):
         hybrid_rules = guard.nft_table(self.ports, 600, ["eth0", "warp"],
                                        exempt_ips=["203.0.113.9"], engine="hybrid")
         self.assertIn("set exempt_v4", hybrid_rules)
-        self.assertIn('oifname "eth0" meta l4proto { tcp, udp } ip saddr . th sport . ip daddr . th dport . meta l4proto @flows4_65746830 counter comment "kto:ndpi_flow" drop', hybrid_rules)
-        self.assertIn('iifname "warp" meta l4proto { tcp, udp } ip6 daddr . th dport . ip6 saddr . th sport . meta l4proto @flows6_77617270 counter comment "kto:ndpi_flow" drop', hybrid_rules)
+        self.assertIn('oifname "eth0" meta l4proto { tcp, udp } ip saddr . th sport . ip daddr . th dport . meta l4proto @flows4_65746830 counter drop comment "kto:ndpi_flow"', hybrid_rules)
+        self.assertIn('iifname "warp" meta l4proto { tcp, udp } ip6 daddr . th dport . ip6 saddr . th sport . meta l4proto @flows6_77617270 counter drop comment "kto:ndpi_flow"', hybrid_rules)
 
     def test_socket_selftest_refuses_the_host_network(self):
         with patch.object(guard.os, "stat") as stat, patch.object(guard, "command") as run:

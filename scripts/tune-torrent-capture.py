@@ -25,7 +25,7 @@ UNIT = Path("/etc/systemd/system/kto-torrent-capture@.service")
 STATUS = Path("/run/kto-torrent-guard/status.json")
 RAW_BASE = os.environ.get("KTO_RAW_BASE", "https://raw.githubusercontent.com/Alpha012/kto-optimize/main").rstrip("/")
 HELPER_URL = f"{RAW_BASE}/scripts/kto-torrent-guard.py"
-HELPER_SHA256 = "27fd15e76dc74423dc632fff1103cefb079194873682f16d975f7a4d594dadf1"
+HELPER_SHA256 = "03ecb6d92892fd23b08f1802120128b407eae799af08acecb2eec949e5b86c5f"
 MAX_BACKUPS = 3
 
 

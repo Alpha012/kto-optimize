@@ -369,24 +369,24 @@ def nft_table(protected, ttl, interfaces, *, exempt_ips=(), engine="kernel"):
     # Verdict helper chains for kernel signature matches in output.
     lines.extend([
         "chain block_bt_tcp {",
-        "meta nfproto ipv4 tcp dport != 80 tcp dport != 443 add @bt_peers4_tcp { ip daddr . th dport }",
-        "meta nfproto ipv6 tcp dport != 80 tcp dport != 443 add @bt_peers6_tcp { ip6 daddr . th dport }",
-        'meta l4proto tcp counter comment "kto:sig_bt_tcp" reject with tcp reset',
+        "meta nfproto ipv4 meta l4proto tcp th dport != 80 th dport != 443 add @bt_peers4_tcp { ip daddr . th dport }",
+        "meta nfproto ipv6 meta l4proto tcp th dport != 80 th dport != 443 add @bt_peers6_tcp { ip6 daddr . th dport }",
+        'meta l4proto tcp counter reject with tcp reset comment "kto:sig_bt_tcp"',
         "}",
         "chain block_http_tracker {",
-        "meta nfproto ipv4 tcp dport != 80 tcp dport != 443 add @bt_peers4_tcp { ip daddr . th dport }",
-        "meta nfproto ipv6 tcp dport != 80 tcp dport != 443 add @bt_peers6_tcp { ip6 daddr . th dport }",
-        'meta l4proto tcp counter comment "kto:sig_http_tracker" reject with tcp reset',
+        "meta nfproto ipv4 meta l4proto tcp th dport != 80 th dport != 443 add @bt_peers4_tcp { ip daddr . th dport }",
+        "meta nfproto ipv6 meta l4proto tcp th dport != 80 th dport != 443 add @bt_peers6_tcp { ip6 daddr . th dport }",
+        'meta l4proto tcp counter reject with tcp reset comment "kto:sig_http_tracker"',
         "}",
         "chain block_udp_tracker {",
-        "meta nfproto ipv4 udp dport != 53 udp dport != 443 udp dport != 853 add @bt_peers4_udp { ip daddr . th dport }",
-        "meta nfproto ipv6 udp dport != 53 udp dport != 443 udp dport != 853 add @bt_peers6_udp { ip6 daddr . th dport }",
-        'meta l4proto udp counter comment "kto:sig_udp_tracker" drop',
+        "meta nfproto ipv4 meta l4proto udp th dport != 53 th dport != 443 th dport != 853 add @bt_peers4_udp { ip daddr . th dport }",
+        "meta nfproto ipv6 meta l4proto udp th dport != 53 th dport != 443 th dport != 853 add @bt_peers6_udp { ip6 daddr . th dport }",
+        'meta l4proto udp counter drop comment "kto:sig_udp_tracker"',
         "}",
         "chain block_dht {",
-        "meta nfproto ipv4 udp dport != 53 udp dport != 443 udp dport != 853 add @bt_peers4_udp { ip daddr . th dport }",
-        "meta nfproto ipv6 udp dport != 53 udp dport != 443 udp dport != 853 add @bt_peers6_udp { ip6 daddr . th dport }",
-        'meta l4proto udp counter comment "kto:sig_dht" drop',
+        "meta nfproto ipv4 meta l4proto udp th dport != 53 th dport != 443 th dport != 853 add @bt_peers4_udp { ip daddr . th dport }",
+        "meta nfproto ipv6 meta l4proto udp th dport != 53 th dport != 443 th dport != 853 add @bt_peers6_udp { ip6 daddr . th dport }",
+        'meta l4proto udp counter drop comment "kto:sig_dht"',
         "}",
     ])
 
@@ -426,10 +426,10 @@ def nft_table(protected, ttl, interfaces, *, exempt_ips=(), engine="kernel"):
     if exempt_v6:
         lines.append("ip6 daddr @exempt_v6 return")
     lines.extend([
-        'meta l4proto tcp ip daddr . th dport @bt_peers4_tcp counter comment "kto:peer_tcp" reject with tcp reset',
-        'meta l4proto tcp ip6 daddr . th dport @bt_peers6_tcp counter comment "kto:peer_tcp" reject with tcp reset',
-        'meta l4proto udp ip daddr . th dport @bt_peers4_udp counter comment "kto:peer_udp" drop',
-        'meta l4proto udp ip6 daddr . th dport @bt_peers6_udp counter comment "kto:peer_udp" drop',
+        'meta l4proto tcp ip daddr . th dport @bt_peers4_tcp counter reject with tcp reset comment "kto:peer_tcp"',
+        'meta l4proto tcp ip6 daddr . th dport @bt_peers6_tcp counter reject with tcp reset comment "kto:peer_tcp"',
+        'meta l4proto udp ip daddr . th dport @bt_peers4_udp counter drop comment "kto:peer_udp"',
+        'meta l4proto udp ip6 daddr . th dport @bt_peers6_udp counter drop comment "kto:peer_udp"',
         "tcp flags & (syn | fin | rst) == 0 jump inspect_tcp",
         "meta l4proto udp jump inspect_udp",
         "}",
@@ -457,13 +457,13 @@ def nft_table(protected, ttl, interfaces, *, exempt_ips=(), engine="kernel"):
             lines.append(f"ip6 {peer_ip} @exempt_v6 return")
         if inbound:
             lines.extend([
-                f'meta l4proto tcp ip {peer_ip} . th {peer_port} @bt_peers4_tcp counter comment "kto:peer_tcp" drop',
-                f'meta l4proto tcp ip6 {peer_ip} . th {peer_port} @bt_peers6_tcp counter comment "kto:peer_tcp" drop',
-                f'meta l4proto udp ip {peer_ip} . th {peer_port} @bt_peers4_udp counter comment "kto:peer_udp" drop',
-                f'meta l4proto udp ip6 {peer_ip} . th {peer_port} @bt_peers6_udp counter comment "kto:peer_udp" drop',
+                f'meta l4proto tcp ip {peer_ip} . th {peer_port} @bt_peers4_tcp counter drop comment "kto:peer_tcp"',
+                f'meta l4proto tcp ip6 {peer_ip} . th {peer_port} @bt_peers6_tcp counter drop comment "kto:peer_tcp"',
+                f'meta l4proto udp ip {peer_ip} . th {peer_port} @bt_peers4_udp counter drop comment "kto:peer_udp"',
+                f'meta l4proto udp ip6 {peer_ip} . th {peer_port} @bt_peers6_udp counter drop comment "kto:peer_udp"',
             ])
             for w1, w2 in SIG_UDP_DHT_PREFIXES:
-                lines.append(f'meta l4proto udp @th,64,64 {w1} @th,128,32 {w2} counter comment "kto:sig_dht" drop')
+                lines.append(f'meta l4proto udp @th,64,64 {w1} @th,128,32 {w2} counter drop comment "kto:sig_dht"')
         if engine == "hybrid":
             for name in interfaces:
                 for version, family in ((4, "ip"), (6, "ip6")):
@@ -471,7 +471,7 @@ def nft_table(protected, ttl, interfaces, *, exempt_ips=(), engine="kernel"):
                     lines.append(
                         f"{interface} {json.dumps(name)} meta l4proto {{ tcp, udp }} "
                         f"{family} {local_ip} . th {local_port} . {family} {peer_ip} . th {peer_port} . "
-                        f'meta l4proto @{set_name} counter comment "kto:ndpi_flow" drop'
+                        f'meta l4proto @{set_name} counter drop comment "kto:ndpi_flow"'
                     )
         lines.append("}")
 
