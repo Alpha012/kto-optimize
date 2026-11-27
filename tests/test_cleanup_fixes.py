@@ -41,13 +41,69 @@ def run_kto_bash(snippet: str, *, timeout: int = 30) -> subprocess.CompletedProc
 
 
 class CleanupFixesTests(unittest.TestCase):
-    def test_version_pinned_and_build_v353_synced(self):
+    def test_version_pinned_and_build_v354_synced(self):
         self.assertIn('SCRIPT_VERSION="1.4.8.8"', KTO)
         self.assertNotIn("1.4.8.10", KTO)
-        self.assertIn('SCRIPT_BUILD="v353"', KTO)
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v353"', KTO)
+        self.assertIn('SCRIPT_BUILD="v354"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v354"', KTO)
         self.assertNotIn("v349", KTO)
-        self.assertNotIn("v352", KTO)
+        self.assertNotIn("v353", KTO)
+
+    def test_optimization_six_bug_fixes_in_place(self):
+        self.assertNotIn("software-properties-common", KTO)
+        self.assertIn("! -name 'systemd-private-*'", KTO)
+        self.assertIn('write_root_file_if_changed "$STORAGE_GUARD_JOURNAL_CONF"', KTO)
+        self.assertIn('cmp -s "$tmp" "$DOCKER_DAEMON_JSON"', KTO)
+        self.assertNotIn("vm.swappiness = 1", KTO)
+        self.assertIn("haproxy_routes_unparsed=1", KTO)
+
+    @unittest.skipUnless(BASH, "bash is unavailable")
+    def test_network_buffer_values_scale_by_ram(self):
+        res = run_kto_bash(
+            r'''
+memory_total_mb() { echo 1024; }
+s1="$(network_buffer_values)"
+memory_total_mb() { echo 4096; }
+s4="$(network_buffer_values)"
+memory_total_mb() { echo 16384; }
+s16="$(network_buffer_values)"
+printf '1G=%s\n4G=%s\n16G=%s\n' "$s1" "$s4" "$s16"
+'''
+        )
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("1G=131072\t16777216\t87380\t65536\t8388608\t262144", res.stdout)
+        self.assertIn("4G=262144\t33554432\t131072\t65536\t16777216\t524288", res.stdout)
+        self.assertIn("16G=262144\t67108864\t131072\t65536\t33554432\t1048576", res.stdout)
+
+    @unittest.skipUnless(BASH, "bash is unavailable")
+    def test_docker_log_rotation_is_idempotent_when_unchanged(self):
+        res = run_kto_bash(
+            r'''
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+SUDO=()
+LOG_FILE="$root/kto.log"
+DOCKER_DAEMON_JSON="$root/daemon.json"
+cat > "$DOCKER_DAEMON_JSON" <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "3"
+  }
+}
+EOF
+command_exists() { [[ "$1" == docker ]]; }
+events="$root/events"
+cmd() { printf '%s\n' "$*" >> "$events"; }
+configure_docker_log_rotation
+if [[ -f "$events" ]]; then
+    ! grep -q 'systemctl reload docker' "$events"
+    ! grep -q 'cp -a' "$events"
+fi
+'''
+        )
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     @unittest.skipUnless(BASH, "bash is unavailable")
     def test_ipcheck_place_handles_upstream_ipv6_trailing_condition_without_false_warning(self):

@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v353"
+SCRIPT_BUILD="v354"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -4440,7 +4440,7 @@ opt_prepare_system() {
 
 optimization_packages() {
     local packages cpus
-    packages=(ca-certificates curl wget gnupg2 software-properties-common ufw openssl dnsutils jq logrotate)
+    packages=(ca-certificates curl wget gnupg2 ufw openssl dnsutils jq logrotate)
     if [[ "$MACHINE_MODE" == "node" ]]; then
         packages+=(chrony cpufrequtils tar xz-utils)
         cpus="$(cpu_count)"
@@ -4590,11 +4590,19 @@ configure_docker_log_rotation() {
 EOF
     fi
 
-    if "${SUDO[@]}" test -f "$DOCKER_DAEMON_JSON" 2>/dev/null; then
-        backup="${DOCKER_DAEMON_JSON}.kto-backup-$(date +%Y%m%d%H%M%S)"
-        cmd "${SUDO[@]}" cp -a "$DOCKER_DAEMON_JSON" "$backup" || true
+    local docker_cfg_changed=1
+    if "${SUDO[@]}" test -f "$DOCKER_DAEMON_JSON" 2>/dev/null &&
+        "${SUDO[@]}" cmp -s "$tmp" "$DOCKER_DAEMON_JSON" 2>/dev/null; then
+        docker_cfg_changed=0
     fi
-    cmd "${SUDO[@]}" install -m 0644 "$tmp" "$DOCKER_DAEMON_JSON"
+
+    if (( docker_cfg_changed == 1 )); then
+        if "${SUDO[@]}" test -f "$DOCKER_DAEMON_JSON" 2>/dev/null; then
+            backup="${DOCKER_DAEMON_JSON}.kto-backup-$(date +%Y%m%d%H%M%S)"
+            cmd "${SUDO[@]}" cp -a "$DOCKER_DAEMON_JSON" "$backup" || true
+        fi
+        cmd "${SUDO[@]}" install -m 0644 "$tmp" "$DOCKER_DAEMON_JSON"
+    fi
     rm -f "$tmp"
 
     if [[ "${KTO_DESTRUCTIVE_CLEANUP:-0}" == "1" ]]; then
@@ -4602,7 +4610,9 @@ EOF
         cmd "${SUDO[@]}" docker image prune -af || true
         cmd "${SUDO[@]}" docker builder prune -af || true
     fi
-    cmd "${SUDO[@]}" systemctl reload docker || true
+    if (( docker_cfg_changed == 1 )); then
+        cmd "${SUDO[@]}" systemctl reload docker || true
+    fi
 }
 
 remnanode_log_rotation_active() {
@@ -4718,7 +4728,7 @@ opt_storage_guard() {
 
     cmd "${SUDO[@]}" mkdir -p /etc/systemd/journald.conf.d /etc/logrotate.d
     cleanup_superseded_kto_files
-    write_root_file "$STORAGE_GUARD_JOURNAL_CONF" <<'EOF'
+    write_root_file_if_changed "$STORAGE_GUARD_JOURNAL_CONF" <<'EOF'
 [Journal]
 SystemMaxUse=256M
 SystemKeepFree=512M
@@ -4731,9 +4741,11 @@ EOF
     if command_exists journalctl; then
         cmd "${SUDO[@]}" journalctl --vacuum-size=256M --vacuum-time=7d || true
     fi
-    cmd "${SUDO[@]}" systemctl restart systemd-journald || true
+    if (( ROOT_FILE_UPDATED == 1 )); then
+        cmd "${SUDO[@]}" systemctl restart systemd-journald || true
+    fi
 
-    write_root_file "$KTO_LOGROTATE_CONF" <<EOF
+    write_root_file_if_changed "$KTO_LOGROTATE_CONF" <<EOF
 $LOG_FILE {
     size 10M
     rotate 5
@@ -4749,8 +4761,12 @@ EOF
     fi
 
     if [[ "${KTO_DESTRUCTIVE_CLEANUP:-0}" == "1" ]]; then
-        cmd "${SUDO[@]}" find /tmp -xdev -mindepth 1 -mtime +2 -exec rm -rf -- {} + || true
-        cmd "${SUDO[@]}" find /var/tmp -xdev -mindepth 1 -mtime +7 -exec rm -rf -- {} + || true
+        cmd "${SUDO[@]}" find /tmp -xdev -mindepth 1 -maxdepth 1 \
+            ! -name 'systemd-private-*' ! -name '.*' ! -name 'ssh-*' ! -name 'kto-tune.log' \
+            -mtime +2 -exec rm -rf -- {} + || true
+        cmd "${SUDO[@]}" find /var/tmp -xdev -mindepth 1 -maxdepth 1 \
+            ! -name 'systemd-private-*' ! -name '.*' \
+            -mtime +7 -exec rm -rf -- {} + || true
         cmd "${SUDO[@]}" find /var/crash -type f -delete || true
         cmd "${SUDO[@]}" find /var/lib/systemd/coredump -type f -mtime +1 -delete || true
         cmd "${SUDO[@]}" find /var/log -xdev -type f \( -name '*.gz' -o -name '*.old' -o -name '*.1' \) -mtime +14 -delete || true
@@ -5216,13 +5232,46 @@ fix_conntrack_capacity_cli() {
     configure_conntrack_capacity
 }
 
+network_buffer_values() {
+    local mem_mb sock_def sock_max tcp_rdef tcp_wdef tcp_max optmem_max
+    mem_mb="$(memory_total_mb)"
+    [[ "$mem_mb" =~ ^[0-9]+$ ]] || mem_mb=0
+
+    if (( mem_mb >= 8192 )); then
+        sock_def=262144
+        sock_max=67108864
+        tcp_rdef=131072
+        tcp_wdef=65536
+        tcp_max=33554432
+        optmem_max=1048576
+    elif (( mem_mb >= 3072 )); then
+        sock_def=262144
+        sock_max=33554432
+        tcp_rdef=131072
+        tcp_wdef=65536
+        tcp_max=16777216
+        optmem_max=524288
+    else
+        sock_def=131072
+        sock_max=16777216
+        tcp_rdef=87380
+        tcp_wdef=65536
+        tcp_max=8388608
+        optmem_max=262144
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sock_def" "$sock_max" "$tcp_rdef" "$tcp_wdef" "$tcp_max" "$optmem_max"
+}
+
 opt_network_limits() {
+    local sock_def sock_max tcp_rdef tcp_wdef tcp_max optmem_max
     opt_dns_guard
     opt_ipv6_mode_guard
     cleanup_superseded_kto_files
 
+    IFS=$'\t' read -r sock_def sock_max tcp_rdef tcp_wdef tcp_max optmem_max < <(network_buffer_values)
+
     cmd "${SUDO[@]}" modprobe tcp_bbr || true
-    write_root_file "$KTO_TUNING_SYSCTL_CONF" <<'EOF'
+    write_root_file "$KTO_TUNING_SYSCTL_CONF" <<EOF
 fs.file-max = 2097152
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -5243,14 +5292,13 @@ net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
-net.core.rmem_default = 1048576
-net.core.rmem_max = 67108864
-net.core.wmem_default = 1048576
-net.core.wmem_max = 67108864
-net.core.optmem_max = 1048576
-net.ipv4.tcp_rmem = 4096 1048576 33554432
-net.ipv4.tcp_wmem = 4096 1048576 33554432
-vm.swappiness = 1
+net.core.rmem_default = ${sock_def}
+net.core.rmem_max = ${sock_max}
+net.core.wmem_default = ${sock_def}
+net.core.wmem_max = ${sock_max}
+net.core.optmem_max = ${optmem_max}
+net.ipv4.tcp_rmem = 4096 ${tcp_rdef} ${tcp_max}
+net.ipv4.tcp_wmem = 4096 ${tcp_wdef} ${tcp_max}
 EOF
     configure_conntrack_capacity || return 1
     if command_exists flock && "${SUDO[@]}" mkdir -p /run/lock >/dev/null 2>&1; then
@@ -5315,7 +5363,12 @@ opt_firewall() {
     else
         echo "node/GCloud: UFW reset/defaults and SSH rules preserved" >> "$LOG_FILE"
     fi
+    local haproxy_routes_unparsed=0
     extract_haproxy_routes "$HAPROXY_CONFIG_FILE" > "$routes_file"
+    if "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null && [[ ! -s "$routes_file" ]]; then
+        haproxy_routes_unparsed=1
+        warn "HAProxy config ${HAPROXY_CONFIG_FILE} не распознан; дополнительные порты HAProxy в UFW оставлены без изменений."
+    fi
     haproxy_listener_ports "$routes_file" > "$ports_file"
     "${SUDO[@]}" ufw status > "$ufw_status_file" 2>/dev/null || true
     if [[ "$MACHINE_MODE" == "whitelist" ]]; then
@@ -5356,7 +5409,7 @@ opt_firewall() {
         fi
     else
         cmd "${SUDO[@]}" ufw --force delete allow 443/udp || true
-        if ! grep -Fqx "$NODE_PORT" "$ports_file"; then
+        if (( haproxy_routes_unparsed == 0 )) && ! grep -Fqx "$NODE_PORT" "$ports_file"; then
             cmd "${SUDO[@]}" ufw --force delete allow "${NODE_PORT}/tcp" || true
         fi
     fi
@@ -5912,7 +5965,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v353"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v354"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5925,7 +5978,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v353"
+KTO_HAPROXY_FIREWALL_BUILD="v354"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -6563,11 +6616,13 @@ system_check_network_limits() {
         system_check_row skip "conntrack" "kernel module не используется"
     fi
 
+    local _sock_def sock_max _tcp_rdef _tcp_wdef _tcp_max _optmem_max
+    IFS=$'\t' read -r _sock_def sock_max _tcp_rdef _tcp_wdef _tcp_max _optmem_max < <(network_buffer_values)
     root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.ipv4.tcp_congestion_control = bbr" || sysctl_file_ok=0
     root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.core.default_qdisc = fq" || sysctl_file_ok=0
     root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "fs.file-max = 2097152" || sysctl_file_ok=0
     root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.ipv4.ip_local_port_range = 10000 65535" || sysctl_file_ok=0
-    root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "vm.swappiness = 1" || sysctl_file_ok=0
+    root_file_has_line "$KTO_TUNING_SYSCTL_CONF" "net.core.rmem_max = ${sock_max}" || sysctl_file_ok=0
     if [[ "$sysctl_file_ok" == "1" ]]; then
         system_check_row ok "sysctl file" "$KTO_TUNING_SYSCTL_CONF"
     else
@@ -6647,7 +6702,12 @@ system_check_firewall() {
             extra+=("22/tcp")
         fi
     fi
+    local haproxy_routes_unparsed=0
     extract_haproxy_routes "$HAPROXY_CONFIG_FILE" > "$routes_file"
+    if "${SUDO[@]}" test -s "$HAPROXY_CONFIG_FILE" 2>/dev/null && [[ ! -s "$routes_file" ]]; then
+        haproxy_routes_unparsed=1
+        system_check_row warn "haproxy ports" "config ${HAPROXY_CONFIG_FILE} не распознан; проверь порты вручную"
+    fi
     haproxy_listener_ports "$routes_file" > "$ports_file"
     if [[ "$MACHINE_MODE" != "whitelist" || ! -s "$ports_file" ]]; then
         printf '443\n' >> "$ports_file"
@@ -6663,7 +6723,7 @@ system_check_firewall() {
         ufw_status_rule_open_to_any "${NODE_PORT}/tcp" < "$ufw_status_file" || missing+=("${NODE_PORT}/tcp")
     else
         ufw_rule_allowed "443/udp" && extra+=("443/udp")
-        if ! grep -Fqx "$NODE_PORT" "$ports_file"; then
+        if (( haproxy_routes_unparsed == 0 )) && ! grep -Fqx "$NODE_PORT" "$ports_file"; then
             ufw_rule_allowed "${NODE_PORT}/tcp" && extra+=("${NODE_PORT}/tcp")
         fi
     fi
