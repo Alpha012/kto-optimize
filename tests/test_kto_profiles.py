@@ -89,15 +89,15 @@ printf '%s\\n' "${{#SUDO[@]}}" "${{SUDO[*]}}" "$lookups"
                 self.assertEqual(result.stdout.splitlines(), expected)
 
     def test_build_markers_stay_in_sync(self):
-        self.assertIn('SCRIPT_BUILD="v354"', KTO)
-        self.assertIn('PUSH_BUILD="v354"', PUSH)
-        self.assertIn('COLLECTOR_BUILD = "v354"', COLLECTOR)
-        self.assertIn('MOBILE443_BUILD="v354"', MOBILE443)
-        self.assertIn('ADDITIONAL_IP_BUILD="v354"', ADDITIONAL_IPS)
-        self.assertIn('REMNA_EGRESS_BUILD="v354"', REMNA_EGRESS)
-        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v354"', HAPROXY_BANDWIDTH)
-        self.assertIn('HAPROXY_GUARD_BUILD="v354"', HAPROXY_GUARD)
-        self.assertIn('DPI_PREFLIGHT_BUILD = "v354"', DPI_PREFLIGHT)
+        self.assertIn('SCRIPT_BUILD="v355"', KTO)
+        self.assertIn('PUSH_BUILD="v355"', PUSH)
+        self.assertIn('COLLECTOR_BUILD = "v355"', COLLECTOR)
+        self.assertIn('MOBILE443_BUILD="v355"', MOBILE443)
+        self.assertIn('ADDITIONAL_IP_BUILD="v355"', ADDITIONAL_IPS)
+        self.assertIn('REMNA_EGRESS_BUILD="v355"', REMNA_EGRESS)
+        self.assertIn('HAPROXY_BANDWIDTH_BUILD="v355"', HAPROXY_BANDWIDTH)
+        self.assertIn('HAPROXY_GUARD_BUILD="v355"', HAPROXY_GUARD)
+        self.assertIn('DPI_PREFLIGHT_BUILD = "v355"', DPI_PREFLIGHT)
 
     def test_runtime_temp_and_storage_preflight_protect_root_disk(self):
         runtime = function_body(KTO, "prepare_runtime_tmpdir")
@@ -4380,7 +4380,7 @@ grep -Fqx 'ufw allow 8443/tcp comment kto-haproxy' "$events"
             optimize.index('progress_step "Проверяю HAProxy firewall" opt_haproxy_firewall_final_check'),
             optimize.index('progress_step "Подключаю AntiScanner" opt_antiscanner'),
         )
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v354"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v355"', KTO)
         self.assertIn('After=network-online.target ufw.service haproxy.service antiscanner-update.service', KTO)
         self.assertIn('failed to restore HAProxy UFW rules', KTO)
 

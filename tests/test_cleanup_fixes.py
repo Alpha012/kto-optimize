@@ -41,13 +41,13 @@ def run_kto_bash(snippet: str, *, timeout: int = 30) -> subprocess.CompletedProc
 
 
 class CleanupFixesTests(unittest.TestCase):
-    def test_version_pinned_and_build_v354_synced(self):
+    def test_version_pinned_and_build_v355_synced(self):
         self.assertIn('SCRIPT_VERSION="1.4.8.8"', KTO)
         self.assertNotIn("1.4.8.10", KTO)
-        self.assertIn('SCRIPT_BUILD="v354"', KTO)
-        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v354"', KTO)
+        self.assertIn('SCRIPT_BUILD="v355"', KTO)
+        self.assertIn('KTO_HAPROXY_FIREWALL_BUILD="v355"', KTO)
         self.assertNotIn("v349", KTO)
-        self.assertNotIn("v353", KTO)
+        self.assertNotIn("v354", KTO)
 
     def test_optimization_six_bug_fixes_in_place(self):
         self.assertNotIn("software-properties-common", KTO)

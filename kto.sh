@@ -7,7 +7,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 KTO_RAW_BASE="${KTO_RAW_BASE:-https://raw.githubusercontent.com/Alpha012/kto-optimize/main}"
 SCRIPT_VERSION="1.4.8.8"
-SCRIPT_BUILD="v354"
+SCRIPT_BUILD="v355"
 NODE_PORT="${KTO_NODE_PORT:-1488}"
 PANEL_IP="${KTO_PANEL_IP:-64.188.91.72}"
 WARP_INSTALL_URL="${KTO_WARP_INSTALL_URL:-https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh}"
@@ -45,6 +45,7 @@ TORRENT_GUARD_CLI="/usr/local/bin/kto-torrent"
 TORRENT_GUARD_STATUS="/run/kto-torrent-guard/status.json"
 CLEANUP_MANAGER="/usr/local/sbin/kto-server-cleanup"
 SSH_PASSWORD_MANAGER="/usr/local/sbin/kto-ssh-password"
+RETURN_ROOT_MANAGER="/usr/local/sbin/kto-return-root"
 KTO_SSH_PASSWORD_MODE_FILE="/etc/kto-ssh-password.enabled"
 REMNA_DIR="/opt/remnawave"
 REMNA_CONTAINER="remnanode"
@@ -778,6 +779,12 @@ need_root() {
         exit 1
     fi
     if [[ ${EUID:-$(id -u)} -ne 0 ]] && ! "${SUDO[@]}" true >/dev/null 2>&1; then
+        if [[ -t 0 && -t 1 ]] && command_exists sudo; then
+            info "Запрашиваю права sudo (введи пароль пользователя $(id -un 2>/dev/null || echo "${USER:-user}"))..."
+            if sudo -v; then
+                return 0
+            fi
+        fi
         fail "sudo требует пароль. Запусти от root или включи NOPASSWD для пользователя."
         exit 1
     fi
@@ -1562,11 +1569,13 @@ settings_menu() {
             "Проверка системы"
             "Очистка диска"
             "SSH: включить пароль root (ключи сохранить)"
+            "Возвращение root"
         )
         actions=(
             "system-check"
             "disk-clean"
             "ssh-password"
+            "return-root"
         )
         if [[ "$MACHINE_MODE" == "panel" ]]; then
             labels+=("Удалить HAProxy / Nginx / Docker")
@@ -1590,6 +1599,10 @@ settings_menu() {
                 ;;
             ssh-password)
                 enable_ssh_password || true
+                menu_pause
+                ;;
+            return-root)
+                return_root_access || true
                 menu_pause
                 ;;
             server-cleanup)
@@ -5965,7 +5978,7 @@ ensure_haproxy_firewall_guard() {
     [[ -n "$listener_ports" ]] || return 0
 
     if "${SUDO[@]}" test -x "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null &&
-        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v354"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
+        "${SUDO[@]}" grep -Fqx 'KTO_HAPROXY_FIREWALL_BUILD="v355"' "$HAPROXY_FIREWALL_MANAGER" 2>/dev/null; then
         manager_current=1
     fi
     if "${SUDO[@]}" test -s "$HAPROXY_FIREWALL_UNIT" 2>/dev/null &&
@@ -5978,7 +5991,7 @@ ensure_haproxy_firewall_guard() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-KTO_HAPROXY_FIREWALL_BUILD="v354"
+KTO_HAPROXY_FIREWALL_BUILD="v355"
 CONFIG="${KTO_HAPROXY_CONFIG:-/etc/haproxy/haproxy.cfg}"
 
 command -v ufw >/dev/null 2>&1 || exit 0
@@ -14558,6 +14571,32 @@ enable_ssh_password() {
     "${SUDO[@]}" python3 "$SSH_PASSWORD_MANAGER" --connection "${SSH_CONNECTION:-}"
 }
 
+return_root_access() {
+    local caller_user
+    need_root
+    if ! command_exists python3 || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))'; then
+        fail "Для возвращения root нужен Python 3.8+."
+        return 1
+    fi
+    if [[ ! -f "${SCRIPT_DIR}/scripts/kto-return-root.py" ]] && ! command_exists curl; then
+        if ! "${SUDO[@]}" test -s "$RETURN_ROOT_MANAGER"; then
+            fail "Нет curl и локального мастера возвращения root. Запусти из полного репозитория."
+            return 1
+        fi
+        warn "Использую локальный мастер возвращения root"
+    elif ! install_asset_file scripts/kto-return-root.py "$RETURN_ROOT_MANAGER" 0755 bounded; then
+        "${SUDO[@]}" test -s "$RETURN_ROOT_MANAGER" || return 1
+        warn "Обновление не удалось; использую локальный мастер возвращения root"
+    fi
+    "${SUDO[@]}" python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$RETURN_ROOT_MANAGER" || return 1
+    caller_user="${SUDO_USER:-$(id -un 2>/dev/null || true)}"
+    "${SUDO[@]}" python3 "$RETURN_ROOT_MANAGER" \
+        --connection "${SSH_CONNECTION:-}" \
+        --caller-user "$caller_user" \
+        --base-key "${KTO_ROOT_BASE_PUBLIC_KEY:-}" \
+        "$@"
+}
+
 mobile443_lte_ports_from_routes() {
     local routes_file="$1"
     awk -F '\t' '$1 ~ /^[0-9]+$/ && $1 >= 1 && $1 <= 65535 { print $1 }' "$routes_file" 2>/dev/null |
@@ -16431,6 +16470,13 @@ main() {
             init_log
             ensure_utf8_locale
             enable_ssh_password
+            return
+            ;;
+        return-root|restore-root|root-restore|fix-root|root)
+            init_log
+            ensure_utf8_locale
+            shift
+            return_root_access "$@"
             return
             ;;
         cleanup|server-cleanup|uninstall-proxies)
