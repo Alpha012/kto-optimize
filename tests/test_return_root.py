@@ -48,7 +48,7 @@ class FakeRunner:
         text = path.read_text(encoding="utf-8") if path.exists() else ""
         dropin_text = self.dropin.read_text(encoding="utf-8") if self.dropin.exists() else ""
         extra_text = self.extra_dropin.read_text(encoding="utf-8") if (self.extra_dropin and self.extra_dropin.exists()) else ""
-        has_include = f"Include {self.dropin}" in text
+        has_include = f"Include {self.dropin.as_posix()}" in text
         has_yes = has_include and "PermitRootLogin yes" in dropin_text
         lines = [
             f"port {self.port}",
@@ -171,19 +171,28 @@ class PureReturnRootTests(unittest.TestCase):
         self.assertIn(SAMPLE_KEY_2, merged)
 
     def test_prepend_include_is_line_one_and_idempotent(self):
-        src = "Include /etc/ssh/sshd_config.d/00-kto-managed.conf\nPort 22\n"
-        dropin = Path("/etc/ssh/sshd_config.d/00-kto-return-root.conf")
+        src = "Include /etc/ssh/sshd_config.d/00-kto-return-root.conf\nInclude /etc/ssh/sshd_config.d/00-kto-managed.conf\nPort 22\n"
+        dropin = Path("/etc/ssh/kto-return-root.conf")
         first = rr.prepend_include(src, dropin)
-        self.assertTrue(first.startswith(f"Include {dropin}\n"))
+        self.assertTrue(first.startswith(f"Include {dropin.as_posix()}\n"))
+        self.assertNotIn("00-kto-return-root.conf", first)
         self.assertEqual(first, rr.prepend_include(first, dropin))
 
+    def test_dropin_lives_outside_sshd_config_d_and_avoids_duplicate_authmethods(self):
+        self.assertNotEqual(rr.DROPIN_PATH.parent, rr.SSHD_CONFIG_D)
+        rendered = rr.render_dropin(include_kbd_interactive=True)
+        self.assertNotIn("AuthenticationMethods", rendered)
+        self.assertIn("PermitRootLogin yes", rendered)
+        self.assertIn("PasswordAuthentication yes", rendered)
+
     def test_fix_access_control_directives_unblocks_root(self):
-        src = "AllowUsers ubuntu admin\nDenyUsers root guest\nDenyGroups root\n"
-        fixed, changed = rr.fix_access_control_directives(src)
+        src = "AllowUsers ubuntu admin\nDenyUsers root guest\nDenyGroups root\nAuthenticationMethods publickey,password\n"
+        fixed, changed = rr.fix_access_control_directives(src, clear_auth_methods=True)
         self.assertTrue(changed)
         self.assertIn("AllowUsers ubuntu admin root\n", fixed)
         self.assertIn("DenyUsers guest\n", fixed)
         self.assertIn("# Disabled by kto return-root: DenyGroups root\n", fixed)
+        self.assertIn("# Disabled by kto return-root: AuthenticationMethods publickey,password\n", fixed)
 
 
 class TransactionReturnRootTests(unittest.TestCase):
@@ -201,7 +210,9 @@ class TransactionReturnRootTests(unittest.TestCase):
         )
         self.extra_dropin = self.ssh_d / "50-cloud-init.conf"
         self.extra_dropin.write_text("PasswordAuthentication no\nDenyUsers root\n", encoding="utf-8")
-        self.dropin = self.ssh_d / rr.DROPIN_NAME
+        self.dropin = self.ssh_dir / rr.DROPIN_NAME
+        self.legacy_dropin = self.ssh_d / "00-kto-return-root.conf"
+        self.legacy_dropin.write_text("AuthenticationMethods any\n", encoding="utf-8")
         self.marker = self.base / "kto-ssh-password.enabled"
         self.backups = self.base / "backups"
         self.sudoers = self.base / "sudoers.d"
@@ -223,6 +234,7 @@ class TransactionReturnRootTests(unittest.TestCase):
             mock.patch.object(rr, "SSHD_CONFIG", self.sshd_config),
             mock.patch.object(rr, "SSHD_CONFIG_D", self.ssh_d),
             mock.patch.object(rr, "DROPIN_PATH", self.dropin),
+            mock.patch.object(rr, "LEGACY_DROPIN_PATH", self.legacy_dropin),
             mock.patch.object(rr, "MARKER_PATH", self.marker),
             mock.patch.object(rr, "BACKUPS_DIR", self.backups),
             mock.patch.object(rr, "SUDOERS_DIR", self.sudoers),
@@ -253,10 +265,11 @@ class TransactionReturnRootTests(unittest.TestCase):
         self.assertFalse(self.runner.socket_active)
         self.assertTrue(self.runner.ssh_active)
 
-        # Line-1 Include + drop-in + fixed DenyUsers + marker
-        self.assertTrue(self.sshd_config.read_text(encoding="utf-8").startswith(f"Include {self.dropin}\n"))
+        # Line-1 Include + drop-in outside sshd_config.d + legacy cleaned + fixed DenyUsers + marker
+        self.assertTrue(self.sshd_config.read_text(encoding="utf-8").startswith(f"Include {self.dropin.as_posix()}\n"))
         self.assertIn("PermitRootLogin yes", self.dropin.read_text(encoding="utf-8"))
-        self.assertIn("AuthenticationMethods any", self.dropin.read_text(encoding="utf-8"))
+        self.assertNotIn("AuthenticationMethods", self.dropin.read_text(encoding="utf-8"))
+        self.assertFalse(self.legacy_dropin.exists())
         self.assertIn("# Disabled by kto return-root: DenyUsers root", self.extra_dropin.read_text(encoding="utf-8"))
         marker_data = json.loads(self.marker.read_text(encoding="utf-8"))
         self.assertEqual(marker_data["mode"], "root-password-and-key")
@@ -300,8 +313,8 @@ class TransactionReturnRootTests(unittest.TestCase):
 
 class KtoIntegrationReturnRootTests(unittest.TestCase):
     def test_menu_cli_wrapper_and_build_sync(self):
-        self.assertIn('SCRIPT_BUILD="v355"', KTO)
-        self.assertEqual(rr.RETURN_ROOT_BUILD, "v355")
+        self.assertIn('SCRIPT_BUILD="v356"', KTO)
+        self.assertEqual(rr.RETURN_ROOT_BUILD, "v356")
         main_body = function_body(KTO, "main")
         self.assertLess(
             main_body.index("return-root|restore-root|root-restore|fix-root|root)"),

@@ -25,12 +25,14 @@ import tempfile
 import time
 
 
-RETURN_ROOT_BUILD = "v355"
+RETURN_ROOT_BUILD = "v356"
 
 SSHD_CONFIG = Path("/etc/ssh/sshd_config")
 SSHD_CONFIG_D = Path("/etc/ssh/sshd_config.d")
-DROPIN_NAME = "00-kto-return-root.conf"
-DROPIN_PATH = SSHD_CONFIG_D / DROPIN_NAME
+DROPIN_NAME = "kto-return-root.conf"
+# Keep outside sshd_config.d/ so "Include /etc/ssh/sshd_config.d/*.conf" never double-includes it.
+DROPIN_PATH = SSHD_CONFIG.parent / DROPIN_NAME
+LEGACY_DROPIN_PATH = SSHD_CONFIG_D / "00-kto-return-root.conf"
 MARKER_PATH = Path("/etc/kto-ssh-password.enabled")
 BACKUPS_DIR = Path("/var/backups/kto-return-root")
 LOCK_PATH = Path("/run/lock/kto-return-root.lock")
@@ -189,19 +191,17 @@ def render_dropin(*, include_kbd_interactive: bool) -> str:
     ]
     if include_kbd_interactive:
         lines.append("KbdInteractiveAuthentication yes")
-    lines.extend([
-        "AuthenticationMethods any",
-        "UsePAM yes",
-    ])
+    lines.append("UsePAM yes")
     return "\n".join(lines) + "\n"
 
 
 def prepend_include(sshd_config_text: str, dropin_path: Path) -> str:
-    directive = f"Include {dropin_path}"
+    directive = f"Include {dropin_path.as_posix()}"
+    legacy_directive = f"Include {LEGACY_DROPIN_PATH.as_posix()}"
     lines = sshd_config_text.splitlines(keepends=True)
     filtered = [
         line for line in lines
-        if line.strip().lower() != directive.lower()
+        if line.strip().lower() not in (directive.lower(), legacy_directive.lower())
     ]
     body = "".join(filtered)
     if body and not body.endswith("\n"):
@@ -209,8 +209,8 @@ def prepend_include(sshd_config_text: str, dropin_path: Path) -> str:
     return directive + "\n" + body
 
 
-def fix_access_control_directives(text: str) -> tuple[str, bool]:
-    """Ensure AllowUsers/DenyUsers/AllowGroups/DenyGroups do not block root."""
+def fix_access_control_directives(text: str, *, clear_auth_methods: bool = False) -> tuple[str, bool]:
+    """Ensure AllowUsers/DenyUsers/AllowGroups/DenyGroups (and optional AuthenticationMethods) do not block root."""
     changed = False
     out_lines: list[str] = []
     for line in text.splitlines(keepends=True):
@@ -244,6 +244,11 @@ def fix_access_control_directives(text: str) -> tuple[str, bool]:
             if values and not has_root:
                 changed = True
                 out_lines.append(f"{leading}{tokens[0]} {' '.join(values)} root{eol}")
+                continue
+        elif clear_auth_methods and key == "authenticationmethods":
+            if [v.lower() for v in values] != ["any"]:
+                changed = True
+                out_lines.append(f"{leading}# Disabled by kto return-root: {stripped}{eol}")
                 continue
         out_lines.append(line)
     return "".join(out_lines), changed
@@ -614,6 +619,12 @@ def return_root(
             dropin_text = render_dropin(include_kbd_interactive=include_kbd)
             atomic_write(DROPIN_PATH, dropin_text.encode("utf-8"), 0o644)
             safe_chown_root(DROPIN_PATH)
+            if LEGACY_DROPIN_PATH.exists():
+                legacy_bytes = LEGACY_DROPIN_PATH.read_bytes()
+                legacy_mode = stat.S_IMODE(LEGACY_DROPIN_PATH.stat().st_mode)
+                modified_extra_files[LEGACY_DROPIN_PATH] = (legacy_bytes, legacy_mode)
+                atomic_write(backup_dir / f"legacy-{LEGACY_DROPIN_PATH.name}", legacy_bytes)
+                LEGACY_DROPIN_PATH.unlink(missing_ok=True)
 
             base_text = (
                 original_sshd_config.decode("utf-8", errors="replace")
@@ -621,20 +632,23 @@ def return_root(
                 else ""
             )
             new_main_text = prepend_include(base_text, DROPIN_PATH)
-            new_main_text, main_acl_fixed = fix_access_control_directives(new_main_text)
+            new_main_text, _ = fix_access_control_directives(new_main_text, clear_auth_methods=True)
             atomic_write(SSHD_CONFIG, new_main_text.encode("utf-8"), original_sshd_mode)
             safe_chown_root(SSHD_CONFIG)
 
-            # Check effective root config and fix any AllowUsers/DenyUsers in sshd_config.d
+            # Check effective root config and fix any AllowUsers/DenyUsers/AuthenticationMethods in sshd_config.d
             effective = get_effective_root_config(runner, sshd_bin, SSHD_CONFIG)
-            acl_issues = root_is_blocked_by_acl(effective)
-            if acl_issues:
+            needs_dropin_fix = bool(root_is_blocked_by_acl(effective)) or (
+                "any" not in effective.get("authenticationmethods", [])
+            )
+            if needs_dropin_fix:
                 for conf_file in sorted(SSHD_CONFIG_D.glob("*.conf")):
                     if conf_file == DROPIN_PATH or not conf_file.is_file():
                         continue
                     raw_bytes = conf_file.read_bytes()
                     fixed_text, changed = fix_access_control_directives(
-                        raw_bytes.decode("utf-8", errors="replace")
+                        raw_bytes.decode("utf-8", errors="replace"),
+                        clear_auth_methods=True,
                     )
                     if changed:
                         file_mode = stat.S_IMODE(conf_file.stat().st_mode)
